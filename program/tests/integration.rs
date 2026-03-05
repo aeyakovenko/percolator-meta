@@ -249,6 +249,7 @@ struct TestEnv {
     pyth_index: Pubkey,
     coin_mint: Pubkey,
     mint_authority_pda: Pubkey,
+    receipt_program: Pubkey,
     account_count: u16,
 }
 
@@ -351,6 +352,9 @@ impl TestEnv {
             ..Clock::default()
         });
 
+        // Receipt program (simulating MetaDAO)
+        let receipt_program = Pubkey::new_unique();
+
         // COIN mint — authority is the rewards PDA
         let (mint_authority_pda, _) =
             Pubkey::find_program_address(&[b"coin_mint_authority", slab.as_ref()], &rewards_id);
@@ -421,6 +425,7 @@ impl TestEnv {
             pyth_index,
             coin_mint,
             mint_authority_pda,
+            receipt_program,
             account_count: 0,
         }
     }
@@ -436,6 +441,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.slab, false),
                 AccountMeta::new(mrc_pda, false),
                 AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new_readonly(self.receipt_program, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_rewards(n, k, total_contributed),
@@ -467,6 +473,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.slab, false),
                 AccountMeta::new(mrc_pda, false),
                 AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new_readonly(self.receipt_program, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_rewards(n, k, total_contributed),
@@ -802,14 +809,14 @@ impl TestEnv {
         contributed_lamports: u64,
     ) -> Pubkey {
         let receipt = Pubkey::new_unique();
-        let meta_dao_id = Pubkey::new_unique(); // fake owner
+        let owner = self.receipt_program;
         self.svm
             .set_account(
                 receipt,
                 Account {
                     lamports: 1_000_000,
                     data: make_receipt_data(contributor, contributed_lamports),
-                    owner: meta_dao_id,
+                    owner,
                     executable: false,
                     rent_epoch: 0,
                 },
@@ -843,7 +850,7 @@ fn test_init_market_rewards_happy_path() {
         Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
     let mrc_account = env.svm.get_account(&mrc_pda).unwrap();
     assert_eq!(mrc_account.owner, env.rewards_id);
-    assert_eq!(mrc_account.data.len(), 112); // MRC_SIZE
+    assert_eq!(mrc_account.data.len(), 144); // MRC_SIZE
 
     // Verify discriminator
     assert_eq!(&mrc_account.data[..8], b"MRC_INIT");
@@ -856,20 +863,24 @@ fn test_init_market_rewards_happy_path() {
     let stored_mint = Pubkey::new_from_array(mrc_account.data[40..72].try_into().unwrap());
     assert_eq!(stored_mint, env.coin_mint);
 
-    // Verify N
-    let stored_n = u64::from_le_bytes(mrc_account.data[72..80].try_into().unwrap());
+    // Verify receipt_program (at offset 72)
+    let stored_rp = Pubkey::new_from_array(mrc_account.data[72..104].try_into().unwrap());
+    assert_eq!(stored_rp, env.receipt_program);
+
+    // Verify N (at offset 104)
+    let stored_n = u64::from_le_bytes(mrc_account.data[104..112].try_into().unwrap());
     assert_eq!(stored_n, n);
 
-    // Verify K
-    let stored_k = u128::from_le_bytes(mrc_account.data[80..96].try_into().unwrap());
+    // Verify K (at offset 112)
+    let stored_k = u128::from_le_bytes(mrc_account.data[112..128].try_into().unwrap());
     assert_eq!(stored_k, k);
 
-    // Verify market_start_slot (should be 100, our clock at init time)
-    let stored_start = u64::from_le_bytes(mrc_account.data[96..104].try_into().unwrap());
+    // Verify market_start_slot (at offset 128)
+    let stored_start = u64::from_le_bytes(mrc_account.data[128..136].try_into().unwrap());
     assert_eq!(stored_start, 100);
 
-    // Verify total_contributed_lamports
-    let stored_total = u64::from_le_bytes(mrc_account.data[104..112].try_into().unwrap());
+    // Verify total_contributed_lamports (at offset 136)
+    let stored_total = u64::from_le_bytes(mrc_account.data[136..144].try_into().unwrap());
     assert_eq!(stored_total, total_contributed);
 }
 
@@ -1072,6 +1083,42 @@ fn test_claim_owner_rewards_wrong_signer() {
 
     let result = env.try_claim_owner_rewards(&attacker, &receipt, &attacker_ata);
     assert!(result.is_err(), "Wrong signer should be rejected");
+}
+
+#[test]
+fn test_claim_owner_rewards_fake_receipt_wrong_owner() {
+    let mut env = TestEnv::new();
+    env.init_market_rewards(1000, 1u128 << 64, 10_000_000);
+
+    let attacker = Keypair::new();
+    env.svm
+        .airdrop(&attacker.pubkey(), 10_000_000_000)
+        .unwrap();
+
+    // Create a fake receipt owned by a different program (not the registered receipt_program)
+    let fake_receipt = Pubkey::new_unique();
+    let fake_owner = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            fake_receipt,
+            Account {
+                lamports: 1_000_000,
+                data: make_receipt_data(&attacker.pubkey(), 10_000_000), // claim 100%
+                owner: fake_owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let coin_ata = env.create_coin_ata(&attacker.pubkey(), 0);
+    env.set_clock(EPOCH_SLOTS + 100);
+
+    let result = env.try_claim_owner_rewards(&attacker, &fake_receipt, &coin_ata);
+    assert!(
+        result.is_err(),
+        "Receipt with wrong owner program should be rejected"
+    );
 }
 
 #[test]

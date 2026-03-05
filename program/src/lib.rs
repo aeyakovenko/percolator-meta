@@ -48,8 +48,8 @@ const IX_CLAIM_LP_REWARDS: u8 = 2;
 // Account sizes
 // ============================================================================
 
-/// MarketRewardsCfg: 8 (discriminator) + 32 + 32 + 8 + 16 + 8 + 8 = 112
-const MRC_SIZE: usize = 8 + 32 + 32 + 8 + 16 + 8 + 8;
+/// MarketRewardsCfg: 8 (discriminator) + 32 + 32 + 32 + 8 + 16 + 8 + 8 = 144
+const MRC_SIZE: usize = 8 + 32 + 32 + 32 + 8 + 16 + 8 + 8;
 /// OwnerClaimState: 8 (discriminator) + 8 = 16
 const OCS_SIZE: usize = 8 + 8;
 /// LpClaimState: 8 (discriminator) + 32 = 40 (u256 = 32 bytes)
@@ -115,6 +115,7 @@ fn read_u128(data: &mut &[u8]) -> Result<u128, ProgramError> {
 struct MarketRewardsCfg {
     market_slab: Pubkey,
     coin_mint: Pubkey,
+    receipt_program: Pubkey,
     n: u64,
     k: u128,
     market_start_slot: u64,
@@ -128,11 +129,12 @@ impl MarketRewardsCfg {
         let mut off = 8;
         let market_slab = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
         let coin_mint = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
+        let receipt_program = Pubkey::new_from_array(data[off..off+32].try_into().unwrap()); off += 32;
         let n = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
         let k = u128::from_le_bytes(data[off..off+16].try_into().unwrap()); off += 16;
         let market_start_slot = u64::from_le_bytes(data[off..off+8].try_into().unwrap()); off += 8;
         let total_contributed_lamports = u64::from_le_bytes(data[off..off+8].try_into().unwrap());
-        Ok(Self { market_slab, coin_mint, n, k, market_start_slot, total_contributed_lamports })
+        Ok(Self { market_slab, coin_mint, receipt_program, n, k, market_start_slot, total_contributed_lamports })
     }
 
     fn serialize(&self, data: &mut [u8]) {
@@ -140,6 +142,7 @@ impl MarketRewardsCfg {
         let mut off = 8;
         data[off..off+32].copy_from_slice(self.market_slab.as_ref()); off += 32;
         data[off..off+32].copy_from_slice(self.coin_mint.as_ref()); off += 32;
+        data[off..off+32].copy_from_slice(self.receipt_program.as_ref()); off += 32;
         data[off..off+8].copy_from_slice(&self.n.to_le_bytes()); off += 8;
         data[off..off+16].copy_from_slice(&self.k.to_le_bytes()); off += 16;
         data[off..off+8].copy_from_slice(&self.market_start_slot.to_le_bytes()); off += 8;
@@ -327,7 +330,8 @@ pub fn process_instruction<'a>(
 //   [1] market_slab (read-only)
 //   [2] market_rewards_cfg PDA (writable, to create)
 //   [3] coin_mint (read-only)
-//   [4] system_program
+//   [4] receipt_program (read-only) — MetaDAO program that owns receipt accounts
+//   [5] system_program
 //
 // Data: N (u64), K (u128), total_contributed_lamports (u64)
 
@@ -341,6 +345,7 @@ fn process_init_market_rewards<'a>(
     let market_slab = next_account_info(iter)?;
     let mrc_account = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
+    let receipt_program = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
     if !payer.is_signer {
@@ -396,6 +401,7 @@ fn process_init_market_rewards<'a>(
     let cfg = MarketRewardsCfg {
         market_slab: *market_slab.key,
         coin_mint: *coin_mint.key,
+        receipt_program: *receipt_program.key,
         n,
         k,
         market_start_slot,
@@ -465,6 +471,12 @@ fn process_claim_owner_rewards<'a>(
         return Err(ProgramError::InvalidSeeds);
     }
     if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    // Verify receipt is owned by the MetaDAO receipt program stored in MRC
+    if *receipt.owner != cfg.receipt_program {
+        msg!("Receipt account not owned by the expected receipt program");
         return Err(ProgramError::IllegalOwner);
     }
 
@@ -625,6 +637,11 @@ fn process_claim_lp_rewards<'a>(
     // Verify market_slab matches config
     if *market_slab.key != cfg.market_slab {
         return Err(ProgramError::InvalidAccountData);
+    }
+    // Verify market_slab is owned by the percolator program we CPI into
+    if market_slab.owner != percolator_program.key {
+        msg!("market_slab owner does not match percolator_program");
+        return Err(ProgramError::IllegalOwner);
     }
 
     // Verify signer is the LP position's owner (read from slab)
