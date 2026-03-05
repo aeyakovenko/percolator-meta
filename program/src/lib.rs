@@ -43,6 +43,7 @@ pub const MAX_LP_COIN_PER_FEE_FP: u128 = 1_000_000u128 << 64; // 1M COIN per fee
 const IX_INIT_MARKET_REWARDS: u8 = 0;
 const IX_CLAIM_OWNER_REWARDS: u8 = 1;
 const IX_CLAIM_LP_REWARDS: u8 = 2;
+const IX_INIT_COIN_CONFIG: u8 = 3;
 
 // ============================================================================
 // Account sizes
@@ -54,11 +55,14 @@ const MRC_SIZE: usize = 8 + 32 + 32 + 32 + 8 + 16 + 8 + 8;
 const OCS_SIZE: usize = 8 + 8;
 /// LpClaimState: 8 (discriminator) + 32 = 40 (u256 = 32 bytes)
 const LCS_SIZE: usize = 8 + 32;
+/// CoinConfig: 8 (discriminator) + 32 (authority) + 32 (receipt_program) = 72
+const COIN_CFG_SIZE: usize = 8 + 32 + 32;
 
 // Discriminators (first 8 bytes)
 const MRC_DISC: [u8; 8] = *b"MRC_INIT";
 const OCS_DISC: [u8; 8] = *b"OCS_INIT";
 const LCS_DISC: [u8; 8] = *b"LCS_INIT";
+const COIN_CFG_DISC: [u8; 8] = *b"CCFG_INI";
 
 // ============================================================================
 // PDA seeds
@@ -72,8 +76,12 @@ fn ocs_seeds<'a>(market_slab: &'a Pubkey, receipt: &'a Pubkey) -> [&'a [u8]; 3] 
     [b"ocs", market_slab.as_ref(), receipt.as_ref()]
 }
 
-fn mint_authority_seeds(market_slab: &Pubkey) -> [&[u8]; 2] {
-    [b"coin_mint_authority", market_slab.as_ref()]
+fn mint_authority_seeds(coin_mint: &Pubkey) -> [&[u8]; 2] {
+    [b"coin_mint_authority", coin_mint.as_ref()]
+}
+
+fn coin_cfg_seeds(coin_mint: &Pubkey) -> [&[u8]; 2] {
+    [b"coin_cfg", coin_mint.as_ref()]
 }
 
 // ============================================================================
@@ -147,6 +155,31 @@ impl MarketRewardsCfg {
         data[off..off+16].copy_from_slice(&self.k.to_le_bytes()); off += 16;
         data[off..off+8].copy_from_slice(&self.market_start_slot.to_le_bytes()); off += 8;
         data[off..off+8].copy_from_slice(&self.total_contributed_lamports.to_le_bytes());
+    }
+}
+
+// ============================================================================
+// CoinConfig — shared across all markets using the same COIN mint
+// ============================================================================
+
+struct CoinConfig {
+    authority: Pubkey,
+    receipt_program: Pubkey,
+}
+
+impl CoinConfig {
+    fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
+        if data.len() < COIN_CFG_SIZE { return Err(ProgramError::InvalidAccountData); }
+        if data[..8] != COIN_CFG_DISC { return Err(ProgramError::InvalidAccountData); }
+        let authority = Pubkey::new_from_array(data[8..40].try_into().unwrap());
+        let receipt_program = Pubkey::new_from_array(data[40..72].try_into().unwrap());
+        Ok(Self { authority, receipt_program })
+    }
+
+    fn serialize(&self, data: &mut [u8]) {
+        data[..8].copy_from_slice(&COIN_CFG_DISC);
+        data[8..40].copy_from_slice(self.authority.as_ref());
+        data[40..72].copy_from_slice(self.receipt_program.as_ref());
     }
 }
 
@@ -318,19 +351,81 @@ pub fn process_instruction<'a>(
         IX_INIT_MARKET_REWARDS => process_init_market_rewards(program_id, accounts, &mut data),
         IX_CLAIM_OWNER_REWARDS => process_claim_owner_rewards(program_id, accounts, &mut data),
         IX_CLAIM_LP_REWARDS => process_claim_lp_rewards(program_id, accounts, &mut data),
+        IX_INIT_COIN_CONFIG => process_init_coin_config(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
+}
+
+// ============================================================================
+// init_coin_config
+// ============================================================================
+// Accounts:
+//   [0] authority (signer, writable — pays for PDA creation)
+//   [1] coin_mint (read-only)
+//   [2] coin_config PDA (writable, to create)
+//   [3] receipt_program (read-only) — MetaDAO program that owns receipt accounts
+//   [4] system_program
+
+fn process_init_coin_config<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    _data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
+    let receipt_program = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Validate coin_mint: freeze_authority must be None, mint_authority must be our PDA
+    let mint_data = coin_mint.try_borrow_data()?;
+    let mint_info = spl_token::state::Mint::unpack(&mint_data)?;
+    if mint_info.freeze_authority.is_some() {
+        msg!("COIN mint must have freeze_authority = None");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (expected_mint_auth, _) = Pubkey::find_program_address(
+        &mint_authority_seeds(coin_mint.key),
+        program_id,
+    );
+    match mint_info.mint_authority {
+        solana_program::program_option::COption::Some(auth) if auth == expected_mint_auth => {}
+        _ => {
+            msg!("COIN mint_authority must be the rewards PDA");
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    drop(mint_data);
+
+    // Create CoinConfig PDA (init guard — fails if already exists)
+    let seeds = coin_cfg_seeds(coin_mint.key);
+    create_pda_account(authority, coin_cfg_account, system_program, program_id, &seeds, COIN_CFG_SIZE)?;
+
+    // Write config
+    let mut cfg_data = coin_cfg_account.try_borrow_mut_data()?;
+    let cfg = CoinConfig {
+        authority: *authority.key,
+        receipt_program: *receipt_program.key,
+    };
+    cfg.serialize(&mut cfg_data);
+
+    Ok(())
 }
 
 // ============================================================================
 // init_market_rewards
 // ============================================================================
 // Accounts:
-//   [0] payer (signer, writable)
+//   [0] authority (signer, writable — must match CoinConfig.authority)
 //   [1] market_slab (read-only)
 //   [2] market_rewards_cfg PDA (writable, to create)
 //   [3] coin_mint (read-only)
-//   [4] receipt_program (read-only) — MetaDAO program that owns receipt accounts
+//   [4] coin_config PDA (read-only)
 //   [5] system_program
 //
 // Data: N (u64), K (u128), total_contributed_lamports (u64)
@@ -341,14 +436,14 @@ fn process_init_market_rewards<'a>(
     data: &mut &[u8],
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
-    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let mrc_account = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
-    let receipt_program = next_account_info(iter)?;
+    let coin_cfg_account = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
-    if !payer.is_signer {
+    if !authority.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
 
@@ -362,6 +457,28 @@ fn process_init_market_rewards<'a>(
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    // Verify CoinConfig PDA
+    let (expected_cfg, _) = Pubkey::find_program_address(
+        &coin_cfg_seeds(coin_mint.key),
+        program_id,
+    );
+    if *coin_cfg_account.key != expected_cfg {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if coin_cfg_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    // Read CoinConfig and verify authority
+    let cfg_data = coin_cfg_account.try_borrow_data()?;
+    let coin_cfg = CoinConfig::deserialize(&cfg_data)?;
+    drop(cfg_data);
+
+    if *authority.key != coin_cfg.authority {
+        msg!("Signer does not match CoinConfig authority");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
     // Read market_start_slot from slab (§2.1) — never trust caller-supplied value
     let slab_data = market_slab.try_borrow_data()?;
     let market_start_slot = state::read_market_start_slot(&slab_data);
@@ -371,37 +488,16 @@ fn process_init_market_rewards<'a>(
     }
     drop(slab_data);
 
-    // Validate coin_mint: freeze_authority must be None
-    let mint_data = coin_mint.try_borrow_data()?;
-    let mint_info = spl_token::state::Mint::unpack(&mint_data)?;
-    if mint_info.freeze_authority.is_some() {
-        msg!("COIN mint must have freeze_authority = None");
-        return Err(ProgramError::InvalidAccountData);
-    }
-    // Verify mint_authority is the expected PDA
-    let (expected_mint_auth, _) = Pubkey::find_program_address(
-        &mint_authority_seeds(market_slab.key),
-        program_id,
-    );
-    match mint_info.mint_authority {
-        solana_program::program_option::COption::Some(auth) if auth == expected_mint_auth => {}
-        _ => {
-            msg!("COIN mint_authority must be the rewards PDA");
-            return Err(ProgramError::InvalidAccountData);
-        }
-    }
-    drop(mint_data);
-
     // Create MarketRewardsCfg PDA (init guard — fails if already exists)
     let seeds = mrc_seeds(market_slab.key);
-    create_pda_account(payer, mrc_account, system_program, program_id, &seeds, MRC_SIZE)?;
+    create_pda_account(authority, mrc_account, system_program, program_id, &seeds, MRC_SIZE)?;
 
-    // Write config
+    // Write config — receipt_program is copied from CoinConfig
     let mut mrc_data = mrc_account.try_borrow_mut_data()?;
     let cfg = MarketRewardsCfg {
         market_slab: *market_slab.key,
         coin_mint: *coin_mint.key,
-        receipt_program: *receipt_program.key,
+        receipt_program: coin_cfg.receipt_program,
         n,
         k,
         market_start_slot,
@@ -561,7 +657,7 @@ fn process_claim_owner_rewards<'a>(
     }
 
     // Verify mint_authority PDA
-    let ma_seeds = mint_authority_seeds(&cfg.market_slab);
+    let ma_seeds = mint_authority_seeds(&cfg.coin_mint);
     let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
     if *mint_authority.key != expected_ma {
         return Err(ProgramError::InvalidSeeds);
@@ -569,7 +665,7 @@ fn process_claim_owner_rewards<'a>(
 
     // Mint COIN
     let bump_bytes = [ma_bump];
-    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.market_slab.as_ref(), &bump_bytes];
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
     mint_coin(token_program, coin_mint, coin_ata, mint_authority, claimable, &signer_seeds)?;
 
     // Update claim state
@@ -747,13 +843,13 @@ fn process_claim_lp_rewards<'a>(
     }
 
     // Mint COIN
-    let ma_seeds = mint_authority_seeds(&cfg.market_slab);
+    let ma_seeds = mint_authority_seeds(&cfg.coin_mint);
     let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
     if *mint_authority.key != expected_ma {
         return Err(ProgramError::InvalidSeeds);
     }
     let bump_bytes = [ma_bump];
-    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.market_slab.as_ref(), &bump_bytes];
+    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", cfg.coin_mint.as_ref(), &bump_bytes];
     mint_coin(token_program, coin_mint, coin_ata, mint_authority, claimable_coins, &signer_seeds)?;
 
     // Update LpClaimState: reward_claimed_fp += claimable_coins * FP

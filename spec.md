@@ -63,9 +63,10 @@ The `rewards` program CPIs this instruction to obtain the monotonically non-decr
 
 COIN mint requirements:
 
-- `mint_authority = PDA(rewards, [b"coin_mint_authority", market_slab_key])`
+- `mint_authority = PDA(rewards, [b"coin_mint_authority", coin_mint_key])`
 - `freeze_authority = None`
-- Decimals are fixed at market creation and committed in the proposal hash.
+- Decimals are fixed at creation and committed in the proposal hash.
+- A single COIN mint is shared across all markets managed by the same DAO. The `CoinConfig` PDA (§10) gates which authority can register new markets.
 
 -----
 
@@ -137,8 +138,10 @@ The caller assembles the following instructions in a single transaction after `p
            market_slab, N, K, coin_mint,
            total_contributed_lamports = proposal.seed_sol_raised
      )
+     // signer: CoinConfig.authority (the DAO)
      // creates MarketRewardsCfg PDA (init guard — fails if already exists)
      // reads and stores market_start_slot from slab (never trusts caller-supplied value)
+     // receipt_program is copied from CoinConfig
 ```
 
 After instruction [3], Percolator’s `require_admin` check (`admin != [0u8;32]`) permanently rejects every admin instruction on this slab. No future governance call, upgrade, or multisig can invoke `UpdateConfig`, `SetRiskThreshold`, `ResolveMarket`, `WithdrawInsurance`, or any other admin-gated instruction on this market.
@@ -221,18 +224,30 @@ Because the admin is burned in §7 step [3], `ResolveMarket` and `WithdrawInsura
 
 ## 10. `rewards` program accounts
 
+### CoinConfig
+
+PDA seeds: `[b"coin_cfg", coin_mint_key]`
+
+Created once per COIN token via `init_coin_config`. The authority (typically the MetaDAO program) is the only key that can register new markets for this COIN.
+
+|Field             |Type  |Description                                     |
+|------------------|------|-------------------------------------------------|
+|`authority`       |Pubkey|Who can call `init_market_rewards` for this COIN |
+|`receipt_program` |Pubkey|MetaDAO program that owns receipt accounts       |
+
 ### MarketRewardsCfg
 
 PDA seeds: `[b"mrc", market_slab_key]`
 
-|Field                       |Type  |Description                      |
-|----------------------------|------|---------------------------------|
-|`market_slab`               |Pubkey|Percolator slab account          |
-|`coin_mint`                 |Pubkey|COIN mint address                |
-|`N`                         |u64   |Owner emission per epoch (COIN)  |
-|`K`                         |u128  |LP COIN per fee-atom (FP)        |
-|`market_start_slot`         |u64   |Read from slab at init; immutable|
-|`total_contributed_lamports`|u64   |From proposal; immutable         |
+|Field                       |Type  |Description                                   |
+|----------------------------|------|----------------------------------------------|
+|`market_slab`               |Pubkey|Percolator slab account                       |
+|`coin_mint`                 |Pubkey|COIN mint address                             |
+|`receipt_program`           |Pubkey|Copied from CoinConfig at init time           |
+|`N`                         |u64   |Owner emission per epoch (COIN)               |
+|`K`                         |u128  |LP COIN per fee-atom (FP)                     |
+|`market_start_slot`         |u64   |Read from slab at init; immutable             |
+|`total_contributed_lamports`|u64   |From proposal; immutable                      |
 
 ### OwnerClaimState
 
