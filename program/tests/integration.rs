@@ -1736,6 +1736,232 @@ fn test_staker_leaves_then_another_earns_all() {
 }
 
 // ============================================================================
+// Tests: multi-user staggered withdrawal with balance verification
+// ============================================================================
+
+#[test]
+fn test_two_users_unstake_at_different_times() {
+    // Alice and Bob both stake 1M at slot 100.
+    // Alice unstakes at slot 200 (1 epoch). Bob unstakes at slot 300 (2 epochs).
+    // Verify both collateral returns and COIN reward amounts.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 0, 100); // N=1000/epoch, epoch_slots=100
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+
+    env.stake(&alice, 1_000_000);
+    env.advance_blockhash();
+    env.stake(&bob, 1_000_000);
+
+    // Slot 200: Alice unstakes fully
+    env.set_clock(200);
+    let (alice_col, alice_coin) = env.unstake_and_get_atas(&alice, 1_000_000);
+
+    let alice_col_bal = env.read_token_balance(&alice_col);
+    let alice_coin_bal = env.read_token_balance(&alice_coin);
+    assert_eq!(alice_col_bal, 1_000_000, "Alice collateral fully returned");
+    // epoch [100..200]: 1000 / 2 = ~500
+    assert!(alice_coin_bal >= 499 && alice_coin_bal <= 500,
+            "Alice COIN ~500, got {}", alice_coin_bal);
+
+    // Slot 300: Bob unstakes — earned shared [100..200] + solo [200..300]
+    env.set_clock(300);
+    let (bob_col, bob_coin) = env.unstake_and_get_atas(&bob, 1_000_000);
+
+    let bob_col_bal = env.read_token_balance(&bob_col);
+    let bob_coin_bal = env.read_token_balance(&bob_coin);
+    assert_eq!(bob_col_bal, 1_000_000, "Bob collateral fully returned");
+    // [100..200] shared: ~500, [200..300] solo: ~1000 => ~1500
+    assert!(bob_coin_bal >= 1498 && bob_coin_bal <= 1500,
+            "Bob COIN ~1500, got {}", bob_coin_bal);
+}
+
+#[test]
+fn test_three_users_staggered_entry_and_exit() {
+    // Alice stakes at 100, Bob at 150, Carol at 200.
+    // Alice unstakes at 250, Bob at 300, Carol at 350.
+    // N=1200/epoch, epoch_slots=100.
+    // Rate = 12 COIN/slot when divided among stakers.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1200, 0, 100);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let carol = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&carol.pubkey(), 10_000_000_000).unwrap();
+
+    // All stake equal amounts at different times
+    // Slot 100: Alice stakes 1M (alone)
+    env.stake(&alice, 1_000_000);
+
+    // Slot 150: Bob stakes 1M (now Alice+Bob)
+    env.set_clock(150);
+    env.stake(&bob, 1_000_000);
+
+    // Slot 200: Carol stakes 1M (now all three)
+    env.set_clock(200);
+    env.stake(&carol, 1_000_000);
+
+    // Slot 250: Alice unstakes
+    env.set_clock(250);
+    let (alice_col, alice_coin) = env.unstake_and_get_atas(&alice, 1_000_000);
+    assert_eq!(env.read_token_balance(&alice_col), 1_000_000);
+
+    // Alice: [100..150] solo 50 slots = 600, [150..200] 1/2 50 slots = 300,
+    //        [200..250] 1/3 50 slots = 200 => total 1100
+    let alice_coin_bal = env.read_token_balance(&alice_coin);
+    assert!(alice_coin_bal >= 1098 && alice_coin_bal <= 1100,
+            "Alice COIN ~1100, got {}", alice_coin_bal);
+
+    // Slot 300: Bob unstakes (Bob+Carol for [250..300])
+    env.set_clock(300);
+    let (bob_col, bob_coin) = env.unstake_and_get_atas(&bob, 1_000_000);
+    assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
+
+    // Bob: [150..200] 1/2 = 300, [200..250] 1/3 = 200, [250..300] 1/2 = 300 => 800
+    let bob_coin_bal = env.read_token_balance(&bob_coin);
+    assert!(bob_coin_bal >= 798 && bob_coin_bal <= 800,
+            "Bob COIN ~800, got {}", bob_coin_bal);
+
+    // Slot 350: Carol unstakes (solo for [300..350])
+    env.set_clock(350);
+    let (carol_col, carol_coin) = env.unstake_and_get_atas(&carol, 1_000_000);
+    assert_eq!(env.read_token_balance(&carol_col), 1_000_000);
+
+    // Carol: [200..250] 1/3 = 200, [250..300] 1/2 = 300, [300..350] solo = 600 => 1100
+    let carol_coin_bal = env.read_token_balance(&carol_coin);
+    assert!(carol_coin_bal >= 1098 && carol_coin_bal <= 1100,
+            "Carol COIN ~1100, got {}", carol_coin_bal);
+}
+
+#[test]
+fn test_partial_unstake_then_full_unstake_different_users() {
+    // Alice stakes 2M, Bob stakes 1M. Alice partial-unstakes 1M at slot 200,
+    // then fully unstakes remaining 1M at slot 300. Bob fully unstakes at 300.
+    // Verify collateral and rewards at each step.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(900, 0, 100); // 9 COIN/slot
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+
+    env.stake(&alice, 2_000_000); // 2/3 of pool
+    env.advance_blockhash();
+    env.stake(&bob, 1_000_000);   // 1/3 of pool
+
+    // Slot 200: Alice partial-unstakes 1M
+    env.set_clock(200);
+    let (alice_col_1, alice_coin_1) = env.unstake_and_get_atas(&alice, 1_000_000);
+    assert_eq!(env.read_token_balance(&alice_col_1), 1_000_000);
+
+    // [100..200]: Alice 2/3 of 900 = 600
+    let alice_coin_1_bal = env.read_token_balance(&alice_coin_1);
+    assert!(alice_coin_1_bal >= 599 && alice_coin_1_bal <= 600,
+            "Alice partial COIN ~600, got {}", alice_coin_1_bal);
+
+    // Slot 300: Both unstake fully (Alice has 1M left, Bob has 1M, pool = 2M)
+    // Note: Alice's partial unstake resets lockup, so she needs another epoch
+    env.set_clock(300);
+    let (alice_col_2, alice_coin_2) = env.unstake_and_get_atas(&alice, 1_000_000);
+    let (bob_col, bob_coin) = env.unstake_and_get_atas(&bob, 1_000_000);
+
+    assert_eq!(env.read_token_balance(&alice_col_2), 1_000_000);
+    assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
+
+    // [200..300]: pool=2M, each has 1M => each gets 900/2 = 450
+    let alice_coin_2_bal = env.read_token_balance(&alice_coin_2);
+    assert!(alice_coin_2_bal >= 449 && alice_coin_2_bal <= 450,
+            "Alice remaining COIN ~450, got {}", alice_coin_2_bal);
+
+    // Bob total: [100..200] 1/3 = 300, [200..300] 1/2 = 450 => 750
+    let bob_coin_bal = env.read_token_balance(&bob_coin);
+    assert!(bob_coin_bal >= 749 && bob_coin_bal <= 750,
+            "Bob COIN ~750, got {}", bob_coin_bal);
+}
+
+#[test]
+fn test_claim_then_unstake_no_double_rewards() {
+    // Alice stakes, claims rewards at slot 200, then unstakes at slot 300.
+    // Total COIN should equal what she'd get by just unstaking at 300.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 0, 100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+
+    env.stake(&alice, 1_000_000);
+
+    // Slot 200: Claim (no unstake)
+    env.set_clock(200);
+    let claim_ata = env.claim_stake_rewards(&alice);
+    let claimed = env.read_token_balance(&claim_ata);
+    // Solo for 1 epoch => ~1000
+    assert!(claimed >= 999 && claimed <= 1000, "Claimed ~1000, got {}", claimed);
+
+    // Slot 300: Unstake — should get rewards for [200..300] only, not double
+    env.set_clock(300);
+    let (col_ata, coin_ata) = env.unstake_and_get_atas(&alice, 1_000_000);
+
+    assert_eq!(env.read_token_balance(&col_ata), 1_000_000);
+    let unstake_coin = env.read_token_balance(&coin_ata);
+    // [200..300] solo => ~1000
+    assert!(unstake_coin >= 999 && unstake_coin <= 1000,
+            "Unstake COIN ~1000, got {}", unstake_coin);
+
+    // Total: claimed + unstake_coin should be ~2000 (2 epochs solo)
+    let total = claimed + unstake_coin;
+    assert!(total >= 1998 && total <= 2000, "Total COIN ~2000, got {}", total);
+}
+
+#[test]
+fn test_user_leaves_mid_epoch_collateral_conserved() {
+    // Verify total collateral in vault equals sum of all staked positions.
+    // Alice stakes 2M, Bob stakes 1M. Alice unstakes 500K. Vault should have 2.5M.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 0, 100);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+
+    env.stake(&alice, 2_000_000);
+    env.advance_blockhash();
+    env.stake(&bob, 1_000_000);
+
+    // Check vault has 3M
+    let (stake_vault, _) = Pubkey::find_program_address(
+        &[b"stake_vault", env.slab.as_ref()],
+        &env.rewards_id,
+    );
+    assert_eq!(env.read_token_balance(&stake_vault), 3_000_000);
+
+    // Alice partial unstake 500K
+    env.set_clock(200);
+    let (alice_col, _) = env.unstake_and_get_atas(&alice, 500_000);
+    assert_eq!(env.read_token_balance(&alice_col), 500_000);
+    assert_eq!(env.read_token_balance(&stake_vault), 2_500_000);
+
+    // Bob full unstake
+    env.set_clock(300);
+    let (bob_col, _) = env.unstake_and_get_atas(&bob, 1_000_000);
+    assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
+    assert_eq!(env.read_token_balance(&stake_vault), 1_500_000);
+}
+
+// ============================================================================
 // Tests: claim_lp_rewards
 // ============================================================================
 

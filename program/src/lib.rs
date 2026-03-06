@@ -708,6 +708,10 @@ fn process_unstake<'a>(
     if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
     if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
 
+    // Verify stake vault PDA
+    let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+
     let clock = Clock::from_account_info(clock_info)?;
 
     // Update accumulator
