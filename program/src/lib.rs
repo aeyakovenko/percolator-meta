@@ -653,7 +653,10 @@ fn process_unstake<'a>(
     // Update accumulator
     update_accumulator(&mut cfg, clock.slot);
 
-    // Load StakePosition
+    // Load and verify StakePosition PDA belongs to this user
+    let sp_seeds_arr = sp_seeds(&cfg.market_slab, user.key);
+    let (expected_sp, _) = Pubkey::find_program_address(&sp_seeds_arr, program_id);
+    if *sp_account.key != expected_sp { return Err(ProgramError::InvalidSeeds); }
     if sp_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
     let sp_data_r = sp_account.try_borrow_data()?;
     let mut pos = StakePosition::deserialize(&sp_data_r)?;

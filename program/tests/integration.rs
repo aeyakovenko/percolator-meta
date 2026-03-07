@@ -631,6 +631,7 @@ impl TestEnv {
                 AccountMeta::new_readonly(self.collateral_mint, false),
                 AccountMeta::new(stake_vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: encode_init_market_rewards(n, epoch_slots),
@@ -2424,4 +2425,687 @@ fn test_unauthorized_market_cannot_inflate_shared_coin() {
     );
     let result = env.svm.send_transaction(tx);
     assert!(result.is_err(), "Attacker cannot register market with shared COIN");
+}
+
+// ============================================================================
+// Tests: non-signer rejection
+// ============================================================================
+
+#[test]
+fn test_stake_non_signer_rejected() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (sp_pda, _) = Pubkey::find_program_address(
+        &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+    let col_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&col_mint, &user.pubkey(), 500);
+
+    // Build instruction with user NOT as signer
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), false), // NOT a signer
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(stake_vault, false),
+            AccountMeta::new(sp_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_stake(500),
+    };
+    let payer = &env.payer;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "Stake without signer must fail");
+}
+
+#[test]
+fn test_unstake_non_signer_rejected() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&user, 500);
+    env.set_clock(300); // past lockup
+
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    let (sp_pda, _) = Pubkey::find_program_address(
+        &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+    let col_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&col_mint, &user.pubkey(), 0);
+    let coin_ata = env.create_coin_ata(&user.pubkey(), 0);
+
+    // Build instruction with user NOT as signer
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), false), // NOT a signer
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(stake_vault, false),
+            AccountMeta::new(sp_pda, false),
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new(coin_ata, false),
+            AccountMeta::new_readonly(env.mint_authority_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_unstake(500),
+    };
+    let payer = &env.payer;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "Unstake without signer must fail");
+}
+
+#[test]
+fn test_claim_stake_rewards_non_signer_rejected() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&user, 500);
+    env.set_clock(200);
+
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (sp_pda, _) = Pubkey::find_program_address(
+        &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+    let coin_ata = env.create_coin_ata(&user.pubkey(), 0);
+
+    // Build instruction with user NOT as signer
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), false), // NOT a signer
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new(sp_pda, false),
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new(coin_ata, false),
+            AccountMeta::new_readonly(env.mint_authority_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_claim_stake_rewards(),
+    };
+    let payer = &env.payer;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "Claim without signer must fail");
+}
+
+#[test]
+fn test_mint_reward_non_signer_rejected() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+
+    let dest = env.create_coin_ata(&Pubkey::new_unique(), 0);
+
+    let (coin_cfg_pda, _) = Pubkey::find_program_address(
+        &[b"coin_cfg", env.coin_mint.as_ref()],
+        &env.rewards_id,
+    );
+
+    // Build instruction with authority NOT as signer
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(env.dao_authority.pubkey(), false), // NOT a signer
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new_readonly(coin_cfg_pda, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new_readonly(env.mint_authority_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: encode_mint_reward(100),
+    };
+    let payer = &env.payer;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "mint_reward without signer must fail");
+}
+
+// ============================================================================
+// Tests: wrong MRC / slab mismatch
+// ============================================================================
+
+#[test]
+fn test_stake_wrong_slab_mismatch_fails() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+
+    // Use a different slab key that doesn't match MRC
+    let wrong_slab = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            wrong_slab,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; SLAB_LEN],
+                owner: env.percolator_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    // SP derived from wrong slab — will fail PDA check too
+    let (sp_pda, _) = Pubkey::find_program_address(
+        &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+    let col_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&col_mint, &user.pubkey(), 500);
+
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(wrong_slab, false), // wrong slab
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(stake_vault, false),
+            AccountMeta::new(sp_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_stake(500),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&user.pubkey()),
+        &[&user],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "Stake with wrong slab must fail");
+}
+
+// ============================================================================
+// Tests: unstake wrong stake_vault PDA
+// ============================================================================
+
+#[test]
+fn test_unstake_wrong_stake_vault_fails() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&user, 500);
+    env.set_clock(300); // past lockup
+
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (sp_pda, _) = Pubkey::find_program_address(
+        &[b"sp", env.slab.as_ref(), user.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+    let col_mint = env.collateral_mint;
+    let user_ata = env.create_ata(&col_mint, &user.pubkey(), 0);
+    let coin_ata = env.create_coin_ata(&user.pubkey(), 0);
+
+    // Create a fake vault that is NOT the correct PDA
+    let fake_vault = Pubkey::new_unique();
+    let (mrc_key, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    env.svm
+        .set_account(
+            fake_vault,
+            Account {
+                lamports: 1_000_000,
+                data: make_token_account_data(&col_mint, &mrc_key, 500),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new(fake_vault, false), // wrong vault
+            AccountMeta::new(sp_pda, false),
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new(coin_ata, false),
+            AccountMeta::new_readonly(env.mint_authority_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_unstake(500),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&user.pubkey()),
+        &[&user],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "Unstake with wrong vault PDA must fail");
+}
+
+// ============================================================================
+// Tests: init_market_rewards with uninitialized slab (market_start_slot=0)
+// ============================================================================
+
+#[test]
+fn test_init_market_rewards_uninitialized_slab_fails() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+
+    // Create a raw slab that was never initialized via InitMarket
+    // (market_start_slot will be 0)
+    let raw_slab = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            raw_slab,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; SLAB_LEN],
+                owner: env.percolator_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", raw_slab.as_ref()], &env.rewards_id);
+    let (coin_cfg_pda, _) = Pubkey::find_program_address(
+        &[b"coin_cfg", env.coin_mint.as_ref()],
+        &env.rewards_id,
+    );
+    let (stake_vault, _) = Pubkey::find_program_address(
+        &[b"stake_vault", raw_slab.as_ref()],
+        &env.rewards_id,
+    );
+
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(env.dao_authority.pubkey(), true),
+            AccountMeta::new_readonly(raw_slab, false),
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(coin_cfg_pda, false),
+            AccountMeta::new_readonly(env.collateral_mint, false),
+            AccountMeta::new(stake_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_rewards(1000, 100),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "init_market_rewards must reject slab with market_start_slot=0"
+    );
+}
+
+// ============================================================================
+// Tests: two markets sharing one COIN work independently
+// ============================================================================
+
+#[test]
+fn test_two_markets_share_one_coin() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    // Create a second percolator market with its own slab
+    let slab2 = Pubkey::new_unique();
+    let vault2 = Pubkey::new_unique();
+    let (vault2_pda, _) =
+        Pubkey::find_program_address(&[b"vault", slab2.as_ref()], &env.percolator_id);
+    env.svm
+        .set_account(
+            slab2,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; SLAB_LEN],
+                owner: env.percolator_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            vault2,
+            Account {
+                lamports: 1_000_000,
+                data: make_token_account_data(&env.collateral_mint, &vault2_pda, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Init market 2 via percolator
+    let dummy_ata2 = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dummy_ata2,
+            Account {
+                lamports: 1_000_000,
+                data: vec![0u8; TokenAccount::LEN],
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: env.percolator_id,
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(slab2, false),
+            AccountMeta::new_readonly(env.collateral_mint, false),
+            AccountMeta::new(vault2, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata2, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market(
+            &env.payer.pubkey(),
+            &env.collateral_mint,
+            &TEST_FEED_ID,
+            0,
+        ),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&env.payer.pubkey()),
+        &[&env.payer],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("init_market2 failed");
+
+    // Init rewards for market 2 (different N)
+    let (mrc_pda2, _) =
+        Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
+    let (coin_cfg_pda, _) = Pubkey::find_program_address(
+        &[b"coin_cfg", env.coin_mint.as_ref()],
+        &env.rewards_id,
+    );
+    let (stake_vault2, _) =
+        Pubkey::find_program_address(&[b"stake_vault", slab2.as_ref()], &env.rewards_id);
+
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(env.dao_authority.pubkey(), true),
+            AccountMeta::new_readonly(slab2, false),
+            AccountMeta::new(mrc_pda2, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new_readonly(coin_cfg_pda, false),
+            AccountMeta::new_readonly(env.collateral_mint, false),
+            AccountMeta::new(stake_vault2, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_rewards(2000, 100), // 2x rewards vs market 1
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&env.dao_authority.pubkey()),
+        &[&env.dao_authority],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("init_market_rewards2 failed");
+
+    // Stake on market 1
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 500); // market 1
+
+    // Stake on market 2 (manually since helpers use env.slab)
+    let bob = Keypair::new();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    let col_mint = env.collateral_mint;
+    let bob_ata = env.create_ata(&col_mint, &bob.pubkey(), 500);
+    let (sp_pda_bob, _) = Pubkey::find_program_address(
+        &[b"sp", slab2.as_ref(), bob.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new(mrc_pda2, false),
+            AccountMeta::new_readonly(slab2, false),
+            AccountMeta::new(bob_ata, false),
+            AccountMeta::new(stake_vault2, false),
+            AccountMeta::new(sp_pda_bob, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_stake(500),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&bob.pubkey()),
+        &[&bob],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("bob stake market2 failed");
+
+    // Advance 100 slots (1 epoch)
+    env.set_clock(200);
+
+    // Claim from market 1 (Alice): should get ~1000 COIN
+    let alice_coin = env.claim_stake_rewards(&alice);
+    let alice_bal = env.read_token_balance(&alice_coin);
+    assert!(
+        alice_bal >= 999 && alice_bal <= 1001,
+        "Alice (market1, N=1000) should get ~1000 COIN, got {}",
+        alice_bal
+    );
+
+    // Claim from market 2 (Bob): should get ~2000 COIN
+    let bob_coin = env.create_coin_ata(&bob.pubkey(), 0);
+    let (sp_pda_bob2, _) = Pubkey::find_program_address(
+        &[b"sp", slab2.as_ref(), bob.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new(mrc_pda2, false),
+            AccountMeta::new_readonly(slab2, false),
+            AccountMeta::new(sp_pda_bob2, false),
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new(bob_coin, false),
+            AccountMeta::new_readonly(env.mint_authority_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_claim_stake_rewards(),
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&bob.pubkey()),
+        &[&bob],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("bob claim market2 failed");
+
+    let bob_bal = env.read_token_balance(&bob_coin);
+    assert!(
+        bob_bal >= 1999 && bob_bal <= 2001,
+        "Bob (market2, N=2000) should get ~2000 COIN, got {}",
+        bob_bal
+    );
+}
+
+// ============================================================================
+// Tests: N=0 (no rewards emitted)
+// ============================================================================
+
+#[test]
+fn test_n_zero_no_rewards_emitted() {
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(0, 100); // N=0: no staking rewards
+
+    let user = Keypair::new();
+    env.svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&user, 500);
+    env.set_clock(200); // 1 full epoch
+
+    let coin_ata = env.claim_stake_rewards(&user);
+    let bal = env.read_token_balance(&coin_ata);
+    assert_eq!(bal, 0, "N=0 should emit zero COIN rewards, got {}", bal);
+
+    // User can still unstake their collateral
+    env.set_clock(300);
+    let (col_ata, _) = env.unstake_and_get_atas(&user, 500);
+    let col_bal = env.read_token_balance(&col_ata);
+    assert_eq!(col_bal, 500, "Collateral must be returned even with N=0");
+}
+
+// ============================================================================
+// Tests: unstake must verify SP PDA belongs to the signer
+// ============================================================================
+
+#[test]
+fn test_unstake_wrong_user_sp_rejected() {
+    // Alice stakes. Bob (attacker) tries to unstake Alice's position to his own ATAs.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 500);
+    env.set_clock(300); // past lockup
+
+    let bob = Keypair::new();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+
+    // Bob builds an unstake tx using Alice's SP PDA but his own ATAs
+    let (mrc_pda, _) =
+        Pubkey::find_program_address(&[b"mrc", env.slab.as_ref()], &env.rewards_id);
+    let (stake_vault, _) =
+        Pubkey::find_program_address(&[b"stake_vault", env.slab.as_ref()], &env.rewards_id);
+    // Alice's stake position PDA
+    let (alice_sp, _) = Pubkey::find_program_address(
+        &[b"sp", env.slab.as_ref(), alice.pubkey().as_ref()],
+        &env.rewards_id,
+    );
+
+    let col_mint = env.collateral_mint;
+    let bob_col_ata = env.create_ata(&col_mint, &bob.pubkey(), 0);
+    let bob_coin_ata = env.create_coin_ata(&bob.pubkey(), 0);
+
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(bob.pubkey(), true),             // Bob is the signer
+            AccountMeta::new(mrc_pda, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new(bob_col_ata, false),             // Bob's collateral ATA
+            AccountMeta::new(stake_vault, false),
+            AccountMeta::new(alice_sp, false),                // Alice's SP PDA!
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new(bob_coin_ata, false),            // Bob's COIN ATA
+            AccountMeta::new_readonly(env.mint_authority_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_unstake(500),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&bob.pubkey()),
+        &[&bob],
+        env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(
+        result.is_err(),
+        "Attacker must not be able to unstake another user's position"
+    );
 }
