@@ -17,6 +17,7 @@ test-sbf = []
 solana-program = { workspace = true }
 spl-token = { workspace = true }
 percolator-prog = { path = "../../percolator-prog", features = ["no-entrypoint"] }
+governance-adapter = { path = "../governance", features = ["no-entrypoint"] }
 
 [dev-dependencies]
 solana-sdk = { workspace = true }

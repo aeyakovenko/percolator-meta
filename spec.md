@@ -7,9 +7,10 @@ this is a pure solana rust program only.  it should use the same litesvm setup f
 ## Design constraints (MUST)
 
 1. No admin keys, no multisigs, no off-chain publishers.
-1. Everything "governance-like" is futarchy-gated by a MetaDAO proposal marked `executed=true`.
+1. Everything "governance-like" is expected to be triggered from a MetaDAO proposal marked `executed=true`.
 1. User funds are never at risk from futarchy itself: no futarchy-triggerable instruction may transfer, freeze, confiscate, or redirect user balances.
 1. The DAO may stake and claim COIN rewards like any user, but cannot claim other users' staked collateral.
+1. Current implementation assumption: the DAO-controlled client bootstraps the governed authority path for this rewards instance at creation time. `rewards` does not independently prove MetaDAO execution beyond that configured path.
 
 -----
 
@@ -18,11 +19,12 @@ this is a pure solana rust program only.  it should use the same litesvm setup f
 |Program                                      |Role                                                                             |
 |---------------------------------------------|---------------------------------------------------------------------------------|
 |`meta_dao` (existing)                        |Proposal lifecycle, futarchy voting, `executed` bit                              |
+|`governance_adapter` (current implementation)|Owns the governance authority PDA and CPIs into `rewards`; bootstrap/signing shim |
 |`percolator` (existing + one addition in §2) |Market creation, insurance vault                                                |
 |`rewards` (new, non-upgradeable)             |COIN mint-authority PDA, staking vault, stake/unstake, governance-gated minting  |
 |SPL Token Program                            |COIN mint, collateral token accounts, staking vault                              |
 
-There is no separate rewards-oracle, rewards-admin, or multisig program. The `rewards` program holds only a COIN mint-authority PDA derived from the coin_mint key; it has no privileged signer of its own.
+Current implementation note: `rewards` accepts a governance PDA owned by `governance_adapter`, and that adapter is expected to be initialized only from the intended MetaDAO-controlled creation flow. The adapter is a signing shim, not a policy engine. The trust boundary is therefore established during the init ceremony rather than re-proven inside `rewards`.
 
 -----
 
@@ -95,6 +97,8 @@ The vault is an SPL token account whose authority is the MRC PDA. Users deposit 
 
 ## 7. Market creation (one atomic transaction, permissionless caller)
 
+Bootstrap prerequisite: before the first governed call for a `(rewards_program, coin_mint)` pair, the DAO-controlled client initializes the governance authority path for that pair. The current repo assumes this binding is established during instance creation and then reused for all governed CPIs.
+
 The caller assembles the following instructions in a single transaction after `proposal.executed == true`:
 
 ```
@@ -120,7 +124,7 @@ The caller assembles the following instructions in a single transaction after `p
 [4]  rewards::init_market_rewards(
            market_slab, N, epoch_slots, coin_mint, collateral_mint
      )
-     // signer: CoinConfig.authority (the DAO)
+     // signer: CoinConfig.authority (the preconfigured governance authority path)
      // creates MarketRewardsCfg PDA (init guard — fails if already exists)
      // creates stake_vault SPL token account PDA
      // reads and stores market_start_slot from slab (never trusts caller-supplied value)
@@ -184,7 +188,7 @@ The DAO can vote to mint COIN to any destination (e.g., rewarding best-performin
 
 **Instruction:** `rewards::mint_reward(amount)`
 
-- Signer must be `CoinConfig.authority` (the DAO/governance key).
+- Signer must be `CoinConfig.authority` (the preconfigured governance authority path for this COIN).
 - Mints `amount` COIN to any provided SPL token destination account.
 - Amount must be non-zero.
 
@@ -208,7 +212,7 @@ On full unstake (amount == staked balance), the StakePosition PDA is closed and 
 
 PDA seeds: `[b"coin_cfg", coin_mint_key]`
 
-Created once per COIN token via `init_coin_config`. The authority (typically the MetaDAO program) is the only key that can register new markets for this COIN and call `mint_reward`.
+Created once per COIN token via `init_coin_config`. The authority is the preconfigured governance PDA path established by the DAO-controlled init ceremony for this COIN. It is the only key that can register new markets for this COIN and call `mint_reward`.
 
 |Field             |Type  |Description                                     |
 |------------------|------|-------------------------------------------------|
@@ -278,3 +282,4 @@ No instruction in MetaDAO, Percolator, or `rewards` may:
 - [ ] After admin burn: `UpdateConfig`, `SetRiskThreshold`, `SetOracleAuthority`, `ResolveMarket`, `WithdrawInsurance`, `SetMaintenanceFee`, `AdminForceCloseAccount`, and `CloseSlab` all fail on this market.
 - [ ] `CoinConfig.authority` is the only key that can register new markets for a given COIN; unauthorized callers are rejected.
 - [ ] Stake vault PDA authority is the MRC PDA; only `unstake` can transfer collateral out.
+- [ ] Deployment/init docs specify how the DAO-controlled client bootstraps the governance authority path for this rewards instance.

@@ -1,0 +1,17 @@
+[package]
+name = "governance-adapter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "governance_adapter"
+path = "src/lib.rs"
+
+[features]
+no-entrypoint = []
+test-sbf = []
+
+[dependencies]
+solana-program = { workspace = true }

@@ -27,6 +27,7 @@ use solana_program::{
 
 declare_id!("Rewards111111111111111111111111111111111111");
 
+use governance_adapter::{authority_address as governance_authority_address, id as governance_program_id};
 use percolator_prog::state;
 
 /// Fixed-point scale for reward math.
@@ -228,6 +229,36 @@ fn create_pda_account<'a>(
     )
 }
 
+fn verify_token_program(token_program: &AccountInfo) -> ProgramResult {
+    if *token_program.key != spl_token::ID {
+        msg!("Expected SPL Token program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    Ok(())
+}
+
+fn load_token_account(account: &AccountInfo) -> Result<spl_token::state::Account, ProgramError> {
+    if account.owner != &spl_token::ID {
+        msg!("Token account must be owned by SPL Token");
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = account.try_borrow_data()?;
+    spl_token::state::Account::unpack(&data).map_err(|_| ProgramError::InvalidAccountData)
+}
+
+fn validate_token_account(
+    account: &AccountInfo,
+    expected_mint: &Pubkey,
+    expected_owner: &Pubkey,
+) -> ProgramResult {
+    let token = load_token_account(account)?;
+    if token.mint != *expected_mint || token.owner != *expected_owner {
+        msg!("Token account mint/owner mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 /// Mint COIN tokens via PDA authority.
 fn mint_coin<'a>(
     token_program: &AccountInfo<'a>,
@@ -297,6 +328,28 @@ fn load_coin_config(
     CoinConfig::deserialize(&cfg_data)
 }
 
+fn validate_governance_authority(
+    authority: &AccountInfo,
+    coin_mint: &Pubkey,
+    rewards_program: &Pubkey,
+) -> ProgramResult {
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if authority.owner != &governance_program_id() {
+        msg!("Authority must be the governance adapter PDA");
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let (expected, _) = governance_authority_address(rewards_program, coin_mint);
+    if *authority.key != expected {
+        msg!("Governance authority PDA mismatch");
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Entrypoint
 // ============================================================================
@@ -326,10 +379,11 @@ pub fn process_instruction<'a>(
 // init_coin_config
 // ============================================================================
 // Accounts:
-//   [0] authority (signer, writable)
-//   [1] coin_mint (read-only)
-//   [2] coin_config PDA (writable, to create)
-//   [3] system_program
+//   [0] payer (signer, writable)
+//   [1] authority (signer, read-only governance PDA)
+//   [2] coin_mint (read-only)
+//   [3] coin_config PDA (writable, to create)
+//   [4] system_program
 
 fn process_init_coin_config<'a>(
     program_id: &Pubkey,
@@ -337,14 +391,16 @@ fn process_init_coin_config<'a>(
     _data: &mut &[u8],
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
     let authority = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
     let coin_cfg_account = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
-    if !authority.is_signer {
+    if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
 
     // Validate coin_mint: freeze_authority must be None, mint_authority must be our PDA
     let mint_data = coin_mint.try_borrow_data()?;
@@ -368,7 +424,7 @@ fn process_init_coin_config<'a>(
 
     // Create CoinConfig PDA (init guard)
     let seeds = coin_cfg_seeds(coin_mint.key);
-    create_pda_account(authority, coin_cfg_account, system_program, program_id, &seeds, COIN_CFG_SIZE)?;
+    create_pda_account(payer, coin_cfg_account, system_program, program_id, &seeds, COIN_CFG_SIZE)?;
 
     let mut cfg_data = coin_cfg_account.try_borrow_mut_data()?;
     let cfg = CoinConfig { authority: *authority.key };
@@ -381,16 +437,17 @@ fn process_init_coin_config<'a>(
 // init_market_rewards
 // ============================================================================
 // Accounts:
-//   [0] authority (signer, writable — must match CoinConfig.authority)
-//   [1] market_slab (read-only)
-//   [2] mrc PDA (writable, to create)
-//   [3] coin_mint (read-only)
-//   [4] coin_config PDA (read-only)
-//   [5] collateral_mint (read-only)
-//   [6] stake_vault PDA (writable, to create — SPL token account)
-//   [7] token_program
-//   [8] rent sysvar
-//   [9] system_program
+//   [0] payer (signer, writable)
+//   [1] authority (signer, read-only governance PDA — must match CoinConfig.authority)
+//   [2] market_slab (read-only)
+//   [3] mrc PDA (writable, to create)
+//   [4] coin_mint (read-only)
+//   [5] coin_config PDA (read-only)
+//   [6] collateral_mint (read-only)
+//   [7] stake_vault PDA (writable, to create — SPL token account)
+//   [8] token_program
+//   [9] rent sysvar
+//   [10] system_program
 //
 // Data: N (u64), epoch_slots (u64)
 
@@ -400,6 +457,7 @@ fn process_init_market_rewards<'a>(
     data: &mut &[u8],
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
     let authority = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let mrc_account = next_account_info(iter)?;
@@ -411,9 +469,11 @@ fn process_init_market_rewards<'a>(
     let rent_sysvar = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
-    if !authority.is_signer {
+    if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    verify_token_program(token_program)?;
 
     let n_per_epoch = read_u64(data)?;
     let epoch_slots = read_u64(data)?;
@@ -423,6 +483,8 @@ fn process_init_market_rewards<'a>(
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
+
     // Verify CoinConfig PDA and authority
     let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
 
@@ -431,8 +493,13 @@ fn process_init_market_rewards<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Read market_start_slot from slab
+    // Read slab header and capture the one-time market_start_slot written by InitMarket.
     let slab_data = market_slab.try_borrow_data()?;
+    let header = state::read_header(&slab_data);
+    if header.admin != [0u8; 32] {
+        msg!("Percolator market admin must be burned before rewards init");
+        return Err(ProgramError::InvalidAccountData);
+    }
     let market_start_slot = state::read_market_start_slot(&slab_data);
     if market_start_slot == 0 {
         msg!("market_start_slot is 0; slab not initialized via futarchy flow");
@@ -442,7 +509,7 @@ fn process_init_market_rewards<'a>(
 
     // Create MarketRewardsCfg PDA (init guard)
     let seeds = mrc_seeds(market_slab.key);
-    create_pda_account(authority, mrc_account, system_program, program_id, &seeds, MRC_SIZE)?;
+    create_pda_account(payer, mrc_account, system_program, program_id, &seeds, MRC_SIZE)?;
 
     let mut mrc_data = mrc_account.try_borrow_mut_data()?;
     let cfg = MarketRewardsCfg {
@@ -468,13 +535,13 @@ fn process_init_market_rewards<'a>(
     let rent = Rent::get()?;
     invoke_signed(
         &system_instruction::create_account(
-            authority.key,
+            payer.key,
             stake_vault.key,
             rent.minimum_balance(spl_token::state::Account::LEN),
             spl_token::state::Account::LEN as u64,
             &spl_token::ID,
         ),
-        &[authority.clone(), stake_vault.clone(), system_program.clone()],
+        &[payer.clone(), stake_vault.clone(), system_program.clone()],
         &[&vault_signer_seeds],
     )?;
 
@@ -541,6 +608,9 @@ fn process_stake<'a>(
     // Verify stake vault
     let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
     if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    verify_token_program(token_program)?;
+    validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
+    validate_token_account(stake_vault, &cfg.collateral_mint, mrc_account.key)?;
 
     let clock = Clock::from_account_info(clock_info)?;
 
@@ -647,6 +717,10 @@ fn process_unstake<'a>(
     // Verify stake vault PDA
     let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
     if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    verify_token_program(token_program)?;
+    validate_token_account(user_ata, &cfg.collateral_mint, user.key)?;
+    validate_token_account(stake_vault, &cfg.collateral_mint, mrc_account.key)?;
+    validate_token_account(user_coin_ata, &cfg.coin_mint, user.key)?;
 
     let clock = Clock::from_account_info(clock_info)?;
 
@@ -772,6 +846,8 @@ fn process_claim_stake_rewards<'a>(
     let (expected_sp, _) = Pubkey::find_program_address(&sp_seeds_arr, program_id);
     if *sp_account.key != expected_sp { return Err(ProgramError::InvalidSeeds); }
     if sp_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    verify_token_program(token_program)?;
+    validate_token_account(user_coin_ata, &cfg.coin_mint, user.key)?;
 
     let clock = Clock::from_account_info(clock_info)?;
 
@@ -809,7 +885,7 @@ fn process_claim_stake_rewards<'a>(
 // mint_reward — governance-gated COIN mint to any destination
 // ============================================================================
 // Accounts:
-//   [0] authority (signer — must match CoinConfig.authority)
+//   [0] authority (signer — governance PDA, must match CoinConfig.authority)
 //   [1] coin_mint (writable)
 //   [2] coin_config PDA (read-only)
 //   [3] destination (writable — any SPL token account for this mint)
@@ -833,7 +909,8 @@ fn process_mint_reward<'a>(
 
     let amount = read_u64(data)?;
     if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
-    if !authority.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    verify_token_program(token_program)?;
+    validate_governance_authority(authority, coin_mint.key, program_id)?;
 
     // Verify CoinConfig and authority
     let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
@@ -846,6 +923,11 @@ fn process_mint_reward<'a>(
     let ma_seeds = mint_authority_seeds(coin_mint.key);
     let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
     if *mint_authority.key != expected_ma { return Err(ProgramError::InvalidSeeds); }
+    let destination_token = load_token_account(destination)?;
+    if destination_token.mint != *coin_mint.key {
+        msg!("Destination mint mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     let bump_bytes = [ma_bump];
     let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
