@@ -27,7 +27,7 @@ pub fn id() -> Pubkey {
 const IX_INIT_AUTHORITY: u8 = 0;
 const IX_INIT_COIN_CONFIG: u8 = 1;
 const IX_INIT_MARKET_REWARDS: u8 = 2;
-const IX_MINT_REWARD: u8 = 3;
+const IX_DRAW_INSURANCE: u8 = 3;
 
 fn read_u8(data: &mut &[u8]) -> Result<u8, ProgramError> {
     if data.is_empty() {
@@ -99,7 +99,7 @@ pub fn process_instruction<'a>(
         IX_INIT_AUTHORITY => process_init_authority(program_id, accounts),
         IX_INIT_COIN_CONFIG => process_init_coin_config(program_id, accounts),
         IX_INIT_MARKET_REWARDS => process_init_market_rewards(program_id, accounts, &mut data),
-        IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
+        IX_DRAW_INSURANCE => process_draw_insurance(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -266,7 +266,7 @@ fn process_init_market_rewards<'a>(
     )
 }
 
-fn process_mint_reward<'a>(
+fn process_draw_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &mut &[u8],
@@ -275,10 +275,12 @@ fn process_mint_reward<'a>(
     let payer = next_account_info(iter)?;
     let authority = next_account_info(iter)?;
     let rewards_program = next_account_info(iter)?;
+    let mrc = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let stake_vault = next_account_info(iter)?;
+    let destination = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
     let coin_cfg = next_account_info(iter)?;
-    let destination = next_account_info(iter)?;
-    let mint_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
 
     if !payer.is_signer {
@@ -291,16 +293,19 @@ fn process_mint_reward<'a>(
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
 
     let mut ix_data = Vec::with_capacity(9);
-    ix_data.push(5u8);
+    ix_data.push(5u8); // IX_DRAW_INSURANCE
     ix_data.extend_from_slice(&amount.to_le_bytes());
     let ix = Instruction {
         program_id: *rewards_program.key,
         accounts: vec![
+            AccountMeta::new(*payer.key, true),
             AccountMeta::new_readonly(*authority.key, true),
-            AccountMeta::new(*coin_mint.key, false),
-            AccountMeta::new_readonly(*coin_cfg.key, false),
+            AccountMeta::new_readonly(*mrc.key, false),
+            AccountMeta::new_readonly(*market_slab.key, false),
+            AccountMeta::new(*stake_vault.key, false),
             AccountMeta::new(*destination.key, false),
-            AccountMeta::new_readonly(*mint_authority.key, false),
+            AccountMeta::new_readonly(*coin_mint.key, false),
+            AccountMeta::new_readonly(*coin_cfg.key, false),
             AccountMeta::new_readonly(*token_program.key, false),
         ],
         data: ix_data,
@@ -309,14 +314,18 @@ fn process_mint_reward<'a>(
     invoke_signed(
         &ix,
         &[
+            payer.clone(),
             authority.clone(),
+            mrc.clone(),
+            market_slab.clone(),
+            stake_vault.clone(),
+            destination.clone(),
             coin_mint.clone(),
             coin_cfg.clone(),
-            destination.clone(),
-            mint_authority.clone(),
             token_program.clone(),
             rewards_program.clone(),
         ],
         &[&signer_seeds],
     )
 }
+

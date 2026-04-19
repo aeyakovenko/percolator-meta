@@ -1,6 +1,6 @@
-//! Rewards program: staking vault + COIN rewards for Percolator market stakers.
-//! Non-upgradeable. No admin keys. CoinConfig authority gates market registration
-//! and governance-voted COIN payouts (e.g. LP rewards).
+//! Insurance deposit program: users deposit collateral into per-market vaults
+//! and earn COIN (DAO token) as yield. No lockup — withdraw anytime.
+//! Non-upgradeable. No admin keys. CoinConfig authority gates market registration.
 
 #![no_std]
 #![deny(unsafe_code)]
@@ -39,7 +39,7 @@ const IX_STAKE: u8 = 1;
 const IX_UNSTAKE: u8 = 2;
 const IX_INIT_COIN_CONFIG: u8 = 3;
 const IX_CLAIM_STAKE_REWARDS: u8 = 4;
-const IX_MINT_REWARD: u8 = 5;
+const IX_DRAW_INSURANCE: u8 = 5;
 
 // ============================================================================
 // Account sizes
@@ -370,7 +370,7 @@ pub fn process_instruction<'a>(
         IX_UNSTAKE => process_unstake(program_id, accounts, &mut data),
         IX_INIT_COIN_CONFIG => process_init_coin_config(program_id, accounts, &mut data),
         IX_CLAIM_STAKE_REWARDS => process_claim_stake_rewards(program_id, accounts),
-        IX_MINT_REWARD => process_mint_reward(program_id, accounts, &mut data),
+        IX_DRAW_INSURANCE => process_draw_insurance(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -402,7 +402,11 @@ fn process_init_coin_config<'a>(
     }
     validate_governance_authority(authority, coin_mint.key, program_id)?;
 
-    // Validate coin_mint: freeze_authority must be None, mint_authority must be our PDA
+    // Validate coin_mint is a real SPL Token mint
+    if coin_mint.owner != &spl_token::ID {
+        msg!("COIN mint must be owned by SPL Token program");
+        return Err(ProgramError::IllegalOwner);
+    }
     let mint_data = coin_mint.try_borrow_data()?;
     let mint_info = spl_token::state::Mint::unpack(&mint_data)?;
     if mint_info.freeze_authority.is_some() {
@@ -493,19 +497,21 @@ fn process_init_market_rewards<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Read slab header and capture the one-time market_start_slot written by InitMarket.
+    // Verify slab is initialized and admin is burned.
     let slab_data = market_slab.try_borrow_data()?;
     let header = state::read_header(&slab_data);
+    if header.magic == 0 {
+        msg!("Slab not initialized (magic = 0)");
+        return Err(ProgramError::InvalidAccountData);
+    }
     if header.admin != [0u8; 32] {
         msg!("Percolator market admin must be burned before rewards init");
         return Err(ProgramError::InvalidAccountData);
     }
-    let market_start_slot = state::read_market_start_slot(&slab_data);
-    if market_start_slot == 0 {
-        msg!("market_start_slot is 0; slab not initialized via futarchy flow");
-        return Err(ProgramError::InvalidAccountData);
-    }
     drop(slab_data);
+    // Use current clock slot as the market start for reward tracking
+    let clock_for_init = Clock::get()?;
+    let market_start_slot = clock_for_init.slot;
 
     // Create MarketRewardsCfg PDA (init guard)
     let seeds = mrc_seeds(market_slab.key);
@@ -622,8 +628,8 @@ fn process_stake<'a>(
     let (expected_sp, _) = Pubkey::find_program_address(&sp_seeds_arr, program_id);
     if *sp_account.key != expected_sp { return Err(ProgramError::InvalidSeeds); }
 
-    let mut pos = if sp_account.data_len() == 0 {
-        // First stake — create PDA
+    let mut pos = if sp_account.data_len() == 0 || sp_account.lamports() == 0 {
+        // First stake (or re-stake after full withdrawal closed the account)
         drop(mrc_data); // release borrow for CPI
         create_pda_account(user, sp_account, system_program, program_id, &sp_seeds_arr, SP_SIZE)?;
         mrc_data = mrc_account.try_borrow_mut_data()?;
@@ -656,7 +662,7 @@ fn process_stake<'a>(
 
     // Update position
     pos.amount = pos.amount.checked_add(amount).ok_or(ProgramError::ArithmeticOverflow)?;
-    pos.deposit_slot = clock.slot; // reset lockup
+    pos.deposit_slot = clock.slot;
     pos.reward_per_token_paid = cfg.reward_per_token_stored;
 
     // Write position
@@ -667,8 +673,16 @@ fn process_stake<'a>(
 }
 
 // ============================================================================
-// unstake — withdraw collateral + claim pending COIN rewards
+// withdraw — return collateral + claim pending COIN rewards (no lockup)
 // ============================================================================
+// WITHDRAWAL GUARANTEE: this instruction is fully permissionless. No
+// governance action can prevent a depositor from calling unstake.
+// draw_insurance can only draw PROFITS (excess above total_staked), so
+// depositor capital is always fully backed. The proportional withdrawal
+// math is defense-in-depth only. Every account and PDA in this path is
+// either user-controlled or program-derived — no governance approval is
+// needed, no governance key is checked, and no governance-modifiable
+// state gates the transfer.
 // Accounts:
 //   [0] user (signer, writable — receives rent on close)
 //   [1] mrc PDA (writable)
@@ -741,33 +755,51 @@ fn process_unstake<'a>(
         return Err(ProgramError::InsufficientFunds);
     }
 
-    // Check lockup
-    if clock.slot < pos.deposit_slot.saturating_add(cfg.epoch_slots) {
-        msg!("Lockup period not elapsed");
-        return Err(ProgramError::Custom(100)); // lockup not met
-    }
-
     // Settle pending rewards
     settle_pending(&mut pos, cfg.reward_per_token_stored);
+
+    // Proportional withdrawal: if insurance draw depleted the vault,
+    // everyone takes the same haircut.
+    // actual_withdrawal = (amount * vault_balance) / total_staked
+    let vault_token = load_token_account(stake_vault)?;
+    let vault_balance = vault_token.amount;
+    let actual_withdrawal = if vault_balance >= cfg.total_staked {
+        // Vault fully backed — no haircut
+        amount
+    } else if cfg.total_staked == 0 {
+        0
+    } else {
+        // Vault underfunded — proportional haircut
+        let w = (amount as u128)
+            .checked_mul(vault_balance as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / (cfg.total_staked as u128);
+        // Cap at amount (prevent rounding-up exploitation)
+        core::cmp::min(w, amount as u128) as u64
+    };
 
     // Update MRC total_staked and serialize before CPI (so re-reads see updated state)
     cfg.total_staked = cfg.total_staked.saturating_sub(amount);
     cfg.serialize(&mut mrc_data);
 
-    // Transfer collateral from vault to user (signed by MRC PDA)
+    // Transfer proportional collateral from vault to user (signed by MRC PDA)
     let mrc_seeds_arr = mrc_seeds(&cfg.market_slab);
     let (_, mrc_bump) = Pubkey::find_program_address(&mrc_seeds_arr, program_id);
     let mrc_signer: [&[u8]; 3] = [b"mrc", cfg.market_slab.as_ref(), &[mrc_bump]];
 
-    let xfer_ix = spl_token::instruction::transfer(
-        token_program.key, stake_vault.key, user_ata.key, mrc_account.key, &[], amount,
-    )?;
-    drop(mrc_data); // release for CPI
-    invoke_signed(
-        &xfer_ix,
-        &[stake_vault.clone(), user_ata.clone(), mrc_account.clone(), token_program.clone()],
-        &[&mrc_signer],
-    )?;
+    if actual_withdrawal > 0 {
+        let xfer_ix = spl_token::instruction::transfer(
+            token_program.key, stake_vault.key, user_ata.key, mrc_account.key, &[], actual_withdrawal,
+        )?;
+        drop(mrc_data); // release for CPI
+        invoke_signed(
+            &xfer_ix,
+            &[stake_vault.clone(), user_ata.clone(), mrc_account.clone(), token_program.clone()],
+            &[&mrc_signer],
+        )?;
+    } else {
+        drop(mrc_data);
+    }
 
     // Mint pending COIN rewards
     let pending = pos.pending_rewards;
@@ -882,56 +914,101 @@ fn process_claim_stake_rewards<'a>(
 }
 
 // ============================================================================
-// mint_reward — governance-gated COIN mint to any destination
+// draw_insurance — governance-gated profit withdrawal from vault
 // ============================================================================
+// The DAO draws PROFITS from the deposit vault — the excess above depositor
+// capital (total_staked). Depositor capital is always protected: the DAO
+// cannot draw below total_staked. When all depositors have withdrawn
+// (total_staked == 0), the DAO can draw whatever remains.
+//
 // Accounts:
-//   [0] authority (signer — governance PDA, must match CoinConfig.authority)
-//   [1] coin_mint (writable)
-//   [2] coin_config PDA (read-only)
-//   [3] destination (writable — any SPL token account for this mint)
-//   [4] mint_authority PDA (read-only)
-//   [5] token_program
+//   [0] payer (signer)
+//   [1] authority (signer, governance PDA — must match CoinConfig.authority)
+//   [2] mrc PDA (read-only, vault authority for signing)
+//   [3] market_slab (read-only)
+//   [4] stake_vault (writable)
+//   [5] destination (writable — where collateral goes)
+//   [6] coin_mint (read-only — for governance authority verification)
+//   [7] coin_config PDA (read-only)
+//   [8] token_program
 //
 // Data: amount (u64)
 
-fn process_mint_reward<'a>(
+fn process_draw_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &mut &[u8],
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
     let authority = next_account_info(iter)?;
+    let mrc_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let stake_vault = next_account_info(iter)?;
+    let destination = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
     let coin_cfg_account = next_account_info(iter)?;
-    let destination = next_account_info(iter)?;
-    let mint_authority = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
     if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
+    if !payer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+
     verify_token_program(token_program)?;
     validate_governance_authority(authority, coin_mint.key, program_id)?;
 
-    // Verify CoinConfig and authority
+    // Verify CoinConfig and authority match
     let coin_cfg = load_coin_config(coin_cfg_account, coin_mint.key, program_id)?;
     if *authority.key != coin_cfg.authority {
         msg!("Signer does not match CoinConfig authority");
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Verify mint authority PDA
-    let ma_seeds = mint_authority_seeds(coin_mint.key);
-    let (expected_ma, ma_bump) = Pubkey::find_program_address(&ma_seeds, program_id);
-    if *mint_authority.key != expected_ma { return Err(ProgramError::InvalidSeeds); }
-    let destination_token = load_token_account(destination)?;
-    if destination_token.mint != *coin_mint.key {
+    // Verify MRC PDA
+    let mrc_data = mrc_account.try_borrow_data()?;
+    let cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
+    let (expected_mrc, _) = Pubkey::find_program_address(&mrc_seeds(&cfg.market_slab), program_id);
+    if *mrc_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
+    if mrc_account.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    if *market_slab.key != cfg.market_slab { return Err(ProgramError::InvalidAccountData); }
+    if *coin_mint.key != cfg.coin_mint { return Err(ProgramError::InvalidAccountData); }
+    drop(mrc_data);
+
+    // Verify stake vault PDA
+    let (expected_vault, _) = Pubkey::find_program_address(&stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    validate_token_account(stake_vault, &cfg.collateral_mint, mrc_account.key)?;
+
+    // Verify destination is correct mint
+    let dest_token = load_token_account(destination)?;
+    if dest_token.mint != cfg.collateral_mint {
         msg!("Destination mint mismatch");
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let bump_bytes = [ma_bump];
-    let signer_seeds: [&[u8]; 3] = [b"coin_mint_authority", coin_mint.key.as_ref(), &bump_bytes];
-    mint_coin(token_program, coin_mint, destination, mint_authority, amount, &signer_seeds)
+    // DAO can only draw PROFITS: excess above depositor capital (total_staked).
+    // Depositor capital is always protected — the DAO cannot haircut depositors.
+    // When total_staked == 0 (all depositors withdrew), DAO can draw everything.
+    let vault_token = load_token_account(stake_vault)?;
+    let available_profit = vault_token.amount.saturating_sub(cfg.total_staked);
+    if amount > available_profit {
+        msg!("Draw exceeds available profit (vault_balance - total_staked)");
+        return Err(ProgramError::InsufficientFunds);
+    }
+
+    // Transfer from vault to destination (signed by MRC PDA)
+    let mrc_seeds_arr = mrc_seeds(&cfg.market_slab);
+    let (_, mrc_bump) = Pubkey::find_program_address(&mrc_seeds_arr, program_id);
+    let mrc_signer: [&[u8]; 3] = [b"mrc", cfg.market_slab.as_ref(), &[mrc_bump]];
+
+    let xfer_ix = spl_token::instruction::transfer(
+        token_program.key, stake_vault.key, destination.key, mrc_account.key, &[], amount,
+    )?;
+    invoke_signed(
+        &xfer_ix,
+        &[stake_vault.clone(), destination.clone(), mrc_account.clone(), token_program.clone()],
+        &[&mrc_signer],
+    )
 }
 
 // ============================================================================
