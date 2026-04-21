@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 // Production SLAB_LEN for SBF target.
 // Must match the BPF binary.
-const SLAB_LEN: usize = 1525592;
+const SLAB_LEN: usize = 1525656;
 const MAX_ACCOUNTS: usize = 4096;
 
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -190,7 +190,7 @@ fn encode_init_market(
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
     data.extend_from_slice(&100u64.to_le_bytes()); // force_close_delay_slots
     data
@@ -226,7 +226,8 @@ fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
 }
 
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
-    let mut data = vec![12u8];
+    // Tag 32 = UpdateAuthority, kind 0 = AUTHORITY_ADMIN (was tag 12 UpdateAdmin)
+    let mut data = vec![32u8, 0u8];
     data.extend_from_slice(new_admin.as_ref());
     data
 }
@@ -727,10 +728,12 @@ impl TestEnv {
         }
 
         let admin = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
+        // UpdateAuthority (tag 32): [current_signer, new_authority, slab]
         let ix = Instruction {
             program_id: self.percolator_id,
             accounts: vec![
-                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(Pubkey::default(), false),
                 AccountMeta::new(*slab, false),
             ],
             data: encode_update_admin(&Pubkey::default()),
@@ -1020,7 +1023,6 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(sysvar::clock::ID, false),
-                AccountMeta::new_readonly(self.pyth_index, false), // oracle
             ],
             data: encode_init_user(1_000_000),
         };
@@ -2463,6 +2465,33 @@ fn try_percolator_admin_ix_2(
         .map_err(|e| format!("{:?}", e))
 }
 
+/// UpdateAuthority (tag 32) — takes 3 accounts: [current_signer, new_authority, slab]
+fn try_update_admin(
+    env: &mut TestEnv,
+    admin: &Keypair,
+    new_admin: &Pubkey,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: env.percolator_id,
+        accounts: vec![
+            AccountMeta::new_readonly(admin.pubkey(), true),
+            AccountMeta::new_readonly(*new_admin, false),
+            AccountMeta::new(env.slab, false),
+        ],
+        data: encode_update_admin(new_admin),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
 fn try_percolator_admin_ix_6(
     env: &mut TestEnv,
     admin: &Keypair,
@@ -2531,20 +2560,12 @@ fn test_admin_burn_disables_all_admin_instructions() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     // Verify admin works by updating admin to self (no-op)
-    let result = try_percolator_admin_ix_2(
-        &mut env,
-        &admin,
-        encode_update_admin(&admin.pubkey()),
-    );
+    let result = try_update_admin(&mut env, &admin, &admin.pubkey());
     assert!(result.is_ok(), "Admin should work before burn: {:?}", result);
 
     // Now burn admin
     env.advance_blockhash();
-    let result = try_percolator_admin_ix_2(
-        &mut env,
-        &admin,
-        encode_update_admin(&Pubkey::default()),
-    );
+    let result = try_update_admin(&mut env, &admin, &Pubkey::default());
     assert!(result.is_ok(), "UpdateAdmin to zero should succeed: {:?}", result);
 
     let anyone = Keypair::new();
@@ -2552,7 +2573,7 @@ fn test_admin_burn_disables_all_admin_instructions() {
 
     // Admin instructions must fail after burn
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &anyone, encode_update_admin(&anyone.pubkey()));
+    let r = try_update_admin(&mut env, &anyone, &anyone.pubkey());
     assert!(r.is_err(), "UpdateAdmin must fail after admin burn");
 
     env.advance_blockhash();
@@ -2588,7 +2609,7 @@ fn test_admin_burn_disables_all_admin_instructions() {
     assert!(r.is_err(), "SetInsuranceWithdrawPolicy must fail after admin burn");
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_update_admin(&admin.pubkey()));
+    let r = try_update_admin(&mut env, &admin, &admin.pubkey());
     assert!(r.is_err(), "Original admin must also fail after burn");
 }
 
@@ -2597,25 +2618,17 @@ fn test_admin_burn_is_irreversible() {
     let mut env = TestEnv::new();
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    let result = try_percolator_admin_ix_2(
-        &mut env,
-        &admin,
-        encode_update_admin(&Pubkey::default()),
-    );
+    let result = try_update_admin(&mut env, &admin, &Pubkey::default());
     assert!(result.is_ok());
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(&mut env, &admin, encode_update_admin(&admin.pubkey()));
+    let r = try_update_admin(&mut env, &admin, &admin.pubkey());
     assert!(r.is_err(), "Cannot re-claim admin once burned");
 
     let new_admin = Keypair::new();
     env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(
-        &mut env,
-        &new_admin,
-        encode_update_admin(&new_admin.pubkey()),
-    );
+    let r = try_update_admin(&mut env, &new_admin, &new_admin.pubkey());
     assert!(r.is_err(), "No one can re-claim admin once burned");
 }
 
@@ -2632,11 +2645,7 @@ fn test_dao_cannot_steal_via_admin_instructions() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 100_000_000);
 
-    let r = try_percolator_admin_ix_2(
-        &mut env,
-        &admin,
-        encode_update_admin(&Pubkey::default()),
-    );
+    let r = try_update_admin(&mut env, &admin, &Pubkey::default());
     assert!(r.is_ok(), "Admin burn should succeed");
 
     env.advance_blockhash();
@@ -2785,11 +2794,7 @@ fn test_insurance_topup_permissionless_withdraw_restricted() {
     assert!(r.is_err(), "Cannot withdraw insurance before resolution");
 
     env.advance_blockhash();
-    let r = try_percolator_admin_ix_2(
-        &mut env,
-        &admin,
-        encode_update_admin(&Pubkey::default()),
-    );
+    let r = try_update_admin(&mut env, &admin, &Pubkey::default());
     assert!(r.is_ok());
 
     env.advance_blockhash();
