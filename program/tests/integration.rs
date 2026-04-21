@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 // Production SLAB_LEN for SBF target.
 // Must match the BPF binary.
-const SLAB_LEN: usize = 1525656;
+const SLAB_LEN: usize = 1525688;
 const MAX_ACCOUNTS: usize = 4096;
 
 const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
@@ -183,9 +183,9 @@ fn encode_init_market(
     data.extend_from_slice(&100u128.to_le_bytes()); // min_initial_deposit
     data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
     data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    // Extended tail (66 bytes) — enable permissionless resolve + force close for admin burn
-    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    // Extended tail (66 bytes) — enable insurance withdrawal + permissionless resolve + force close
+    data.extend_from_slice(&10_000u16.to_le_bytes()); // insurance_withdraw_max_bps = 100% (full drain per call)
+    data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1 slot
     data.extend_from_slice(&2000u64.to_le_bytes()); // permissionless_resolve_stale_slots (> max_crank)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
@@ -653,8 +653,10 @@ impl TestEnv {
     }
 
     fn init_market_rewards(&mut self, n: u64, epoch_slots: u64) {
-        self.burn_market_admin();
         let slab = self.slab;
+        // Register MRC PDA as insurance_operator BEFORE admin burn.
+        self.register_insurance_operator_for_slab(&slab);
+        self.burn_market_admin();
         self.try_init_market_rewards_for_slab(&slab, n, epoch_slots)
             .expect("init_market_rewards failed");
     }
@@ -747,6 +749,36 @@ impl TestEnv {
         self.svm
             .send_transaction(tx)
             .expect("burn market admin failed");
+    }
+
+    /// Call our rewards program's register_insurance_operator instruction,
+    /// which CPIs percolator's UpdateAuthority to set MRC_PDA as insurance_operator.
+    /// Must be called BEFORE admin burn (admin signs here).
+    fn register_insurance_operator_for_slab(&mut self, slab: &Pubkey) {
+        let admin = Keypair::from_bytes(&self.payer.to_bytes()).unwrap();
+        let (mrc_pda, _) = Pubkey::find_program_address(
+            &[b"mrc", slab.as_ref()], &self.rewards_id);
+
+        let ix = Instruction {
+            program_id: self.rewards_id,
+            accounts: vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(mrc_pda, false),
+                AccountMeta::new(*slab, false),
+                AccountMeta::new_readonly(self.percolator_id, false),
+            ],
+            data: vec![6u8], // IX_REGISTER_INSURANCE_OPERATOR
+        };
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&admin.pubkey()),
+            &[&admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .expect("register_insurance_operator failed");
     }
 
     fn stake(&mut self, user: &Keypair, amount: u64) {
@@ -1279,6 +1311,7 @@ impl TestEnv {
             &[cu_ix, ix], Some(&self.payer.pubkey()),
             &[&self.payer], self.svm.latest_blockhash());
         self.svm.send_transaction(tx).expect("init_second_market failed");
+        self.register_insurance_operator_for_slab(&slab2);
         self.burn_market_admin_for_slab(&slab2);
         self.try_init_market_rewards_for_slab(&slab2, n_per_epoch, epoch_slots)
             .expect("init_market_rewards for second market failed");
@@ -1419,6 +1452,115 @@ impl TestEnv {
             &[xfer], Some(&self.dao_authority.pubkey()),
             &[&self.dao_authority], self.svm.latest_blockhash());
         self.svm.send_transaction(tx).expect("inject_profit failed");
+    }
+
+    /// Top up percolator's insurance fund directly via percolator::TopUpInsurance
+    /// (permissionless, any donor can call). Simulates fees/profit accruing in
+    /// the percolator market's insurance fund.
+    fn topup_percolator_insurance(&mut self, slab: &Pubkey, amount: u64) {
+        let donor = Keypair::new();
+        self.svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+        let col_mint = self.collateral_mint;
+        let donor_ata = self.create_ata(&col_mint, &donor.pubkey(), amount);
+
+        // The percolator vault for a given slab is stored in MarketConfig.
+        // For the default env.slab we use env.vault; for new slabs we look up.
+        let perc_vault = if *slab == self.slab {
+            self.vault
+        } else {
+            // Need to get from MarketConfig — stored at known offset in slab.
+            let slab_data = self.svm.get_account(slab).unwrap().data;
+            let config = percolator_prog::state::read_config(&slab_data);
+            Pubkey::new_from_array(config.vault_pubkey)
+        };
+
+        let ix = Instruction {
+            program_id: self.percolator_id,
+            accounts: vec![
+                AccountMeta::new(donor.pubkey(), true),
+                AccountMeta::new(*slab, false),
+                AccountMeta::new(donor_ata, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_topup_insurance(amount),
+        };
+        let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix, ix], Some(&donor.pubkey()),
+            &[&donor], self.svm.latest_blockhash());
+        self.svm.send_transaction(tx).expect("topup_percolator_insurance failed");
+    }
+
+    /// Call our rewards program's pull_insurance instruction, which CPIs
+    /// WithdrawInsuranceLimited on percolator, destination = our stake_vault.
+    /// Returns Ok(()) on success, Err on failure (e.g., cooldown not elapsed,
+    /// insufficient balance, MRC PDA not operator).
+    fn try_pull_insurance(&mut self, slab: &Pubkey, amount: u64) -> Result<(), String> {
+        let (mrc_pda, _) = Pubkey::find_program_address(
+            &[b"mrc", slab.as_ref()], &self.rewards_id);
+        let (stake_vault, _) = Pubkey::find_program_address(
+            &[b"stake_vault", slab.as_ref()], &self.rewards_id);
+        let (perc_vault_pda, _) = Pubkey::find_program_address(
+            &[b"vault", slab.as_ref()], &self.percolator_id);
+
+        let perc_vault = if *slab == self.slab {
+            self.vault
+        } else {
+            let slab_data = self.svm.get_account(slab).unwrap().data;
+            let config = percolator_prog::state::read_config(&slab_data);
+            Pubkey::new_from_array(config.vault_pubkey)
+        };
+
+        let mut data = vec![7u8]; // IX_PULL_INSURANCE
+        data.extend_from_slice(&amount.to_le_bytes());
+
+        let payer = Keypair::new();
+        self.svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+
+        let ix = Instruction {
+            program_id: self.rewards_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(mrc_pda, false),
+                AccountMeta::new(*slab, false),
+                AccountMeta::new(stake_vault, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(perc_vault_pda, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.percolator_id, false),
+            ],
+            data,
+        };
+        let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix, ix], Some(&payer.pubkey()),
+            &[&payer], self.svm.latest_blockhash());
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn pull_insurance(&mut self, slab: &Pubkey, amount: u64) {
+        self.try_pull_insurance(slab, amount)
+            .expect("pull_insurance failed");
+    }
+
+    /// Read the current percolator insurance fund balance from the slab's engine state.
+    /// Uses BPF-target byte offset (ENGINE_OFF=568, insurance_fund.balance at +16).
+    fn percolator_insurance_balance(&self, slab: &Pubkey) -> u128 {
+        const INSURANCE_BALANCE_OFFSET: usize = 568 + 16;
+        let slab_data = self.svm.get_account(slab).unwrap().data;
+        u128::from_le_bytes(
+            slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 }
 
@@ -1625,7 +1767,8 @@ fn test_trusted_bootstrap_ceremony_flow() {
     assert!(result.is_err(), "live-admin slab should be rejected before burn");
     env.advance_blockhash();
 
-    // Step 3: burn admin as part of the market-creation ceremony.
+    // Step 3: register MRC PDA as insurance_operator, then burn admin.
+    env.register_insurance_operator_for_slab(&env.slab.clone());
     env.burn_market_admin();
     let burned_header =
         percolator_prog::state::read_header(&env.svm.get_account(&env.slab).unwrap().data);
@@ -3316,6 +3459,7 @@ fn test_two_markets_share_one_coin() {
         Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
     let (stake_vault2, _) =
         Pubkey::find_program_address(&[b"stake_vault", slab2.as_ref()], &env.rewards_id);
+    env.register_insurance_operator_for_slab(&slab2);
     env.burn_market_admin_for_slab(&slab2);
     env.try_init_market_rewards_for_slab(&slab2, 2000, 100)
         .expect("init_market_rewards2 failed");
@@ -4892,4 +5036,337 @@ fn test_isolation_dao_can_only_drain_after_local_market_depositors_exit() {
     // Bob still gets his full deposit
     let (bob_col, _) = env.unstake_in_get_atas(&slab2, &bob, 1_000_000);
     assert_eq!(env.read_token_balance(&bob_col), 1_000_000);
+}
+
+// ============================================================================
+// Tests: end-to-end insurance integration (real on-chain CPI path)
+//
+// These tests exercise the full wire between our program and the percolator
+// insurance fund:
+//   1. Bootstrap registers MRC PDA as percolator insurance_operator.
+//   2. Fees accrue on percolator's side (simulated via permissionless TopUpInsurance).
+//   3. Our program's pull_insurance CPIs percolator's WithdrawInsuranceLimited
+//      (signed by MRC PDA as operator) to capture fees into the stake_vault.
+//   4. DAO's draw_insurance extracts the resulting profit.
+//   5. User unstake is unaffected and drains from the stake_vault.
+// ============================================================================
+
+#[test]
+fn test_e2e_register_insurance_operator_sets_header() {
+    // Verify the bootstrap ceremony actually updated the percolator header.
+    let mut env = TestEnv::new();
+    let (mrc_pda, _) = Pubkey::find_program_address(
+        &[b"mrc", env.slab.as_ref()], &env.rewards_id);
+
+    // Before init_market_rewards, admin is still self.payer.
+    let header_pre = percolator_prog::state::read_header(
+        &env.svm.get_account(&env.slab).unwrap().data);
+    assert_eq!(Pubkey::new_from_array(header_pre.admin), env.payer.pubkey());
+    assert_eq!(Pubkey::new_from_array(header_pre.insurance_operator), env.payer.pubkey(),
+        "before registration, operator defaults to admin");
+
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    // After: operator should be MRC PDA, admin burned.
+    let header_post = percolator_prog::state::read_header(
+        &env.svm.get_account(&env.slab).unwrap().data);
+    assert_eq!(header_post.admin, [0u8; 32], "admin burned");
+    assert_eq!(Pubkey::new_from_array(header_post.insurance_operator), mrc_pda,
+        "insurance_operator = MRC PDA");
+}
+
+#[test]
+fn test_e2e_pull_insurance_succeeds_when_operator_registered() {
+    // Full happy path: donor pushes funds into percolator insurance, our
+    // pull_insurance pulls them out via the operator PDA path.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    // Need a staker so the stake_vault has a legit origin and we can verify
+    // the pulled funds become drawable profit (not depositor capital).
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 1_000_000);
+
+    // Donor pushes 500K into percolator's insurance_fund (simulates earned fees).
+    assert_eq!(env.percolator_insurance_balance(&env.slab.clone()), 0);
+    let slab = env.slab;
+    env.topup_percolator_insurance(&slab, 500_000);
+    assert_eq!(env.percolator_insurance_balance(&env.slab.clone()), 500_000);
+
+    // Pre-pull: stake_vault has exactly the staker's deposit.
+    assert_eq!(env.vault_balance(), 1_000_000);
+
+    // Pull 500K from percolator → our stake_vault via WithdrawInsuranceLimited CPI.
+    env.set_clock(200); // ensure cooldown not an issue (first call anyway)
+    env.pull_insurance(&slab, 500_000);
+
+    // stake_vault grew by exactly 500K; percolator insurance drained.
+    assert_eq!(env.vault_balance(), 1_500_000);
+    assert_eq!(env.percolator_insurance_balance(&slab), 0);
+}
+
+#[test]
+fn test_e2e_pull_then_draw_extracts_real_profit_to_dao() {
+    // Full profit-extraction flow: stake → fees → pull → draw.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 1_000_000);
+    // vault=1M, total_staked=1M, no profit yet
+
+    let slab = env.slab;
+    env.topup_percolator_insurance(&slab, 300_000);
+    env.set_clock(200);
+    env.pull_insurance(&slab, 300_000);
+    // vault=1.3M, total_staked=1M, profit=300K
+
+    // DAO draws profit via our existing draw_insurance (local vault path).
+    let col_mint = env.collateral_mint;
+    let dao_dest = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 0);
+    env.advance_blockhash();
+    env.draw_insurance(300_000, &dao_dest);
+
+    assert_eq!(env.read_token_balance(&dao_dest), 300_000, "DAO extracted real profit");
+    assert_eq!(env.vault_balance(), 1_000_000, "vault back to depositor capital");
+    assert_eq!(env.percolator_insurance_balance(&slab), 0);
+
+    // Depositor capital is still intact — Alice can withdraw full 1M.
+    env.advance_blockhash();
+    let (alice_col, _) = env.unstake_and_get_atas(&alice, 1_000_000);
+    assert_eq!(env.read_token_balance(&alice_col), 1_000_000);
+}
+
+#[test]
+fn test_e2e_pull_insurance_requires_operator_pda() {
+    // Negative test: if we somehow attempt to pull without the MRC PDA being
+    // the operator, the percolator CPI must reject with Custom(10) (UnauthorizedAdmin-like).
+    // Achieve this by creating a market where we SKIP register_insurance_operator.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+
+    // Manually init market rewards WITHOUT registering operator first.
+    env.burn_market_admin();
+    let slab = env.slab;
+    env.try_init_market_rewards_for_slab(&slab, 1000, 100)
+        .expect("init rewards ok");
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 1_000_000);
+    env.topup_percolator_insurance(&slab, 500_000);
+
+    env.set_clock(200);
+    let result = env.try_pull_insurance(&slab, 500_000);
+    assert!(result.is_err(), "pull must fail when MRC PDA is not insurance_operator");
+    // Percolator insurance balance unchanged
+    assert_eq!(env.percolator_insurance_balance(&slab), 500_000);
+    // Our vault unchanged
+    assert_eq!(env.vault_balance(), 1_000_000);
+}
+
+#[test]
+fn test_e2e_pull_insurance_respects_cooldown() {
+    // Our InitMarket sets cooldown = 1 slot. Back-to-back pulls in the same
+    // slot should be rejected by percolator's WithdrawInsuranceLimited.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let alice = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.stake(&alice, 1_000_000);
+
+    let slab = env.slab;
+    env.topup_percolator_insurance(&slab, 100);
+    env.set_clock(200);
+    env.pull_insurance(&slab, 50);
+
+    // Second pull in same slot: should fail cooldown check (1 slot required).
+    env.advance_blockhash();
+    let result = env.try_pull_insurance(&slab, 50);
+    assert!(result.is_err(), "back-to-back pull must hit cooldown");
+
+    // Advance slot by 1 → now it works.
+    env.set_clock(201);
+    env.pull_insurance(&slab, 50);
+    assert_eq!(env.vault_balance(), 1_000_100);
+}
+
+#[test]
+fn test_e2e_multi_market_pull_isolation() {
+    // Two markets, each with its own MRC PDA as operator. Fees accrue on A
+    // only. Pull from A does not affect B's insurance balance, and B's operator
+    // (its own MRC PDA) is distinct.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+    let slab2 = env.init_second_market(1000, 100);
+    let slab1 = env.slab;
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    env.stake_in(&slab1, &alice, 1_000_000);
+    env.stake_in(&slab2, &bob, 1_000_000);
+
+    env.topup_percolator_insurance(&slab1, 200_000);
+    assert_eq!(env.percolator_insurance_balance(&slab1), 200_000);
+    assert_eq!(env.percolator_insurance_balance(&slab2), 0);
+
+    env.set_clock(200);
+    env.pull_insurance(&slab1, 200_000);
+
+    // Market 1's insurance drained; Market 2 untouched.
+    assert_eq!(env.percolator_insurance_balance(&slab1), 0);
+    assert_eq!(env.percolator_insurance_balance(&slab2), 0);
+    assert_eq!(env.vault_balance_for(&slab1), 1_200_000);
+    assert_eq!(env.vault_balance_for(&slab2), 1_000_000, "market 2 vault untouched");
+
+    // Verify each market's operator is its own MRC PDA.
+    let (mrc1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
+    let (mrc2, _) = Pubkey::find_program_address(&[b"mrc", slab2.as_ref()], &env.rewards_id);
+    let h1 = percolator_prog::state::read_header(&env.svm.get_account(&slab1).unwrap().data);
+    let h2 = percolator_prog::state::read_header(&env.svm.get_account(&slab2).unwrap().data);
+    assert_eq!(Pubkey::new_from_array(h1.insurance_operator), mrc1);
+    assert_eq!(Pubkey::new_from_array(h2.insurance_operator), mrc2);
+    assert_ne!(mrc1, mrc2);
+}
+
+#[test]
+fn test_e2e_cross_market_cannot_pull_using_wrong_mrc() {
+    // Attack: pass Market A's MRC PDA as operator but Market B's vault/slab.
+    // Must fail at either our PDA check or percolator's operator check.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+    let slab2 = env.init_second_market(1000, 100);
+    let slab1 = env.slab;
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+    env.stake_in(&slab1, &alice, 1_000_000);
+    env.stake_in(&slab2, &bob, 1_000_000);
+
+    // Put fees in market 2's insurance
+    env.topup_percolator_insurance(&slab2, 500_000);
+    env.set_clock(200);
+
+    // Build a malicious pull: market 1's MRC as operator, market 2's vault as source
+    let (mrc1, _) = Pubkey::find_program_address(&[b"mrc", slab1.as_ref()], &env.rewards_id);
+    let (stake_vault1, _) = Pubkey::find_program_address(
+        &[b"stake_vault", slab1.as_ref()], &env.rewards_id);
+    let slab2_data = env.svm.get_account(&slab2).unwrap().data;
+    let config2 = percolator_prog::state::read_config(&slab2_data);
+    let perc_vault2 = Pubkey::new_from_array(config2.vault_pubkey);
+    let (perc_vault_pda2, _) = Pubkey::find_program_address(
+        &[b"vault", slab2.as_ref()], &env.percolator_id);
+
+    let mut data = vec![7u8]; // IX_PULL_INSURANCE
+    data.extend_from_slice(&500_000u64.to_le_bytes());
+
+    let payer = Keypair::new();
+    env.svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+
+    // Pass market 1's MRC but market 2's slab/vault
+    let ix = Instruction {
+        program_id: env.rewards_id,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(mrc1, false),        // Market 1 MRC
+            AccountMeta::new(slab2, false),                 // Market 2 slab
+            AccountMeta::new(stake_vault1, false),          // Market 1 stake_vault
+            AccountMeta::new(perc_vault2, false),           // Market 2 percolator vault
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(perc_vault_pda2, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.percolator_id, false),
+        ],
+        data,
+    };
+    let cu_ix = ComputeBudgetInstruction::set_compute_unit_limit(400_000);
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix, ix], Some(&payer.pubkey()),
+        &[&payer], env.svm.latest_blockhash());
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "cross-market pull must be rejected");
+
+    // Both markets unchanged
+    assert_eq!(env.percolator_insurance_balance(&slab2), 500_000);
+    assert_eq!(env.vault_balance_for(&slab1), 1_000_000);
+    assert_eq!(env.vault_balance_for(&slab2), 1_000_000);
+}
+
+#[test]
+fn test_e2e_full_lifecycle_with_real_cpi() {
+    // End-to-end: stake, fees accrue, pull, COIN yield earned, DAO draws profit,
+    // users unstake with full capital + rewards.
+    let mut env = TestEnv::new();
+    env.init_coin_config();
+    env.init_market_rewards(1000, 100);
+
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    env.svm.airdrop(&alice.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&bob.pubkey(), 10_000_000_000).unwrap();
+
+    // Epoch 1: Alice + Bob stake equal amounts
+    env.stake(&alice, 1_000_000);
+    env.advance_blockhash();
+    env.stake(&bob, 1_000_000);
+    let slab = env.slab;
+
+    // Simulate trading fees accruing over time
+    env.set_clock(150);
+    env.topup_percolator_insurance(&slab, 200_000); // first batch of fees
+    env.set_clock(200);
+    env.pull_insurance(&slab, 200_000);
+
+    env.set_clock(250);
+    env.topup_percolator_insurance(&slab, 300_000); // second batch
+    env.set_clock(300);
+    env.pull_insurance(&slab, 300_000);
+
+    // Total fees captured: 500K. vault = 2M (deposits) + 500K (profit) = 2.5M.
+    assert_eq!(env.vault_balance(), 2_500_000);
+    assert_eq!(env.percolator_insurance_balance(&slab), 0);
+
+    // DAO draws profit
+    let col_mint = env.collateral_mint;
+    let dao_dest = env.create_ata(&col_mint, &env.dao_authority.pubkey(), 0);
+    env.advance_blockhash();
+    env.draw_insurance(500_000, &dao_dest);
+    assert_eq!(env.read_token_balance(&dao_dest), 500_000);
+    assert_eq!(env.vault_balance(), 2_000_000, "only depositor capital left");
+
+    // DAO cannot draw more (all profit extracted)
+    env.advance_blockhash();
+    let result = env.try_draw_insurance(1, &dao_dest);
+    assert!(result.is_err(), "no more profit to draw");
+
+    // Users withdraw full deposits + accumulated COIN
+    env.set_clock(400);
+    let (alice_col, alice_coin) = env.unstake_and_get_atas(&alice, 1_000_000);
+    let (bob_col, bob_coin) = env.unstake_and_get_atas(&bob, 1_000_000);
+
+    assert_eq!(env.read_token_balance(&alice_col), 1_000_000, "Alice: full deposit");
+    assert_eq!(env.read_token_balance(&bob_col), 1_000_000, "Bob: full deposit");
+
+    // COIN rewards: over ~3 epochs (slot 100 → 400), 1000 × 3 = 3000 total COIN
+    let alice_c = env.read_token_balance(&alice_coin);
+    let bob_c = env.read_token_balance(&bob_coin);
+    let total_coin = alice_c + bob_c;
+    assert!(total_coin >= 2998 && total_coin <= 3000,
+        "Total COIN ~3000, got {}", total_coin);
+
+    // Final state: everything drained
+    assert_eq!(env.vault_balance(), 0);
 }

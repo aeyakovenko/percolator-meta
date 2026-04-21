@@ -40,6 +40,24 @@ const IX_UNSTAKE: u8 = 2;
 const IX_INIT_COIN_CONFIG: u8 = 3;
 const IX_CLAIM_STAKE_REWARDS: u8 = 4;
 const IX_DRAW_INSURANCE: u8 = 5;
+/// Register the MRC PDA as the percolator market's insurance_operator.
+/// Callable only by the current percolator admin before admin burn.
+/// Uses invoke_signed with MRC seeds so the new authority (the PDA)
+/// is treated as a signer by percolator's UpdateAuthority handler.
+const IX_REGISTER_INSURANCE_OPERATOR: u8 = 6;
+/// Pull tokens from the percolator market's insurance fund into our
+/// stake_vault via WithdrawInsuranceLimited. MRC PDA must be the
+/// registered insurance_operator. Permissionless keeper — anyone can
+/// call it; destination is always the stake_vault, so only deposit-
+/// facing instructions and draw_insurance can redistribute the pulled
+/// funds.
+const IX_PULL_INSURANCE: u8 = 7;
+
+/// Percolator instruction tags we CPI into
+const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
+const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
+const PERC_IX_WITHDRAW_INSURANCE_LIMITED: u8 = 23;
+const PERC_AUTHORITY_INSURANCE_OPERATOR: u8 = 4;
 
 // ============================================================================
 // Account sizes
@@ -371,6 +389,8 @@ pub fn process_instruction<'a>(
         IX_INIT_COIN_CONFIG => process_init_coin_config(program_id, accounts, &mut data),
         IX_CLAIM_STAKE_REWARDS => process_claim_stake_rewards(program_id, accounts),
         IX_DRAW_INSURANCE => process_draw_insurance(program_id, accounts, &mut data),
+        IX_REGISTER_INSURANCE_OPERATOR => process_register_insurance_operator(program_id, accounts),
+        IX_PULL_INSURANCE => process_pull_insurance(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1009,6 +1029,191 @@ fn process_draw_insurance<'a>(
         &[stake_vault.clone(), destination.clone(), mrc_account.clone(), token_program.clone()],
         &[&mrc_signer],
     )
+}
+
+// ============================================================================
+// register_insurance_operator — set MRC PDA as percolator insurance_operator
+// ============================================================================
+// Called by the current percolator admin BEFORE admin burn to transfer the
+// insurance_operator authority to our MRC PDA. After this, the MRC PDA is
+// the only account that can call WithdrawInsuranceLimited on that market,
+// which our program uses via pull_insurance to capture profits into the
+// stake_vault.
+//
+// Accounts:
+//   [0] admin (signer — current percolator admin)
+//   [1] mrc_pda (not a signer here; we sign for it via invoke_signed)
+//   [2] market_slab (writable — percolator mutates the header)
+//   [3] percolator_program
+//
+// Data: (none)
+
+fn process_register_insurance_operator<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let admin = next_account_info(iter)?;
+    let mrc_pda_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Derive expected MRC PDA from market_slab and verify the passed account matches.
+    let seeds_arr = mrc_seeds(market_slab.key);
+    let (expected_mrc, mrc_bump) = Pubkey::find_program_address(&seeds_arr, program_id);
+    if *mrc_pda_account.key != expected_mrc {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Build percolator UpdateAuthority { kind: INSURANCE_OPERATOR, new: MRC_PDA }.
+    // Wire format: tag(1) + kind(1) + pubkey(32) = 34 bytes.
+    let mut ix_data = alloc::vec::Vec::with_capacity(34);
+    ix_data.push(PERC_IX_UPDATE_AUTHORITY);
+    ix_data.push(PERC_AUTHORITY_INSURANCE_OPERATOR);
+    ix_data.extend_from_slice(expected_mrc.as_ref());
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: *percolator_program.key,
+        accounts: alloc::vec![
+            solana_program::instruction::AccountMeta::new_readonly(*admin.key, true),
+            solana_program::instruction::AccountMeta::new_readonly(expected_mrc, true),
+            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
+        ],
+        data: ix_data,
+    };
+
+    let bump_bytes = [mrc_bump];
+    let signer_seeds: [&[u8]; 3] = [b"mrc", market_slab.key.as_ref(), &bump_bytes];
+    invoke_signed(
+        &ix,
+        &[
+            admin.clone(),
+            mrc_pda_account.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+// ============================================================================
+// pull_insurance — capture profit from percolator insurance into stake_vault
+// ============================================================================
+// Permissionless keeper instruction. CPIs percolator's WithdrawInsuranceLimited
+// with MRC PDA as the insurance_operator (signed via invoke_signed), and
+// destination = our stake_vault. The bps cap and cooldown on percolator's
+// side gate the rate at which fees can be swept. Once funds land in the
+// stake_vault, draw_insurance (DAO-gated, profit-only) is how the DAO
+// realizes the profit; user unstake continues to draw from the same vault.
+//
+// Accounts:
+//   [0] payer (signer — anyone, pays CPI fees)
+//   [1] mrc PDA (writable is NOT needed; we read only, but percolator wants operator signer)
+//   [2] market_slab (writable)
+//   [3] operator_ata = stake_vault (writable)
+//   [4] percolator_vault (writable — source)
+//   [5] token_program
+//   [6] percolator_vault_pda (signing vault authority on percolator side)
+//   [7] clock
+//   [8] percolator_program
+//
+// Data: amount (u64)
+
+fn process_pull_insurance<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &mut &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let mrc_pda_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let stake_vault = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    let percolator_vault_pda = next_account_info(iter)?;
+    let clock_info = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+
+    let amount = read_u64(data)?;
+    if amount == 0 { return Err(ProgramError::InvalidInstructionData); }
+    if !payer.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+
+    verify_token_program(token_program)?;
+
+    // Verify MRC PDA & derive seeds
+    let mrc_data = mrc_account_data_ref(mrc_pda_account, program_id, market_slab.key)?;
+    let cfg = MarketRewardsCfg::deserialize(&mrc_data)?;
+    drop(mrc_data);
+
+    let (expected_mrc, mrc_bump) = Pubkey::find_program_address(
+        &mrc_seeds(&cfg.market_slab), program_id);
+    if *mrc_pda_account.key != expected_mrc { return Err(ProgramError::InvalidSeeds); }
+
+    // Verify stake_vault PDA (destination for the CPI)
+    let (expected_vault, _) = Pubkey::find_program_address(
+        &stake_vault_seeds(&cfg.market_slab), program_id);
+    if *stake_vault.key != expected_vault { return Err(ProgramError::InvalidSeeds); }
+    validate_token_account(stake_vault, &cfg.collateral_mint, mrc_pda_account.key)?;
+
+    // Build WithdrawInsuranceLimited(amount) — tag 23.
+    // Accounts: [operator, slab, operator_ata, vault, token_program, vault_pda, clock]
+    let mut ix_data = alloc::vec::Vec::with_capacity(9);
+    ix_data.push(PERC_IX_WITHDRAW_INSURANCE_LIMITED);
+    ix_data.extend_from_slice(&amount.to_le_bytes());
+
+    let ix = solana_program::instruction::Instruction {
+        program_id: *percolator_program.key,
+        accounts: alloc::vec![
+            solana_program::instruction::AccountMeta::new_readonly(expected_mrc, true),
+            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
+            solana_program::instruction::AccountMeta::new(*stake_vault.key, false),
+            solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*percolator_vault_pda.key, false),
+            solana_program::instruction::AccountMeta::new_readonly(*clock_info.key, false),
+        ],
+        data: ix_data,
+    };
+
+    let bump_bytes = [mrc_bump];
+    let signer_seeds: [&[u8]; 3] = [b"mrc", cfg.market_slab.as_ref(), &bump_bytes];
+    invoke_signed(
+        &ix,
+        &[
+            mrc_pda_account.clone(),
+            market_slab.clone(),
+            stake_vault.clone(),
+            percolator_vault.clone(),
+            token_program.clone(),
+            percolator_vault_pda.clone(),
+            clock_info.clone(),
+            percolator_program.clone(),
+        ],
+        &[&signer_seeds],
+    )
+}
+
+/// Helper: borrow MRC data and verify the account is a valid MRC PDA for the given slab.
+fn mrc_account_data_ref<'a>(
+    mrc_account: &'a AccountInfo,
+    program_id: &Pubkey,
+    _market_slab: &Pubkey,
+) -> Result<core::cell::Ref<'a, &'a mut [u8]>, ProgramError> {
+    if mrc_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = mrc_account.try_borrow_data()?;
+    // Basic size/disc check — the full PDA check must be done by the caller
+    // after reading the slab key from the data.
+    if data.len() < MRC_SIZE || data[..8] != MRC_DISC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(data)
 }
 
 // ============================================================================
