@@ -1770,6 +1770,82 @@ impl TestEnv {
             percolator_prog::state::market_view_mut(&mut slab_data).expect("read market view");
         group.header.insurance.get()
     }
+
+    /// Simulate a FAITHFUL insurance-side trading loss: debit the internal insurance
+    /// counter, the per-domain insurance budgets (asset 0, long+short), the aggregate
+    /// vault counter, AND the on-chain collateral token vault in lockstep — exactly
+    /// the lockstep a real loss settlement applies. This keeps the slab internally
+    /// consistent (passes `validate_shape`) while making Percolator's real
+    /// recoverability caps the binding constraint on recovery: unlike a token-only
+    /// mock, recovery is now bounded by the engine's post-loss insurance budgets, not
+    /// by a hand-picked amount. `loss` must not exceed the current insurance.
+    fn simulate_insurance_loss(&mut self, slab: &Pubkey, percolator_vault: &Pubkey, loss: u128) {
+        let mut slab_account = self.svm.get_account(slab).expect("slab missing");
+        {
+            let (_, mut group) = percolator_prog::state::market_view_mut(&mut slab_account.data)
+                .expect("read market view");
+            let new_insurance = group.header.insurance.get() - loss;
+            let new_vault = group.header.vault.get() - loss;
+            group.header.insurance = percolator_prog::risk::V16PodU128::new(new_insurance);
+            group.header.vault = percolator_prog::risk::V16PodU128::new(new_vault);
+            // Re-derive the per-domain budgets from the post-loss insurance total
+            // (kickstart credits insurance as long = total/2, short = remainder).
+            let slot = &mut group.markets[0].engine;
+            slot.insurance_domain_budget_long =
+                percolator_prog::risk::V16PodU128::new(new_insurance / 2);
+            slot.insurance_domain_budget_short =
+                percolator_prog::risk::V16PodU128::new(new_insurance - new_insurance / 2);
+        }
+        self.svm.set_account(*slab, slab_account).unwrap();
+        let token = self.read_token_balance(percolator_vault);
+        self.set_token_balance_for_test(percolator_vault, token - loss as u64);
+    }
+
+    /// Futarchy-gated recover (through the governance adapter, signed by the
+    /// governance authority): pulls `amount` of `kind`/`domain` principal from the
+    /// market into the shared genesis_vault. Requires the COIN to be live.
+    fn governance_recover(
+        &mut self,
+        slab: &Pubkey,
+        percolator_vault: &Pubkey,
+        kind: u8,
+        domain: u8,
+        amount: u64,
+    ) -> Result<(), String> {
+        let (pvp, _) =
+            Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id);
+        let ix = Instruction {
+            program_id: self.governance_id,
+            accounts: vec![
+                AccountMeta::new(self.dao_authority.pubkey(), true),
+                AccountMeta::new(self.governance_authority_pda, false),
+                AccountMeta::new_readonly(self.rewards_id, false),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new_readonly(self.coin_cfg_pda(), false),
+                AccountMeta::new_readonly(self.genesis_cfg_pda(), false),
+                AccountMeta::new_readonly(self.market_admin_pda(), false),
+                AccountMeta::new(*slab, false),
+                AccountMeta::new(self.genesis_vault_pda(), false),
+                AccountMeta::new(*percolator_vault, false),
+                AccountMeta::new_readonly(pvp, false),
+                AccountMeta::new_readonly(self.percolator_id, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_governance_recover_genesis_market(kind, domain, amount),
+        };
+        self.svm.expire_blockhash();
+        let dao = Keypair::from_bytes(&self.dao_authority.to_bytes()).unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), ix],
+            Some(&dao.pubkey()),
+            &[&dao],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
 }
 
 // ============================================================================
@@ -3458,11 +3534,13 @@ fn test_genesis_bootstrap_withdraw_before_kickstart_full_refund() {
     assert_eq!(u64::from_le_bytes(cfg.data[104..112].try_into().unwrap()), 0);
 }
 
-/// After kickstart the deposit is deployed into the market; the depositor pulls
-/// their principal back from the insurance fund + backing bucket and forfeits
-/// their vote.
+/// After kickstart the deposit is deployed into the market. A depositor exits by
+/// withdrawing a pro-rata share of the shared vault — withdraw itself never touches
+/// the market, so no exit can drain it first-come-first-served. Futarchy recovers
+/// market capital into the shared vault (it stays at risk until then); on a healthy,
+/// fully-recovered market the depositor recovers their full principal.
 #[test]
-fn test_genesis_bootstrap_withdraw_after_kickstart_pulls_from_market() {
+fn test_genesis_bootstrap_exit_after_kickstart_recovers_then_withdraws() {
     let mut env = TestEnv::new();
     env.init_coin_config_with_delay(50);
     env.init_genesis_bootstrap(100);
@@ -3480,47 +3558,31 @@ fn test_genesis_bootstrap_withdraw_after_kickstart_pulls_from_market() {
     assert_eq!(env.read_token_balance(&percolator_vault), 4);
     assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 0);
 
-    let (percolator_vault_pda, _) =
-        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
-    let collateral_mint = env.collateral_mint;
-    let user_ata = env.create_ata(&collateral_mint, &alice.pubkey(), 0);
-    // Alice recovers her full principal: 1 from insurance + 1 from backing.
-    let ix = Instruction {
-        program_id: env.rewards_id,
-        accounts: vec![
-            AccountMeta::new(alice.pubkey(), true),
-            AccountMeta::new_readonly(env.coin_mint, false),
-            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
-            AccountMeta::new(env.genesis_cfg_pda(), false),
-            AccountMeta::new(env.genesis_position_pda(&alice.pubkey()), false),
-            AccountMeta::new(user_ata, false),
-            AccountMeta::new(env.genesis_vault_pda(), false),
-            AccountMeta::new_readonly(env.market_admin_pda(), false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(percolator_vault, false),
-            AccountMeta::new_readonly(percolator_vault_pda, false),
-            AccountMeta::new_readonly(env.percolator_id, false),
-        ],
-        data: encode_genesis_bootstrap_withdraw(0, 1, 1),
-    };
+    // A direct market pull from withdraw is now rejected (this was the bank-run path).
+    let bad = genesis_bootstrap_exit_ix(&mut env, &alice, 0, 1, 1, Some((slab, percolator_vault)));
     env.svm.expire_blockhash();
     let tx = Transaction::new_signed_with_payer(
-        &[
-            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
-            ix,
-        ],
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), bad],
         Some(&alice.pubkey()),
         &[&alice],
         env.svm.latest_blockhash(),
     );
-    env.svm
-        .send_transaction(tx)
-        .expect("bootstrap withdraw after kickstart failed");
+    assert!(env.svm.send_transaction(tx).is_err(), "withdraw no longer pulls from the market");
 
-    assert_eq!(env.read_token_balance(&user_ata), 2, "principal recovered from market");
+    // Recovery is futarchy-gated and requires the COIN to be live.
+    env.set_clock(150);
+    env.activate_live();
+    env.governance_recover(&slab, &percolator_vault, 0, 0, 2)
+        .expect("governance insurance recovery");
+    env.governance_recover(&slab, &percolator_vault, 1, 0, 2)
+        .expect("governance backing recovery");
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 4, "market gathered into shared vault");
+
+    // Alice withdraws her pro-rata share of the (fully recovered, healthy) vault:
+    // her full principal of 2.
+    let user_ata = env.genesis_withdraw(&alice);
+    assert_eq!(env.read_token_balance(&user_ata), 2, "full principal recovered on a healthy market");
     assert_eq!(read_genesis_start_slot(&env, &alice.pubkey()), 0, "vote forfeited");
-    assert_eq!(env.percolator_insurance_balance(&slab), 1, "insurance drawn down by 1");
 }
 
 /// A depositor who never voted may exit at any time, including during voting —
@@ -3660,10 +3722,10 @@ fn test_voter_retracts_then_exits_and_quorum_recomputes() {
 
 /// One continuous run exercising every phase with no test shortcuts:
 /// deposit -> create real market -> create Squads 1/1+48h -> real 50/50 kickstart
-/// (with capital-protected insurance policy) -> a depositor exits mid-bootstrap
-/// pulling principal back from the live market -> go live -> propose/vote/mint
-/// 100% of supply -> recover market principal -> finalize -> hand the Squads
-/// config-authority to the winning DAO -> remaining depositors withdraw.
+/// (with capital-protected insurance policy) -> go live -> a depositor exits
+/// (futarchy recovers market principal into the shared vault, then she takes a
+/// pro-rata withdraw) -> propose/vote/mint 100% of supply -> finalize -> hand the
+/// Squads config-authority to the winning DAO -> remaining depositors withdraw.
 #[test]
 fn test_full_genesis_to_dao_lifecycle_end_to_end() {
     let mut env = TestEnv::new();
@@ -3689,8 +3751,6 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
 
     // --- 2. Real Percolator market, born under the futarchy market_admin PDA ---
     let (slab, percolator_vault) = env.init_futarchy_percolator_market();
-    let (percolator_vault_pda, _) =
-        Pubkey::find_program_address(&[b"vault", slab.as_ref()], &env.percolator_id);
 
     // --- 3. Program creates the controlled 1/1 + 48h Squads multisig ---
     let create_squads = Instruction {
@@ -3728,43 +3788,23 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
     assert_eq!(env.percolator_insurance_balance(&slab), 5, "half to insurance");
     assert_eq!(env.read_token_balance(&percolator_vault), 10);
 
-    // --- 5. Carol exits mid-bootstrap, pulling her principal back from the live market ---
-    let collateral_mint = env.collateral_mint;
-    let carol_ata = env.create_ata(&collateral_mint, &carol.pubkey(), 0);
-    let exit = Instruction {
-        program_id: env.rewards_id,
-        accounts: vec![
-            AccountMeta::new(carol.pubkey(), true),
-            AccountMeta::new_readonly(env.coin_mint, false),
-            AccountMeta::new_readonly(env.coin_cfg_pda(), false),
-            AccountMeta::new(env.genesis_cfg_pda(), false),
-            AccountMeta::new(env.genesis_position_pda(&carol.pubkey()), false),
-            AccountMeta::new(carol_ata, false),
-            AccountMeta::new(env.genesis_vault_pda(), false),
-            AccountMeta::new_readonly(market_admin, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(percolator_vault, false),
-            AccountMeta::new_readonly(percolator_vault_pda, false),
-            AccountMeta::new_readonly(env.percolator_id, false),
-        ],
-        data: encode_genesis_bootstrap_withdraw(0, 1, 1),
-    };
-    env.svm.expire_blockhash();
-    let tx = Transaction::new_signed_with_payer(
-        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), exit],
-        Some(&carol.pubkey()),
-        &[&carol],
-        env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("carol mid-bootstrap exit");
-    assert_eq!(env.read_token_balance(&carol_ata), 2, "carol recovered her principal");
-    assert_eq!(read_genesis_start_slot(&env, &carol.pubkey()), 0, "carol forfeited her vote");
-    assert_eq!(env.percolator_insurance_balance(&slab), 4, "insurance drawn down by carol's share");
-
-    // --- 6. Voting opens once the COIN goes live ---
+    // --- 5. Go live (voting opens; futarchy recovery becomes available) ---
     env.set_clock(150);
     env.activate_live();
+
+    // --- 6. Carol exits. Withdraw never pulls from the market; futarchy recovers the
+    // healthy market principal back into the shared vault, then Carol claims her
+    // pro-rata share — her full 2. (This is the post-fix replacement for the old
+    // unilateral market pull that allowed the first-come-first-served bank run.) ---
+    env.governance_recover(&slab, &percolator_vault, 0, 0, 5)
+        .expect("governance insurance recovery");
+    env.governance_recover(&slab, &percolator_vault, 1, 0, 5)
+        .expect("governance backing recovery");
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 10, "healthy market gathered into shared vault");
+    let carol_ata = env.genesis_withdraw(&carol);
+    assert_eq!(env.read_token_balance(&carol_ata), 2, "carol recovers her full principal (healthy market)");
+    assert_eq!(read_genesis_start_slot(&env, &carol.pubkey()), 0, "carol forfeited her vote");
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 8, "carol paid; 8 remains for alice+bob");
 
     // --- 7. One proposal wins; the permissionless trigger mints 100% of supply ---
     let dao_coin = env.create_coin_ata(&alice.pubkey(), 0);
@@ -3781,39 +3821,9 @@ fn test_full_genesis_to_dao_lifecycle_end_to_end() {
     assert_eq!(env.read_token_balance(&dao_coin), 100, "winner-take-all: full supply minted");
     assert_eq!(env.read_token_balance(&bob_coin), 0, "the losing proposal mints nothing");
 
-    // --- 8. Recover remaining market principal back to the vault (pre-finalize) ---
-    let recover = |env: &mut TestEnv, kind: u8, domain: u8, amount: u64| {
-        let ix = Instruction {
-            program_id: env.governance_id,
-            accounts: vec![
-                AccountMeta::new(env.dao_authority.pubkey(), true),
-                AccountMeta::new(env.governance_authority_pda, false),
-                AccountMeta::new_readonly(env.rewards_id, false),
-                AccountMeta::new_readonly(env.coin_mint, false),
-                AccountMeta::new_readonly(env.coin_cfg_pda(), false),
-                AccountMeta::new_readonly(env.genesis_cfg_pda(), false),
-                AccountMeta::new_readonly(env.market_admin_pda(), false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new(env.genesis_vault_pda(), false),
-                AccountMeta::new(percolator_vault, false),
-                AccountMeta::new_readonly(percolator_vault_pda, false),
-                AccountMeta::new_readonly(env.percolator_id, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: encode_governance_recover_genesis_market(kind, domain, amount),
-        };
-        env.svm.expire_blockhash();
-        let tx = Transaction::new_signed_with_payer(
-            &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), ix],
-            Some(&env.dao_authority.pubkey()),
-            &[&env.dao_authority],
-            env.svm.latest_blockhash(),
-        );
-        env.svm.send_transaction(tx).expect("recover genesis market");
-    };
-    recover(&mut env, 0, 0, 4); // insurance-limited
-    recover(&mut env, 1, 0, 4); // backing bucket, domain 0
-    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 8, "principal recovered to vault");
+    // --- 8. Market principal is already in the shared vault (cranked at step 5),
+    // so there is nothing left to recover pre-finalize. ---
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 8, "alice+bob principal sits in the vault");
 
     // --- 9. Finalize ---
     env.finalize_genesis();
@@ -4074,4 +4084,71 @@ fn test_genesis_bootstrap_exit_rejects_overpull() {
         "cannot recover more than the remaining principal"
     );
     assert_eq!(env.percolator_insurance_balance(&slab), 2, "market untouched on rejected over-pull");
+}
+
+/// FIX VERIFICATION — the former pre-finalization withdrawal race is gone.
+///
+/// Withdraw no longer pulls from the market; capital is brought back into the shared
+/// genesis_vault by the (futarchy-gated) recover_genesis_market, and exits pay
+/// a pro-rata share of that shared vault with the full claim settled. So on a
+/// loss-bearing market every depositor recovers the same share regardless of order,
+/// and looping pays nothing — the same guarantee
+/// `test_underfunded_genesis_haircut_is_order_independent_and_loop_proof` proves for
+/// the finalized path, now holding in the live decision window too. (Before the fix
+/// this scenario paid the first mover 100% and the equal co-depositor 0.)
+#[test]
+fn test_prefinalization_exit_is_pro_rata_and_order_independent() {
+    let mut env = TestEnv::new();
+    env.init_coin_config_with_delay(50);
+    env.init_genesis_bootstrap(100);
+
+    // Two equal depositors: 2 base units each (total pool 4).
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    for kp in [&alice, &bob] {
+        env.svm.airdrop(&kp.pubkey(), 10_000_000_000).unwrap();
+    }
+    env.genesis_deposit(&alice, 2);
+    env.genesis_deposit(&bob, 2);
+
+    // Real Percolator market, kickstarted 50/50: collateral token vault = 4.
+    let (slab, percolator_vault) = env.init_futarchy_percolator_market();
+    env.kickstart_genesis_market(&slab, &percolator_vault);
+    assert_eq!(env.read_token_balance(&percolator_vault), 4, "pool deployed to market");
+
+    // The bootstrap market takes a FAITHFUL 50% trading loss: the insurance side
+    // (2 units) is wiped — internal insurance counter, per-domain budgets, vault
+    // counter, and the token vault all debited in lockstep. Backing (2) survives.
+    // So 2 of the 4 deployed units are recoverable against 4 outstanding principal;
+    // fair pro-rata = 1 each.
+    env.simulate_insurance_loss(&slab, &percolator_vault, 2);
+
+    // Live decision window: COIN live, market kicked, NOT finalized.
+    env.set_clock(150);
+    env.activate_live();
+
+    // Recovery is bounded by Percolator's REAL post-loss accounting, not a hand-picked
+    // amount: the wiped insurance can no longer be recovered (engine caps to 0).
+    assert!(
+        env.governance_recover(&slab, &percolator_vault, 0, 0, 1).is_err(),
+        "engine caps recovery to the real post-loss insurance (0); the loss is not recoverable"
+    );
+
+    // Futarchy recovers the SURVIVING collateral (backing) into the SHARED vault.
+    env.governance_recover(&slab, &percolator_vault, 1, 0, 2)
+        .expect("governance recovery of the surviving backing");
+    assert_eq!(env.read_token_balance(&env.genesis_vault_pda()), 2, "survivors gathered into shared vault");
+
+    // Alice exits FIRST: pro-rata share of the shared vault = 2 * 2/4 = 1.
+    let alice_ata = env.genesis_withdraw(&alice);
+    assert_eq!(env.read_token_balance(&alice_ata), 1, "first mover gets her fair 50% share, not 100%");
+
+    // Looping pays nothing more — the full claim is settled.
+    let alice_again = env.genesis_withdraw(&alice);
+    assert_eq!(env.read_token_balance(&alice_again), 0, "re-withdrawing yields nothing: no loop extraction");
+
+    // Bob exits SECOND and recovers the SAME fair share — the straggler is NOT wiped
+    // out. (Before the fix bob, going second against the drained market, got 0.)
+    let bob_ata = env.genesis_withdraw(&bob);
+    assert_eq!(env.read_token_balance(&bob_ata), 1, "the patient co-depositor recovers the same 50% share");
 }

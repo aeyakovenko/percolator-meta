@@ -1749,50 +1749,6 @@ fn process_genesis_deposit<'a>(
     Ok(())
 }
 
-/// CPI one capital-protected withdrawal (insurance-limited or backing) from the
-/// genesis market into the genesis vault, signed by the market_admin PDA.
-#[allow(clippy::too_many_arguments)]
-fn genesis_pull_from_market<'a>(
-    kind: u8,
-    domain: u8,
-    amount: u64,
-    market_admin: &AccountInfo<'a>,
-    market_slab: &AccountInfo<'a>,
-    genesis_vault: &AccountInfo<'a>,
-    percolator_vault: &AccountInfo<'a>,
-    percolator_vault_pda: &AccountInfo<'a>,
-    token_program: &AccountInfo<'a>,
-    percolator_program: &AccountInfo<'a>,
-    signer_seeds: &[&[u8]],
-) -> ProgramResult {
-    let ix_data = genesis_recovery_ix_data(kind, domain, amount)?;
-    let ix = solana_program::instruction::Instruction {
-        program_id: *percolator_program.key,
-        accounts: alloc::vec![
-            solana_program::instruction::AccountMeta::new_readonly(*market_admin.key, true),
-            solana_program::instruction::AccountMeta::new(*market_slab.key, false),
-            solana_program::instruction::AccountMeta::new(*genesis_vault.key, false),
-            solana_program::instruction::AccountMeta::new(*percolator_vault.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(*percolator_vault_pda.key, false),
-            solana_program::instruction::AccountMeta::new_readonly(*token_program.key, false),
-        ],
-        data: ix_data,
-    };
-    invoke_signed(
-        &ix,
-        &[
-            market_admin.clone(),
-            market_slab.clone(),
-            genesis_vault.clone(),
-            percolator_vault.clone(),
-            percolator_vault_pda.clone(),
-            token_program.clone(),
-            percolator_program.clone(),
-        ],
-        &[signer_seeds],
-    )
-}
-
 // genesis_withdraw accounts:
 //   [0] user (signer)
 //   [1] coin_mint
@@ -1803,26 +1759,30 @@ fn genesis_pull_from_market<'a>(
 //   [6] genesis_vault (writable)
 //   [7] market_admin PDA
 //   [8] token_program
-//   -- only for the kicked, pre-finalize market pull: --
-//   [9] market_slab (writable)
-//   [10] percolator_vault (writable)
-//   [11] percolator_vault_pda
-//   [12] percolator_program
 //
-// Data: backing_domain (u8), insurance_pull (u64), backing_pull (u64)
+// Data: backing_domain (u8), insurance_pull (u64), backing_pull (u64).
+// The pull fields are retained for ABI stability but must now be 0 — withdraw no
+// longer touches the market (see below).
 //
 // One permissionless withdraw for every phase; it always forfeits the vote
-// (start_slot -> 0). Withdrawals are locked only during voting (COIN live but
-// genesis not finalized), so a vote counts only if held through finalization.
-// By phase:
+// (start_slot -> 0). A voter must retract before exiting during voting, so a vote
+// counts only if held through finalization. By phase:
 //   - Before kickstart: capital is still in the genesis vault; refund the full
-//     remaining principal and shrink the pool. (pulls must be 0)
-//   - After kickstart, before voting: capital is deployed 50/50 into the
-//     market's insurance fund + backing bucket. The caller pulls their principal
-//     back from both (capital-protected; sized off-chain, so a lossy market
-//     yields a pro-rata partial exit) and is paid the recovered amount.
-//   - After finalization: pay the remaining principal pro-rata against the
-//     recovered vault balance. (pulls must be 0; unpaid principal stays claimable)
+//     remaining principal and shrink the pool.
+//   - After kickstart (the live decision window OR after finalization): pay the
+//     remaining principal pro-rata against the genesis_vault's health ratio and
+//     settle the FULL claim, so every depositor recovers the same share (up to
+//     sub-unit integer-division dust, which accrues to later exiters — the safe
+//     direction) regardless of withdrawal order, and looping pays nothing.
+//
+// Withdraw never pulls from the market itself. Bringing deployed capital back into
+// the shared genesis_vault is the (futarchy-gated) recover_genesis_market step —
+// decoupling recovery (which fills the shared vault, helping everyone equally) from
+// withdrawal (which takes a pro-rata share) is what removes the first-come-first-
+// served bank run that the old in-line market pull allowed. NOTE: this means a
+// depositor exiting before governance has recovered market capital realizes the
+// un-recovered remainder as loss against the full-claim settlement — the exit-anytime
+// vs. keep-capital-at-risk tension is a governance design choice, left as-is here.
 fn process_genesis_withdraw<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1884,17 +1844,24 @@ fn process_genesis_withdraw<'a>(
         &bump_bytes,
     ];
 
+    // Withdraw never pulls from the market. The pull fields are retained for ABI
+    // stability but must be 0; bringing deployed capital back into the shared
+    // genesis_vault is the (futarchy-gated) recover_genesis_market step. Decoupling
+    // recovery (fills the shared vault, helping everyone equally) from withdrawal
+    // (takes a pro-rata share) is what removes the first-come-first-served bank run.
+    if insurance_pull != 0 || backing_pull != 0 {
+        msg!("withdraw no longer pulls from the market; crank recover_genesis_market first");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let _ = backing_domain;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     if !cfg.is_kicked() {
-        // Capital is still in the genesis vault: refund the full remaining
-        // principal and shrink the pool so a later kickstart deploys the right
-        // amount.
-        if insurance_pull != 0 || backing_pull != 0 {
-            msg!("no market to draw from before kickstart");
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if iter.next().is_some() {
-            return Err(ProgramError::InvalidInstructionData);
-        }
+        // Pre-kickstart: capital is still in the genesis vault. Refund the full
+        // remaining principal and shrink the pool so a later kickstart deploys the
+        // right amount.
         if remaining > 0 {
             let vault_balance = load_token_account(genesis_vault)?.amount;
             let actual = core::cmp::min(remaining, vault_balance);
@@ -1921,17 +1888,18 @@ fn process_genesis_withdraw<'a>(
             cfg.total_deposited = cfg.total_deposited.saturating_sub(actual);
             pos.amount = pos.amount.saturating_sub(actual);
         }
-    } else if cfg.is_finalized() {
-        // Post-finalization: futarchy has recovered market funds into the vault;
-        // pay the remaining principal pro-rata against the vault's health ratio
-        // and settle the FULL claim. Retiring the whole `remaining` (not just the
-        // paid `actual`) keeps the health ratio vault/outstanding invariant, so
-        // every depositor recovers the same share regardless of withdrawal order
-        // and looping pays nothing. The unpaid shortfall is this depositor's
-        // realized share of the market loss.
-        if insurance_pull != 0 || backing_pull != 0 || iter.next().is_some() {
-            return Err(ProgramError::InvalidInstructionData);
-        }
+    } else {
+        // Kicked — the live decision window OR post-finalization. Pay the remaining
+        // principal pro-rata against the genesis_vault's health ratio and settle the
+        // FULL claim. Retiring the whole `remaining` (not just the paid `actual`)
+        // keeps the vault/outstanding ratio invariant, so every depositor recovers
+        // the same share regardless of withdrawal order (exact in real arithmetic; up
+        // to sub-unit flooring dust that accrues to later exiters — the safe
+        // direction) and looping pays nothing. The unpaid shortfall is this
+        // depositor's realized share of the market loss.
+        // Capital still deployed in the market must first be recovered to the shared
+        // vault via the (futarchy-gated) recover_genesis_market — exiting before
+        // recovery realizes the un-recovered remainder as loss.
         if remaining > 0 {
             let outstanding = cfg.outstanding_principal();
             if outstanding == 0 {
@@ -1966,106 +1934,6 @@ fn process_genesis_withdraw<'a>(
             pos.withdrawn = pos
                 .withdrawn
                 .checked_add(remaining)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-        }
-    } else {
-        // Capital is deployed in the market: pull the depositor's principal back
-        // from the insurance fund and backing bucket, then pay them.
-        let total_pull = insurance_pull
-            .checked_add(backing_pull)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        if total_pull == 0 {
-            msg!("specify insurance/backing amounts to recover from the market");
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        if total_pull > remaining {
-            msg!("cannot recover more than the remaining principal");
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let market_slab = next_account_info(iter)?;
-        let percolator_vault = next_account_info(iter)?;
-        let percolator_vault_pda = next_account_info(iter)?;
-        let percolator_program = next_account_info(iter)?;
-        if iter.next().is_some() {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        verify_percolator_program(percolator_program)?;
-        let percolator_cfg = load_percolator_market_config(market_slab, &cfg.base_mint)?;
-        if percolator_cfg.admin != market_admin.key.to_bytes()
-            || percolator_cfg.insurance_authority != market_admin.key.to_bytes()
-            || percolator_cfg.insurance_operator != market_admin.key.to_bytes()
-            || percolator_cfg.backing_bucket_authority != market_admin.key.to_bytes()
-        {
-            msg!("genesis market must be controlled by the COIN market-admin PDA");
-            return Err(ProgramError::InvalidAccountData);
-        }
-        validate_percolator_vault_accounts(
-            market_slab,
-            percolator_vault,
-            percolator_vault_pda,
-            &cfg.base_mint,
-        )?;
-
-        let vault_before = load_token_account(genesis_vault)?.amount;
-        if insurance_pull > 0 {
-            genesis_pull_from_market(
-                GENESIS_RECOVER_INSURANCE_LIMITED,
-                0,
-                insurance_pull,
-                market_admin,
-                market_slab,
-                genesis_vault,
-                percolator_vault,
-                percolator_vault_pda,
-                token_program,
-                percolator_program,
-                &signer_seeds,
-            )?;
-        }
-        if backing_pull > 0 {
-            genesis_pull_from_market(
-                GENESIS_RECOVER_BACKING,
-                backing_domain,
-                backing_pull,
-                market_admin,
-                market_slab,
-                genesis_vault,
-                percolator_vault,
-                percolator_vault_pda,
-                token_program,
-                percolator_program,
-                &signer_seeds,
-            )?;
-        }
-        let vault_after = load_token_account(genesis_vault)?.amount;
-        let recovered = vault_after.saturating_sub(vault_before);
-        let actual = core::cmp::min(recovered, remaining);
-        if actual > 0 {
-            let xfer_ix = spl_token::instruction::transfer(
-                token_program.key,
-                genesis_vault.key,
-                user_base_ata.key,
-                market_admin.key,
-                &[],
-                actual,
-            )?;
-            invoke_signed(
-                &xfer_ix,
-                &[
-                    genesis_vault.clone(),
-                    user_base_ata.clone(),
-                    market_admin.clone(),
-                    token_program.clone(),
-                ],
-                &[&signer_seeds],
-            )?;
-            cfg.total_withdrawn = cfg
-                .total_withdrawn
-                .checked_add(actual)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            pos.withdrawn = pos
-                .withdrawn
-                .checked_add(actual)
                 .ok_or(ProgramError::ArithmeticOverflow)?;
         }
     }
