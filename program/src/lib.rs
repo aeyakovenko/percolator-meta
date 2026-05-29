@@ -403,13 +403,14 @@ impl CoinConfig {
 struct GenesisConfig {
     coin_mint: Pubkey,
     base_mint: Pubkey,
-    token_vault: Pubkey,
+    kicked_market: Pubkey,
     total_deposited: u64,
     total_withdrawn: u64,
     reward_supply: u64,
     minted_supply: u64,
     finalized: u8,
     kicked: u8,
+    kicked_backing_domain: u8,
     /// Sum of the raw principal of every voter who currently backs a proposal.
     /// Quorum is valid once this exceeds half the outstanding principal.
     total_voted_principal: u64,
@@ -425,19 +426,21 @@ impl GenesisConfig {
         }
         let finalized = data[136];
         let kicked = data[137];
+        let kicked_backing_domain = data[139];
         if finalized > 1 || kicked > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
             coin_mint: Pubkey::new_from_array(data[8..40].try_into().unwrap()),
             base_mint: Pubkey::new_from_array(data[40..72].try_into().unwrap()),
-            token_vault: Pubkey::new_from_array(data[72..104].try_into().unwrap()),
+            kicked_market: Pubkey::new_from_array(data[72..104].try_into().unwrap()),
             total_deposited: u64::from_le_bytes(data[104..112].try_into().unwrap()),
             total_withdrawn: u64::from_le_bytes(data[112..120].try_into().unwrap()),
             reward_supply: u64::from_le_bytes(data[120..128].try_into().unwrap()),
             minted_supply: u64::from_le_bytes(data[128..136].try_into().unwrap()),
             finalized,
             kicked,
+            kicked_backing_domain,
             total_voted_principal: u64::from_le_bytes(data[144..152].try_into().unwrap()),
             total_cast_weight: u64::from_le_bytes(data[152..160].try_into().unwrap()),
         })
@@ -447,14 +450,16 @@ impl GenesisConfig {
         data[..8].copy_from_slice(&GENESIS_CFG_DISC);
         data[8..40].copy_from_slice(self.coin_mint.as_ref());
         data[40..72].copy_from_slice(self.base_mint.as_ref());
-        data[72..104].copy_from_slice(self.token_vault.as_ref());
+        data[72..104].copy_from_slice(self.kicked_market.as_ref());
         data[104..112].copy_from_slice(&self.total_deposited.to_le_bytes());
         data[112..120].copy_from_slice(&self.total_withdrawn.to_le_bytes());
         data[120..128].copy_from_slice(&self.reward_supply.to_le_bytes());
         data[128..136].copy_from_slice(&self.minted_supply.to_le_bytes());
         data[136] = self.finalized;
         data[137] = self.kicked;
-        data[138..144].fill(0);
+        data[138] = 0;
+        data[139] = self.kicked_backing_domain;
+        data[140..144].fill(0);
         data[144..152].copy_from_slice(&self.total_voted_principal.to_le_bytes());
         data[152..160].copy_from_slice(&self.total_cast_weight.to_le_bytes());
     }
@@ -845,7 +850,7 @@ fn verify_genesis_vault(
 ) -> ProgramResult {
     let (expected_vault, _) =
         Pubkey::find_program_address(&genesis_vault_seeds(&cfg.coin_mint), program_id);
-    if *genesis_vault.key != expected_vault || cfg.token_vault != expected_vault {
+    if *genesis_vault.key != expected_vault {
         return Err(ProgramError::InvalidSeeds);
     }
     validate_token_account(genesis_vault, &cfg.base_mint, market_admin)
@@ -1598,13 +1603,14 @@ fn process_init_genesis_bootstrap<'a>(
     let cfg = GenesisConfig {
         coin_mint: *coin_mint.key,
         base_mint: *base_mint.key,
-        token_vault: *genesis_vault.key,
+        kicked_market: Pubkey::default(),
         total_deposited: 0,
         total_withdrawn: 0,
         reward_supply,
         minted_supply: 0,
         finalized: 0,
         kicked: 0,
+        kicked_backing_domain: 0,
         total_voted_principal: 0,
         total_cast_weight: 0,
     };
@@ -2005,6 +2011,14 @@ fn process_genesis_withdraw<'a>(
             percolator_vault_pda,
             &cfg.base_mint,
         )?;
+        if cfg.kicked_market != *market_slab.key {
+            msg!("genesis withdraw must use the kickstarted market");
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if backing_pull > 0 && backing_domain != cfg.kicked_backing_domain {
+            msg!("genesis withdraw must use the kickstarted backing domain");
+            return Err(ProgramError::InvalidInstructionData);
+        }
 
         let vault_before = load_token_account(genesis_vault)?.amount;
         if insurance_pull > 0 {
@@ -2709,6 +2723,8 @@ fn process_kickstart_genesis_market<'a>(
         )?;
     }
     cfg.kicked = 1;
+    cfg.kicked_backing_domain = backing_domain;
+    cfg.kicked_market = *market_slab.key;
     let mut cfg_data = genesis_cfg_account.try_borrow_mut_data()?;
     cfg.serialize(&mut cfg_data);
     Ok(())
@@ -2984,6 +3000,22 @@ fn process_recover_genesis_market<'a>(
         percolator_vault_pda,
         &cfg.base_mint,
     )?;
+    if cfg.kicked_market != *market_slab.key {
+        msg!("genesis recovery must use the kickstarted market");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if recovery_kind == GENESIS_RECOVER_INSURANCE_DOMAIN {
+        msg!("genesis bootstrap never funds insurance domains");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if matches!(
+        recovery_kind,
+        GENESIS_RECOVER_BACKING | GENESIS_RECOVER_BACKING_EARNINGS
+    ) && domain != cfg.kicked_backing_domain
+    {
+        msg!("genesis recovery must use the kickstarted backing domain");
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
     let ix_data = genesis_recovery_ix_data(recovery_kind, domain, amount)?;
     let bump_bytes = [admin_bump];
@@ -3158,13 +3190,14 @@ mod tests {
         let cfg = GenesisConfig {
             coin_mint: Pubkey::new_unique(),
             base_mint: Pubkey::new_unique(),
-            token_vault: Pubkey::new_unique(),
+            kicked_market: Pubkey::new_unique(),
             total_deposited: 101,
             total_withdrawn: 1,
             reward_supply: 1_000_000,
             minted_supply: 250_000,
             finalized: 1,
             kicked: 1,
+            kicked_backing_domain: 3,
             total_voted_principal: 64,
             total_cast_weight: 320,
         };
@@ -3175,13 +3208,14 @@ mod tests {
 
         assert_eq!(decoded.coin_mint, cfg.coin_mint);
         assert_eq!(decoded.base_mint, cfg.base_mint);
-        assert_eq!(decoded.token_vault, cfg.token_vault);
+        assert_eq!(decoded.kicked_market, cfg.kicked_market);
         assert_eq!(decoded.total_deposited, cfg.total_deposited);
         assert_eq!(decoded.total_withdrawn, cfg.total_withdrawn);
         assert_eq!(decoded.reward_supply, cfg.reward_supply);
         assert_eq!(decoded.minted_supply, cfg.minted_supply);
         assert!(decoded.is_finalized());
         assert!(decoded.is_kicked());
+        assert_eq!(decoded.kicked_backing_domain, 3);
         assert_eq!(decoded.total_voted_principal, 64);
         assert_eq!(decoded.total_cast_weight, 320);
         assert_eq!(decoded.outstanding_principal(), 100);
