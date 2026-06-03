@@ -38,6 +38,8 @@ const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
     0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
     0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
 ]);
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
 // All-zeros feed_id = Hyperp mode (no external oracle read at init)
 const TEST_FEED_ID: [u8; 32] = [0u8; 32];
@@ -95,6 +97,18 @@ fn make_token_account_data(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8
     account.state = AccountState::Initialized;
     TokenAccount::pack(account, &mut data).unwrap();
     data
+}
+
+fn canonical_percolator_vault(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0
 }
 
 fn make_mint_data_with_authority(mint_authority: &Pubkey) -> Vec<u8> {
@@ -503,7 +517,7 @@ impl TestEnv {
         let pyth_index = Pubkey::new_unique();
         let (vault_pda, _) =
             Pubkey::find_program_address(&[b"vault", slab.as_ref()], &percolator_id);
-        let vault = Pubkey::new_unique();
+        let vault = canonical_percolator_vault(&vault_pda, &collateral_mint);
 
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
@@ -1267,7 +1281,7 @@ impl TestEnv {
                 },
             )
             .unwrap();
-        let vault = Pubkey::new_unique();
+        let vault = canonical_percolator_vault(&vault_authority, &self.collateral_mint);
         self.svm
             .set_account(
                 vault,
@@ -1335,7 +1349,7 @@ impl TestEnv {
             .unwrap();
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id);
-        let vault = Pubkey::new_unique();
+        let vault = canonical_percolator_vault(&vault_authority, &self.collateral_mint);
         self.svm
             .set_account(
                 vault,
@@ -1725,8 +1739,7 @@ impl TestEnv {
 
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", slab.as_ref()], &self.percolator_id);
-        let (vault_token, _) =
-            Pubkey::find_program_address(&[b"test_perc_vault", slab.as_ref()], &self.rewards_id);
+        let vault_token = canonical_percolator_vault(&vault_authority, &self.collateral_mint);
         if self.svm.get_account(&vault_token).is_none() {
             self.svm
                 .set_account(

@@ -177,6 +177,9 @@ const GENESIS_RECOVER_BACKING_EARNINGS: u8 = 2;
 const GENESIS_RECOVER_INSURANCE_TERMINAL: u8 = 3;
 const GENESIS_RECOVER_INSURANCE_DOMAIN: u8 = 4;
 
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+
 // ============================================================================
 // Account sizes
 // ============================================================================
@@ -813,6 +816,18 @@ fn validate_percolator_vault_accounts(
     if *percolator_vault_pda.key != expected_vault_authority {
         msg!("Percolator vault authority PDA mismatch");
         return Err(ProgramError::InvalidSeeds);
+    }
+    let (expected_vault, _) = Pubkey::find_program_address(
+        &[
+            expected_vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            collateral_mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    );
+    if *percolator_vault.key != expected_vault {
+        msg!("Percolator vault must be the canonical ATA for the market vault PDA");
+        return Err(ProgramError::InvalidAccountData);
     }
     validate_token_account(percolator_vault, collateral_mint, &expected_vault_authority)
 }
