@@ -52,6 +52,7 @@ pub struct TwapAuthorityChain {
     pub metadao_futarchy: Pubkey,
     pub squads: Pubkey,
     pub twap_program: Pubkey,
+    pub percolator_program: Pubkey,
     pub market: Pubkey,
     pub twap_pda: Pubkey,
     pub bump: u8,
@@ -62,18 +63,27 @@ impl TwapAuthorityChain {
         metadao_futarchy: Pubkey,
         squads: Pubkey,
         twap_program: Pubkey,
+        percolator_program: Pubkey,
         market: Pubkey,
     ) -> Result<Self, SurplusError> {
         require_nonzero(metadao_futarchy)?;
         require_nonzero(squads)?;
         require_nonzero(twap_program)?;
+        require_nonzero(percolator_program)?;
         require_nonzero(market)?;
-        let (twap_pda, bump) =
-            Pubkey::find_program_address(&[TWAP_AUTHORITY_SEED, market.as_ref()], &twap_program);
+        let (twap_pda, bump) = Pubkey::find_program_address(
+            &[
+                TWAP_AUTHORITY_SEED,
+                market.as_ref(),
+                percolator_program.as_ref(),
+            ],
+            &twap_program,
+        );
         Ok(Self {
             metadao_futarchy,
             squads,
             twap_program,
+            percolator_program,
             market,
             twap_pda,
             bump,
@@ -192,6 +202,7 @@ impl TwapProgramConfig {
             self.authority_chain.metadao_futarchy,
             self.authority_chain.squads,
             new_twap_program,
+            self.authority_chain.percolator_program,
             self.authority_chain.market,
         )?;
         let rotation = TwapProgramRotation {

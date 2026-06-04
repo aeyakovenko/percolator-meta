@@ -132,6 +132,14 @@ fn twap_config_pda(
     .0
 }
 
+fn twap_authority_pda(market: &Pubkey, percolator_program: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"market-0-twap", market.as_ref(), percolator_program.as_ref()],
+        &twap_id(),
+    )
+    .0
+}
+
 #[allow(clippy::too_many_arguments)]
 fn init_config_ix(
     payer: &Pubkey,
@@ -556,8 +564,7 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
     // path — squads execute -> accept_operator -> percolator UpdateAssetAuthority on a
     // real market with asset_admin = the squads vault — is the next slice.)
     let imposter = Keypair::new();
-    let twap_authority =
-        Pubkey::find_program_address(&[b"market-0-twap", market.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&market, &percolator_program);
     let bad_accept = Instruction {
         program_id: twap_id(),
         accounts: vec![
@@ -694,7 +701,7 @@ fn handoff_rotates_operator_to_twap_only_after_timelock() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let cfg = twap_config_pda(&slab, &multisig, &dummy_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     // DAO proposes: accept_operator (rotate the operator to twap_authority).
     let message = build_accept_operator_message(&squads_vault, &slab, &cfg, &twap_authority, &perc_id(), &twap_id());
@@ -1357,7 +1364,7 @@ fn e2e_full_genesis_to_twap_surplus_pull() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     // policy -> surplus mode (deposits_only = 0, max_bps < 1e4, cooldown != 0).
     let policy_msg = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 8_000, 0, 100);
@@ -1529,7 +1536,7 @@ fn e2e_finding_o_floor_blocks_principal_drain() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     // Fund insurance with PURE PRINCIPAL (no surplus) via a Squads TopUp — squads is the
     // insurance_authority before the handoff.
@@ -1800,7 +1807,7 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
     let op_msg = build_accept_operator_message(&squads_vault, &slab, &twap_cfg, &twap_authority, &perc_id(), &twap_id());
     let op_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(twap_cfg, false),
@@ -1872,7 +1879,7 @@ fn e2e_floor_holds_across_repeated_pulls() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     // insurance = principal(1,000,000) + surplus(500,000); floor = principal.
     let principal = 1_000_000u64;
@@ -1962,7 +1969,7 @@ fn e2e_cranker_cannot_redirect_surplus_to_own_holding() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     // insurance = principal + surplus; floor = principal (so 500k is genuinely pullable).
     let principal = 1_000_000u64;
@@ -2087,7 +2094,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     svm.expire_blockhash(); let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
     let pol = build_update_insurance_policy_message(&squads_vault, &slab, &perc_id(), 9_000, 0, 10);
     let pr = vec![AccountMeta::new_readonly(squads_vault, false), AccountMeta::new(slab, false), AccountMeta::new_readonly(perc_id(), false)];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr).expect("policy");
@@ -2288,7 +2295,7 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     let principal = 1_000_000u64;
     let surplus = 500_000u64;
@@ -2536,7 +2543,7 @@ fn e2e_no_surplus_pull_before_floor_is_configured() {
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(&[twap_init], Some(&payer.pubkey()), &[&payer], bh)).expect("twap init");
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
-    let twap_authority = Pubkey::find_program_address(&[b"market-0-twap", slab.as_ref()], &twap_id()).0;
+    let twap_authority = twap_authority_pda(&slab, &perc_id());
 
     // Fund insurance with genuine surplus, rotate the policy + operator — but DO NOT set the floor.
     let surplus = 500_000u64;

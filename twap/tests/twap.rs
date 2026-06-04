@@ -6,6 +6,7 @@
 // copied byte-for-byte from the reference; only the crate import path was changed
 // from `percolator_genesis::` to `twap::`.
 
+use solana_program::pubkey::Pubkey;
 use twap::percolator_v16::{
     encode_update_asset_authority, encode_withdraw_insurance_domain,
     update_market_0_insurance_operator_by_asset_admin_ix, ASSET_AUTH_INSURANCE_OPERATOR,
@@ -13,13 +14,13 @@ use twap::percolator_v16::{
 };
 use twap::surplus::{
     derive_associated_token_address, derive_bid_escrow_pda, BidBook, BidRefundAtaSnapshot,
-    Market0Insurance, PermissionlessBuyBurnRequest, RegisteredBid, SurplusError, TwapAuthorityChain,
-    TwapBuyBurnSchedule, TwapBuyBurnState, TwapProgramConfig, TwapWithdrawAccounts,
-    MARKET_0_SURPLUS_BUY_BURN_BPS, MAX_TWAP_BIDS_PER_EXECUTION, MAX_TWAP_INTERVAL_COUNT,
-    TWAP_AUTHORITY_SEED, TWAP_INTERVAL_COUNT, TWAP_INTERVAL_SLOTS, TWAP_TOTAL_SLOTS,
+    Market0Insurance, PermissionlessBuyBurnRequest, RegisteredBid, SurplusError,
+    TwapAuthorityChain, TwapBuyBurnSchedule, TwapBuyBurnState, TwapProgramConfig,
+    TwapWithdrawAccounts, MARKET_0_SURPLUS_BUY_BURN_BPS, MAX_TWAP_BIDS_PER_EXECUTION,
+    MAX_TWAP_INTERVAL_COUNT, TWAP_AUTHORITY_SEED, TWAP_INTERVAL_COUNT, TWAP_INTERVAL_SLOTS,
+    TWAP_TOTAL_SLOTS,
 };
 use twap::twap_program::ReusableTwapProgram;
-use solana_program::pubkey::Pubkey;
 
 fn key() -> Pubkey {
     Pubkey::new_unique()
@@ -216,10 +217,18 @@ fn market0_twap_percentage_is_squads_controlled_and_defaults_to_eighty_percent()
     let metadao_futarchy = key();
     let squads = key();
     let twap_program = key();
+    let percolator_program = key();
     let market = key();
-    let chain = TwapAuthorityChain::new(metadao_futarchy, squads, twap_program, market).unwrap();
+    let chain = TwapAuthorityChain::new(
+        metadao_futarchy,
+        squads,
+        twap_program,
+        percolator_program,
+        market,
+    )
+    .unwrap();
     let withdraw_accounts = TwapWithdrawAccounts {
-        percolator_program: key(),
+        percolator_program,
         market,
         twap_pda_collateral_token: key(),
         market_vault_token: key(),
@@ -871,10 +880,18 @@ fn reusable_twap_program_executes_permissionless_buy_burn_from_post_handoff_prof
     let metadao_futarchy = key();
     let squads = key();
     let twap_program_id = key();
+    let percolator_program = key();
     let market = key();
-    let chain = TwapAuthorityChain::new(metadao_futarchy, squads, twap_program_id, market).unwrap();
+    let chain = TwapAuthorityChain::new(
+        metadao_futarchy,
+        squads,
+        twap_program_id,
+        percolator_program,
+        market,
+    )
+    .unwrap();
     let withdraw_accounts = TwapWithdrawAccounts {
-        percolator_program: key(),
+        percolator_program,
         market,
         twap_pda_collateral_token: key(),
         market_vault_token: key(),
@@ -919,12 +936,19 @@ fn squads_can_rotate_twap_program_out_and_rebind_market0_operator_pda() {
     let metadao_futarchy = key();
     let squads = key();
     let old_twap_program = key();
+    let percolator_program = key();
     let market = key();
-    let chain =
-        TwapAuthorityChain::new(metadao_futarchy, squads, old_twap_program, market).unwrap();
+    let chain = TwapAuthorityChain::new(
+        metadao_futarchy,
+        squads,
+        old_twap_program,
+        percolator_program,
+        market,
+    )
+    .unwrap();
     let old_twap_pda = chain.twap_pda;
     let old_withdraw_accounts = TwapWithdrawAccounts {
-        percolator_program: key(),
+        percolator_program,
         market,
         twap_pda_collateral_token: key(),
         market_vault_token: key(),
@@ -934,8 +958,14 @@ fn squads_can_rotate_twap_program_out_and_rebind_market0_operator_pda() {
     let mut cfg = TwapProgramConfig::initialize(chain, squads, 0, old_withdraw_accounts).unwrap();
 
     let new_twap_program = key();
-    let expected_new_chain =
-        TwapAuthorityChain::new(metadao_futarchy, squads, new_twap_program, market).unwrap();
+    let expected_new_chain = TwapAuthorityChain::new(
+        metadao_futarchy,
+        squads,
+        new_twap_program,
+        percolator_program,
+        market,
+    )
+    .unwrap();
     let new_withdraw_accounts = TwapWithdrawAccounts {
         percolator_program: old_withdraw_accounts.percolator_program,
         market,
@@ -1059,16 +1089,42 @@ fn twap_authority_chain_routes_futarchy_through_squads_to_pda_for_permissionless
     let metadao_futarchy = key();
     let squads = key();
     let twap_program = key();
+    let percolator_program = key();
     let market = key();
-    let chain = TwapAuthorityChain::new(metadao_futarchy, squads, twap_program, market).unwrap();
-    let (expected_pda, expected_bump) =
-        Pubkey::find_program_address(&[TWAP_AUTHORITY_SEED, market.as_ref()], &twap_program);
+    let chain = TwapAuthorityChain::new(
+        metadao_futarchy,
+        squads,
+        twap_program,
+        percolator_program,
+        market,
+    )
+    .unwrap();
+    let (expected_pda, expected_bump) = Pubkey::find_program_address(
+        &[
+            TWAP_AUTHORITY_SEED,
+            market.as_ref(),
+            percolator_program.as_ref(),
+        ],
+        &twap_program,
+    );
     assert_eq!(chain.twap_pda, expected_pda);
     assert_eq!(chain.bump, expected_bump);
+    let alternate_percolator_program = key();
+    let alternate_chain = TwapAuthorityChain::new(
+        metadao_futarchy,
+        squads,
+        twap_program,
+        alternate_percolator_program,
+        market,
+    )
+    .unwrap();
+    assert_ne!(
+        chain.twap_pda, alternate_chain.twap_pda,
+        "configs with different Percolator programs must not share a signer PDA"
+    );
     assert_ne!(chain.twap_pda, metadao_futarchy);
     assert_ne!(chain.twap_pda, squads);
 
-    let percolator_program = key();
     let ledger = key();
     let withdraw_accounts = TwapWithdrawAccounts {
         percolator_program,

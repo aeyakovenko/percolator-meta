@@ -42,8 +42,9 @@ const SQUADS_PROGRAM_ID: Pubkey =
 // config_authority is at bytes [40..72] of the account.
 const SQUADS_MULTISIG_DISC: [u8; 8] = [224, 116, 121, 186, 68, 161, 79, 236];
 
-// The twap_authority PDA seed — matches the `twap` lib's TWAP_AUTHORITY_SEED so the
-// authority address is the canonical market-0 TWAP authority.
+// The twap_authority PDA seed — matches the `twap` lib's TWAP_AUTHORITY_SEED. The
+// authority is bound to the Percolator program as well as the market so a
+// permissionless config with a different CPI target cannot reuse the same signer.
 const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
 const CONFIG_SEED: &[u8] = b"twap_config";
 
@@ -106,8 +107,12 @@ fn config_seeds<'a>(
     ]
 }
 
-fn authority_seeds<'a>(market: &'a Pubkey) -> [&'a [u8]; 2] {
-    [TWAP_AUTHORITY_SEED, market.as_ref()]
+fn authority_seeds<'a>(market: &'a Pubkey, percolator_program: &'a Pubkey) -> [&'a [u8]; 3] {
+    [
+        TWAP_AUTHORITY_SEED,
+        market.as_ref(),
+        percolator_program.as_ref(),
+    ]
 }
 
 // The Squads multisig's default (index 0) vault PDA — the address that signs the
@@ -237,7 +242,11 @@ fn read_u64(data: &[u8]) -> Result<u64, ProgramError> {
 // Pins the whole authority chain: the controller must be a real Squads multisig and
 // the DAO (metadao_futarchy) is recorded. The twap_authority PDA derived here is the
 // address that must hold percolator's insurance authority/operator role.
-fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_init_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     if !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -282,7 +291,12 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
 
     let (expected_config, config_bump) = Pubkey::find_program_address(
-        &config_seeds(market_slab.key, squads_multisig.key, coin_mint.key, percolator_program.key),
+        &config_seeds(
+            market_slab.key,
+            squads_multisig.key,
+            coin_mint.key,
+            percolator_program.key,
+        ),
         program_id,
     );
     if *config_account.key != expected_config {
@@ -291,8 +305,10 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     if config_account.lamports() != 0 || config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    let (_twap_authority, authority_bump) =
-        Pubkey::find_program_address(&authority_seeds(market_slab.key), program_id);
+    let (_twap_authority, authority_bump) = Pubkey::find_program_address(
+        &authority_seeds(market_slab.key, percolator_program.key),
+        program_id,
+    );
 
     let rent = solana_program::rent::Rent::get()?;
     let bump_arr = [config_bump];
@@ -312,7 +328,11 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
             CONFIG_SIZE as u64,
             program_id,
         ),
-        &[payer.clone(), config_account.clone(), system_program.clone()],
+        &[
+            payer.clone(),
+            config_account.clone(),
+            system_program.clone(),
+        ],
         &[&seeds],
     )?;
 
@@ -383,9 +403,14 @@ fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u
     }
     // Re-derive the twap_authority so the signing seeds are trusted.
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config.market_slab.as_ref(), &auth_bump];
-    let expected_authority =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let auth_seeds: [&[u8]; 4] = [
+        TWAP_AUTHORITY_SEED,
+        config.market_slab.as_ref(),
+        config.percolator_program.as_ref(),
+        &auth_bump,
+    ];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_authority {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -445,7 +470,11 @@ fn process_pull_surplus(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u
 // Squads -> TWAP control: only the config's Squads multisig default vault PDA may
 // reconfigure, and that PDA can only sign as the executor of a multisig
 // vault-transaction — which requires a DAO proposal to clear the 1-week timelock.
-fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_reconfigure(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -539,13 +568,20 @@ fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
         return Err(ProgramError::IllegalOwner);
     }
-    if *market_slab.key != config.market_slab || *percolator_program.key != config.percolator_program {
+    if *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config.market_slab.as_ref(), &auth_bump];
-    let expected_authority =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let auth_seeds: [&[u8]; 4] = [
+        TWAP_AUTHORITY_SEED,
+        config.market_slab.as_ref(),
+        config.percolator_program.as_ref(),
+        &auth_bump,
+    ];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_authority {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -632,5 +668,22 @@ mod tests {
         assert_eq!(d.authority_bump, 251);
         assert_eq!(d.reserved_floor, 123_456_789);
         assert!(d.surplus_buy_burn_bps < BPS_DENOMINATOR);
+    }
+
+    #[test]
+    fn twap_authority_is_bound_to_percolator_program() {
+        let market = Pubkey::new_unique();
+        let real_percolator = Pubkey::new_unique();
+        let fake_percolator = Pubkey::new_unique();
+
+        let (real_authority, _) =
+            Pubkey::find_program_address(&authority_seeds(&market, &real_percolator), &id());
+        let (fake_authority, _) =
+            Pubkey::find_program_address(&authority_seeds(&market, &fake_percolator), &id());
+
+        assert_ne!(
+            real_authority, fake_authority,
+            "a config with a different Percolator program must not reuse the same TWAP signer"
+        );
     }
 }
