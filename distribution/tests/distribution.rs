@@ -4,6 +4,7 @@
 
 use litesvm::LiteSVM;
 use solana_sdk::{
+    account::Account,
     clock::Clock,
     instruction::{AccountMeta, Instruction},
     program_pack::Pack,
@@ -263,6 +264,15 @@ fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypai
     let ix = spl_token::instruction::mint_to(&spl_token::ID, mint, dest, &authority.pubkey(), &[], amount).unwrap();
     let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer, authority], svm.latest_blockhash());
     svm.send_transaction(tx).unwrap();
+}
+
+fn token_account_bytes(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
+    let mut data = vec![0u8; spl_token::state::Account::LEN];
+    data[0..32].copy_from_slice(mint.as_ref());
+    data[32..64].copy_from_slice(owner.as_ref());
+    data[64..72].copy_from_slice(&amount.to_le_bytes());
+    data[108] = 1; // AccountState::Initialized
+    data
 }
 
 #[test]
@@ -737,6 +747,61 @@ fn init_config_rejects_a_vault_underfunded_below_a_fully_minted_supply() {
     assert!(r.is_err(), "a vault holding 60 of a fully-minted 100 supply must be rejected (solvency, :318)");
     // No config PDA was created — the underfunded bind was refused.
     assert!(svm.get_account(&config).map_or(true, |a| a.data.is_empty()), "no config bound to the underfunded vault");
+}
+
+// TYPE-COSPLAY INIT SQUAT: init_config must reject a vault account that has SPL Token
+// account-shaped bytes but is not actually owned by the SPL Token program. Otherwise a
+// front-runner could initialize the real distribution config with a fake vault whose
+// bytes claim (mint = COIN, owner = config PDA, amount = total_supply). Later claims
+// and burns would fail at the SPL Token CPI, and the real config PDA would already be
+// occupied: permanent distribution DOS.
+#[test]
+fn init_config_rejects_a_token_shaped_vault_not_owned_by_spl_token() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let authority = Pubkey::new_unique();
+    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &pid()).0;
+
+    let decoy = create_token_account(&mut svm, &payer, &coin_mint, &payer.pubkey());
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &decoy, 100);
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
+
+    let fake_vault = Pubkey::new_unique();
+    svm.set_account(
+        fake_vault,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(spl_token::state::Account::LEN),
+            data: token_account_bytes(&coin_mint, &config, 100),
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let mut data = vec![0u8]; // IX_INIT_CONFIG
+    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let ix = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(fake_vault, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    let bh = svm.latest_blockhash();
+    let r = svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh));
+    assert!(r.is_err(), "a token-shaped vault not owned by SPL Token must be rejected");
+    assert!(svm.get_account(&config).map_or(true, |a| a.data.is_empty()), "fake vault must not squat the config");
 }
 
 // ZERO CLAIM WINDOW (recipient-LOF DOS): init_config rejects claim_window_slots == 0 (lib.rs:276). A zero
