@@ -375,6 +375,25 @@ fn read_asset0_insurance(slab_data: &[u8]) -> Result<u64, ProgramError> {
     Ok(u64::try_from(v).unwrap_or(u64::MAX))
 }
 
+// Byte offset of the asset-0 `source_insurance_credit_reserved_total_atoms` lien:
+// MARKET_GROUP_OFF(448) + offset_of!(MarketGroupV16HeaderAccount, source_insurance_credit_reserved_total_atoms)(429).
+// A trader raises this when they reserve insurance as source credit (percolator update_source_credit_
+// aggregate_totals); it leaves `insurance` (at +301) UNCHANGED, but percolator then caps every insurance
+// withdraw at `insurance - reserved` (market_insurance_withdraw_capacity_view). Pinned against the real
+// percolator struct by the reserved_offset canary in the tests.
+pub const PERC_INSURANCE_RESERVED_OFFSET: usize = 448 + 429;
+
+/// The asset-0 insurance-credit lien: insurance a trader has reserved as source credit, which
+/// percolator will NOT release to the insurance operator. `insurance - reserved` is the truly
+/// withdrawable fund the impairment haircut must price against; raw `insurance` over-counts it.
+fn read_asset0_insurance_reserved(slab_data: &[u8]) -> Result<u64, ProgramError> {
+    let b = slab_data
+        .get(PERC_INSURANCE_RESERVED_OFFSET..PERC_INSURANCE_RESERVED_OFFSET + 16)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let v = u128::from_le_bytes(b.try_into().unwrap());
+    Ok(u64::try_from(v).unwrap_or(u64::MAX))
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -1190,6 +1209,14 @@ fn process_insurance_withdraw(
     // only their pro-rata share `owed`. (POLICY_WITH_SURPLUS pools always pro-rata, returning
     // any yield too.)
     let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
+    // percolator caps the operator's insurance withdraw at `insurance - reserved`: the trader
+    // insurance-credit lien (`source_insurance_credit_reserved_total_atoms`) is NOT withdrawable
+    // (market_insurance_withdraw_capacity_view). Price the impairment haircut against the WITHDRAWABLE
+    // fund, not raw `insurance` — otherwise, while a lien is live, the fund reads healthy
+    // (insurance >= outstanding) but only `insurance - reserved` is payable, so an early exiter is paid
+    // 1:1 and a late exiter's tag-57 withdraw reverts (stranded), breaking order-independence.
+    let reserved = read_asset0_insurance_reserved(&market_slab.try_borrow_data()?)?;
+    let insurance = insurance.saturating_sub(reserved);
     // POLICY_WITH_SURPLUS exits by redeeming shares priced at the LIVE balance — a
     // tenure-fair slice of (principal + surplus). POLICY_PRINCIPAL keeps the original
     // pro-rata/principal payout. `shares_to_burn` is the share fraction matching the

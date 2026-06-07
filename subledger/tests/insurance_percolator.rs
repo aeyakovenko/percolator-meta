@@ -3005,3 +3005,119 @@ fn top_up_resets_the_position_start_slot() {
     assert!(start1 > start0, "start_slot moved forward (no inherited early-join hold time)");
 }
 
+/// Patch ONLY the asset-0 `source_insurance_credit_reserved_total_atoms` lien into the slab,
+/// leaving `insurance` / `vault` / the per-domain budgets at their healthy funded values.
+/// This faithfully mirrors a live trader insurance-credit reservation: percolator's
+/// `update_source_credit_aggregate_totals` (percolator/src/v16.rs:5534) bumps this field WITHOUT
+/// touching `header.insurance`, and percolator caps every insurance withdraw at
+/// `insurance - reserved` (`market_insurance_withdraw_capacity_view`, v16_program.rs:5129-5135).
+/// The subledger's `read_asset0_insurance` (subledger/src/lib.rs:370-376) reads ONLY raw
+/// `header.insurance` and never subtracts this lien.
+fn set_credit_lien(env: &mut Env, reserved: u128) {
+    use percolator::MarketGroupV16HeaderAccount as H;
+    let off_res =
+        MARKET_GROUP_OFF + core::mem::offset_of!(H, source_insurance_credit_reserved_total_atoms);
+    let off_ins = MARKET_GROUP_OFF + core::mem::offset_of!(H, insurance);
+    assert_eq!(off_ins, MARKET_GROUP_OFF + 301, "insurance offset drifted from real percolator struct");
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    let insurance = u128::from_le_bytes(acct.data[off_ins..off_ins + 16].try_into().unwrap());
+    assert!(reserved <= insurance, "lien cannot exceed insurance (percolator reservation cap v16.rs:6249)");
+    acct.data[off_res..off_res + 16].copy_from_slice(&reserved.to_le_bytes());
+    env.svm.set_account(env.slab, acct).unwrap();
+    // insurance itself is UNCHANGED — that is the whole point: the fund looks full to a raw read.
+    let acct2 = env.svm.get_account(&env.slab).unwrap();
+    assert_eq!(
+        u128::from_le_bytes(acct2.data[off_ins..off_ins + 16].try_into().unwrap()),
+        insurance,
+        "set_credit_lien must not touch header.insurance"
+    );
+}
+
+// INSURANCE-CREDIT LIEN — the impairment haircut must price against `insurance - reserved` (regression).
+//
+// This pins the second over-count channel beyond finding T's vault-vs-insurance offset fix. The subledger
+// prices every exit off `read_asset0_insurance` = the RAW `header.insurance` scalar (subledger/src/lib.rs),
+// and `payout(POLICY_PRINCIPAL, balance, outstanding, amount)` returns the FULL principal 1:1 whenever
+// `balance >= outstanding`. But percolator does NOT make all of `header.insurance` withdrawable: the real
+// cap is `insurance - source_insurance_credit_reserved_total_atoms`, a per-trader insurance-credit lien a
+// live trader raises WITHOUT moving `header.insurance` (percolator/src/v16.rs:5520), bounded only by
+// `<= insurance` (v16.rs:6249) — so it can encumber the very principal the subledger depositors funded.
+//
+// Without the fix, while a reservation is live the subledger reads the impaired fund as HEALTHY and pays
+// the EARLY exiter full principal 1:1, draining `insurance - reserved`; the LATE exiter's tag-57 withdraw
+// then reverts (`EngineLockActive`, v16_program.rs:8269) and their principal is stranded — voiding the
+// order-independence `impaired_insurance_exit_is_pro_rata` (and finding ER) guarantees. The fix prices the
+// haircut against `insurance - reserved` (subledger read at the WITHDRAW site only — NOT the deposit
+// share-mint, where subtracting a transient lien would misprice shares). This test pins it: a credit lien
+// must produce the SAME pro-rata share for the first and last exiter. (It FAILS pre-fix: the late exiter
+// reverts; the CONTROL run with no lien is unaffected, isolating the lien as the cause.)
+/// Read `(insurance, reserved, outstanding)` straight from the live slab + pool, the same scalars the
+/// subledger reads, so the expected pro-rata is computed from the FORMULA rather than a hand-figure.
+/// Doubles as a layout canary: it pins BOTH shipped subledger offsets against the real percolator struct.
+fn read_fund_state(env: &Env) -> (u128, u128, u128) {
+    use percolator::MarketGroupV16HeaderAccount as H;
+    let off_ins = MARKET_GROUP_OFF + core::mem::offset_of!(H, insurance);
+    let off_res =
+        MARKET_GROUP_OFF + core::mem::offset_of!(H, source_insurance_credit_reserved_total_atoms);
+    assert_eq!(off_ins, subledger_program::PERC_INSURANCE_OFFSET, "insurance offset drifted");
+    assert_eq!(off_res, subledger_program::PERC_INSURANCE_RESERVED_OFFSET, "reserved offset drifted");
+    let acct = env.svm.get_account(&env.slab).unwrap();
+    let rd = |o: usize| u128::from_le_bytes(acct.data[o..o + 16].try_into().unwrap());
+    (rd(off_ins), rd(off_res), env.pool_outstanding() as u128)
+}
+
+#[test]
+fn insurance_credit_lien_exit_stays_pro_rata_and_order_independent() {
+    // Run a two-depositor (1M each, 2M outstanding) exit under a given asset-0 credit lien. The market
+    // is otherwise HEALTHY: insurance == vault == 2M. Returns
+    // (alice_payout, bob_withdraw_ok, bob_payout, expected_each) where expected_each is the pro-rata
+    // share derived FROM THE SLAB via amount * (insurance - reserved) / outstanding — so the assertions
+    // test the fix's formula, not a hand-computed number.
+    fn run(reserved_lien: u128) -> (u64, bool, u64, u128) {
+        let mut env = Env::new();
+        env.init_insurance_pool();
+        let amount = 1_000_000u64;
+        let (alice, alice_ata) = new_depositor(&mut env, amount);
+        let (bob, bob_ata) = new_depositor(&mut env, amount);
+        let pool = env.pool;
+        let a_hold = create_holding(&mut env, &pool);
+        let b_hold = create_holding(&mut env, &pool);
+        env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
+        env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
+        assert_eq!(env.pool_outstanding(), 2 * amount, "outstanding = both deposits");
+        assert_eq!(env.token_amount(&env.perc_vault.clone()), 2 * amount, "insurance funded by both");
+
+        // A live trader reserves `reserved_lien` of asset-0 insurance credit. header.insurance is
+        // UNCHANGED — the fund reads HEALTHY to a raw read — but only `insurance - reserved` is withdrawable.
+        if reserved_lien > 0 {
+            set_credit_lien(&mut env, reserved_lien);
+        }
+
+        // Expected per-depositor pro-rata, from the FORMULA the fix must implement, read live pre-exit.
+        let (insurance, reserved, outstanding) = read_fund_state(&env);
+        let expected_each = (amount as u128) * insurance.saturating_sub(reserved) / outstanding;
+
+        env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice (early) exits");
+        let alice_payout = env.token_amount(&alice_ata);
+        let bob_res = env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount);
+        (alice_payout, bob_res.is_ok(), env.token_amount(&bob_ata), expected_each)
+    }
+
+    // CONTROL — no lien. Healthy fund: withdrawable == insurance, each owed the full principal 1:1.
+    let (a0, bob_ok0, b0, exp0) = run(0);
+    assert_eq!(exp0, 1_000_000, "control: withdrawable == insurance => full principal each");
+    assert_eq!(a0 as u128, exp0, "control: early exiter gets the full-principal pro-rata");
+    assert!(bob_ok0, "control: late exiter also succeeds");
+    assert_eq!(b0 as u128, exp0, "control: late exiter gets the same");
+
+    // TREATMENT — a 1M trader credit lien. Withdrawable = insurance(2M) - reserved(1M) = 1M across 2M of
+    // principal => a 50% haircut. With the fix the haircut is priced against `insurance - reserved`, so
+    // BOTH depositors take the SAME pro-rata share and neither is stranded, regardless of exit order.
+    let (a1, bob_ok1, b1, exp1) = run(1_000_000);
+    assert_eq!(exp1, 500_000, "treatment: 1M withdrawable / 2M principal => 50% haircut each");
+    assert!(bob_ok1, "fix: late exiter is NOT stranded — the lien-aware haircut leaves budget for them");
+    assert_eq!(a1 as u128, exp1, "fix: early exiter takes the pro-rata haircut, not full 1:1");
+    assert_eq!(b1 as u128, exp1, "fix: late exiter takes the SAME pro-rata haircut");
+    assert_eq!(a1, b1, "fix: order-independent — first and last exiter receive exactly the same");
+}
+
