@@ -12,7 +12,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
     msg,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -161,6 +161,29 @@ fn verify_authority_controller<'a>(
     Ok(bump)
 }
 
+fn existing_authority_initialized<'a>(
+    program_id: &Pubkey,
+    authority: &AccountInfo<'a>,
+    payer_key: &Pubkey,
+) -> Result<bool, ProgramError> {
+    if authority.lamports() == 0 && authority.data_len() == 0 {
+        return Ok(false);
+    }
+    if authority.owner == program_id {
+        let data = authority.try_borrow_data()?;
+        let cfg = AuthorityConfig::deserialize(&data)?;
+        if cfg.controller != *payer_key {
+            msg!("Governance adapter controller mismatch");
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        return Ok(true);
+    }
+    if authority.owner == &solana_program::system_program::ID && authority.data_len() == 0 {
+        return Ok(false);
+    }
+    Err(ProgramError::IllegalOwner)
+}
+
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
@@ -219,16 +242,7 @@ fn process_init_authority<'a>(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    if authority.lamports() > 0 {
-        if authority.owner != program_id {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let data = authority.try_borrow_data()?;
-        let cfg = AuthorityConfig::deserialize(&data)?;
-        if cfg.controller != *payer.key {
-            msg!("Governance adapter controller mismatch");
-            return Err(ProgramError::MissingRequiredSignature);
-        }
+    if existing_authority_initialized(program_id, authority, payer.key)? {
         return Ok(());
     }
 
@@ -251,15 +265,22 @@ fn process_init_authority<'a>(
     let bump_bytes = [bump];
     let signer_seeds = authority_signer_seeds(rewards_program.key, coin_mint.key, &bump_bytes);
     let rent = Rent::get()?;
+    let required = rent.minimum_balance(AUTHORITY_SIZE);
+    let current = authority.lamports();
+    if current < required {
+        invoke(
+            &system_instruction::transfer(payer.key, authority.key, required - current),
+            &[payer.clone(), authority.clone(), system_program.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(
-            payer.key,
-            authority.key,
-            rent.minimum_balance(AUTHORITY_SIZE),
-            AUTHORITY_SIZE as u64,
-            program_id,
-        ),
-        &[payer.clone(), authority.clone(), system_program.clone()],
+        &system_instruction::allocate(authority.key, AUTHORITY_SIZE as u64),
+        &[authority.clone(), system_program.clone()],
+        &[&signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(authority.key, program_id),
+        &[authority.clone(), system_program.clone()],
         &[&signer_seeds],
     )?;
 
@@ -326,6 +347,36 @@ fn process_init_coin_config<'a>(
         ],
         &[&signer_seeds],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dusted_system_authority_pda_remains_initializable() {
+        let program_id = id();
+        let payer = Pubkey::new_unique();
+        let authority_key = Pubkey::new_unique();
+        let system_id = solana_program::system_program::ID;
+        let mut lamports = 1;
+        let mut data = Vec::new();
+        let authority = AccountInfo::new(
+            &authority_key,
+            false,
+            true,
+            &mut lamports,
+            data.as_mut_slice(),
+            &system_id,
+            false,
+            0,
+        );
+
+        assert_eq!(
+            existing_authority_initialized(&program_id, &authority, &payer),
+            Ok(false)
+        );
+    }
 }
 
 fn process_activate_live<'a>(

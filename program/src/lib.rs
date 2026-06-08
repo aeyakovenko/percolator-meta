@@ -667,13 +667,25 @@ fn create_pda_account_with_owner<'a>(
         return Err(ProgramError::InvalidSeeds);
     }
     let rent = Rent::get()?;
-    let lamports = rent.minimum_balance(size);
+    let required = rent.minimum_balance(size);
+    let current = target.lamports();
     let mut seeds_with_bump: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::from(seeds);
     let bump_bytes = [bump];
     seeds_with_bump.push(&bump_bytes);
+    if current < required {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, required - current),
+            &[payer.clone(), target.clone(), system_program.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(payer.key, target.key, lamports, size as u64, owner),
-        &[payer.clone(), target.clone(), system_program.clone()],
+        &system_instruction::allocate(target.key, size as u64),
+        &[target.clone(), system_program.clone()],
+        &[&seeds_with_bump],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, owner),
+        &[target.clone(), system_program.clone()],
         &[&seeds_with_bump],
     )
 }
