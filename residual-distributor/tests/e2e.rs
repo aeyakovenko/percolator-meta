@@ -81,6 +81,65 @@ fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra: &[&Keypa
     svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
 }
 
+fn rd_init_data(
+    supply: u64,
+    emission_end: u64,
+    insurance_bps: u16,
+    backing_bps: u16,
+    lp_bps: u16,
+    finalize_window: u64,
+    ins_pool: Pubkey,
+    back_pool: Pubkey,
+    market: Pubkey,
+    extras: &[Pubkey],
+    residual_fee_bps: Option<u16>,
+) -> Vec<u8> {
+    let mut d = vec![0u8];
+    d.extend_from_slice(&supply.to_le_bytes());
+    d.extend_from_slice(&emission_end.to_le_bytes());
+    d.extend_from_slice(&insurance_bps.to_le_bytes());
+    d.extend_from_slice(&backing_bps.to_le_bytes());
+    d.extend_from_slice(&lp_bps.to_le_bytes());
+    d.extend_from_slice(&finalize_window.to_le_bytes());
+    d.extend_from_slice(ins_pool.as_ref());
+    d.extend_from_slice(back_pool.as_ref());
+    d.extend_from_slice(market.as_ref());
+    d.push(extras.len() as u8);
+    for e in extras {
+        d.extend_from_slice(e.as_ref());
+    }
+    if let Some(fee_bps) = residual_fee_bps {
+        d.extend_from_slice(&fee_bps.to_le_bytes());
+    }
+    d
+}
+
+fn rd_init_accounts(
+    payer: Pubkey,
+    coin_mint: Pubkey,
+    dist_config: Pubkey,
+    percolator_program: Pubkey,
+    subledger_program: Pubkey,
+    rd_config: Pubkey,
+    coin_mint_authority: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(dist_id(), false),
+        AccountMeta::new_readonly(dist_config, false),
+        AccountMeta::new_readonly(percolator_program, false),
+        AccountMeta::new_readonly(subledger_program, false),
+        AccountMeta::new(rd_config, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new_readonly(coin_mint_authority, true),
+    ]
+}
+
+fn rd_config_fee_bps(svm: &LiteSVM, rd_config: Pubkey) -> u16 {
+    u16::from_le_bytes(svm.get_account(&rd_config).unwrap().data[144..146].try_into().unwrap())
+}
+
 // Mock subledger Position at the pinned offsets: pool@8, owner@40, withdrawn@88, shares@104.
 fn set_position(svm: &mut LiteSVM, key: &Pubkey, sub: &Pubkey, pool: &Pubkey, owner: &Pubkey, shares: u128, withdrawn: bool) {
     let mut data = vec![0u8; 160];
@@ -137,31 +196,21 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config); // rd-owned claim vault
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
-    revoke_mint(svm, payer, &coin_mint, &mint_auth);
 
     let stub_sub = Pubkey::new_unique();
     let stub_perc = Pubkey::new_unique();
     let ins_pool = Pubkey::new_unique();
     let back_pool = Pubkey::new_unique();
     let market = Pubkey::new_unique();
-    // wire: supply, emission_end, insurance_bps, backing_bps, lp_bps, finalize_window, ins_pool, back_pool, market
-    let mut d = vec![0u8];
-    d.extend_from_slice(&supply.to_le_bytes());
-    d.extend_from_slice(&emission_end.to_le_bytes());
-    d.extend_from_slice(&1_000u16.to_le_bytes()); // insurance 10%
-    d.extend_from_slice(&1_000u16.to_le_bytes()); // backing 10%
-    d.extend_from_slice(&4_000u16.to_le_bytes()); // lp 40% (trader = remainder 40%)
-    d.extend_from_slice(&finalize_window.to_le_bytes());
-    d.extend_from_slice(ins_pool.as_ref());
-    d.extend_from_slice(back_pool.as_ref());
-    d.extend_from_slice(market.as_ref());
-    d.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]).expect("rd init");
+    let d = rd_init_data(
+        supply, emission_end, 1_000, 1_000, 4_000, finalize_window, ins_pool, back_pool, market, &[], Some(0),
+    );
+    send(svm, payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]).expect("rd init");
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
     Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
 }
 
@@ -174,23 +223,17 @@ fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16)
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
-    revoke_mint(svm, payer, &coin_mint, &mint_auth);
     let (stub_sub, stub_perc, ins_pool, back_pool, market) =
         (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-    let mut d = vec![0u8];
-    d.extend_from_slice(&supply.to_le_bytes());
-    d.extend_from_slice(&emission_end.to_le_bytes());
-    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
-    d.extend_from_slice(&finalize_window.to_le_bytes());
-    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
-    d.extend_from_slice(&[0u8]);                    // extra market count
-    d.extend_from_slice(&fee_bps.to_le_bytes());    // OPTIONAL trailing residual_fee_bps
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]).expect("rd init with fee");
+    let d = rd_init_data(
+        supply, emission_end, 1_000, 1_000, 4_000, finalize_window, ins_pool, back_pool, market, &[], Some(fee_bps),
+    );
+    send(svm, payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]).expect("rd init with fee");
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
     Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
 }
 
@@ -213,30 +256,111 @@ fn init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda() {
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
-    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
 
     // ATTACK: a front-runner dusts the canonical rd_config PDA with lamports (system-owned, empty).
     svm.set_account(rd_config, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
 
     let (stub_sub, stub_perc, ins_pool, back_pool, market) =
         (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-    let mut d = vec![0u8];
-    d.extend_from_slice(&supply.to_le_bytes());
-    d.extend_from_slice(&2_000u64.to_le_bytes());
-    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
-    d.extend_from_slice(&500u64.to_le_bytes());
-    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
-    d.extend_from_slice(&[0u8]);
-    let r = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
+    let d = rd_init_data(supply, 2_000, 1_000, 1_000, 4_000, 500, ins_pool, back_pool, market, &[], Some(0));
+    let r = send(&mut svm, &payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]);
+    assert!(r.is_ok(), "rd init must succeed despite a lamport-prefund of the config PDA (no front-run brick): {r:?}");
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+    // The config really got initialized (program-owned, sized), not left as the dusted system stub.
+    let acc = svm.get_account(&rd_config).unwrap();
+    assert_eq!(acc.owner, rd_id(), "rd_config is now program-owned (robust create adopted the dusted PDA)");
+}
+
+#[test]
+fn init_requires_current_coin_mint_authority_no_config_squat() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let supply = 1_000_000u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let stub_perc = Pubkey::new_unique();
+    let stub_sub = Pubkey::new_unique();
+    let ins_pool = Pubkey::new_unique();
+    let back_pool = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let d = rd_init_data(supply, 2_000, 1_000, 1_000, 4_000, 500, ins_pool, back_pool, market, &[], Some(0));
+
+    let attacker = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
         AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
         AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
         AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]);
-    assert!(r.is_ok(), "rd init must succeed despite a lamport-prefund of the config PDA (no front-run brick): {r:?}");
-    // The config really got initialized (program-owned, sized), not left as the dusted system stub.
-    let acc = svm.get_account(&rd_config).unwrap();
-    assert_eq!(acc.owner, rd_id(), "rd_config is now program-owned (robust create adopted the dusted PDA)");
+    ], data: d.clone() }], &[]);
+    assert!(attacker.is_err(), "init without the current coin mint authority must not squat the canonical rd_config");
+    assert!(svm.get_account(&rd_config).is_none(), "rejected attacker init must not create rd_config");
+
+    let wrong_auth = Keypair::new();
+    let wrong = send(&mut svm, &payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, wrong_auth.pubkey()),
+        data: d.clone(),
+    }], &[&wrong_auth]);
+    assert!(wrong.is_err(), "a signer that is not the current coin mint authority must not initialize rd_config");
+    assert!(svm.get_account(&rd_config).is_none(), "wrong-authority init must not create rd_config");
+
+    send(&mut svm, &payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d.clone(),
+    }], &[&mint_auth]).expect("the current mint authority can initialize");
+
+    let later = send(&mut svm, &payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]);
+    assert!(later.is_err(), "after the legitimate init, rd_config remains one-shot");
+}
+
+#[test]
+fn init_omitted_fee_uses_default_but_explicit_zero_remains_allowed() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let init_case = |svm: &mut LiteSVM, residual_fee_bps: Option<u16>| -> Pubkey {
+        let mint_auth = Keypair::new();
+        let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
+        let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+        let stub_perc = Pubkey::new_unique();
+        let stub_sub = Pubkey::new_unique();
+        let d = rd_init_data(
+            1_000_000, 2_000, 1_000, 1_000, 4_000, 500,
+            Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), &[], residual_fee_bps,
+        );
+        send(svm, &payer, &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+            data: d,
+        }], &[&mint_auth]).expect("rd init");
+        rd_config
+    };
+
+    let omitted = init_case(&mut svm, None);
+    assert_eq!(
+        rd_config_fee_bps(&svm, omitted),
+        residual_distributor::DEFAULT_FEE_SUPPORT_BPS,
+        "omitting the optional residual_fee_bps should use the declared default",
+    );
+
+    let explicit_zero = init_case(&mut svm, Some(0));
+    assert_eq!(rd_config_fee_bps(&svm, explicit_zero), 0, "explicit 0% fee remains an intentional no-fee config");
 }
 
 // DoS PROBE (lamport-prefund of a VICTIM's stake PDA, sweep tick D): the rd_config test above pins the
@@ -276,23 +400,17 @@ fn setup_with_extra_markets(svm: &mut LiteSVM, payer: &Keypair, supply: u64, ext
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
-    revoke_mint(svm, payer, &coin_mint, &mint_auth);
     let (stub_sub, stub_perc, ins_pool, back_pool, market) =
         (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-    let mut d = vec![0u8];
-    d.extend_from_slice(&supply.to_le_bytes());
-    d.extend_from_slice(&emission_end.to_le_bytes());
-    d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
-    d.extend_from_slice(&finalize_window.to_le_bytes());
-    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
-    d.extend_from_slice(&[extras.len() as u8]); // extra market allow-list count
-    for e in extras { d.extend_from_slice(e.as_ref()); }
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]).expect("rd init with extra markets");
+    let d = rd_init_data(
+        supply, emission_end, 1_000, 1_000, 4_000, finalize_window, ins_pool, back_pool, market, extras, Some(0),
+    );
+    send(svm, payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]).expect("rd init with extra markets");
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
     Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
 }
 
@@ -769,23 +887,21 @@ fn init_rejects_an_anti_wash_fee_above_100pct_no_claim_underflow_dos() {
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     // Build an rd init with a CUSTOM trailing fee_bps. Fresh coin_mint each call -> distinct rd_config.
     let try_fee = |svm: &mut LiteSVM, fee_bps: u16| -> Result<(), String> {
-        let coin_mint = Pubkey::new_unique();
+        let mint_auth = Keypair::new();
+        let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
         let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
         let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
-        let mut d = vec![0u8];
-        d.extend_from_slice(&1_000_000u64.to_le_bytes()); // supply
-        d.extend_from_slice(&2_000u64.to_le_bytes());     // emission_end
-        d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&1_000u16.to_le_bytes()); d.extend_from_slice(&4_000u16.to_le_bytes());
-        d.extend_from_slice(&500u64.to_le_bytes());       // finalize_window
-        d.extend_from_slice(Pubkey::new_unique().as_ref()); d.extend_from_slice(Pubkey::new_unique().as_ref()); d.extend_from_slice(Pubkey::new_unique().as_ref());
-        d.extend_from_slice(&[0u8]);                       // extra market count
-        d.extend_from_slice(&fee_bps.to_le_bytes());       // trailing anti-wash fee_bps
-        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-            AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-            AccountMeta::new_readonly(Pubkey::new_unique(), false), AccountMeta::new_readonly(Pubkey::new_unique(), false),
-            AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ], data: d }], &[])
+        let stub_perc = Pubkey::new_unique();
+        let stub_sub = Pubkey::new_unique();
+        let d = rd_init_data(
+            1_000_000, 2_000, 1_000, 1_000, 4_000, 500,
+            Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), &[], Some(fee_bps),
+        );
+        send(svm, &payer, &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+            data: d,
+        }], &[&mint_auth])
     };
     // fee > 100% -> rejected (else `payout = amount - fee` underflows -> permanent claim revert = fund freeze).
     assert!(try_fee(&mut svm, 10_001).is_err(), "anti-wash fee > 100% must be rejected (claim-underflow DoS)");
@@ -1505,6 +1621,44 @@ fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit(
     assert_eq!(h_got, 200_000, "H is diluted by A's frozen-denominator share (the locked half is a grief, not A's profit)");
 }
 
+#[test]
+fn trader_fresh_post_freeze_loss_cannot_revive_recovered_frozen_points() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000); // trader cohort = 40% = 400_000, fee = 0
+    set_slot(&mut svm, 100);
+
+    let h = Keypair::new(); let h_pf = Pubkey::new_unique();
+    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 0, 0);
+    register(&mut svm, &payer, &env, &h, &h.pubkey(), &h_pf, COHORT_TRADER).expect("reg H");
+    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
+    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0, 0);
+    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_TRADER).expect("reg A");
+
+    set_slot(&mut svm, 100 + 1024);
+    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 6_000, 0);
+    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 0);
+    crystallize(&mut svm, &payer, &env, &h, &h_pf).expect("cry H (net 6_000)");
+    crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A (net 6_000)");
+
+    set_slot(&mut svm, 100 + 2048);
+    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 6_000);
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 12_000, 6_000);
+    let h_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &h.pubkey());
+    let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
+    claim(&mut svm, &payer, &env, &h, &h_ata, None).expect("H claim");
+    claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim");
+
+    assert_eq!(token_amount(&svm, &a_ata), 0, "fresh post-freeze net must not revive stale points from a recovered frozen loss");
+    assert_eq!(token_amount(&svm, &h_ata), 200_000, "H remains limited by the frozen denominator; A's stale share stays locked");
+}
+
 // LIVE-CAP ONE-SIDEDNESS (the fix must not over-pay either, sweep): the claim live-cap scales points by
 // min(1, live_net/frozen_net). It caps DOWN on a recovery (live < frozen) — but it must NEVER pay UP when the
 // live net is HIGHER than the crystallized (frozen) net. If a trader takes MORE loss after crystallizing and
@@ -1737,29 +1891,21 @@ fn claim_before_freeze_is_rejected() {
 
 // init validation guards: reject zero supply, a cohort bps sum > 100%, an active insurance/backing cohort
 // with no pool scope, and an active LP/trader cohort with no market_group (finding IL — else an unscoped
-// genesis could mint COIN to positions from any pool / any market). init reads only coin_mint.key (the mint
-// is unpacked at freeze, not init), so a fresh random pubkey suffices as the coin_mint. Real .so.
+// genesis could mint COIN to positions from any pool / any market). init authenticates the live SPL mint
+// authority, so each case uses a fresh real coin mint. Real .so.
 fn try_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, ins: u16, back: u16, lp: u16, ins_pool: Pubkey, back_pool: Pubkey, market: Pubkey) -> Result<(), String> {
-    let coin_mint = Pubkey::new_unique();
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
-    let mut d = vec![0u8];
-    d.extend_from_slice(&supply.to_le_bytes());
-    d.extend_from_slice(&2_000u64.to_le_bytes());     // emission_end
-    d.extend_from_slice(&ins.to_le_bytes());
-    d.extend_from_slice(&back.to_le_bytes());
-    d.extend_from_slice(&lp.to_le_bytes());
-    d.extend_from_slice(&500u64.to_le_bytes());        // finalize_window
-    d.extend_from_slice(ins_pool.as_ref());
-    d.extend_from_slice(back_pool.as_ref());
-    d.extend_from_slice(market.as_ref());
-    d.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(Pubkey::new_unique(), false), AccountMeta::new_readonly(Pubkey::new_unique(), false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[])
+    let stub_perc = Pubkey::new_unique();
+    let stub_sub = Pubkey::new_unique();
+    let d = rd_init_data(supply, 2_000, ins, back, lp, 500, ins_pool, back_pool, market, &[], Some(0));
+    send(svm, payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth])
 }
 
 #[test]
@@ -1804,7 +1950,8 @@ fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_ta
     // extra-market tail: a declared u8 count followed by the given pubkeys (which may mismatch the count to
     // exercise the exact-length check). Fresh coin_mint each call -> distinct rd_config, no reinit collision.
     let try_tail = |svm: &mut LiteSVM, market_group: Pubkey, declared_count: u8, extras: &[Pubkey]| -> Result<(), String> {
-        let coin_mint = Pubkey::new_unique();
+        let mint_auth = Keypair::new();
+        let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
         let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
         let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
         let mut d = vec![0u8];
@@ -1819,12 +1966,11 @@ fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_ta
         d.extend_from_slice(market_group.as_ref());
         d.push(declared_count);
         for e in extras { d.extend_from_slice(e.as_ref()); }
-        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-            AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-            AccountMeta::new_readonly(Pubkey::new_unique(), false), AccountMeta::new_readonly(Pubkey::new_unique(), false),
-            AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ], data: d }], &[])
+        send(svm, &payer, &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, Pubkey::new_unique(), Pubkey::new_unique(), rd_config, mint_auth.pubkey()),
+            data: d,
+        }], &[&mint_auth])
     };
     let mg = Pubkey::new_unique(); // a real primary trusted market
     let u = Pubkey::new_unique;
@@ -1885,8 +2031,9 @@ fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
         AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
         AccountMeta::new_readonly(env.stub_perc, false), AccountMeta::new_readonly(env.stub_sub, false),
         AccountMeta::new(env.rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]);
-    assert!(res.is_err(), "re-initializing an existing rd config must be rejected (data_len != 0) — no un-freeze / denominator reset");
+        AccountMeta::new_readonly(env.mint_auth.pubkey(), true),
+    ], data: d }], &[&env.mint_auth]);
+    assert!(res.is_err(), "re-initializing an existing rd config must be rejected — no un-freeze / denominator reset");
 
     // The frozen config is byte-identical: freeze_slot + all denominators + the bound vault are immutable.
     let cfg_after = svm.get_account(&env.rd_config).unwrap().data.clone();
@@ -2193,7 +2340,6 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
-    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
     let (stub_sub, stub_perc, ins_pool, back_pool, market) =
         (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
     // ATTACK WIRE: insurance 50% + backing 50% + lp 50% = 150% (trader would saturate to 0). Sum > 100%.
@@ -2206,12 +2352,11 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     d.extend_from_slice(&500u64.to_le_bytes());
     d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
     d.extend_from_slice(&[0u8]);
-    let r = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]);
+    let r = send(&mut svm, &payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]);
     assert!(r.is_err(), "init with cohort bps summing to 150% must be rejected (no over-allocation)");
 
     // CONTROL: the same wire with shares summing to EXACTLY 100% (50/30/20/0) initializes fine — the guard
@@ -2225,12 +2370,11 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     d.extend_from_slice(&500u64.to_le_bytes());
     d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
     d.extend_from_slice(&[0u8]);
-    let r = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]);
+    let r = send(&mut svm, &payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
+        data: d,
+    }], &[&mint_auth]);
     assert!(r.is_ok(), "a valid 100% split (50/30/20/0) must initialize — the guard rejects only over-allocation");
 }
 
@@ -2321,26 +2465,20 @@ fn create_mint_with_freeze(svm: &mut LiteSVM, payer: &Keypair, mint_auth: &Pubke
     mint.pubkey()
 }
 // Init an rd_config for a prepared coin_mint (the vault is bound later at freeze). emission_end=2000, window=500.
-fn rd_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, coin_mint: &Pubkey) -> Pubkey {
+fn rd_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, coin_mint: &Pubkey, mint_authority: &Keypair) -> Pubkey {
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
-    let mut d = vec![0u8];
-    d.extend_from_slice(&supply.to_le_bytes());
-    d.extend_from_slice(&2_000u64.to_le_bytes()); // emission_end
-    d.extend_from_slice(&1_000u16.to_le_bytes()); // insurance
-    d.extend_from_slice(&1_000u16.to_le_bytes()); // backing
-    d.extend_from_slice(&4_000u16.to_le_bytes()); // lp (trader remainder)
-    d.extend_from_slice(&500u64.to_le_bytes());   // finalize_window
-    d.extend_from_slice(Pubkey::new_unique().as_ref()); // ins_pool
-    d.extend_from_slice(Pubkey::new_unique().as_ref()); // back_pool
-    d.extend_from_slice(Pubkey::new_unique().as_ref()); // market
-    d.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(*coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(Pubkey::new_unique(), false), AccountMeta::new_readonly(Pubkey::new_unique(), false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]).expect("rd init");
+    let stub_perc = Pubkey::new_unique();
+    let stub_sub = Pubkey::new_unique();
+    let d = rd_init_data(
+        supply, 2_000, 1_000, 1_000, 4_000, 500,
+        Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), &[], Some(0),
+    );
+    send(svm, payer, &[Instruction {
+        program_id: rd_id(),
+        accounts: rd_init_accounts(payer.pubkey(), *coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_authority.pubkey()),
+        data: d,
+    }], &[mint_authority]).expect("rd init");
     rd_config
 }
 fn freeze_ix(svm: &mut LiteSVM, payer: &Keypair, rd_config: Pubkey, coin_mint: Pubkey, vault: Pubkey) -> Result<(), String> {
@@ -2418,7 +2556,7 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     // after revoking it, the fixed-supply mint + rd-owned full vault is accepted.
     let ma = Keypair::new();
     let mint = create_mint(&mut svm, &payer, &ma.pubkey());
-    let rd_config = rd_init(&mut svm, &payer, supply, &mint);
+    let rd_config = rd_init(&mut svm, &payer, supply, &mint, &ma);
     let vault = create_token_account(&mut svm, &payer, &mint, &rd_config);
     mint_to(&mut svm, &payer, &mint, &ma, &vault, supply);
     set_slot(&mut svm, past);
@@ -2431,7 +2569,7 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     let ma2 = Keypair::new();
     let fa = Keypair::new();
     let mint2 = create_mint_with_freeze(&mut svm, &payer, &ma2.pubkey(), Some(&fa.pubkey()));
-    let rd2 = rd_init(&mut svm, &payer, supply, &mint2);
+    let rd2 = rd_init(&mut svm, &payer, supply, &mint2, &ma2);
     let vault2 = create_token_account(&mut svm, &payer, &mint2, &rd2);
     mint_to(&mut svm, &payer, &mint2, &ma2, &vault2, supply);
     revoke_mint(&mut svm, &payer, &mint2, &ma2); // clear mint authority; freeze authority remains
@@ -2444,7 +2582,7 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     // (EZ) a vault NOT owned by rd_config is rejected even when fully funded.
     let ma3 = Keypair::new();
     let mint3 = create_mint(&mut svm, &payer, &ma3.pubkey());
-    let rd3 = rd_init(&mut svm, &payer, supply, &mint3);
+    let rd3 = rd_init(&mut svm, &payer, supply, &mint3, &ma3);
     let attacker = Pubkey::new_unique();
     let decoy = create_token_account(&mut svm, &payer, &mint3, &attacker);
     mint_to(&mut svm, &payer, &mint3, &ma3, &decoy, supply);
@@ -2455,7 +2593,7 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     // (EZ) an rd-owned but UNDER-funded vault is rejected (mint.supply == total, but the bound vault holds < it).
     let ma4 = Keypair::new();
     let mint4 = create_mint(&mut svm, &payer, &ma4.pubkey());
-    let rd4 = rd_init(&mut svm, &payer, supply, &mint4);
+    let rd4 = rd_init(&mut svm, &payer, supply, &mint4, &ma4);
     let under = create_token_account(&mut svm, &payer, &mint4, &rd4);
     let sink = create_token_account(&mut svm, &payer, &mint4, &Pubkey::new_unique());
     mint_to(&mut svm, &payer, &mint4, &ma4, &under, supply - 1);
@@ -2475,7 +2613,8 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
-    let coin_mint = create_mint(&mut svm, &payer, &Keypair::new().pubkey());
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
     let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
     let stub_perc = Pubkey::new_unique();
@@ -2501,7 +2640,8 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
         AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
         AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
         AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d }], &[]).expect("init with a 3-market allow-list");
+        AccountMeta::new_readonly(mint_auth.pubkey(), true),
+    ], data: d }], &[&mint_auth]).expect("init with a 3-market allow-list");
     set_slot(&mut svm, 100);
 
     let reg = |svm: &mut LiteSVM, owner: &Keypair, pf: &Pubkey| -> Result<(), String> {

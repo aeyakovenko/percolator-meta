@@ -24,10 +24,9 @@
 //! bypass of net-by-spent. The tenure weight (registration age) is computed here, so JIT
 //! capture is damped with no percolator start-slot field. NOTE: an earlier design used a
 //! per-window `eligible = min(Δresidual, Δfee*10000/bps)` fee-cap (the `earnings_snap` /
-//! `eligible_accum` fields); it was SUPERSEDED by net-by-spent + the claim-fee. `eligible_accum`
-//! is now VESTIGIAL (held at 0, kept for serialized-layout stability); `earnings_snap` was
-//! REPURPOSED to store the crystallize-time `net_delta` that the claim live-cap (3) reads —
-//! it is LOAD-BEARING, not vestigial.
+//! `eligible_accum` fields); it was SUPERSEDED by net-by-spent + the claim-fee. `earnings_snap`
+//! stores the crystallize-time `net_delta`, and `eligible_accum` stores trader `spent` at
+//! crystallize so fresh post-freeze exposure cannot revive recovered frozen losses.
 //!
 //! ## Distribution = self-service deterministic claim (the seal path was RETIRED)
 //! Each backer's COIN share is paid DIRECTLY from this program's own `vault` by IX_CLAIM:
@@ -55,6 +54,7 @@ use solana_program::{
     entrypoint::ProgramResult,
     program::{invoke, invoke_signed},
     program_error::ProgramError,
+    program_option::COption,
     program_pack::Pack,
     pubkey::Pubkey,
     rent::Rent,
@@ -440,10 +440,9 @@ struct Stake {
     bump: u8,
     cohort: u8, // COHORT_RESIDUAL | COHORT_INSURANCE. For insurance, `backing_ledger` is the
                 // subledger position and `recipient` is the depositor.
-    // VESTIGIAL (held at 0): the per-window `min(Δresidual, Δfee*10000/bps)` fee-cap design was
-    // superseded by net-by-spent (crystallized - spent, in residual_counter) + the claim-fee
-    // (fee_support_bps). Retained only so the serialized layout / offset canary stays stable; do NOT
-    // reintroduce a fee-cap here without re-checking the live anti-wash (it is the counter + claim-fee).
+    // TRADER live-cap anchor: crystallize stores the absolute `spent` counter here so claim can distinguish
+    // still-unrecovered frozen loss from fresh post-freeze net. Held at 0 for non-trader cohorts. Repurposed
+    // from the superseded fee-cap design without changing the serialized layout.
     eligible_accum: u128,
     // Self-service claim: set true when this stake's COIN share has been paid, so it can't be
     // double-claimed.
@@ -547,7 +546,7 @@ fn create_pda<'a>(
 }
 
 // init accounts: [payer(s,w), coin_mint, distribution_program, distribution_config,
-//   percolator_program, subledger_program, config(pda,w), system]
+//   percolator_program, subledger_program, config(pda,w), system, coin_mint_authority(s)]
 // data: total_supply(u64), fee_support_bps(u16), emission_end_slot(u64), insurance_bps(u16)
 fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
@@ -559,6 +558,7 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     let subledger_program = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let system = next_account_info(iter)?;
+    let coin_mint_authority = next_account_info(iter)?;
 
     // 4-cohort wire (10/10/40/40 default): total_supply, emission_end, insurance_bps, backing_bps,
     // lp_bps (trader = remainder), finalize_window, subledger_pool (insurance), backing_pool, market_group.
@@ -587,8 +587,8 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         *slot = m;
     }
     // OPTIONAL trailing residual_fee_bps (u16, finding NZ): the anti-wash fee skimmed from LP/trader claims
-    // (process_claim). Absent (no trailing bytes) = 0, so every existing init wire is unchanged. Must be <= 100%.
-    let residual_fee_bps = if data.len() == 2 { take_u16(&mut data)? } else { 0 };
+    // (process_claim). Absent (no trailing bytes) = DEFAULT_FEE_SUPPORT_BPS; explicit 0 remains allowed.
+    let residual_fee_bps = if data.len() == 2 { take_u16(&mut data)? } else { DEFAULT_FEE_SUPPORT_BPS };
     if residual_fee_bps > BPS_DENOMINATOR as u16 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -638,6 +638,15 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     );
     if *distribution_config.key != expected_dist {
         return Err(ProgramError::InvalidSeeds);
+    }
+    // The rd_config PDA is canonical per coin mint, so init must be authorized by the current SPL mint authority.
+    // This prevents a first-mover from squatting PDA(["rd_config", coin_mint]) with attacker-chosen parameters.
+    if coin_mint.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mint = spl_token::state::Mint::unpack(&coin_mint.try_borrow_data()?)?;
+    if mint.mint_authority != COption::Some(*coin_mint_authority.key) || !coin_mint_authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
     }
     let bump_arr = [bump];
     let seeds: [&[u8]; 3] = [b"rd_config", coin_mint.key.as_ref(), &bump_arr];
@@ -862,10 +871,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let slot = config.cohort_points_mut(stake.cohort);
             *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
             stake.points = new_pts;
-            // Record the net_delta behind these points (repurposing the vestigial earnings_snap) so the CLAIM
-            // can cap proportionally to a later net DROP (loss recovery / spent rise) without re-deriving the
-            // frozen time-weight. See the claim live-cap (finding: stale-points wash bypass of net-by-spent).
+            // Record the net_delta behind these points so CLAIM can cap proportionally to a later net DROP
+            // without re-deriving the frozen time-weight. For traders, also remember `spent` at crystallize:
+            // later spent growth recovers the frozen loss and must not be replaceable with fresh live net.
             stake.earnings_snap = net_delta;
+            stake.eligible_accum = if stake.cohort == COHORT_TRADER { spent } else { 0 };
         }
     }
 
@@ -1022,12 +1032,11 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // the net. Without re-reading, a farmer could crystallize at PEAK net, recover the loss to net 0,
             // SKIP the re-crystallize, and claim the stale-high FROZEN points — bypassing net-by-spent and
             // diluting honest co-claimants (finding: stale-points wash). Re-read the bound portfolio and scale
-            // the points by min(1, live_net/frozen_net): a recovery (live_net < frozen_net) lowers the payout
-            // PROPORTIONALLY, while the frozen TIME-WEIGHT (already baked into stake.points) is preserved
-            // exactly — so an unrecovered net keeps its full crystallize-tenure multiplier. (LP's `received`
-            // is monotonic, so live_net >= frozen_net and the cap is a harmless no-op.) Permissionless-safe:
-            // each underlying counter is monotonic, so there is no transient-low moment to grief — live_net is
-            // the true current net, which is exactly what should be paid.
+            // the points by the still-valid frozen net: recovery after crystallize lowers the payout
+            // proportionally, while the frozen TIME-WEIGHT (already baked into stake.points) is preserved.
+            // For traders, the crystallize-time `spent` anchor prevents fresh post-freeze net from reviving
+            // points whose original frozen loss was already recovered. LP's `received` is monotonic, so the
+            // cap remains a harmless no-op there.
             let portfolio = next_account_info(iter)?;
             if *portfolio.key != stake.backing_ledger || *portfolio.owner != config.percolator_program {
                 return Err(ProgramError::InvalidAccountData);
@@ -1036,10 +1045,16 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let live_net = residual_counter(stake.cohort, received, crystallized, spent)
                 .saturating_sub(stake.residual_snap);
             let frozen_net = stake.earnings_snap; // net_delta captured at the last crystallize
-            let pts = if frozen_net == 0 || live_net >= frozen_net {
+            let cap_net = if stake.cohort == COHORT_TRADER {
+                let spent_since_crystallize = spent.saturating_sub(stake.eligible_accum);
+                core::cmp::min(frozen_net.saturating_sub(spent_since_crystallize), live_net)
+            } else {
+                live_net
+            };
+            let pts = if frozen_net == 0 || cap_net >= frozen_net {
                 stake.points
             } else {
-                stake.points.saturating_mul(live_net) / frozen_net
+                stake.points.saturating_mul(cap_net) / frozen_net
             };
             points_to_amount(cohort_supply, pts, frozen_denom)
         }
