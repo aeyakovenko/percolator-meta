@@ -307,6 +307,11 @@ impl Env {
         (principal, start_slot, withdrawn)
     }
 
+    fn position_shares(&self, owner: &Pubkey) -> u128 {
+        let acc = self.svm.get_account(&self.position_pda(owner)).unwrap();
+        u128::from_le_bytes(acc.data[104..120].try_into().unwrap())
+    }
+
     fn pool_outstanding(&self) -> u64 {
         let acc = self.svm.get_account(&self.pool).unwrap();
         u64::from_le_bytes(acc.data[80..88].try_into().unwrap())
@@ -1096,6 +1101,49 @@ fn surplus_above_outstanding_is_excluded_a_depositor_recovers_principal_only_not
     assert_eq!(env.token_amount(&bob_ata), 1_000_000, "second depositor also recovers principal only");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 1_000_000, "the 1M surplus REMAINS in insurance after all principals are returned");
     assert_eq!(env.pool_outstanding(), 0, "all principal retired; the surviving 1M is pure surplus, not a depositor's");
+}
+
+// ISSUE #40 REGRESSION (principal-policy partial exit must reduce RD live-cap shares): insurance deposits
+// mint Position.shares for residual-distributor share-value cohorts even when the pool's payout policy is
+// POLICY_PRINCIPAL. A principal-policy partial withdraw keeps the principal-only payout rule, but it must still
+// burn the same fraction of shares as the principal fraction being retired. Otherwise a depositor can reduce
+// capital at risk before claiming RD COIN while preserving a stale-high live share cap.
+#[test]
+fn principal_policy_partial_insurance_withdraw_burns_proportional_shares_issue_40() {
+    let mut env = Env::new();
+    env.init_insurance_pool(); // POLICY_PRINCIPAL
+
+    let amount = 100_000u64;
+    let withdraw_amount = 99_999u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+
+    let shares_before = env.position_shares(&alice.pubkey());
+    let pool_shares_before = env.pool_total_shares();
+    assert!(shares_before > 0, "insurance deposits record shares for RD share-value accounting");
+    assert_eq!(pool_shares_before, shares_before, "single depositor owns the whole share supply");
+
+    let expected_burn = shares_before * withdraw_amount as u128 / amount as u128;
+    let expected_after = shares_before - expected_burn;
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, withdraw_amount)
+        .expect("principal-policy partial withdraw");
+
+    let (principal_after, _start_slot, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(principal_after, amount - withdraw_amount, "principal falls by the withdrawn amount");
+    assert!(!withdrawn, "one atom of principal remains, so the position is still live");
+    assert_eq!(
+        env.position_shares(&alice.pubkey()),
+        expected_after,
+        "principal-policy partial withdraw burns the retired principal fraction of shares"
+    );
+    assert_eq!(
+        env.pool_total_shares(),
+        expected_after,
+        "pool total shares falls with the position shares"
+    );
+    assert_eq!(env.token_amount(&alice_ata), withdraw_amount, "principal-policy payout remains principal-only");
 }
 
 // POLICY_WITH_SURPLUS pays out PRO-RATA SURPLUS (sweep tick B — the configurable policy distinction, INTENDED):
@@ -3610,4 +3658,3 @@ fn top_up_resets_the_position_start_slot() {
     assert_eq!(start1, 1_000, "top-up RESET start_slot to now — the huge late capital earns no early-join age");
     assert!(start1 > start0, "start_slot moved forward (no inherited early-join hold time)");
 }
-

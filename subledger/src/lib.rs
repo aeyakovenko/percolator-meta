@@ -255,9 +255,9 @@ struct Position {
     /// Set by the pool's vote_authority while a genesis vote is live on this
     /// position. Blocks insurance-withdraw until the vote is retracted.
     vote_locked: bool,
-    /// Shares held (POLICY_WITH_SURPLUS). Minted at deposit priced by the live
-    /// insurance balance, so this position only ever redeems the surplus that
-    /// accrued during its own tenure. 0 for POLICY_PRINCIPAL pools.
+    /// Shares held for share-value accounting. Insurance deposits mint priced
+    /// shares for both payout policies so residual-distributor live caps track
+    /// remaining capital; own-vault POLICY_PRINCIPAL deposits keep this at 0.
     shares: u128,
 }
 
@@ -1204,23 +1204,23 @@ fn process_insurance_withdraw(
     // only their pro-rata share `owed`. (POLICY_WITH_SURPLUS pools always pro-rata, returning
     // any yield too.)
     let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
-    // POLICY_WITH_SURPLUS exits by redeeming shares priced at the LIVE balance — a
-    // tenure-fair slice of (principal + surplus). POLICY_PRINCIPAL keeps the original
-    // pro-rata/principal payout. `shares_to_burn` is the share fraction matching the
-    // withdrawn principal fraction `amount / position.principal`.
-    let (owed, shares_to_burn) = if pool.policy == POLICY_WITH_SURPLUS {
-        let stb = if position.principal == 0 {
-            0u128
-        } else {
-            position
-                .shares
-                .checked_mul(amount as u128)
-                .and_then(|v| v.checked_div(position.principal as u128))
-                .ok_or(ProgramError::ArithmeticOverflow)?
-        };
-        (redeem_shares(stb, insurance, pool.total_shares)?, stb)
+    // Burn the share fraction matching the withdrawn principal fraction for BOTH policies. The payout
+    // policy remains separate: WITH_SURPLUS redeems those shares at the live balance, while PRINCIPAL keeps
+    // the principal-only/pro-rata-haircut payout. This keeps RD's live share-value cap aligned with capital
+    // still at risk even for a principal-policy partial exit.
+    let shares_to_burn = if position.principal == 0 {
+        0u128
     } else {
-        (payout(pool.policy, insurance, pool.outstanding_principal, amount)?, 0u128)
+        position
+            .shares
+            .checked_mul(amount as u128)
+            .and_then(|v| v.checked_div(position.principal as u128))
+            .ok_or(ProgramError::ArithmeticOverflow)?
+    };
+    let owed = if pool.policy == POLICY_WITH_SURPLUS {
+        redeem_shares(shares_to_burn, insurance, pool.total_shares)?
+    } else {
+        payout(pool.policy, insurance, pool.outstanding_principal, amount)?
     };
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,
