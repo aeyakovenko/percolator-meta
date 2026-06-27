@@ -144,8 +144,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     let rd_vault = Pubkey::new_unique(); set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
     send(&mut svm, &[
         spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &rd_vault, &coin_auth.pubkey(), &[], SUPPLY).unwrap(),
-        spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
-    ], &[&coin_auth]).expect("fund + freeze the COIN supply");
+    ], &[&coin_auth]).expect("fund the COIN supply");
     let mut ri = vec![0u8];
     ri.extend_from_slice(&SUPPLY.to_le_bytes()); ri.extend_from_slice(&2_000u64.to_le_bytes());
     ri.extend_from_slice(&INS_BPS.to_le_bytes()); ri.extend_from_slice(&BACK_BPS.to_le_bytes()); ri.extend_from_slice(&LP_BPS.to_le_bytes());
@@ -159,8 +158,11 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id(), false),
         AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false),
-    ], data: ri }], &[]).expect("rd init with the N-market allow-list");
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(coin_auth.pubkey(), true),
+    ], data: ri }], &[&coin_auth]).expect("rd init with the N-market allow-list");
+    send(&mut svm, &[
+        spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
+    ], &[&coin_auth]).expect("freeze the COIN supply");
 
     // ---- THE FARM: per market, a delta-neutral miner pair (long + short, both miner-owned) ----
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
@@ -577,8 +579,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     let rd_vault = Pubkey::new_unique(); set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
     tx(&mut svm, &[
         spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &rd_vault, &coin_auth.pubkey(), &[], SUPPLY).unwrap(),
-        spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
-    ], &[&coin_auth]).expect("fund + freeze COIN");
+    ], &[&coin_auth]).expect("fund COIN");
     let mut ri = vec![0u8];
     ri.extend_from_slice(&SUPPLY.to_le_bytes()); ri.extend_from_slice(&2_000u64.to_le_bytes());
     ri.extend_from_slice(&INS_BPS.to_le_bytes()); ri.extend_from_slice(&BACK_BPS.to_le_bytes()); ri.extend_from_slice(&LP_BPS.to_le_bytes());
@@ -591,8 +592,11 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id(), false),
         AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false),
-    ], data: ri }], &[]).expect("rd init");
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(coin_auth.pubkey(), true),
+    ], data: ri }], &[&coin_auth]).expect("rd init");
+    tx(&mut svm, &[
+        spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
+    ], &[&coin_auth]).expect("freeze COIN");
 
 
     // ---- insurance + backing cohorts: 10 depositors x 1M shares each (modeled subledger positions) ----
@@ -870,8 +874,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     let rd_vault = Pubkey::new_unique(); set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
     tx(&mut svm, &[
         spl_token::instruction::mint_to(&spl_token::ID, &coin_mint, &rd_vault, &coin_auth.pubkey(), &[], SUPPLY).unwrap(),
-        spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
-    ], &[&coin_auth]).expect("fund + freeze COIN");
+    ], &[&coin_auth]).expect("fund COIN");
     let mut ri = vec![0u8];
     ri.extend_from_slice(&SUPPLY.to_le_bytes()); ri.extend_from_slice(&2_000u64.to_le_bytes());
     ri.extend_from_slice(&INS_BPS.to_le_bytes()); ri.extend_from_slice(&BACK_BPS.to_le_bytes()); ri.extend_from_slice(&LP_BPS.to_le_bytes());
@@ -883,8 +886,11 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new_readonly(dist_id(), false),
         AccountMeta::new_readonly(dist_config, false), AccountMeta::new_readonly(perc_id(), false), AccountMeta::new_readonly(sub_id(), false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false),
-    ], data: ri }], &[]).expect("rd init");
+        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(system_program::ID, false), AccountMeta::new_readonly(coin_auth.pubkey(), true),
+    ], data: ri }], &[&coin_auth]).expect("rd init");
+    tx(&mut svm, &[
+        spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
+    ], &[&coin_auth]).expect("freeze COIN");
 
     // ---- insurance + backing cohorts: 10 depositors x 1M shares each ----
     let mut ins_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();

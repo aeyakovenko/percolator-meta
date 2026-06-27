@@ -22,5 +22,5 @@ solana-sdk = { workspace = true }
 litesvm = { workspace = true }
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 percolator-prog = { workspace = true }
-percolator = { git = "file:///home/anatoly/percolator", rev = "58dc11803ebbb272d84db410168f55f3eeb5acd4" }
+percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "bbe745a26fb3fa7deda4bedb3560eb3499dd295f" }
 solana-program-runtime = "1.18"

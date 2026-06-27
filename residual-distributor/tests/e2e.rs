@@ -1,7 +1,7 @@
 //! [branch-only, DO NOT PUSH] e2e: residual-distributor 4-cohort deterministic distribution
 //! (10/10/40/40). Insurance + backing reward SUBLEDGER SHARE VALUE (Position.shares — pro-rata with
-//! fees, soft-veto on exit); LP + trader reward the percolator PortfolioAccountV16 residual counters
-//! (received / crystallized_loss — monotonic, real-loss-backed, un-gameable). Self-service flow:
+//! fees, soft-veto on exit); LP/trader reward residual counters; optional funding-payer cohort rewards
+//! cumulative Percolator funding-paid counters. Self-service flow:
 //! register -> crystallize -> freeze -> claim, against mock dependency accounts at the offset-pinned
 //! layouts (tests/offsets.rs pins every offset vs the real percolator/subledger structs).
 
@@ -26,59 +26,137 @@ fn dist_id() -> Pubkey {
     Pubkey::try_from("D1str1but1on11111111111111111111111111111111").unwrap()
 }
 fn rd_so() -> String {
-    format!("{}/../target/deploy/residual_distributor.so", env!("CARGO_MANIFEST_DIR"))
+    format!(
+        "{}/../target/deploy/residual_distributor.so",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 const COHORT_INSURANCE: u8 = 0;
 const COHORT_BACKING: u8 = 1;
 const COHORT_LP: u8 = 2;
 const COHORT_TRADER: u8 = 3;
+const COHORT_FUNDING_PAYER: u8 = 4;
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
     let mint = Keypair::new();
     let rent = svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN);
     let ixs = [
-        system_instruction::create_account(&payer.pubkey(), &mint.pubkey(), rent, spl_token::state::Mint::LEN as u64, &spl_token::ID),
-        spl_token::instruction::initialize_mint(&spl_token::ID, &mint.pubkey(), authority, None, 6).unwrap(),
+        system_instruction::create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            rent,
+            spl_token::state::Mint::LEN as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_mint(&spl_token::ID, &mint.pubkey(), authority, None, 6)
+            .unwrap(),
     ];
-    let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[payer, &mint], svm.latest_blockhash());
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[payer, &mint],
+        svm.latest_blockhash(),
+    );
     svm.send_transaction(tx).unwrap();
     mint.pubkey()
 }
-fn create_token_account(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, owner: &Pubkey) -> Pubkey {
+fn create_token_account(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) -> Pubkey {
     let acc = Keypair::new();
     let rent = svm.minimum_balance_for_rent_exemption(spl_token::state::Account::LEN);
     let ixs = [
-        system_instruction::create_account(&payer.pubkey(), &acc.pubkey(), rent, spl_token::state::Account::LEN as u64, &spl_token::ID),
-        spl_token::instruction::initialize_account(&spl_token::ID, &acc.pubkey(), mint, owner).unwrap(),
+        system_instruction::create_account(
+            &payer.pubkey(),
+            &acc.pubkey(),
+            rent,
+            spl_token::state::Account::LEN as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_account(&spl_token::ID, &acc.pubkey(), mint, owner)
+            .unwrap(),
     ];
-    let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[payer, &acc], svm.latest_blockhash());
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[payer, &acc],
+        svm.latest_blockhash(),
+    );
     svm.send_transaction(tx).unwrap();
     acc.pubkey()
 }
-fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypair, dest: &Pubkey, amount: u64) {
-    let ix = spl_token::instruction::mint_to(&spl_token::ID, mint, dest, &authority.pubkey(), &[], amount).unwrap();
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer, authority], svm.latest_blockhash());
+fn mint_to(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    authority: &Keypair,
+    dest: &Pubkey,
+    amount: u64,
+) {
+    let ix = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        mint,
+        dest,
+        &authority.pubkey(),
+        &[],
+        amount,
+    )
+    .unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer, authority],
+        svm.latest_blockhash(),
+    );
     svm.send_transaction(tx).unwrap();
 }
 fn revoke_mint(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypair) {
-    let ix = spl_token::instruction::set_authority(&spl_token::ID, mint, None, AuthorityType::MintTokens, &authority.pubkey(), &[]).unwrap();
-    let tx = Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[payer, authority], svm.latest_blockhash());
+    let ix = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        mint,
+        None,
+        AuthorityType::MintTokens,
+        &authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer, authority],
+        svm.latest_blockhash(),
+    );
     svm.send_transaction(tx).unwrap();
 }
 fn token_amount(svm: &LiteSVM, acc: &Pubkey) -> u64 {
-    spl_token::state::Account::unpack(&svm.get_account(acc).unwrap().data).unwrap().amount
+    spl_token::state::Account::unpack(&svm.get_account(acc).unwrap().data)
+        .unwrap()
+        .amount
 }
 fn set_slot(svm: &mut LiteSVM, slot: u64) {
-    svm.set_sysvar(&Clock { slot, ..Default::default() });
+    svm.set_sysvar(&Clock {
+        slot,
+        ..Default::default()
+    });
 }
-fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra: &[&Keypair]) -> Result<(), String> {
+fn send(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    ixs: &[Instruction],
+    extra: &[&Keypair],
+) -> Result<(), String> {
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     let mut signers: Vec<&Keypair> = vec![payer];
     signers.extend_from_slice(extra);
     let tx = Transaction::new_signed_with_payer(ixs, Some(&payer.pubkey()), &signers, bh);
-    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
+    svm.send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
 }
 
 fn rd_init_data(
@@ -114,6 +192,38 @@ fn rd_init_data(
     d
 }
 
+#[allow(clippy::too_many_arguments)]
+fn rd_init_data_with_funding_bps(
+    supply: u64,
+    emission_end: u64,
+    insurance_bps: u16,
+    backing_bps: u16,
+    lp_bps: u16,
+    funding_payer_bps: u16,
+    finalize_window: u64,
+    ins_pool: Pubkey,
+    back_pool: Pubkey,
+    market: Pubkey,
+    extras: &[Pubkey],
+    residual_fee_bps: u16,
+) -> Vec<u8> {
+    let mut d = rd_init_data(
+        supply,
+        emission_end,
+        insurance_bps,
+        backing_bps,
+        lp_bps,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        extras,
+        Some(residual_fee_bps),
+    );
+    d.extend_from_slice(&funding_payer_bps.to_le_bytes());
+    d
+}
+
 fn rd_init_accounts(
     payer: Pubkey,
     coin_mint: Pubkey,
@@ -137,38 +247,128 @@ fn rd_init_accounts(
 }
 
 fn rd_config_fee_bps(svm: &LiteSVM, rd_config: Pubkey) -> u16 {
-    u16::from_le_bytes(svm.get_account(&rd_config).unwrap().data[144..146].try_into().unwrap())
+    u16::from_le_bytes(
+        svm.get_account(&rd_config).unwrap().data[144..146]
+            .try_into()
+            .unwrap(),
+    )
 }
 
 // Mock subledger Position at the pinned offsets: pool@8, owner@40, withdrawn@88, shares@104.
-fn set_position(svm: &mut LiteSVM, key: &Pubkey, sub: &Pubkey, pool: &Pubkey, owner: &Pubkey, shares: u128, withdrawn: bool) {
+fn set_position(
+    svm: &mut LiteSVM,
+    key: &Pubkey,
+    sub: &Pubkey,
+    pool: &Pubkey,
+    owner: &Pubkey,
+    shares: u128,
+    withdrawn: bool,
+) {
     let mut data = vec![0u8; 160];
     data[8..40].copy_from_slice(pool.as_ref());
     data[40..72].copy_from_slice(owner.as_ref());
     data[88] = withdrawn as u8;
     data[104..120].copy_from_slice(&shares.to_le_bytes());
-    svm.set_account(*key, Account { lamports: 1_000_000_000, data, owner: *sub, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        *key,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: *sub,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 }
 // Mock percolator PortfolioAccount at the pinned offsets: market_group@16, owner@116, crystallized@196,
-// received@228. market_group is the trusted-Pyth scope the LP/trader cohorts enforce (finding IL).
-fn set_portfolio(svm: &mut LiteSVM, key: &Pubkey, perc: &Pubkey, market: &Pubkey, owner: &Pubkey, received: u128, crystallized: u128) {
+// spent@212, received@228. market_group is the trusted-Pyth scope portfolio-flow cohorts enforce.
+fn set_portfolio(
+    svm: &mut LiteSVM,
+    key: &Pubkey,
+    perc: &Pubkey,
+    market: &Pubkey,
+    owner: &Pubkey,
+    received: u128,
+    crystallized: u128,
+) {
     let mut data = vec![0u8; 512];
     data[16..48].copy_from_slice(market.as_ref());
     data[116..148].copy_from_slice(owner.as_ref());
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[228..244].copy_from_slice(&received.to_le_bytes());
-    svm.set_account(*key, Account { lamports: 1_000_000_000, data, owner: *perc, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        *key,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: *perc,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 }
 
-// Like set_portfolio but ALSO writes residual_spent@212 (the self-recovery counter the trader cohort nets out).
-fn set_portfolio_full(svm: &mut LiteSVM, key: &Pubkey, perc: &Pubkey, market: &Pubkey, owner: &Pubkey, received: u128, crystallized: u128, spent: u128) {
+// Like set_portfolio but also writes residual_spent@212.
+fn set_portfolio_full(
+    svm: &mut LiteSVM,
+    key: &Pubkey,
+    perc: &Pubkey,
+    market: &Pubkey,
+    owner: &Pubkey,
+    received: u128,
+    crystallized: u128,
+    spent: u128,
+) {
     let mut data = vec![0u8; 512];
     data[16..48].copy_from_slice(market.as_ref());
     data[116..148].copy_from_slice(owner.as_ref());
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[212..228].copy_from_slice(&spent.to_le_bytes());
     data[228..244].copy_from_slice(&received.to_le_bytes());
-    svm.set_account(*key, Account { lamports: 1_000_000_000, data, owner: *perc, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        *key,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: *perc,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
+fn set_portfolio_funding(
+    svm: &mut LiteSVM,
+    key: &Pubkey,
+    perc: &Pubkey,
+    market: &Pubkey,
+    owner: &Pubkey,
+    long_paid: u128,
+    long_received: u128,
+    short_paid: u128,
+    short_received: u128,
+) {
+    let mut data = vec![0u8; 512];
+    data[16..48].copy_from_slice(market.as_ref());
+    data[116..148].copy_from_slice(owner.as_ref());
+    data[244..260].copy_from_slice(&long_paid.to_le_bytes());
+    data[260..276].copy_from_slice(&long_received.to_le_bytes());
+    data[276..292].copy_from_slice(&short_paid.to_le_bytes());
+    data[292..308].copy_from_slice(&short_received.to_le_bytes());
+    svm.set_account(
+        *key,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: *perc,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 }
 
 struct Env {
@@ -193,7 +393,11 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config); // rd-owned claim vault
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
 
@@ -203,38 +407,366 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     let back_pool = Pubkey::new_unique();
     let market = Pubkey::new_unique();
     let d = rd_init_data(
-        supply, emission_end, 1_000, 1_000, 4_000, finalize_window, ins_pool, back_pool, market, &[], Some(0),
+        supply,
+        emission_end,
+        1_000,
+        1_000,
+        4_000,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        &[],
+        Some(0),
     );
-    send(svm, payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]).expect("rd init");
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .expect("rd init");
     revoke_mint(svm, payer, &coin_mint, &mint_auth);
-    Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
+}
+
+fn setup_funding_payer_only_with_fee_and_extras(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    fee_bps: u16,
+    extras: &[Pubkey],
+) -> Env {
+    let emission_end = 2_000u64;
+    let finalize_window = 500u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
+    let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
+    mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
+
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let ins_pool = Pubkey::new_unique();
+    let back_pool = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let d = rd_init_data_with_funding_bps(
+        supply,
+        emission_end,
+        0,
+        0,
+        0,
+        10_000,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        extras,
+        fee_bps,
+    );
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .unwrap();
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
+}
+
+fn setup_funding_payer_only_with_fee(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    fee_bps: u16,
+) -> Env {
+    setup_funding_payer_only_with_fee_and_extras(svm, payer, supply, fee_bps, &[])
+}
+
+fn setup_funding_payer_only(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
+    setup_funding_payer_only_with_fee(svm, payer, supply, 0)
+}
+
+fn setup_share_value_and_funding_split(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    insurance_bps: u16,
+    backing_bps: u16,
+    funding_payer_bps: u16,
+) -> Env {
+    let emission_end = 2_000u64;
+    let finalize_window = 500u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
+    let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
+    mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
+
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let ins_pool = Pubkey::new_unique();
+    let back_pool = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let d = rd_init_data_with_funding_bps(
+        supply,
+        emission_end,
+        insurance_bps,
+        backing_bps,
+        0,
+        funding_payer_bps,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        &[],
+        0,
+    );
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .expect("rd init with share-value/funding split");
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_custom_split_with_fee_and_extras(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    insurance_bps: u16,
+    backing_bps: u16,
+    lp_bps: u16,
+    funding_payer_bps: u16,
+    fee_bps: u16,
+    extras: &[Pubkey],
+) -> Env {
+    let emission_end = 2_000u64;
+    let finalize_window = 500u64;
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
+    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
+    let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
+    mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
+
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let ins_pool = Pubkey::new_unique();
+    let back_pool = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let d = rd_init_data_with_funding_bps(
+        supply,
+        emission_end,
+        insurance_bps,
+        backing_bps,
+        lp_bps,
+        funding_payer_bps,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        extras,
+        fee_bps,
+    );
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .expect("custom rd init");
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
 }
 
 // Like setup(), but appends the OPTIONAL trailing residual_fee_bps (the anti-wash fee on LP/trader claims).
 fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16) -> Env {
-    let emission_end = 2_000u64; let finalize_window = 500u64;
+    let emission_end = 2_000u64;
+    let finalize_window = 500u64;
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
-    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
-        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-    let d = rd_init_data(
-        supply, emission_end, 1_000, 1_000, 4_000, finalize_window, ins_pool, back_pool, market, &[], Some(fee_bps),
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
     );
-    send(svm, payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]).expect("rd init with fee");
+    let d = rd_init_data(
+        supply,
+        emission_end,
+        1_000,
+        1_000,
+        4_000,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        &[],
+        Some(fee_bps),
+    );
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .expect("rd init with fee");
     revoke_mint(svm, payer, &coin_mint, &mint_auth);
-    Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
 }
 
 // DoS PROBE (lamport-prefund front-run brick, sweep tick D): the rd creates its rd_config (and every stake) PDA
@@ -253,26 +785,74 @@ fn init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda() {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
 
     // ATTACK: a front-runner dusts the canonical rd_config PDA with lamports (system-owned, empty).
-    svm.set_account(rd_config, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        rd_config,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
-    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
-        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-    let d = rd_init_data(supply, 2_000, 1_000, 1_000, 4_000, 500, ins_pool, back_pool, market, &[], Some(0));
-    let r = send(&mut svm, &payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]);
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    );
+    let d = rd_init_data(
+        supply,
+        2_000,
+        1_000,
+        1_000,
+        4_000,
+        500,
+        ins_pool,
+        back_pool,
+        market,
+        &[],
+        Some(0),
+    );
+    let r = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    );
     assert!(r.is_ok(), "rd init must succeed despite a lamport-prefund of the config PDA (no front-run brick): {r:?}");
     revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
     // The config really got initialized (program-owned, sized), not left as the dusted system stub.
     let acc = svm.get_account(&rd_config).unwrap();
-    assert_eq!(acc.owner, rd_id(), "rd_config is now program-owned (robust create adopted the dusted PDA)");
+    assert_eq!(
+        acc.owner,
+        rd_id(),
+        "rd_config is now program-owned (robust create adopted the dusted PDA)"
+    );
 }
 
 #[test]
@@ -286,44 +866,128 @@ fn init_requires_current_coin_mint_authority_no_config_squat() {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
     let ins_pool = Pubkey::new_unique();
     let back_pool = Pubkey::new_unique();
     let market = Pubkey::new_unique();
-    let d = rd_init_data(supply, 2_000, 1_000, 1_000, 4_000, 500, ins_pool, back_pool, market, &[], Some(0));
+    let d = rd_init_data(
+        supply,
+        2_000,
+        1_000,
+        1_000,
+        4_000,
+        500,
+        ins_pool,
+        back_pool,
+        market,
+        &[],
+        Some(0),
+    );
 
-    let attacker = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: d.clone() }], &[]);
-    assert!(attacker.is_err(), "init without the current coin mint authority must not squat the canonical rd_config");
-    assert!(svm.get_account(&rd_config).is_none(), "rejected attacker init must not create rd_config");
+    let attacker = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new_readonly(dist_id(), false),
+                AccountMeta::new_readonly(dist_config, false),
+                AccountMeta::new_readonly(stub_perc, false),
+                AccountMeta::new_readonly(stub_sub, false),
+                AccountMeta::new(rd_config, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: d.clone(),
+        }],
+        &[],
+    );
+    assert!(
+        attacker.is_err(),
+        "init without the current coin mint authority must not squat the canonical rd_config"
+    );
+    assert!(
+        svm.get_account(&rd_config).is_none(),
+        "rejected attacker init must not create rd_config"
+    );
 
     let wrong_auth = Keypair::new();
-    let wrong = send(&mut svm, &payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, wrong_auth.pubkey()),
-        data: d.clone(),
-    }], &[&wrong_auth]);
-    assert!(wrong.is_err(), "a signer that is not the current coin mint authority must not initialize rd_config");
-    assert!(svm.get_account(&rd_config).is_none(), "wrong-authority init must not create rd_config");
+    let wrong = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                wrong_auth.pubkey(),
+            ),
+            data: d.clone(),
+        }],
+        &[&wrong_auth],
+    );
+    assert!(
+        wrong.is_err(),
+        "a signer that is not the current coin mint authority must not initialize rd_config"
+    );
+    assert!(
+        svm.get_account(&rd_config).is_none(),
+        "wrong-authority init must not create rd_config"
+    );
 
-    send(&mut svm, &payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d.clone(),
-    }], &[&mint_auth]).expect("the current mint authority can initialize");
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d.clone(),
+        }],
+        &[&mint_auth],
+    )
+    .expect("the current mint authority can initialize");
 
-    let later = send(&mut svm, &payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]);
-    assert!(later.is_err(), "after the legitimate init, rd_config remains one-shot");
+    let later = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    );
+    assert!(
+        later.is_err(),
+        "after the legitimate init, rd_config remains one-shot"
+    );
 }
 
 #[test]
@@ -336,19 +1000,47 @@ fn init_omitted_fee_uses_default_but_explicit_zero_remains_allowed() {
     let init_case = |svm: &mut LiteSVM, residual_fee_bps: Option<u16>| -> Pubkey {
         let mint_auth = Keypair::new();
         let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
-        let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+        let rd_config =
+            Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+        let dist_config = Pubkey::find_program_address(
+            &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+            &dist_id(),
+        )
+        .0;
         let stub_perc = Pubkey::new_unique();
         let stub_sub = Pubkey::new_unique();
         let d = rd_init_data(
-            1_000_000, 2_000, 1_000, 1_000, 4_000, 500,
-            Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), &[], residual_fee_bps,
+            1_000_000,
+            2_000,
+            1_000,
+            1_000,
+            4_000,
+            500,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            &[],
+            residual_fee_bps,
         );
-        send(svm, &payer, &[Instruction {
-            program_id: rd_id(),
-            accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-            data: d,
-        }], &[&mint_auth]).expect("rd init");
+        send(
+            svm,
+            &payer,
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: rd_init_accounts(
+                    payer.pubkey(),
+                    coin_mint,
+                    dist_config,
+                    stub_perc,
+                    stub_sub,
+                    rd_config,
+                    mint_auth.pubkey(),
+                ),
+                data: d,
+            }],
+            &[&mint_auth],
+        )
+        .expect("rd init");
         rd_config
     };
 
@@ -360,7 +1052,11 @@ fn init_omitted_fee_uses_default_but_explicit_zero_remains_allowed() {
     );
 
     let explicit_zero = init_case(&mut svm, Some(0));
-    assert_eq!(rd_config_fee_bps(&svm, explicit_zero), 0, "explicit 0% fee remains an intentional no-fee config");
+    assert_eq!(
+        rd_config_fee_bps(&svm, explicit_zero),
+        0,
+        "explicit 0% fee remains an intentional no-fee config"
+    );
 }
 
 // DoS PROBE (lamport-prefund of a VICTIM's stake PDA, sweep tick D): the rd_config test above pins the
@@ -379,39 +1075,122 @@ fn register_is_not_bricked_by_a_lamport_prefund_of_the_victims_stake_pda() {
 
     let victim = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &victim.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &victim.pubkey(),
+        0,
+        0,
+    );
 
     // ATTACK: dust the victim's deterministic stake PDA with 1 lamport before they register.
     let stake = stake_pda(&env, &victim.pubkey());
-    svm.set_account(stake, Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        stake,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     // The victim can STILL register (robust create adopts the dusted PDA) — their share is not denied.
-    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pf, COHORT_LP).expect("register must succeed over a lamport-prefunded stake PDA (no per-victim brick)");
-    assert_eq!(svm.get_account(&stake).unwrap().owner, rd_id(), "stake PDA adopted + program-owned despite the dust");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &victim,
+        &victim.pubkey(),
+        &pf,
+        COHORT_LP,
+    )
+    .expect("register must succeed over a lamport-prefunded stake PDA (no per-victim brick)");
+    assert_eq!(
+        svm.get_account(&stake).unwrap().owner,
+        rd_id(),
+        "stake PDA adopted + program-owned despite the dust"
+    );
 }
 
 // Like setup(), but configures the IL+ multi-market allow-list: `extras` are ADDITIONAL trusted-Pyth markets
 // (beyond the primary `market`) the LP/trader cohorts will also accept. Returns the Env (primary market).
-fn setup_with_extra_markets(svm: &mut LiteSVM, payer: &Keypair, supply: u64, extras: &[Pubkey]) -> Env {
-    let emission_end = 2_000u64; let finalize_window = 500u64;
+fn setup_with_extra_markets(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    extras: &[Pubkey],
+) -> Env {
+    let emission_end = 2_000u64;
+    let finalize_window = 500u64;
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
-    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
-        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
-    let d = rd_init_data(
-        supply, emission_end, 1_000, 1_000, 4_000, finalize_window, ins_pool, back_pool, market, extras, Some(0),
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
     );
-    send(svm, payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]).expect("rd init with extra markets");
+    let d = rd_init_data(
+        supply,
+        emission_end,
+        1_000,
+        1_000,
+        4_000,
+        finalize_window,
+        ins_pool,
+        back_pool,
+        market,
+        extras,
+        Some(0),
+    );
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .expect("rd init with extra markets");
     revoke_mint(svm, payer, &coin_mint, &mint_auth);
-    Env { rd_config, coin_mint, vault, mint_auth, stub_sub, stub_perc, ins_pool, back_pool, market, supply, emission_end, finalize_window }
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
 }
 
 // FREE-FARM PROBE (finding IL+ multi-market allow-list, sweep tick D): register_rejects_portfolio_from_a_foreign_market
@@ -431,22 +1210,78 @@ fn allow_list_accepts_a_listed_extra_market_and_still_rejects_an_off_list_market
     set_slot(&mut svm, 100);
 
     // (1) trader portfolio whose provenance is an allow-listed EXTRA market -> ACCEPTED.
-    let t1 = Keypair::new(); let pf1 = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf1, &env.stub_perc, &extra_b, &t1.pubkey(), 0, 9_000);
-    register(&mut svm, &payer, &env, &t1, &t1.pubkey(), &pf1, COHORT_TRADER).expect("an allow-listed extra market must be accepted");
+    let t1 = Keypair::new();
+    let pf1 = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &pf1,
+        &env.stub_perc,
+        &extra_b,
+        &t1.pubkey(),
+        0,
+        9_000,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &t1,
+        &t1.pubkey(),
+        &pf1,
+        COHORT_TRADER,
+    )
+    .expect("an allow-listed extra market must be accepted");
 
     // (2) trader portfolio from an OFF-list market (attacker's own auth-mark oracle) -> REJECTED, even with the
     // longer list. This is the free-farm boundary: no off-list market can mint trader/LP points.
-    let t2 = Keypair::new(); let pf2 = Pubkey::new_unique();
+    let t2 = Keypair::new();
+    let pf2 = Pubkey::new_unique();
     let off_list = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf2, &env.stub_perc, &off_list, &t2.pubkey(), 0, 9_000);
-    assert!(register(&mut svm, &payer, &env, &t2, &t2.pubkey(), &pf2, COHORT_TRADER).is_err(),
-        "an off-list (attacker-oracle'd) market must be rejected even when extras are configured");
+    set_portfolio(
+        &mut svm,
+        &pf2,
+        &env.stub_perc,
+        &off_list,
+        &t2.pubkey(),
+        0,
+        9_000,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &t2,
+            &t2.pubkey(),
+            &pf2,
+            COHORT_TRADER
+        )
+        .is_err(),
+        "an off-list (attacker-oracle'd) market must be rejected even when extras are configured"
+    );
 
     // (3) the PRIMARY market still counts (the extras didn't displace it).
-    let t3 = Keypair::new(); let pf3 = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf3, &env.stub_perc, &env.market, &t3.pubkey(), 0, 9_000);
-    register(&mut svm, &payer, &env, &t3, &t3.pubkey(), &pf3, COHORT_TRADER).expect("the primary market still counts");
+    let t3 = Keypair::new();
+    let pf3 = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &pf3,
+        &env.stub_perc,
+        &env.market,
+        &t3.pubkey(),
+        0,
+        9_000,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &t3,
+        &t3.pubkey(),
+        &pf3,
+        COHORT_TRADER,
+    )
+    .expect("the primary market still counts");
 }
 
 // DoS/HYGIENE PROBE (allow-list init bounds, sweep tick D): the extra-market tail is `count: u8` + count keys.
@@ -462,7 +1297,10 @@ fn init_rejects_a_malformed_or_overlong_extra_market_allow_list() {
     let over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[Pubkey::new_unique(); 10])
     }));
-    assert!(over.is_err(), "an allow-list of 10 extras (> MAX 9) must be rejected at init");
+    assert!(
+        over.is_err(),
+        "an allow-list of 10 extras (> MAX 9) must be rejected at init"
+    );
     // a default (zero) extra key is rejected.
     let zero = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[Pubkey::default()])
@@ -496,13 +1334,31 @@ fn anti_wash_fee_cannot_be_dust_dodged_by_fragmentation() {
     for _ in 0..n {
         let t = Keypair::new();
         let pf = Pubkey::new_unique();
-        set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0); // snap 0 at register
+        set_portfolio(
+            &mut svm,
+            &pf,
+            &env.stub_perc,
+            &env.market,
+            &t.pubkey(),
+            0,
+            0,
+        ); // snap 0 at register
         register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
-        set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 1_000); // equal crystallized loss
+        set_portfolio(
+            &mut svm,
+            &pf,
+            &env.stub_perc,
+            &env.market,
+            &t.pubkey(),
+            0,
+            1_000,
+        ); // equal crystallized loss
         traders.push((t, pf));
     }
     set_slot(&mut svm, 1_000); // tenure 900 -> floor(log2)=9 (uniform across all stakes)
-    for (t, pf) in &traders { crystallize(&mut svm, &payer, &env, t, pf).expect("cry"); }
+    for (t, pf) in &traders {
+        crystallize(&mut svm, &payer, &env, t, pf).expect("cry");
+    }
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
@@ -515,13 +1371,16 @@ fn anti_wash_fee_cannot_be_dust_dodged_by_fragmentation() {
     // trader cohort = 40; the INTENDED 20% fee on the aggregate is 8, so an un-dodgeable fee leaves <= 32 paid out.
     let trader_cohort = supply as u128 * 4_000 / 10_000; // 40
     let intended_fee = (trader_cohort * 2_000 / 10_000) as u64; // 8
-    // FRAGMENTATION DODGE GUARD: total paid out must NOT exceed cohort - intended_fee. A floor fee lets each
-    // 4-atom dust claim pay 0 -> total_payout = 40 > 32 (fee fully dodged). A ceil fee makes each pay >= 1 ->
-    // total_payout <= 32. Pin that fragmentation cannot dodge the anti-wash skim.
+                                                                // FRAGMENTATION DODGE GUARD: total paid out must NOT exceed cohort - intended_fee. A floor fee lets each
+                                                                // 4-atom dust claim pay 0 -> total_payout = 40 > 32 (fee fully dodged). A ceil fee makes each pay >= 1 ->
+                                                                // total_payout <= 32. Pin that fragmentation cannot dodge the anti-wash skim.
     assert!(total_payout <= trader_cohort as u64 - intended_fee,
         "anti-wash fee dust-dodged via fragmentation: {n} dust claims paid out {total_payout} of the {trader_cohort} trader cohort (intended fee {intended_fee} skimmed -> should leave <= {})", trader_cohort as u64 - intended_fee);
     // The dodged/retained fee stays locked in the vault (deflationary), never over-drawn.
-    assert!(total_payout as u128 <= trader_cohort, "conservation: never pays more than the cohort");
+    assert!(
+        total_payout as u128 <= trader_cohort,
+        "conservation: never pays more than the cohort"
+    );
 }
 
 #[test]
@@ -540,16 +1399,49 @@ fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
     // in the claim ratio, but it must be > 0).
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        9_000,
+        0,
+    );
     set_slot(&mut svm, 1_000); // tenure = 900 -> floor(log2) = 9 > 0
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
     // sole INSURANCE staker (share-value cohort -> NO fee, NOT time-weighted).
     let ins = Keypair::new();
     let ins_pos = Pubkey::new_unique();
-    set_position(&mut svm, &ins_pos, &env.stub_sub, &env.ins_pool, &ins.pubkey(), 500, false);
-    register(&mut svm, &payer, &env, &ins, &ins.pubkey(), &ins_pos, COHORT_INSURANCE).expect("reg ins");
+    set_position(
+        &mut svm,
+        &ins_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &ins.pubkey(),
+        500,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &ins,
+        &ins.pubkey(),
+        &ins_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg ins");
     crystallize(&mut svm, &payer, &env, &ins, &ins_pos).expect("cry ins");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -557,16 +1449,32 @@ fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
 
     let lp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
     claim(&mut svm, &payer, &env, &lp, &lp_ata, None).expect("lp claim");
-    assert_eq!(token_amount(&svm, &lp_ata), 320_000, "LP claims 80% of its 400_000 cohort — 20% anti-wash fee skimmed");
+    assert_eq!(
+        token_amount(&svm, &lp_ata),
+        320_000,
+        "LP claims 80% of its 400_000 cohort — 20% anti-wash fee skimmed"
+    );
 
     let ins_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &ins.pubkey());
     claim(&mut svm, &payer, &env, &ins, &ins_ata, Some(&ins_pos)).expect("ins claim");
-    assert_eq!(token_amount(&svm, &ins_ata), 100_000, "insurance (capital-at-risk) claims its FULL 100_000 — no fee");
+    assert_eq!(
+        token_amount(&svm, &ins_ata),
+        100_000,
+        "insurance (capital-at-risk) claims its FULL 100_000 — no fee"
+    );
 
     // The 80_000 LP fee is retained in the vault (locked, deflationary), not paid to the farmer.
     let paid_out = token_amount(&svm, &lp_ata) + token_amount(&svm, &ins_ata);
-    assert_eq!(vault_start - token_amount(&svm, &env.vault), paid_out, "vault drained only by what was paid out");
-    assert_eq!(token_amount(&svm, &env.vault), supply - 320_000 - 100_000, "the 80_000 fee + unclaimed cohorts stay locked in the vault");
+    assert_eq!(
+        vault_start - token_amount(&svm, &env.vault),
+        paid_out,
+        "vault drained only by what was paid out"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply - 320_000 - 100_000,
+        "the 80_000 fee + unclaimed cohorts stay locked in the vault"
+    );
 }
 
 // LIVENESS/NO-DILUTION PROBE (registered-but-never-crystallized stake, sweep tick D): a backer can register and
@@ -586,17 +1494,44 @@ fn a_registered_but_never_crystallized_stake_claims_zero_and_does_not_dilute_the
     set_slot(&mut svm, 100);
 
     // Staker A: registers AND crystallizes a real residual (points > 0).
-    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0);
+    let a = Keypair::new();
+    let a_pf = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_LP).expect("reg A");
-    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 9_000, 0);
+    set_portfolio(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        9_000,
+        0,
+    );
     set_slot(&mut svm, 1_000);
     crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A");
 
     // Staker B: registers in the SAME cohort but NEVER crystallizes — points stay 0.
-    let b = Keypair::new(); let b_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 0, 0);
-    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pf, COHORT_LP).expect("reg B (never crystallizes)");
+    let b = Keypair::new();
+    let b_pf = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &b_pf,
+        &env.stub_perc,
+        &env.market,
+        &b.pubkey(),
+        0,
+        0,
+    );
+    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pf, COHORT_LP)
+        .expect("reg B (never crystallizes)");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -604,12 +1539,20 @@ fn a_registered_but_never_crystallized_stake_claims_zero_and_does_not_dilute_the
     // A takes the FULL lp cohort — B's 0 points never entered the frozen denominator (no dilution).
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim");
-    assert_eq!(token_amount(&svm, &a_ata), 400_000, "the sole crystallized LP staker takes the full cohort — the idle stake did not dilute");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        400_000,
+        "the sole crystallized LP staker takes the full cohort — the idle stake did not dilute"
+    );
 
     // B's claim pays 0 gracefully — no panic, no div-by-zero, no brick of its own slot.
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &b, &b_ata, None).expect("B claim succeeds (pays 0)");
-    assert_eq!(token_amount(&svm, &b_ata), 0, "a registered-but-never-crystallized stake claims 0, gracefully");
+    assert_eq!(
+        token_amount(&svm, &b_ata),
+        0,
+        "a registered-but-never-crystallized stake claims 0, gracefully"
+    );
 }
 
 // FREE-FARM PROBE (finding NZ, sweep): the TRADER cohort is the PRIMARY delta-neutral wash surface, so the
@@ -629,10 +1572,26 @@ fn trader_cohort_claim_also_pays_the_anti_wash_fee() {
 
     let t = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
     // crystallized loss = 9_000 (received/spent 0 -> trader counter = crystallized - spent = 9_000).
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 9_000);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        9_000,
+    );
     set_slot(&mut svm, 1_000); // tenure > 0 for the time-weight
     crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry trader");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -641,7 +1600,11 @@ fn trader_cohort_claim_also_pays_the_anti_wash_fee() {
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
     claim(&mut svm, &payer, &env, &t, &ata, None).expect("trader claim");
     assert_eq!(token_amount(&svm, &ata), 320_000, "trader claims 80% of its 400_000 cohort — the 20% anti-wash fee IS skimmed (no fee-free trader farm)");
-    assert_eq!(token_amount(&svm, &env.vault), supply - 320_000, "the 80_000 trader fee is retained in the vault");
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply - 320_000,
+        "the 80_000 trader fee is retained in the vault"
+    );
 }
 
 // ANTI-WASH FEE AT THE 100% EXTREME (claim-layer graceful degradation): init accepts fee_support_bps == 10_000
@@ -663,9 +1626,25 @@ fn trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consume
 
     let t = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 9_000); // crystallized loss
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        9_000,
+    ); // crystallized loss
     set_slot(&mut svm, 1_000);
     crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry trader");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -673,12 +1652,28 @@ fn trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consume
 
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
     // The claim SUCCEEDS (no panic / no underflow) even though the entire payout is skimmed.
-    claim(&mut svm, &payer, &env, &t, &ata, None).expect("claim at 100% fee must succeed gracefully, not revert");
-    assert_eq!(token_amount(&svm, &ata), 0, "100% anti-wash fee -> the trader receives 0 (whole payout skimmed)");
-    assert_eq!(token_amount(&svm, &env.vault), supply, "the full payout is retained in the vault (deflationary) — nothing left it");
+    claim(&mut svm, &payer, &env, &t, &ata, None)
+        .expect("claim at 100% fee must succeed gracefully, not revert");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        0,
+        "100% anti-wash fee -> the trader receives 0 (whole payout skimmed)"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply,
+        "the full payout is retained in the vault (deflationary) — nothing left it"
+    );
     // The stake is consumed: a re-claim cannot retry to drain the vault even though the first claim paid 0.
-    assert!(claim(&mut svm, &payer, &env, &t, &ata, None).is_err(), "a zero-payout claim still consumes the stake — no re-claim retry");
-    assert_eq!(token_amount(&svm, &env.vault), supply, "vault still intact after the rejected re-claim");
+    assert!(
+        claim(&mut svm, &payer, &env, &t, &ata, None).is_err(),
+        "a zero-payout claim still consumes the stake — no re-claim retry"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply,
+        "vault still intact after the rejected re-claim"
+    );
 }
 
 // PERMISSIONLESS CRYSTALLIZE (LP/trader, sweep tick D): share_value_crystallize_cannot_be_forced_by_a_third_party
@@ -699,21 +1694,42 @@ fn lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_point
 
     let t = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 9_000);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        9_000,
+    );
     set_slot(&mut svm, 1_000);
 
     // A THIRD PARTY (not the stake owner) crystallizes the trader stake — permissionless (monotonic-safe).
     let cranker = Keypair::new();
-    crystallize_as(&mut svm, &payer, &env, &cranker, &t.pubkey(), &pf).expect("LP/trader crystallize is permissionless — any cranker may finalize");
+    crystallize_as(&mut svm, &payer, &env, &cranker, &t.pubkey(), &pf)
+        .expect("LP/trader crystallize is permissionless — any cranker may finalize");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
     // The third-party crystallize recorded the points, so the sole trader staker claims its full cohort.
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
     claim(&mut svm, &payer, &env, &t, &ata, None).expect("owner claim");
-    assert_eq!(token_amount(&svm, &ata), 400_000, "the third-party crystallize finalized the points; the sole trader claims its full cohort");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        400_000,
+        "the third-party crystallize finalized the points; the sole trader claims its full cohort"
+    );
 }
 
 // FREE-FARM PROBE (time-weight semantics, sweep): the log2(tenure) weight keys off `start_slot`, set at
@@ -739,23 +1755,73 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     let env = setup(&mut svm, &payer, supply); // no fee -> isolate the time-weight
 
     let r = 9_000u128; // IDENTICAL net residual for both stakers
-    // EARLY: register at slot 100 (residual-empty), manufacture R only at slot 10_000 -> tenure 9_900, log2=13.
+                       // EARLY: register at slot 100 (residual-empty), manufacture R only at slot 10_000 -> tenure 9_900, log2=13.
     let early = Keypair::new();
     let early_pf = Pubkey::new_unique();
     set_slot(&mut svm, 100);
-    set_portfolio(&mut svm, &early_pf, &env.stub_perc, &env.market, &early.pubkey(), 0, 0);
-    register(&mut svm, &payer, &env, &early, &early.pubkey(), &early_pf, COHORT_TRADER).expect("reg early");
+    set_portfolio(
+        &mut svm,
+        &early_pf,
+        &env.stub_perc,
+        &env.market,
+        &early.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &early,
+        &early.pubkey(),
+        &early_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg early");
     // LATE: register at slot 9_000 -> crystallize at 10_000 gives tenure 1_000, log2=9 (same R).
     let late = Keypair::new();
     let late_pf = Pubkey::new_unique();
     set_slot(&mut svm, 9_000);
-    set_portfolio(&mut svm, &late_pf, &env.stub_perc, &env.market, &late.pubkey(), 0, 0);
-    register(&mut svm, &payer, &env, &late, &late.pubkey(), &late_pf, COHORT_TRADER).expect("reg late");
+    set_portfolio(
+        &mut svm,
+        &late_pf,
+        &env.stub_perc,
+        &env.market,
+        &late.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &late,
+        &late.pubkey(),
+        &late_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg late");
 
     // Both manufacture the SAME loss at the SAME slot, then crystallize together.
     set_slot(&mut svm, 10_000);
-    set_portfolio(&mut svm, &early_pf, &env.stub_perc, &env.market, &early.pubkey(), 0, r);
-    set_portfolio(&mut svm, &late_pf, &env.stub_perc, &env.market, &late.pubkey(), 0, r);
+    set_portfolio(
+        &mut svm,
+        &early_pf,
+        &env.stub_perc,
+        &env.market,
+        &early.pubkey(),
+        0,
+        r,
+    );
+    set_portfolio(
+        &mut svm,
+        &late_pf,
+        &env.stub_perc,
+        &env.market,
+        &late.pubkey(),
+        0,
+        r,
+    );
     crystallize(&mut svm, &payer, &env, &early, &early_pf).expect("cry early");
     crystallize(&mut svm, &payer, &env, &late, &late_pf).expect("cry late");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -769,14 +1835,32 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     // points: early = 13*9_000 = 117_000, late = 9*9_000 = 81_000; denom = 198_000; cohort = 400_000.
     let early_paid = token_amount(&svm, &early_ata);
     let late_paid = token_amount(&svm, &late_ata);
-    assert_eq!(early_paid, 400_000u64 * 117_000 / 198_000, "early registrant captures the log2(9_900)=13 multiplier");
-    assert_eq!(late_paid, 400_000u64 * 81_000 / 198_000, "late registrant only gets log2(1_000)=9 on the SAME residual");
+    assert_eq!(
+        early_paid,
+        400_000u64 * 117_000 / 198_000,
+        "early registrant captures the log2(9_900)=13 multiplier"
+    );
+    assert_eq!(
+        late_paid,
+        400_000u64 * 81_000 / 198_000,
+        "late registrant only gets log2(1_000)=9 on the SAME residual"
+    );
     // The pin: SAME residual, different registration -> early over-captures (~59% vs ~41%). The weight rewards
     // stake-tenure, not how long the loss was held; the bound is the cost to manufacture R, not the multiplier.
-    assert!(early_paid > late_paid, "pre-registration over-captures vs a late registrant with identical residual");
+    assert!(
+        early_paid > late_paid,
+        "pre-registration over-captures vs a late registrant with identical residual"
+    );
     // Conserved: the two split the whole cohort up to 1 atom of independent-floor rounding dust (stays locked).
-    assert_eq!(early_paid + late_paid, 399_999, "cohort fully shared between the two minus 1-atom floor dust");
-    assert!(400_000 - (early_paid + late_paid) <= 1, "at most 1 atom of rounding dust stays locked in the vault");
+    assert_eq!(
+        early_paid + late_paid,
+        399_999,
+        "cohort fully shared between the two minus 1-atom floor dust"
+    );
+    assert!(
+        400_000 - (early_paid + late_paid) <= 1,
+        "at most 1 atom of rounding dust stays locked in the vault"
+    );
 }
 
 // TIME-WEIGHT FLOOR (floor_log2(tenure) boundary): points = floor_log2(now - start_slot) * netΔ, and
@@ -798,17 +1882,49 @@ fn time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2
     // Both register at slot 100 (snap 0), same cohort, IDENTICAL residual.
     let (a, a_pf) = (Keypair::new(), Pubkey::new_unique());
     let (b, b_pf) = (Keypair::new(), Pubkey::new_unique());
-    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0);
-    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        0,
+    );
+    set_portfolio(
+        &mut svm,
+        &b_pf,
+        &env.stub_perc,
+        &env.market,
+        &b.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_LP).expect("reg A");
     register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pf, COHORT_LP).expect("reg B");
 
     // A crystallizes at tenure 1 (slot 101) -> floor_log2(1) = 0 -> 0 points.
-    set_portfolio(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 9_000, 0);
+    set_portfolio(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        9_000,
+        0,
+    );
     set_slot(&mut svm, 101);
     crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A at tenure 1");
     // B crystallizes at tenure 2 (slot 102) -> floor_log2(2) = 1 -> 9_000 points.
-    set_portfolio(&mut svm, &b_pf, &env.stub_perc, &env.market, &b.pubkey(), 9_000, 0);
+    set_portfolio(
+        &mut svm,
+        &b_pf,
+        &env.stub_perc,
+        &env.market,
+        &b.pubkey(),
+        9_000,
+        0,
+    );
     set_slot(&mut svm, 102);
     crystallize(&mut svm, &payer, &env, &b, &b_pf).expect("cry B at tenure 2");
 
@@ -819,7 +1935,11 @@ fn time_weight_floor_tenure_below_2_crystallizes_zero_points_first_positive_at_2
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim (succeeds, pays 0)");
     claim(&mut svm, &payer, &env, &b, &b_ata, None).expect("B claim");
-    assert_eq!(token_amount(&svm, &a_ata), 0, "tenure-1 stake earns 0 points (floor_log2(1)=0) -> claims nothing");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        0,
+        "tenure-1 stake earns 0 points (floor_log2(1)=0) -> claims nothing"
+    );
     assert_eq!(token_amount(&svm, &b_ata), 400_000, "tenure-2 stake takes the WHOLE LP cohort — the tenure-1 stake did not dilute the denominator");
 }
 
@@ -846,16 +1966,61 @@ fn churn_zeroes_a_trader_via_spent_netting_but_lp_received_is_bounded_only_by_th
     set_slot(&mut svm, 100);
 
     // A TRADER and an LP staker, each on a fresh empty portfolio (register-time snap = 0).
-    let t = Keypair::new(); let t_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &t_pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0);
-    register(&mut svm, &payer, &env, &t, &t.pubkey(), &t_pf, COHORT_TRADER).expect("reg trader");
-    let l = Keypair::new(); let l_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &l_pf, &env.stub_perc, &env.market, &l.pubkey(), 0, 0);
+    let t = Keypair::new();
+    let t_pf = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &t_pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &t,
+        &t.pubkey(),
+        &t_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg trader");
+    let l = Keypair::new();
+    let l_pf = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &l_pf,
+        &env.stub_perc,
+        &env.market,
+        &l.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &l, &l.pubkey(), &l_pf, COHORT_LP).expect("reg lp");
 
     // The IDENTICAL fully-churned wash counters on both: crystallized 10_000 FULLY spent (net 0), received 10_000.
-    set_portfolio_full(&mut svm, &t_pf, &env.stub_perc, &env.market, &t.pubkey(), 10_000, 10_000, 10_000);
-    set_portfolio_full(&mut svm, &l_pf, &env.stub_perc, &env.market, &l.pubkey(), 10_000, 10_000, 10_000);
+    set_portfolio_full(
+        &mut svm,
+        &t_pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        10_000,
+        10_000,
+        10_000,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &l_pf,
+        &env.stub_perc,
+        &env.market,
+        &l.pubkey(),
+        10_000,
+        10_000,
+        10_000,
+    );
     set_slot(&mut svm, 1_000); // tenure > 0
     crystallize(&mut svm, &payer, &env, &t, &t_pf).expect("cry trader");
     crystallize(&mut svm, &payer, &env, &l, &l_pf).expect("cry lp");
@@ -865,7 +2030,11 @@ fn churn_zeroes_a_trader_via_spent_netting_but_lp_received_is_bounded_only_by_th
     // TRADER: counter = crystallized - spent = 0 -> 0 points -> claims NOTHING. Churn defeated by net-by-spent.
     let t_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
     claim(&mut svm, &payer, &env, &t, &t_ata, None).expect("trader claim (zero)");
-    assert_eq!(token_amount(&svm, &t_ata), 0, "a fully-churned trader nets to 0 — spent-netting kills trader churn");
+    assert_eq!(
+        token_amount(&svm, &t_ata),
+        0,
+        "a fully-churned trader nets to 0 — spent-netting kills trader churn"
+    );
 
     // LP: counter = received = 10_000 (spent is irrelevant to it) -> full points -> claims the WHOLE lp cohort
     // minus only the 20% anti-wash fee. The SAME churn that zeroed the trader does NOTHING to the LP cohort.
@@ -889,88 +2058,2209 @@ fn init_rejects_an_anti_wash_fee_above_100pct_no_claim_underflow_dos() {
     let try_fee = |svm: &mut LiteSVM, fee_bps: u16| -> Result<(), String> {
         let mint_auth = Keypair::new();
         let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
-        let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+        let rd_config =
+            Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+        let dist_config = Pubkey::find_program_address(
+            &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+            &dist_id(),
+        )
+        .0;
         let stub_perc = Pubkey::new_unique();
         let stub_sub = Pubkey::new_unique();
         let d = rd_init_data(
-            1_000_000, 2_000, 1_000, 1_000, 4_000, 500,
-            Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), &[], Some(fee_bps),
+            1_000_000,
+            2_000,
+            1_000,
+            1_000,
+            4_000,
+            500,
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            &[],
+            Some(fee_bps),
         );
-        send(svm, &payer, &[Instruction {
-            program_id: rd_id(),
-            accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-            data: d,
-        }], &[&mint_auth])
+        send(
+            svm,
+            &payer,
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: rd_init_accounts(
+                    payer.pubkey(),
+                    coin_mint,
+                    dist_config,
+                    stub_perc,
+                    stub_sub,
+                    rd_config,
+                    mint_auth.pubkey(),
+                ),
+                data: d,
+            }],
+            &[&mint_auth],
+        )
     };
     // fee > 100% -> rejected (else `payout = amount - fee` underflows -> permanent claim revert = fund freeze).
-    assert!(try_fee(&mut svm, 10_001).is_err(), "anti-wash fee > 100% must be rejected (claim-underflow DoS)");
-    assert!(try_fee(&mut svm, u16::MAX).is_err(), "a max-u16 fee is rejected");
+    assert!(
+        try_fee(&mut svm, 10_001).is_err(),
+        "anti-wash fee > 100% must be rejected (claim-underflow DoS)"
+    );
+    assert!(
+        try_fee(&mut svm, u16::MAX).is_err(),
+        "a max-u16 fee is rejected"
+    );
     // fee == 100% -> accepted boundary (everything skimmed, payout 0, no underflow); fee 0 -> accepted.
     try_fee(&mut svm, 10_000).expect("exactly 100% is the inclusive boundary");
     try_fee(&mut svm, 0).expect("0% (no fee) accepted");
 }
 
 fn stake_pda(env: &Env, owner: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"rd_stake", env.rd_config.as_ref(), owner.as_ref()], &rd_id()).0
+    Pubkey::find_program_address(
+        &[b"rd_stake", env.rd_config.as_ref(), owner.as_ref()],
+        &rd_id(),
+    )
+    .0
 }
-fn register(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Keypair, recipient: &Pubkey, linked: &Pubkey, cohort: u8) -> Result<(), String> {
+fn register(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    owner: &Keypair,
+    recipient: &Pubkey,
+    linked: &Pubkey,
+    cohort: u8,
+) -> Result<(), String> {
     let stake = stake_pda(env, &owner.pubkey());
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.rd_config, false),
-        AccountMeta::new_readonly(owner.pubkey(), true), AccountMeta::new_readonly(*recipient, false),
-        AccountMeta::new_readonly(*linked, false), AccountMeta::new(stake, false),
-        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ], data: vec![1u8, cohort] }], &[owner])
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(env.rd_config, false),
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new_readonly(*recipient, false),
+                AccountMeta::new_readonly(*linked, false),
+                AccountMeta::new(stake, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: vec![1u8, cohort],
+        }],
+        &[owner],
+    )
 }
 // `cranker` triggers crystallize (first account, must sign). Share-value cohorts (insurance/backing)
 // require it to be the stake owner (finding KO); LP/trader accept any cranker.
-fn crystallize_as(svm: &mut LiteSVM, payer: &Keypair, env: &Env, cranker: &Keypair, owner: &Pubkey, linked: &Pubkey) -> Result<(), String> {
+fn crystallize_as(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    cranker: &Keypair,
+    owner: &Pubkey,
+    linked: &Pubkey,
+) -> Result<(), String> {
     let stake = stake_pda(env, owner);
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new(env.rd_config, false),
-        AccountMeta::new(stake, false), AccountMeta::new_readonly(*linked, false),
-    ], data: vec![2u8] }], &[cranker])
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(cranker.pubkey(), true),
+                AccountMeta::new(env.rd_config, false),
+                AccountMeta::new(stake, false),
+                AccountMeta::new_readonly(*linked, false),
+            ],
+            data: vec![2u8],
+        }],
+        &[cranker],
+    )
 }
 // Default crystallize: the owner authorizes their own (valid for every cohort).
-fn crystallize(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Keypair, linked: &Pubkey) -> Result<(), String> {
+fn crystallize(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    owner: &Keypair,
+    linked: &Pubkey,
+) -> Result<(), String> {
     crystallize_as(svm, payer, env, owner, &owner.pubkey(), linked)
 }
 fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(env.rd_config, false),
-        AccountMeta::new_readonly(env.coin_mint, false), AccountMeta::new(env.vault, false),
-    ], data: vec![4u8] }], &[])
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(env.rd_config, false),
+                AccountMeta::new_readonly(env.coin_mint, false),
+                AccountMeta::new(env.vault, false),
+            ],
+            data: vec![4u8],
+        }],
+        &[],
+    )
 }
-// claim: insurance/backing append the live subledger position (for the live-share cap); LP/trader don't.
+// claim: insurance/backing append the live subledger position (for the live-share cap); LP/trader append
+// the live portfolio (for the residual live cap). Funding-payer claims are frozen-counter only and do not
+// require the Percolator portfolio at claim time; extra accounts are ignored.
 // `cranker` is the claim trigger (first account, must sign). Share-value cohorts (insurance/backing)
-// require it to be the stake owner (finding KM); LP/trader accept any cranker. The helper takes the
+// require it to be the stake owner (finding KM); portfolio-flow cohorts accept any cranker. The helper takes the
 // cranker keypair explicitly so tests can model both the owner's own claim and a foreign forced claim.
-fn claim_as(svm: &mut LiteSVM, payer: &Keypair, env: &Env, cranker: &Keypair, owner: &Pubkey, recipient_ata: &Pubkey, position: Option<&Pubkey>) -> Result<(), String> {
+fn claim_as(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    cranker: &Keypair,
+    owner: &Pubkey,
+    recipient_ata: &Pubkey,
+    position: Option<&Pubkey>,
+) -> Result<(), String> {
     let stake = stake_pda(env, owner);
     // The bound linked account is now REQUIRED at claim for EVERY cohort (share-value: the subledger position;
     // LP/trader: the percolator portfolio — both == stake.backing_ledger). Use the explicit (possibly decoy)
     // account if a test gives one; otherwise derive it from the stake's recorded backing_ledger (offset 72..104).
     let linked = position.copied().unwrap_or_else(|| {
-        svm.get_account(&stake).filter(|a| a.data.len() >= 104)
+        svm.get_account(&stake)
+            .filter(|a| a.data.len() >= 104)
             .map(|a| Pubkey::new_from_array(a.data[72..104].try_into().unwrap()))
             .unwrap_or(*recipient_ata)
     });
     let accounts = vec![
-        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new_readonly(env.rd_config, false),
-        AccountMeta::new(stake, false), AccountMeta::new(env.vault, false),
-        AccountMeta::new(*recipient_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(cranker.pubkey(), true),
+        AccountMeta::new_readonly(env.rd_config, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new(*recipient_ata, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(linked, false),
     ];
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts, data: vec![5u8] }], &[cranker])
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts,
+            data: vec![5u8],
+        }],
+        &[cranker],
+    )
 }
 // Default claim: the owner authorizes their own claim (valid for every cohort).
-fn claim(svm: &mut LiteSVM, payer: &Keypair, env: &Env, owner: &Keypair, recipient_ata: &Pubkey, position: Option<&Pubkey>) -> Result<(), String> {
-    claim_as(svm, payer, env, owner, &owner.pubkey(), recipient_ata, position)
+fn claim(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    owner: &Keypair,
+    recipient_ata: &Pubkey,
+    position: Option<&Pubkey>,
+) -> Result<(), String> {
+    claim_as(
+        svm,
+        payer,
+        env,
+        owner,
+        &owner.pubkey(),
+        recipient_ata,
+        position,
+    )
+}
+fn claim_without_linked(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    owner: &Keypair,
+    recipient_ata: &Pubkey,
+) -> Result<(), String> {
+    let stake = stake_pda(env, &owner.pubkey());
+    let accounts = vec![
+        AccountMeta::new(owner.pubkey(), true),
+        AccountMeta::new_readonly(env.rd_config, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new(*recipient_ata, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts,
+            data: vec![5u8],
+        }],
+        &[owner],
+    )
 }
 
-// HEADLINE: all four cohorts in one genesis, one staker each -> each claims its full cohort_supply
-// (10/10/40/40). Insurance/backing from subledger share value; LP/trader from portfolio residual counters.
+#[test]
+fn funding_payer_points_go_to_paid_side_not_received_side() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup_funding_payer_only(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let long_payer = Keypair::new();
+    let long_receiver = Keypair::new();
+    let short_payer = Keypair::new();
+    let short_receiver = Keypair::new();
+    let lp_pf = Pubkey::new_unique();
+    let lr_pf = Pubkey::new_unique();
+    let sp_pf = Pubkey::new_unique();
+    let sr_pf = Pubkey::new_unique();
+
+    for (owner, pf, cohort) in [
+        (&long_payer, &lp_pf, COHORT_FUNDING_PAYER),
+        (&long_receiver, &lr_pf, COHORT_FUNDING_PAYER),
+        (&short_payer, &sp_pf, COHORT_FUNDING_PAYER),
+        (&short_receiver, &sr_pf, COHORT_FUNDING_PAYER),
+    ] {
+        set_portfolio_funding(
+            &mut svm,
+            pf,
+            &env.stub_perc,
+            &env.market,
+            &owner.pubkey(),
+            0,
+            0,
+            0,
+            0,
+        );
+        register(&mut svm, &payer, &env, owner, &owner.pubkey(), pf, cohort)
+            .expect("register funding stake");
+    }
+
+    set_slot(&mut svm, 1_000);
+    // Long side: receiver-only activity must NOT earn funding-payer points; paid activity earns.
+    set_portfolio_funding(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &long_payer.pubkey(),
+        10_000,
+        50_000,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &lr_pf,
+        &env.stub_perc,
+        &env.market,
+        &long_receiver.pubkey(),
+        0,
+        50_000,
+        0,
+        0,
+    );
+    // Short side: receiver-only activity must NOT earn funding-payer points; paid activity earns.
+    set_portfolio_funding(
+        &mut svm,
+        &sp_pf,
+        &env.stub_perc,
+        &env.market,
+        &short_payer.pubkey(),
+        0,
+        0,
+        10_000,
+        40_000,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &sr_pf,
+        &env.stub_perc,
+        &env.market,
+        &short_receiver.pubkey(),
+        0,
+        0,
+        0,
+        40_000,
+    );
+
+    crystallize(&mut svm, &payer, &env, &long_payer, &lp_pf).expect("crystallize long payer");
+    crystallize(&mut svm, &payer, &env, &long_receiver, &lr_pf).expect("crystallize long receiver");
+    crystallize(&mut svm, &payer, &env, &short_payer, &sp_pf).expect("crystallize short payer");
+    crystallize(&mut svm, &payer, &env, &short_receiver, &sr_pf)
+        .expect("crystallize short receiver");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let lp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &long_payer.pubkey());
+    let lr_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &long_receiver.pubkey());
+    let sp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &short_payer.pubkey());
+    let sr_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &short_receiver.pubkey());
+    claim(&mut svm, &payer, &env, &long_payer, &lp_ata, None).expect("long payer claim");
+    claim(&mut svm, &payer, &env, &long_receiver, &lr_ata, None).expect("long receiver claim");
+    claim(&mut svm, &payer, &env, &short_payer, &sp_ata, None).expect("short payer claim");
+    claim(&mut svm, &payer, &env, &short_receiver, &sr_ata, None).expect("short receiver claim");
+
+    assert_eq!(
+        token_amount(&svm, &lp_ata),
+        500_000,
+        "funding-payer cohort rewards funding_long_paid, not funding_long_received"
+    );
+    assert_eq!(
+        token_amount(&svm, &lr_ata),
+        0,
+        "long receiver-only account gets no payer points"
+    );
+    assert_eq!(
+        token_amount(&svm, &sp_ata),
+        500_000,
+        "funding-payer cohort rewards funding_short_paid, not funding_short_received"
+    );
+    assert_eq!(
+        token_amount(&svm, &sr_ata),
+        0,
+        "short receiver-only account gets no payer points"
+    );
+}
+
+// FREE-FARM COST PROBE (funding-payer cohort): the anti-wash fee must apply to OI/funding farming exactly
+// like LP/trader residual farming. Otherwise a delta-neutral pair could farm the funding-payer supply slice
+// without paying the DAO fee that is supposed to be the Sybil-flat economic bound. Pins both paid-side flows
+// inside the cumulative funding-payer cohort.
+#[test]
+fn funding_payer_claims_pay_the_anti_wash_fee_for_both_sides() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // funding-payer = 1_000_000
+    let env = setup_funding_payer_only_with_fee(&mut svm, &payer, supply, 2_000); // 20% fee
+    set_slot(&mut svm, 100);
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    let long_pf = Pubkey::new_unique();
+    let short_pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &long_pf,
+        &env.stub_perc,
+        &env.market,
+        &long.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &short_pf,
+        &env.stub_perc,
+        &env.market,
+        &short.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &long,
+        &long.pubkey(),
+        &long_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg long payer");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &short,
+        &short.pubkey(),
+        &short_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg short payer");
+
+    set_slot(&mut svm, 1_000);
+    set_portfolio_funding(
+        &mut svm,
+        &long_pf,
+        &env.stub_perc,
+        &env.market,
+        &long.pubkey(),
+        10_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &short_pf,
+        &env.stub_perc,
+        &env.market,
+        &short.pubkey(),
+        0,
+        0,
+        10_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &long, &long_pf).expect("cry long payer");
+    crystallize(&mut svm, &payer, &env, &short, &short_pf).expect("cry short payer");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let long_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &long.pubkey());
+    let short_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &short.pubkey());
+    claim(&mut svm, &payer, &env, &long, &long_ata, None).expect("long claim");
+    claim(&mut svm, &payer, &env, &short, &short_ata, None).expect("short claim");
+
+    assert_eq!(
+        token_amount(&svm, &long_ata),
+        400_000,
+        "long-paid funding gets 80% of its 500k pro-rata share after fee"
+    );
+    assert_eq!(
+        token_amount(&svm, &short_ata),
+        400_000,
+        "short-paid funding gets 80% of its 500k pro-rata share after fee"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        200_000,
+        "both 100k OI-farming fees stay retained in the vault"
+    );
+}
+
+// FREE-FARM PROBE (funding-payer market scope): funding-paid counters from an attacker-controlled market must
+// not register. This is the OI/funding counterpart to the LP/trader foreign-market allow-list tests.
+#[test]
+fn funding_payer_register_rejects_portfolios_from_foreign_markets() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let attacker = Keypair::new();
+    let foreign = Pubkey::new_unique();
+    let evil_long = Pubkey::new_unique();
+    let evil_short = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &evil_long,
+        &env.stub_perc,
+        &foreign,
+        &attacker.pubkey(),
+        9_000_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &evil_short,
+        &env.stub_perc,
+        &foreign,
+        &attacker.pubkey(),
+        0,
+        0,
+        9_000_000,
+        0,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &evil_long,
+            COHORT_FUNDING_PAYER
+        )
+        .is_err(),
+        "funding-payer cohort rejects long-paid counters from a foreign market"
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &evil_short,
+            COHORT_FUNDING_PAYER
+        )
+        .is_err(),
+        "funding-payer cohort rejects short-paid counters from a foreign market"
+    );
+
+    let good = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &good,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &good,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("the same owner can register a portfolio from the allow-listed market");
+}
+
+// COVERAGE PROBE (funding-payer extra market allow-list): the funding-payer cohort uses the same market
+// allow-list branch as LP/trader, but the OI-farming path must also accept vetted non-primary markets.
+#[test]
+fn funding_payer_accepts_extra_allowlisted_market_and_rejects_off_list_market() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let extra_market = Pubkey::new_unique();
+    let env = setup_funding_payer_only_with_fee_and_extras(
+        &mut svm,
+        &payer,
+        1_000_000,
+        0,
+        &[extra_market],
+    );
+    set_slot(&mut svm, 100);
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    let off_list = Keypair::new();
+    let long_pf = Pubkey::new_unique();
+    let short_pf = Pubkey::new_unique();
+    let off_list_pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &long_pf,
+        &env.stub_perc,
+        &extra_market,
+        &long.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &short_pf,
+        &env.stub_perc,
+        &extra_market,
+        &short.pubkey(),
+        0,
+        0,
+        1_000,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &off_list_pf,
+        &env.stub_perc,
+        &Pubkey::new_unique(),
+        &off_list.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &long,
+        &long.pubkey(),
+        &long_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("funding-payer accepts long-paid counters from an extra allow-listed market");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &short,
+        &short.pubkey(),
+        &short_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("funding-payer accepts short-paid counters from an extra allow-listed market");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &off_list,
+            &off_list.pubkey(),
+            &off_list_pf,
+            COHORT_FUNDING_PAYER
+        )
+        .is_err(),
+        "off-list funding-payer market still rejects"
+    );
+}
+
+// ATTACK PROBE (funding-payer denominator inflation via substituted crystallize portfolio): funding-payer
+// crystallize mutates the cohort denominator, so it must bind the portfolio to the one registered at start.
+#[test]
+fn funding_payer_crystallize_rejects_a_substituted_portfolio_no_denominator_inflation() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000); // funding-payer cohort = 1_000_000
+    set_slot(&mut svm, 100);
+
+    let attacker = Keypair::new();
+    let honest = Keypair::new();
+    let attacker_pf = Pubkey::new_unique();
+    let honest_pf = Pubkey::new_unique();
+    let decoy_pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &attacker_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg attacker");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &honest,
+        &honest.pubkey(),
+        &honest_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg honest");
+
+    set_slot(&mut svm, 1_124); // tenure 1024 -> floor_log2 = 10
+    set_portfolio_funding(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &decoy_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        99_999,
+        0,
+        0,
+        0,
+    );
+    assert!(crystallize(&mut svm, &payer, &env, &attacker, &decoy_pf).is_err(),
+        "a substituted funding portfolio is rejected before it can inflate the funding-payer denominator");
+
+    crystallize(&mut svm, &payer, &env, &attacker, &attacker_pf)
+        .expect("attacker bound crystallize");
+    crystallize(&mut svm, &payer, &env, &honest, &honest_pf).expect("honest crystallize");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let attacker_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &attacker.pubkey());
+    let honest_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &honest.pubkey());
+    claim(&mut svm, &payer, &env, &attacker, &attacker_ata, None).expect("attacker claim");
+    claim(&mut svm, &payer, &env, &honest, &honest_ata, None).expect("honest claim");
+    assert_eq!(
+        token_amount(&svm, &attacker_ata),
+        500_000,
+        "attacker gets only its honest half of the funding-payer cohort"
+    );
+    assert_eq!(
+        token_amount(&svm, &honest_ata),
+        500_000,
+        "honest claim is not diluted by a decoy high counter"
+    );
+}
+
+// ATTACK PROBE (same-key portfolio reuse): Percolator `ClosePortfolio` dematerializes a flat portfolio and
+// `InitPortfolio` can later write fresh owner/market provenance into an uninitialized account at the same key.
+// The funding-payer stake binds the portfolio KEY at register, but crystallize is where the denominator is
+// updated. So crystallize must re-check the registered key still has the registered owner and an allow-listed
+// market; otherwise a user can register a clean key, reinitialize that same key against an attacker-controlled
+// market or owner, and mint long/short funding points into this genesis.
+#[test]
+fn funding_payer_crystallize_rejects_same_key_reinitialized_owner_or_market() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let attacker = Keypair::new();
+    let honest = Keypair::new();
+    let attacker_pf = Pubkey::new_unique();
+    let honest_pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &attacker_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register attacker funding payer");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &honest,
+        &honest.pubkey(),
+        &honest_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register honest funding payer");
+
+    set_slot(&mut svm, 1_124);
+    let foreign_market = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &foreign_market,
+        &attacker.pubkey(),
+        99_999,
+        0,
+        0,
+        0,
+    );
+    assert!(
+        crystallize(&mut svm, &payer, &env, &attacker, &attacker_pf).is_err(),
+        "same portfolio key reinitialized to a foreign market must not mint funding-payer points"
+    );
+
+    let foreign_owner = Keypair::new();
+    set_portfolio_funding(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &env.market,
+        &foreign_owner.pubkey(),
+        99_999,
+        0,
+        0,
+        0,
+    );
+    assert!(
+        crystallize(&mut svm, &payer, &env, &attacker, &attacker_pf).is_err(),
+        "same portfolio key reinitialized to a foreign owner must not mint funding-payer points"
+    );
+
+    set_portfolio_funding(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &attacker, &attacker_pf)
+        .expect("attacker valid crystallize");
+    crystallize(&mut svm, &payer, &env, &honest, &honest_pf).expect("honest crystallize");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let attacker_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &attacker.pubkey());
+    let honest_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &honest.pubkey());
+    claim(&mut svm, &payer, &env, &attacker, &attacker_ata, None).expect("attacker claim");
+    claim(&mut svm, &payer, &env, &honest, &honest_ata, None).expect("honest claim");
+    assert_eq!(
+        token_amount(&svm, &attacker_ata),
+        500_000,
+        "attacker only receives its valid same-market/owner half"
+    );
+    assert_eq!(
+        token_amount(&svm, &honest_ata),
+        500_000,
+        "honest denominator is not diluted by same-key reuse attempts"
+    );
+}
+
+// LIFECYCLE PROBE (funding-payer claim after portfolio cleanup): paid-funding counters are monotonic and points
+// are frozen at crystallize/freeze, so the claim must not require the Percolator portfolio to still exist. Users
+// can close flat portfolios before claiming; requiring the account here strands otherwise valid COIN.
+#[test]
+fn funding_payer_claim_does_not_require_portfolio_after_freeze() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let farmer = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &farmer.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer.pubkey(),
+        &pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg funding payer");
+    set_slot(&mut svm, 1_000);
+    set_portfolio_funding(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &farmer.pubkey(),
+        5_000,
+        0,
+        0,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &farmer, &pf).expect("cry long payer");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &farmer.pubkey());
+
+    svm.set_account(
+        pf,
+        Account {
+            lamports: 0,
+            data: Vec::new(),
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    claim_without_linked(&mut svm, &payer, &env, &farmer, &ata)
+        .expect("funding-payer claim after portfolio cleanup");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        1_000_000,
+        "frozen funding-payer points remain claimable after portfolio cleanup"
+    );
+}
+
+// PAY-UP PROBE (funding-payer claim one-sided live cap): if paid funding grows after the last crystallize,
+// claim must not pay the higher live counter against the frozen denominator. Extra funding needs a re-crystallize
+// before freeze; otherwise it stays out of both numerator and denominator.
+#[test]
+fn funding_payer_claim_never_pays_above_frozen_points_when_live_counter_grows_without_recrystallize(
+) {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000); // funding-payer cohort = 1_000_000
+    set_slot(&mut svm, 100);
+
+    let honest = Keypair::new();
+    let grower = Keypair::new();
+    let honest_pf = Pubkey::new_unique();
+    let grower_pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &grower_pf,
+        &env.stub_perc,
+        &env.market,
+        &grower.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &honest,
+        &honest.pubkey(),
+        &honest_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg honest");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &grower,
+        &grower.pubkey(),
+        &grower_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("reg grower");
+
+    set_slot(&mut svm, 1_124); // tenure 1024 -> floor_log2 = 10
+    set_portfolio_funding(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &grower_pf,
+        &env.stub_perc,
+        &env.market,
+        &grower.pubkey(),
+        1_000,
+        0,
+        0,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &honest, &honest_pf).expect("honest crystallize");
+    crystallize(&mut svm, &payer, &env, &grower, &grower_pf).expect("grower crystallize");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    set_portfolio_funding(
+        &mut svm,
+        &grower_pf,
+        &env.stub_perc,
+        &env.market,
+        &grower.pubkey(),
+        100_000,
+        0,
+        0,
+        0,
+    );
+
+    let honest_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &honest.pubkey());
+    let grower_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &grower.pubkey());
+    claim(&mut svm, &payer, &env, &honest, &honest_ata, None).expect("honest claim");
+    claim(&mut svm, &payer, &env, &grower, &grower_ata, None).expect("grower claim");
+    assert_eq!(
+        token_amount(&svm, &honest_ata),
+        500_000,
+        "honest frozen share is not diluted by an uncrystallized live-counter grow"
+    );
+    assert_eq!(
+        token_amount(&svm, &grower_ata),
+        500_000,
+        "live counter growth after freeze does not pay above frozen points"
+    );
+}
+
+// USER-EXPECTATION PROBE (cumulative funding-payer points): a single portfolio that paid funding as both
+// long and short over time earns both counters through ONE stake.
+#[test]
+fn one_funding_payer_stake_claims_long_paid_plus_short_paid_for_one_portfolio() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let both = Keypair::new();
+    let long_only = Keypair::new();
+    let both_pf = Pubkey::new_unique();
+    let long_pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &both_pf,
+        &env.stub_perc,
+        &env.market,
+        &both.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &long_pf,
+        &env.stub_perc,
+        &env.market,
+        &long_only.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &both,
+        &both.pubkey(),
+        &both_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("owner registers one cumulative funding-payer stake");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &long_only,
+        &long_only.pubkey(),
+        &long_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("control owner registers a funding-payer stake");
+
+    set_slot(&mut svm, 1_124); // same tenure for both portfolios
+    set_portfolio_funding(
+        &mut svm,
+        &both_pf,
+        &env.stub_perc,
+        &env.market,
+        &both.pubkey(),
+        6_000,
+        0,
+        4_000,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &long_pf,
+        &env.stub_perc,
+        &env.market,
+        &long_only.pubkey(),
+        10_000,
+        0,
+        0,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &both, &both_pf).expect("crystallize cumulative payer");
+    crystallize(&mut svm, &payer, &env, &long_only, &long_pf).expect("crystallize long-only payer");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let both_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &both.pubkey());
+    let long_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &long_only.pubkey());
+    claim(&mut svm, &payer, &env, &both, &both_ata, None).expect("both-side claim");
+    claim(&mut svm, &payer, &env, &long_only, &long_ata, None).expect("long-only claim");
+
+    assert_eq!(
+        token_amount(&svm, &both_ata),
+        500_000,
+        "6k long-paid + 4k short-paid earns the same as 10k long-paid"
+    );
+    assert_eq!(
+        token_amount(&svm, &long_ata),
+        500_000,
+        "control gets the other half of the funding-payer cohort"
+    );
+}
+
+// SEMANTICS PROBE (funding-payer has no age multiplier): funding paid late should earn the same points as
+// the same paid delta from an early-registered portfolio. Residual LP/trader cohorts keep log-time weighting,
+// but funding-payer is just the paid accumulator delta.
+#[test]
+fn funding_payer_points_are_accumulator_delta_without_age_multiplier() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only(&mut svm, &payer, 1_000_000);
+
+    let early = Keypair::new();
+    let late = Keypair::new();
+    let early_pf = Pubkey::new_unique();
+    let late_pf = Pubkey::new_unique();
+
+    set_slot(&mut svm, 100);
+    set_portfolio_funding(
+        &mut svm,
+        &early_pf,
+        &env.stub_perc,
+        &env.market,
+        &early.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &early,
+        &early.pubkey(),
+        &early_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register early funding payer");
+
+    set_slot(&mut svm, 9_000);
+    set_portfolio_funding(
+        &mut svm,
+        &late_pf,
+        &env.stub_perc,
+        &env.market,
+        &late.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &late,
+        &late.pubkey(),
+        &late_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register late funding payer");
+
+    set_slot(&mut svm, 10_000);
+    set_portfolio_funding(
+        &mut svm,
+        &early_pf,
+        &env.stub_perc,
+        &env.market,
+        &early.pubkey(),
+        10_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &late_pf,
+        &env.stub_perc,
+        &env.market,
+        &late.pubkey(),
+        10_000,
+        0,
+        0,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &early, &early_pf).expect("crystallize early");
+    crystallize(&mut svm, &payer, &env, &late, &late_pf).expect("crystallize late");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let early_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &early.pubkey());
+    let late_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &late.pubkey());
+    claim(&mut svm, &payer, &env, &early, &early_ata, None).expect("early claim");
+    claim(&mut svm, &payer, &env, &late, &late_ata, None).expect("late claim");
+
+    assert_eq!(
+        token_amount(&svm, &early_ata),
+        500_000,
+        "early registration gives no extra funding-payer points"
+    );
+    assert_eq!(
+        token_amount(&svm, &late_ata),
+        500_000,
+        "same paid accumulator delta earns the same funding-payer share"
+    );
+}
+
+// NO-AGE/FREE-FARMING SWEEP: 100 deterministic LiteSVM cases where two funding payers register at
+// different slots but pay the same net funding amount. Funding-payer points are raw accumulator deltas,
+// so early and late registrations must pay equally unless one portfolio later pays more. The sweep also
+// pins permissionless crystallize replay, claim redirection rejection, receiver-only canaries, fee edges,
+// omitted linked claim accounts, extra-market allow-listing, and vault conservation.
+#[test]
+fn funding_payer_100_case_no_age_replay_and_claim_redirect_sweep() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let splits: [(u16, u16, u16, u16); 6] = [
+        (0, 0, 0, 10_000),
+        (1_000, 1_000, 0, 8_000),
+        (2_500, 0, 2_500, 5_000),
+        (0, 500, 0, 1),
+        (333, 777, 1_111, 2_222),
+        (4_999, 1, 0, 5_000),
+    ];
+    let fees: [u16; 8] = [0, 1, 9, 333, 2_500, 7_777, 9_999, 10_000];
+    let ceil_fee = |amount: u64, fee_bps: u16| -> u64 {
+        (((amount as u128) * (fee_bps as u128) + 9_999) / 10_000) as u64
+    };
+
+    for case_idx in 0..100usize {
+        let (insurance_bps, backing_bps, lp_bps, funding_bps) = splits[case_idx % splits.len()];
+        let fee_bps = fees[(case_idx / splits.len()) % fees.len()];
+        let supply = 25_001u64 + (case_idx as u64 * 211);
+        let extras: Vec<Pubkey> = if case_idx % 3 == 0 {
+            vec![Pubkey::new_unique(), Pubkey::new_unique()]
+        } else {
+            Vec::new()
+        };
+        let env = setup_custom_split_with_fee_and_extras(
+            &mut svm,
+            &payer,
+            supply,
+            insurance_bps,
+            backing_bps,
+            lp_bps,
+            funding_bps,
+            fee_bps,
+            &extras,
+        );
+        let market = if extras.is_empty() {
+            env.market
+        } else {
+            extras[case_idx % extras.len()]
+        };
+
+        let early = Keypair::new();
+        let late = Keypair::new();
+        let receiver = Keypair::new();
+        let attacker = Keypair::new();
+        svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+        let early_pf = Pubkey::new_unique();
+        let late_pf = Pubkey::new_unique();
+        let receiver_pf = Pubkey::new_unique();
+        let start_slot = 100 + case_idx as u64;
+        let late_slot = start_slot + 500 + ((case_idx as u64 * 13) % 3_000);
+        let final_slot = late_slot + 1 + ((case_idx as u64 * 29) % 6_000);
+
+        let early_baseline_long = ((case_idx as u128 * 17) % 2_000) + 3;
+        let early_baseline_short = ((case_idx as u128 * 19) % 2_000) + 5;
+        let late_baseline_long = ((case_idx as u128 * 23) % 2_000) + 7;
+        let late_baseline_short = ((case_idx as u128 * 31) % 2_000) + 11;
+        let shared_delta = ((case_idx as u128 * 97) % 20_000) + 1;
+        let early_long_delta = shared_delta * (((case_idx % 5) + 1) as u128) / 6;
+        let early_short_delta = shared_delta - early_long_delta;
+        let late_short_delta = shared_delta * (((case_idx % 7) + 1) as u128) / 8;
+        let late_long_delta = shared_delta - late_short_delta;
+
+        set_slot(&mut svm, start_slot);
+        set_portfolio_funding(
+            &mut svm,
+            &early_pf,
+            &env.stub_perc,
+            &market,
+            &early.pubkey(),
+            early_baseline_long,
+            0,
+            early_baseline_short,
+            0,
+        );
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &early,
+            &early.pubkey(),
+            &early_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register early funding payer");
+
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &early.pubkey(),
+            &early_pf,
+        )
+        .expect("foreign cranker can crystallize unchanged early funding payer");
+
+        set_slot(&mut svm, late_slot);
+        set_portfolio_funding(
+            &mut svm,
+            &late_pf,
+            &env.stub_perc,
+            &market,
+            &late.pubkey(),
+            late_baseline_long,
+            0,
+            late_baseline_short,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &receiver_pf,
+            &env.stub_perc,
+            &market,
+            &receiver.pubkey(),
+            0,
+            shared_delta + 50_000,
+            0,
+            shared_delta + 75_000,
+        );
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &late,
+            &late.pubkey(),
+            &late_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register late funding payer");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &receiver,
+            &receiver.pubkey(),
+            &receiver_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register receiver-only canary");
+
+        set_slot(&mut svm, final_slot);
+        set_portfolio_funding(
+            &mut svm,
+            &early_pf,
+            &env.stub_perc,
+            &market,
+            &early.pubkey(),
+            early_baseline_long + early_long_delta,
+            90_000,
+            early_baseline_short + early_short_delta,
+            80_000,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &late_pf,
+            &env.stub_perc,
+            &market,
+            &late.pubkey(),
+            late_baseline_long + late_long_delta,
+            70_000,
+            late_baseline_short + late_short_delta,
+            60_000,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &receiver_pf,
+            &env.stub_perc,
+            &market,
+            &receiver.pubkey(),
+            0,
+            shared_delta + 90_000,
+            0,
+            shared_delta + 110_000,
+        );
+
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &early.pubkey(),
+            &early_pf,
+        )
+        .expect("foreign cranker crystallizes early funding payer");
+        crystallize(&mut svm, &payer, &env, &late, &late_pf)
+            .expect("late funding payer crystallize");
+        crystallize(&mut svm, &payer, &env, &receiver, &receiver_pf)
+            .expect("receiver-only canary crystallize");
+
+        let extra_delta = if case_idx % 4 == 0 {
+            ((case_idx as u128 * 41) % 1_000) + 1
+        } else {
+            0
+        };
+        if extra_delta > 0 {
+            set_portfolio_funding(
+                &mut svm,
+                &early_pf,
+                &env.stub_perc,
+                &market,
+                &early.pubkey(),
+                early_baseline_long + early_long_delta + extra_delta,
+                90_000,
+                early_baseline_short + early_short_delta,
+                80_000,
+            );
+        }
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &early.pubkey(),
+            &early_pf,
+        )
+        .expect("foreign replay crystallize is idempotent except new paid delta");
+
+        set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+        freeze(&mut svm, &payer, &env).expect("freeze");
+
+        let early_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &early.pubkey());
+        let late_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &late.pubkey());
+        let receiver_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &receiver.pubkey());
+        let attacker_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &attacker.pubkey());
+
+        assert!(
+            claim_as(
+                &mut svm,
+                &payer,
+                &env,
+                &attacker,
+                &early.pubkey(),
+                &attacker_ata,
+                None,
+            )
+            .is_err(),
+            "case {case_idx}: foreign claim cannot redirect payout to attacker-owned token account"
+        );
+        assert_eq!(
+            token_amount(&svm, &attacker_ata),
+            0,
+            "case {case_idx}: failed redirect pays nothing"
+        );
+
+        if case_idx % 2 == 0 {
+            claim_without_linked(&mut svm, &payer, &env, &early, &early_ata)
+                .expect("early funding-payer claim without linked portfolio");
+        } else {
+            claim(&mut svm, &payer, &env, &early, &early_ata, None)
+                .expect("early funding-payer claim with linked portfolio");
+        }
+        claim_without_linked(&mut svm, &payer, &env, &late, &late_ata)
+            .expect("late funding-payer claim without linked portfolio");
+        claim_without_linked(&mut svm, &payer, &env, &receiver, &receiver_ata)
+            .expect("receiver-only funding-payer claim without linked portfolio");
+
+        let funding_supply = ((env.supply as u128) * (funding_bps as u128) / 10_000) as u64;
+        let early_points = shared_delta + extra_delta;
+        let late_points = shared_delta;
+        let total_points = early_points + late_points;
+        let early_amount = ((funding_supply as u128) * early_points / total_points) as u64;
+        let late_amount = ((funding_supply as u128) * late_points / total_points) as u64;
+        let expected_early = early_amount - ceil_fee(early_amount, fee_bps);
+        let expected_late = late_amount - ceil_fee(late_amount, fee_bps);
+
+        assert_eq!(
+            token_amount(&svm, &early_ata),
+            expected_early,
+            "case {case_idx}: early payout follows raw paid delta, not registration age"
+        );
+        assert_eq!(
+            token_amount(&svm, &late_ata),
+            expected_late,
+            "case {case_idx}: late payout follows raw paid delta, not registration age"
+        );
+        assert_eq!(
+            token_amount(&svm, &receiver_ata),
+            0,
+            "case {case_idx}: receiver-only portfolio cannot farm payer distribution"
+        );
+        if extra_delta == 0 {
+            assert_eq!(
+                token_amount(&svm, &early_ata),
+                token_amount(&svm, &late_ata),
+                "case {case_idx}: equal raw paid deltas pay equally despite different registration slots"
+            );
+        }
+
+        let pre_fee_paid = early_amount + late_amount;
+        assert!(
+            pre_fee_paid <= funding_supply,
+            "case {case_idx}: pre-fee funding payout cannot exceed configured slice"
+        );
+        assert!(
+            funding_supply - pre_fee_paid <= 1,
+            "case {case_idx}: only integer floor dust remains in funding slice"
+        );
+        let paid = token_amount(&svm, &early_ata)
+            + token_amount(&svm, &late_ata)
+            + token_amount(&svm, &receiver_ata)
+            + token_amount(&svm, &attacker_ata);
+        assert_eq!(
+            token_amount(&svm, &env.vault),
+            env.supply - paid,
+            "case {case_idx}: vault only decreases by successful claims"
+        );
+    }
+}
+
+// CONFIG/FARMING SWEEP: 100 deterministic litesvm cases over funding-payer bps, mixed cohort splits, fee bps
+// including dust/100% fee, primary vs extra allow-listed markets, nonzero register-time baselines, and asymmetric
+// long-paid/short-paid deltas. This catches the weird branches that are easy to miss in single happy-path tests:
+// receiver-only portfolios must never earn, baseline counters must not be replayed as new farming, the anti-wash
+// fee must ceil on dust, and all paid COIN must be bounded by the configured funding-payer slice.
+#[test]
+fn funding_payer_100_case_config_sweep_preserves_payer_only_payouts() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let splits: [(u16, u16, u16, u16); 6] = [
+        (0, 0, 0, 10_000),
+        (1_000, 1_000, 0, 8_000),
+        (2_500, 0, 2_500, 5_000),
+        (0, 500, 0, 1),
+        (333, 777, 1_111, 2_222),
+        (4_999, 1, 0, 5_000),
+    ];
+    let fees: [u16; 8] = [0, 1, 9, 333, 2_500, 7_777, 9_999, 10_000];
+
+    let ceil_fee = |amount: u64, fee_bps: u16| -> u64 {
+        (((amount as u128) * (fee_bps as u128) + 9_999) / 10_000) as u64
+    };
+
+    for case_idx in 0..100usize {
+        let (insurance_bps, backing_bps, lp_bps, funding_bps) = splits[case_idx % splits.len()];
+        let fee_bps = fees[(case_idx / splits.len()) % fees.len()];
+        let supply = 10_003u64 + (case_idx as u64 * 137);
+        let extras: Vec<Pubkey> = if case_idx % 4 == 0 {
+            vec![Pubkey::new_unique(), Pubkey::new_unique()]
+        } else {
+            Vec::new()
+        };
+        let env = setup_custom_split_with_fee_and_extras(
+            &mut svm,
+            &payer,
+            supply,
+            insurance_bps,
+            backing_bps,
+            lp_bps,
+            funding_bps,
+            fee_bps,
+            &extras,
+        );
+        let market = if extras.is_empty() {
+            env.market
+        } else {
+            extras[case_idx % extras.len()]
+        };
+
+        let start_slot = 100 + case_idx as u64;
+        set_slot(&mut svm, start_slot);
+        let long = Keypair::new();
+        let short = Keypair::new();
+        let long_receiver = Keypair::new();
+        let short_receiver = Keypair::new();
+        let long_pf = Pubkey::new_unique();
+        let short_pf = Pubkey::new_unique();
+        let long_receiver_pf = Pubkey::new_unique();
+        let short_receiver_pf = Pubkey::new_unique();
+
+        let long_baseline = ((case_idx as u128 * 11) % 997) + 1;
+        let short_baseline = ((case_idx as u128 * 17) % 991) + 1;
+        let long_delta = ((case_idx as u128 * 37) % 5_000) + 1;
+        let short_delta = ((case_idx as u128 * 53) % 7_000) + 1;
+
+        set_portfolio_funding(
+            &mut svm,
+            &long_pf,
+            &env.stub_perc,
+            &market,
+            &long.pubkey(),
+            long_baseline,
+            0,
+            0,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &short_pf,
+            &env.stub_perc,
+            &market,
+            &short.pubkey(),
+            0,
+            0,
+            short_baseline,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &long_receiver_pf,
+            &env.stub_perc,
+            &market,
+            &long_receiver.pubkey(),
+            0,
+            long_baseline + long_delta + 5,
+            0,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &short_receiver_pf,
+            &env.stub_perc,
+            &market,
+            &short_receiver.pubkey(),
+            0,
+            0,
+            0,
+            short_baseline + short_delta + 7,
+        );
+
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &long,
+            &long.pubkey(),
+            &long_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register long payer");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &short,
+            &short.pubkey(),
+            &short_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register short payer");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &long_receiver,
+            &long_receiver.pubkey(),
+            &long_receiver_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register long receiver canary");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &short_receiver,
+            &short_receiver.pubkey(),
+            &short_receiver_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register short receiver canary");
+
+        set_slot(&mut svm, start_slot + 2 + ((case_idx as u64 * 19) % 4_096));
+        set_portfolio_funding(
+            &mut svm,
+            &long_pf,
+            &env.stub_perc,
+            &market,
+            &long.pubkey(),
+            long_baseline + long_delta,
+            99_000,
+            0,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &short_pf,
+            &env.stub_perc,
+            &market,
+            &short.pubkey(),
+            0,
+            0,
+            short_baseline + short_delta,
+            88_000,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &long_receiver_pf,
+            &env.stub_perc,
+            &market,
+            &long_receiver.pubkey(),
+            0,
+            long_baseline + long_delta + 50_000,
+            0,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &short_receiver_pf,
+            &env.stub_perc,
+            &market,
+            &short_receiver.pubkey(),
+            0,
+            0,
+            0,
+            short_baseline + short_delta + 50_000,
+        );
+        crystallize(&mut svm, &payer, &env, &long, &long_pf).expect("crystallize long payer");
+        crystallize(&mut svm, &payer, &env, &short, &short_pf).expect("crystallize short payer");
+        crystallize(&mut svm, &payer, &env, &long_receiver, &long_receiver_pf)
+            .expect("crystallize long receiver canary");
+        crystallize(&mut svm, &payer, &env, &short_receiver, &short_receiver_pf)
+            .expect("crystallize short receiver canary");
+
+        set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+        freeze(&mut svm, &payer, &env).expect("freeze");
+
+        let long_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &long.pubkey());
+        let short_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &short.pubkey());
+        let long_receiver_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &long_receiver.pubkey());
+        let short_receiver_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &short_receiver.pubkey());
+        claim(&mut svm, &payer, &env, &long, &long_ata, None).expect("long payer claim");
+        claim(&mut svm, &payer, &env, &short, &short_ata, None).expect("short payer claim");
+        claim(
+            &mut svm,
+            &payer,
+            &env,
+            &long_receiver,
+            &long_receiver_ata,
+            None,
+        )
+        .expect("long receiver canary claim");
+        claim(
+            &mut svm,
+            &payer,
+            &env,
+            &short_receiver,
+            &short_receiver_ata,
+            None,
+        )
+        .expect("short receiver canary claim");
+
+        let funding_supply = ((env.supply as u128) * (funding_bps as u128) / 10_000) as u64;
+        let total_delta = long_delta + short_delta;
+        let long_amount = ((funding_supply as u128) * long_delta / total_delta) as u64;
+        let short_amount = ((funding_supply as u128) * short_delta / total_delta) as u64;
+        let expected_long = long_amount - ceil_fee(long_amount, fee_bps);
+        let expected_short = short_amount - ceil_fee(short_amount, fee_bps);
+
+        assert_eq!(
+            token_amount(&svm, &long_ata),
+            expected_long,
+            "case {case_idx}: long-paid payout"
+        );
+        assert_eq!(
+            token_amount(&svm, &short_ata),
+            expected_short,
+            "case {case_idx}: short-paid payout"
+        );
+        assert_eq!(
+            token_amount(&svm, &long_receiver_ata),
+            0,
+            "case {case_idx}: long receiver-only cannot farm"
+        );
+        assert_eq!(
+            token_amount(&svm, &short_receiver_ata),
+            0,
+            "case {case_idx}: short receiver-only cannot farm"
+        );
+        assert!(
+            long_amount + short_amount <= funding_supply,
+            "case {case_idx}: pre-fee payout does not exceed funding slice"
+        );
+        assert!(
+            funding_supply - (long_amount + short_amount) <= 1,
+            "case {case_idx}: only floor dust remains in the funding slice"
+        );
+        let paid = token_amount(&svm, &long_ata)
+            + token_amount(&svm, &short_ata)
+            + token_amount(&svm, &long_receiver_ata)
+            + token_amount(&svm, &short_receiver_ata);
+        assert_eq!(
+            token_amount(&svm, &env.vault),
+            env.supply - paid,
+            "case {case_idx}: vault only decreases by paid COIN"
+        );
+    }
+}
+
+// CONFIG COMPATIBILITY PROBE: older clients may still send the 6-byte tail
+// `(fee_bps, old_long_payer_bps, old_short_payer_bps)`. The program intentionally sums the old long/short
+// fields into the single cumulative funding-payer cohort. Pin both the successful parse and the overflow reject.
+#[test]
+fn legacy_long_short_funding_tail_maps_to_cumulative_funding_payer_bps() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let make_env =
+        |svm: &mut LiteSVM, old_long_bps: u16, old_short_bps: u16| -> Result<Env, String> {
+            let supply = 1_000_000u64;
+            let emission_end = 2_000u64;
+            let finalize_window = 500u64;
+            let mint_auth = Keypair::new();
+            let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
+            let rd_config =
+                Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+            let dist_config = Pubkey::find_program_address(
+                &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+                &dist_id(),
+            )
+            .0;
+            let vault = create_token_account(svm, &payer, &coin_mint, &rd_config);
+            mint_to(svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+            let stub_sub = Pubkey::new_unique();
+            let stub_perc = Pubkey::new_unique();
+            let ins_pool = Pubkey::new_unique();
+            let back_pool = Pubkey::new_unique();
+            let market = Pubkey::new_unique();
+            let mut d = rd_init_data(
+                supply,
+                emission_end,
+                1_000,
+                1_000,
+                0,
+                finalize_window,
+                ins_pool,
+                back_pool,
+                market,
+                &[],
+                Some(0),
+            );
+            d.extend_from_slice(&old_long_bps.to_le_bytes());
+            d.extend_from_slice(&old_short_bps.to_le_bytes());
+            send(
+                svm,
+                &payer,
+                &[Instruction {
+                    program_id: rd_id(),
+                    accounts: rd_init_accounts(
+                        payer.pubkey(),
+                        coin_mint,
+                        dist_config,
+                        stub_perc,
+                        stub_sub,
+                        rd_config,
+                        mint_auth.pubkey(),
+                    ),
+                    data: d,
+                }],
+                &[&mint_auth],
+            )?;
+            revoke_mint(svm, &payer, &coin_mint, &mint_auth);
+            Ok(Env {
+                rd_config,
+                coin_mint,
+                vault,
+                mint_auth,
+                stub_sub,
+                stub_perc,
+                ins_pool,
+                back_pool,
+                market,
+                supply,
+                emission_end,
+                finalize_window,
+            })
+        };
+
+    let env = make_env(&mut svm, 3_000, 5_000)
+        .expect("legacy 3000/5000 tail initializes as cumulative 8000");
+    let funding_bps_off = 466 + 1 + 9 * 32;
+    let stored_funding_bps = u16::from_le_bytes(
+        svm.get_account(&env.rd_config).unwrap().data[funding_bps_off..funding_bps_off + 2]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        stored_funding_bps, 8_000,
+        "legacy long+short funding bps are summed into one cumulative cohort"
+    );
+
+    set_slot(&mut svm, 100);
+    let farmer = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &farmer.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer.pubkey(),
+        &pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register funding payer");
+    set_slot(&mut svm, 1_000);
+    set_portfolio_funding(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &farmer.pubkey(),
+        1_000,
+        0,
+        1_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &farmer, &pf).expect("crystallize funding payer");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &farmer.pubkey());
+    claim(&mut svm, &payer, &env, &farmer, &ata, None).expect("claim funding payer");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        800_000,
+        "legacy 3000+5000 tail pays the cumulative 80% slice"
+    );
+
+    assert!(
+        make_env(&mut svm, 6_000, 5_000).is_err(),
+        "legacy long+short funding bps above 100% is rejected"
+    );
+}
+
+// GENESIS SPLIT PROBE: the intended points split can be 10% insurance + 10% backing + 80% cumulative
+// funding-payer. The funding-payer stake uses ONE portfolio and earns long-paid + short-paid together.
+#[test]
+fn ten_ten_eighty_split_pays_insurance_backing_and_cumulative_funding() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup_share_value_and_funding_split(&mut svm, &payer, supply, 1_000, 1_000, 8_000);
+    set_slot(&mut svm, 100);
+
+    let insurance = Keypair::new();
+    let backing = Keypair::new();
+    let funding = Keypair::new();
+    let ins_pos = Pubkey::new_unique();
+    let back_pos = Pubkey::new_unique();
+    let funding_pf = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &ins_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &insurance.pubkey(),
+        1_000,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &back_pos,
+        &env.stub_sub,
+        &env.back_pool,
+        &backing.pubkey(),
+        1_000,
+        false,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &funding_pf,
+        &env.stub_perc,
+        &env.market,
+        &funding.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &insurance,
+        &insurance.pubkey(),
+        &ins_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("register insurance");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &backing,
+        &backing.pubkey(),
+        &back_pos,
+        COHORT_BACKING,
+    )
+    .expect("register backing");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &funding,
+        &funding.pubkey(),
+        &funding_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register funding-payer");
+
+    set_slot(&mut svm, 1_124); // same tenure for every cohort; share-value cohorts ignore tenure in current points.
+    set_portfolio_funding(
+        &mut svm,
+        &funding_pf,
+        &env.stub_perc,
+        &env.market,
+        &funding.pubkey(),
+        6_000,
+        0,
+        4_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &insurance, &ins_pos).expect("crystallize insurance");
+    crystallize(&mut svm, &payer, &env, &backing, &back_pos).expect("crystallize backing");
+    crystallize(&mut svm, &payer, &env, &funding, &funding_pf)
+        .expect("crystallize cumulative funding");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let ins_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &insurance.pubkey());
+    let back_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &backing.pubkey());
+    let funding_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &funding.pubkey());
+    claim(&mut svm, &payer, &env, &insurance, &ins_ata, Some(&ins_pos)).expect("insurance claim");
+    claim(&mut svm, &payer, &env, &backing, &back_ata, Some(&back_pos)).expect("backing claim");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &funding,
+        &funding_ata,
+        Some(&funding_pf),
+    )
+    .expect("funding-payer claim");
+
+    assert_eq!(
+        token_amount(&svm, &ins_ata),
+        100_000,
+        "insurance share-value cohort receives 10%"
+    );
+    assert_eq!(
+        token_amount(&svm, &back_ata),
+        100_000,
+        "backing share-value cohort receives 10%"
+    );
+    assert_eq!(
+        token_amount(&svm, &funding_ata),
+        800_000,
+        "one funding stake receives the 80% cumulative long-paid + short-paid slice"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        0,
+        "10/10/80 claims exhaust the fixed supply with no dust in this exact split"
+    );
+}
+
+// HEADLINE: all four legacy cohorts in one genesis, one staker each -> each claims its full cohort_supply
+// (10/10/40/40). Insurance/backing from subledger share value; LP/trader portfolios from residual counters.
 #[test]
 fn full_four_way_split_pays_each_cohort_its_share() {
     let mut svm = LiteSVM::new();
@@ -981,26 +4271,106 @@ fn full_four_way_split_pays_each_cohort_its_share() {
     let env = setup(&mut svm, &payer, supply);
     set_slot(&mut svm, 100);
 
-    let (ins, back, lp, trd) = (Keypair::new(), Keypair::new(), Keypair::new(), Keypair::new());
+    let (ins, back, lp, trd) = (
+        Keypair::new(),
+        Keypair::new(),
+        Keypair::new(),
+        Keypair::new(),
+    );
     let ins_pos = Pubkey::new_unique();
     let back_pos = Pubkey::new_unique();
     let lp_pf = Pubkey::new_unique();
     let trd_pf = Pubkey::new_unique();
     // Insurance + backing positions (share value); LP/trader portfolios (residual counters, start 0).
-    set_position(&mut svm, &ins_pos, &env.stub_sub, &env.ins_pool, &ins.pubkey(), 500, false);
-    set_position(&mut svm, &back_pos, &env.stub_sub, &env.back_pool, &back.pubkey(), 700, false);
-    set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
-    set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &env.market, &trd.pubkey(), 0, 0);
+    set_position(
+        &mut svm,
+        &ins_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &ins.pubkey(),
+        500,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &back_pos,
+        &env.stub_sub,
+        &env.back_pool,
+        &back.pubkey(),
+        700,
+        false,
+    );
+    set_portfolio(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
+    set_portfolio(
+        &mut svm,
+        &trd_pf,
+        &env.stub_perc,
+        &env.market,
+        &trd.pubkey(),
+        0,
+        0,
+    );
 
-    register(&mut svm, &payer, &env, &ins, &ins.pubkey(), &ins_pos, COHORT_INSURANCE).expect("reg ins");
-    register(&mut svm, &payer, &env, &back, &back.pubkey(), &back_pos, COHORT_BACKING).expect("reg back");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &ins,
+        &ins.pubkey(),
+        &ins_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg ins");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &back,
+        &back.pubkey(),
+        &back_pos,
+        COHORT_BACKING,
+    )
+    .expect("reg back");
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &lp_pf, COHORT_LP).expect("reg lp");
-    register(&mut svm, &payer, &env, &trd, &trd.pubkey(), &trd_pf, COHORT_TRADER).expect("reg trd");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &trd,
+        &trd.pubkey(),
+        &trd_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg trd");
 
     // LP absorbs 10_000 residual_received; trader crystallizes 20_000 loss.
     set_slot(&mut svm, 1_500);
-    set_portfolio(&mut svm, &lp_pf, &env.stub_perc, &env.market, &lp.pubkey(), 10_000, 0);
-    set_portfolio(&mut svm, &trd_pf, &env.stub_perc, &env.market, &trd.pubkey(), 0, 20_000);
+    set_portfolio(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        10_000,
+        0,
+    );
+    set_portfolio(
+        &mut svm,
+        &trd_pf,
+        &env.stub_perc,
+        &env.market,
+        &trd.pubkey(),
+        0,
+        20_000,
+    );
     crystallize(&mut svm, &payer, &env, &ins, &ins_pos).expect("cry ins");
     crystallize(&mut svm, &payer, &env, &back, &back_pos).expect("cry back");
     crystallize(&mut svm, &payer, &env, &lp, &lp_pf).expect("cry lp");
@@ -1018,7 +4388,15 @@ fn full_four_way_split_pays_each_cohort_its_share() {
         (&trd, &trd_pf, COHORT_TRADER, 400_000u64, false),
     ] {
         let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
-        claim(&mut svm, &payer, &env, &owner, &ata, if is_share { Some(linked) } else { None }).expect("claim");
+        claim(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &ata,
+            if is_share { Some(linked) } else { None },
+        )
+        .expect("claim");
         assert_eq!(token_amount(&svm, &ata), want, "cohort {cohort} payout");
     }
     // Conservation: total paid == supply (10+10+40+40 = 100%).
@@ -1040,15 +4418,57 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     let (a, b) = (Keypair::new(), Keypair::new());
     let a_pos = Pubkey::new_unique();
     let b_pos = Pubkey::new_unique();
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
-    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        300,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &b.pubkey(),
+        100,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg a");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &b,
+        &b.pubkey(),
+        &b_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg b");
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
     crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts (denom 400)
 
     // b EXITS before claim: redeems all shares -> withdrawn. (Denominator stays 400 -> b's 100 share burns.)
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 0, true);
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &b.pubkey(),
+        0,
+        true,
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1059,7 +4479,11 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim b");
     // a: 100_000 * 300/400 = 75_000. b: exited -> live shares 0 -> 0 (forfeit; its 25_000 stays in the vault).
     assert_eq!(token_amount(&svm, &a_ata), 75_000, "a pro-rata by shares");
-    assert_eq!(token_amount(&svm, &b_ata), 0, "b exited -> soft-veto forfeit");
+    assert_eq!(
+        token_amount(&svm, &b_ata),
+        0,
+        "b exited -> soft-veto forfeit"
+    );
 }
 
 // SOFT-VETO PARTIAL DIRECTION (sweep tick D): the exit-forfeit test above covers a FULL exit (shares 0 +
@@ -1081,21 +4505,54 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
 
     let a = Keypair::new();
     let a_pos = Pubkey::new_unique();
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        300,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg a");
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // frozen points = 300 (sole staker -> denom 300)
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
     // PARTIAL post-freeze withdraw: shares 300 -> 150, still NOT fully withdrawn (withdrawn=false).
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 150, false);
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        150,
+        false,
+    );
 
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
     // min(frozen 300, live 150) = 150 -> 100_000 * 150 / 300 = 50_000; the other 50_000 stays locked (forfeited).
-    assert_eq!(token_amount(&svm, &a_ata), 50_000, "partial post-freeze withdraw pays the REDUCED live shares, not the frozen snapshot");
-    assert_eq!(token_amount(&svm, &env.vault), supply - 50_000, "the de-risked half stays locked in the vault (partial soft-veto)");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        50_000,
+        "partial post-freeze withdraw pays the REDUCED live shares, not the frozen snapshot"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply - 50_000,
+        "the de-risked half stays locked in the vault (partial soft-veto)"
+    );
 }
 
 // ATTACK PROBE (post-freeze share inflation of a share-value claim): the insurance/backing claim pays
@@ -1119,10 +4576,44 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
     let (a, b) = (Keypair::new(), Keypair::new());
     let a_pos = Pubkey::new_unique();
     let b_pos = Pubkey::new_unique();
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
-    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        300,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &b.pubkey(),
+        100,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg a");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &b,
+        &b.pubkey(),
+        &b_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg b");
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
     crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts (frozen denom 400)
 
@@ -1131,17 +4622,37 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
 
     // ATTACK: AFTER freeze, b tops up their subledger position 100x (100 -> 10_000 live shares), trying to
     // claim cohort_supply * 10_000 / 400 = 2_500_000 — 25x the WHOLE cohort supply.
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 10_000, false);
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &b.pubkey(),
+        10_000,
+        false,
+    );
 
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
     claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim b");
     // b is capped at its FROZEN-time 100 points: 100_000 * min(100, 10_000)/400 = 25_000 — NOT inflated.
-    assert_eq!(token_amount(&svm, &b_ata), 25_000, "post-freeze top-up cannot inflate the claim above frozen points");
-    assert_eq!(token_amount(&svm, &a_ata), 75_000, "a unaffected: 100_000 * 300/400");
+    assert_eq!(
+        token_amount(&svm, &b_ata),
+        25_000,
+        "post-freeze top-up cannot inflate the claim above frozen points"
+    );
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        75_000,
+        "a unaffected: 100_000 * 300/400"
+    );
     // Conservation: the fixed cohort supply is not over-drawn by the inflation attempt.
-    assert_eq!(token_amount(&svm, &a_ata) + token_amount(&svm, &b_ata), 100_000, "claims sum to the fixed cohort supply, no over-draw");
+    assert_eq!(
+        token_amount(&svm, &a_ata) + token_amount(&svm, &b_ata),
+        100_000,
+        "claims sum to the fixed cohort supply, no over-draw"
+    );
 }
 
 // ATTACK PROBE (soft-veto bypass via a SUBSTITUTED position at claim). A share-value (insurance/backing) claim
@@ -1165,19 +4676,69 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
     let (a, b) = (Keypair::new(), Keypair::new());
     let a_pos = Pubkey::new_unique();
     let b_pos = Pubkey::new_unique();
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 300, false);
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
-    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        300,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &b.pubkey(),
+        100,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg a");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &b,
+        &b.pubkey(),
+        &b_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg b");
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
     crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts
 
     // a EXITS its bound position (live shares 0) — the soft veto must now forfeit a's claim.
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 0, true);
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        0,
+        true,
+    );
     // A decoy position with HIGH live shares (subledger-owned so it passes the program-owner check) that a
     // will try to substitute to read a high live_pts and dodge the forfeit.
     let decoy_pos = Pubkey::new_unique();
-    set_position(&mut svm, &decoy_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 9_999, false);
+    set_position(
+        &mut svm,
+        &decoy_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        9_999,
+        false,
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1186,15 +4747,27 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
     // ATTACK: a claims but appends the DECOY position (9_999 shares) instead of its own (now-empty) bound one.
     assert!(claim(&mut svm, &payer, &env, &a, &a_ata, Some(&decoy_pos)).is_err(),
         "a substituted position is rejected (position.key != stake.backing_ledger) — no soft-veto bypass");
-    assert_eq!(token_amount(&svm, &a_ata), 0, "the substituted-position claim paid nothing");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        0,
+        "the substituted-position claim paid nothing"
+    );
 
     // (control) claiming with the CORRECT bound (now-empty) position pays 0 — the soft veto forfeits, as designed.
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim with the bound position");
-    assert_eq!(token_amount(&svm, &a_ata), 0, "a exited its capital -> soft-veto forfeit, 0 COIN");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        0,
+        "a exited its capital -> soft-veto forfeit, 0 COIN"
+    );
     // The honest staker b still claims its full 100/400 share with its own intact position.
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("b claims");
-    assert_eq!(token_amount(&svm, &b_ata), 25_000, "b gets its honest 100_000 * 100/400");
+    assert_eq!(
+        token_amount(&svm, &b_ata),
+        25_000,
+        "b gets its honest 100_000 * 100/400"
+    );
 }
 
 // ATTACK PROBE (denominator inflation via a SUBSTITUTED ledger at CRYSTALLIZE). crystallize for a share-value
@@ -1219,23 +4792,74 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
     let (a, b) = (Keypair::new(), Keypair::new());
     let a_pos = Pubkey::new_unique();
     let b_pos = Pubkey::new_unique();
-    set_position(&mut svm, &a_pos, &env.stub_sub, &env.ins_pool, &a.pubkey(), 100, false);
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.ins_pool, &b.pubkey(), 100, false);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pos, COHORT_INSURANCE).expect("reg a");
-    register(&mut svm, &payer, &env, &b, &b.pubkey(), &b_pos, COHORT_INSURANCE).expect("reg b");
+    set_position(
+        &mut svm,
+        &a_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        100,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &b.pubkey(),
+        100,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg a");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &b,
+        &b.pubkey(),
+        &b_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg b");
 
     // A decoy position with HIGH live shares (subledger-owned), which a will try to crystallize INSTEAD of
     // its bound a_pos to inflate its points + the cohort denominator.
     let decoy = Pubkey::new_unique();
-    set_position(&mut svm, &decoy, &env.stub_sub, &env.ins_pool, &a.pubkey(), 9_999, false);
-    assert!(crystallize(&mut svm, &payer, &env, &a, &decoy).is_err(),
-        "a substituted ledger at crystallize is rejected (backing_ledger != stake.backing_ledger)");
+    set_position(
+        &mut svm,
+        &decoy,
+        &env.stub_sub,
+        &env.ins_pool,
+        &a.pubkey(),
+        9_999,
+        false,
+    );
+    assert!(
+        crystallize(&mut svm, &payer, &env, &a, &decoy).is_err(),
+        "a substituted ledger at crystallize is rejected (backing_ledger != stake.backing_ledger)"
+    );
 
     // Honest crystallize of the BOUND ledgers -> denominator = 100 + 100 = 200 (NOT inflated by the decoy).
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("a crystallizes its bound ledger");
     crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("b crystallizes its bound ledger");
-    let denom = u128::from_le_bytes(svm.get_account(&env.rd_config).unwrap().data[174..190].try_into().unwrap());
-    assert_eq!(denom, 200, "insurance denominator reflects the real bound shares, not the 9_999 decoy");
+    let denom = u128::from_le_bytes(
+        svm.get_account(&env.rd_config).unwrap().data[174..190]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        denom, 200,
+        "insurance denominator reflects the real bound shares, not the 9_999 decoy"
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1246,8 +4870,16 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("a claims");
     claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("b claims");
-    assert_eq!(token_amount(&svm, &a_ata), 50_000, "a gets its honest half — no self-inflation");
-    assert_eq!(token_amount(&svm, &b_ata), 50_000, "b is NOT diluted by a phantom decoy in the denominator");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        50_000,
+        "a gets its honest half — no self-inflation"
+    );
+    assert_eq!(
+        token_amount(&svm, &b_ata),
+        50_000,
+        "b is NOT diluted by a phantom decoy in the denominator"
+    );
 }
 
 // finding KM: a share-value claim must be authorized by the stake's OWN owner. claim caps the payout by
@@ -1268,24 +4900,76 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
     let victim = Keypair::new();
     let attacker = Keypair::new();
     let pos = Pubkey::new_unique();
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
-    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pos, COHORT_INSURANCE).expect("reg");
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        300,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &victim,
+        &victim.pubkey(),
+        &pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg");
     crystallize(&mut svm, &payer, &env, &victim, &pos).expect("cry"); // 300 pts, denom 300
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
     // victim is mid partial-withdraw: still a live backer (withdrawn=false) but shares transiently at 30.
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 30, false);
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        30,
+        false,
+    );
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &victim.pubkey());
     // the attacker cannot force the victim's claim at the low-share moment.
-    assert!(claim_as(&mut svm, &payer, &env, &attacker, &victim.pubkey(), &ata, Some(&pos)).is_err(),
-        "a third party must not be able to force a share-value claim");
-    assert_eq!(token_amount(&svm, &ata), 0, "nothing was paid out by the forced attempt");
+    assert!(
+        claim_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &victim.pubkey(),
+            &ata,
+            Some(&pos)
+        )
+        .is_err(),
+        "a third party must not be able to force a share-value claim"
+    );
+    assert_eq!(
+        token_amount(&svm, &ata),
+        0,
+        "nothing was paid out by the forced attempt"
+    );
 
     // the victim re-deposits to full shares and claims THEMSELVES -> full 100_000 (grief avoided).
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        300,
+        false,
+    );
     claim(&mut svm, &payer, &env, &victim, &ata, Some(&pos)).expect("owner claims their own");
-    assert_eq!(token_amount(&svm, &ata), 100_000, "victim claims their full pro-rata share");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        100_000,
+        "victim claims their full pro-rata share"
+    );
 }
 
 // finding KO (KM parity, one step earlier): crystallize OVERWRITES a share-value stake's points from the
@@ -1307,22 +4991,61 @@ fn share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_mome
     let victim = Keypair::new();
     let attacker = Keypair::new();
     let pos = Pubkey::new_unique();
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
-    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pos, COHORT_INSURANCE).expect("reg");
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        300,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &victim,
+        &victim.pubkey(),
+        &pos,
+        COHORT_INSURANCE,
+    )
+    .expect("reg");
     crystallize(&mut svm, &payer, &env, &victim, &pos).expect("owner crystallizes at 300");
 
     // victim mid partial-withdraw -> live shares transiently 30. The attacker tries to force the points down.
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 30, false);
-    assert!(crystallize_as(&mut svm, &payer, &env, &attacker, &victim.pubkey(), &pos).is_err(),
-        "a third party must not be able to force a share-value crystallize");
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        30,
+        false,
+    );
+    assert!(
+        crystallize_as(&mut svm, &payer, &env, &attacker, &victim.pubkey(), &pos).is_err(),
+        "a third party must not be able to force a share-value crystallize"
+    );
 
     // victim restores shares and the genesis freezes; the victim claims their FULL 100_000 (grief avoided).
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 300, false);
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        300,
+        false,
+    );
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &victim.pubkey());
     claim(&mut svm, &payer, &env, &victim, &ata, Some(&pos)).expect("owner claims");
-    assert_eq!(token_amount(&svm, &ata), 100_000, "victim's points were not force-lowered");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        100_000,
+        "victim's points were not force-lowered"
+    );
 }
 
 // REGISTER binds the linked account's owner (finding GY): a foreign signer cannot register against
@@ -1339,17 +5062,55 @@ fn register_rejects_foreign_owner_and_foreign_pool() {
     let victim = Keypair::new();
     let attacker = Keypair::new();
     let pos = Pubkey::new_unique();
-    set_position(&mut svm, &pos, &env.stub_sub, &env.ins_pool, &victim.pubkey(), 500, false);
+    set_position(
+        &mut svm,
+        &pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &victim.pubkey(),
+        500,
+        false,
+    );
     // attacker signs but the position.owner is the victim -> rejected.
-    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pos, COHORT_INSURANCE).is_err(),
-        "foreign owner must be rejected");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &pos,
+            COHORT_INSURANCE
+        )
+        .is_err(),
+        "foreign owner must be rejected"
+    );
 
     // a position in a FOREIGN pool (not the genesis insurance pool) -> rejected even for the owner.
     let foreign_pool = Pubkey::new_unique();
     let pos2 = Pubkey::new_unique();
-    set_position(&mut svm, &pos2, &env.stub_sub, &foreign_pool, &victim.pubkey(), 500, false);
-    assert!(register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pos2, COHORT_INSURANCE).is_err(),
-        "foreign pool must be rejected");
+    set_position(
+        &mut svm,
+        &pos2,
+        &env.stub_sub,
+        &foreign_pool,
+        &victim.pubkey(),
+        500,
+        false,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &victim,
+            &victim.pubkey(),
+            &pos2,
+            COHORT_INSURANCE
+        )
+        .is_err(),
+        "foreign pool must be rejected"
+    );
 }
 
 // ATTACK PROBE (cross-cohort pool-scope confusion: insurance position farms the backing cohort, or vice
@@ -1372,18 +5133,74 @@ fn register_rejects_cross_cohort_pool_scope_insurance_vs_backing() {
     let (i_owner, b_owner) = (Keypair::new(), Keypair::new());
     let i_pos = Pubkey::new_unique(); // a real INSURANCE-pool position
     let b_pos = Pubkey::new_unique(); // a real BACKING-pool position
-    set_position(&mut svm, &i_pos, &env.stub_sub, &env.ins_pool, &i_owner.pubkey(), 500, false);
-    set_position(&mut svm, &b_pos, &env.stub_sub, &env.back_pool, &b_owner.pubkey(), 500, false);
+    set_position(
+        &mut svm,
+        &i_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &i_owner.pubkey(),
+        500,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &b_pos,
+        &env.stub_sub,
+        &env.back_pool,
+        &b_owner.pubkey(),
+        500,
+        false,
+    );
 
     // (1) An insurance-pool position declared under the BACKING cohort -> pool (ins) != backing scope -> reject.
-    assert!(register(&mut svm, &payer, &env, &i_owner, &i_owner.pubkey(), &i_pos, COHORT_BACKING).is_err(),
-        "an insurance-pool position cannot farm the backing cohort");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &i_owner,
+            &i_owner.pubkey(),
+            &i_pos,
+            COHORT_BACKING
+        )
+        .is_err(),
+        "an insurance-pool position cannot farm the backing cohort"
+    );
     // (2) A backing-pool position declared under the INSURANCE cohort -> pool (back) != insurance scope -> reject.
-    assert!(register(&mut svm, &payer, &env, &b_owner, &b_owner.pubkey(), &b_pos, COHORT_INSURANCE).is_err(),
-        "a backing-pool position cannot farm the insurance cohort");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &b_owner,
+            &b_owner.pubkey(),
+            &b_pos,
+            COHORT_INSURANCE
+        )
+        .is_err(),
+        "a backing-pool position cannot farm the insurance cohort"
+    );
     // (control) Each position registers fine under its OWN cohort — the gate is the scope, not the owner/pool.
-    register(&mut svm, &payer, &env, &i_owner, &i_owner.pubkey(), &i_pos, COHORT_INSURANCE).expect("ins pos -> ins cohort ok");
-    register(&mut svm, &payer, &env, &b_owner, &b_owner.pubkey(), &b_pos, COHORT_BACKING).expect("back pos -> back cohort ok");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &i_owner,
+        &i_owner.pubkey(),
+        &i_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("ins pos -> ins cohort ok");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &b_owner,
+        &b_owner.pubkey(),
+        &b_pos,
+        COHORT_BACKING,
+    )
+    .expect("back pos -> back cohort ok");
 }
 
 // finding IL: the LP/trader cohorts must be scoped to the ONE allow-listed (trusted-Pyth) genesis
@@ -1402,19 +5219,65 @@ fn register_rejects_portfolio_from_a_foreign_market() {
 
     let attacker = Keypair::new();
     let foreign_market = Pubkey::new_unique(); // attacker's own market, oracle they control
-    // attacker owns the portfolio and has manufactured a fat loss/receipt — but in a foreign market.
+                                               // attacker owns the portfolio and has manufactured a fat loss/receipt — but in a foreign market.
     let evil_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &evil_pf, &env.stub_perc, &foreign_market, &attacker.pubkey(), 9_000_000, 9_000_000);
-    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &evil_pf, COHORT_TRADER).is_err(),
-        "trader cohort: a portfolio from a foreign (attacker-oracle'd) market must be rejected");
-    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &evil_pf, COHORT_LP).is_err(),
-        "lp cohort: a portfolio from a foreign market must be rejected");
+    set_portfolio(
+        &mut svm,
+        &evil_pf,
+        &env.stub_perc,
+        &foreign_market,
+        &attacker.pubkey(),
+        9_000_000,
+        9_000_000,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &evil_pf,
+            COHORT_TRADER
+        )
+        .is_err(),
+        "trader cohort: a portfolio from a foreign (attacker-oracle'd) market must be rejected"
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &evil_pf,
+            COHORT_LP
+        )
+        .is_err(),
+        "lp cohort: a portfolio from a foreign market must be rejected"
+    );
 
     // the SAME attacker, but a portfolio in the genesis (allow-listed) market -> accepted.
     let good_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &good_pf, &env.stub_perc, &env.market, &attacker.pubkey(), 0, 0);
-    register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &good_pf, COHORT_TRADER)
-        .expect("a portfolio in the allow-listed genesis market registers");
+    set_portfolio(
+        &mut svm,
+        &good_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &good_pf,
+        COHORT_TRADER,
+    )
+    .expect("a portfolio in the allow-listed genesis market registers");
 }
 
 // ATTACK PROBE (LP/trader residual double-count / point-theft via foreign-portfolio register): the LP/trader
@@ -1440,17 +5303,56 @@ fn register_lp_trader_binds_portfolio_to_its_owner_no_double_count() {
     let attacker = Keypair::new();
     // victim owns a portfolio in the ALLOW-LISTED genesis market with real residual (received & crystallized).
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &victim.pubkey(), 7_000, 7_000);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &victim.pubkey(),
+        7_000,
+        7_000,
+    );
 
     // attacker signs as owner=attacker, naming the VICTIM's portfolio — the market is allow-listed, so the
     // ONLY thing that can reject is the portfolio-owner bind (660). Both cohorts must reject.
-    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pf, COHORT_LP).is_err(),
-        "LP: a non-owner cannot register the victim's portfolio (no double-count)");
-    assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pf, COHORT_TRADER).is_err(),
-        "trader: a non-owner cannot register the victim's portfolio (no point-theft)");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &pf,
+            COHORT_LP
+        )
+        .is_err(),
+        "LP: a non-owner cannot register the victim's portfolio (no double-count)"
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker.pubkey(),
+            &pf,
+            COHORT_TRADER
+        )
+        .is_err(),
+        "trader: a non-owner cannot register the victim's portfolio (no point-theft)"
+    );
 
     // The rightful owner registers it once (control) — P's residual counts exactly once, under its true owner.
-    register(&mut svm, &payer, &env, &victim, &victim.pubkey(), &pf, COHORT_LP).expect("owner registers P");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &victim,
+        &victim.pubkey(),
+        &pf,
+        COHORT_LP,
+    )
+    .expect("owner registers P");
     // And the attacker STILL cannot register P (its owner is the victim) — no second crediting of the same R.
     assert!(register(&mut svm, &payer, &env, &attacker, &attacker.pubkey(), &pf, COHORT_LP).is_err(),
         "even after the owner registers, a non-owner cannot re-register P to double-count its residual");
@@ -1473,13 +5375,30 @@ fn register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_pollut
 
     let owner = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &owner.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+    );
 
     // recipient = Pubkey::default() -> rejected at register (the guard fires BEFORE the stake PDA is created).
     assert!(register(&mut svm, &payer, &env, &owner, &Pubkey::default(), &pf, COHORT_LP).is_err(),
         "a default-pubkey recipient must be rejected (would be an unclaimable, denominator-polluting stake)");
     // The PDA is still free, so a register with a REAL recipient succeeds (the rejected attempt squatted nothing).
-    register(&mut svm, &payer, &env, &owner, &owner.pubkey(), &pf, COHORT_LP).expect("a real recipient registers cleanly");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &pf,
+        COHORT_LP,
+    )
+    .expect("a real recipient registers cleanly");
 }
 
 // LP/trader points are the Δ of the monotonic residual counter since register; claim is frozen-final
@@ -1497,10 +5416,26 @@ fn lp_residual_delta_and_double_claim_rejected() {
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
     // register at received=5_000 (pre-existing); only the Δ after register should count.
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        5_000,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
     set_slot(&mut svm, 1_500);
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 12_000, 0); // Δ = 7_000
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        12_000,
+        0,
+    ); // Δ = 7_000
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1508,9 +5443,16 @@ fn lp_residual_delta_and_double_claim_rejected() {
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
     claim(&mut svm, &payer, &env, &lp, &ata, None).expect("claim lp");
     // sole LP staker -> whole cohort supply regardless of the absolute Δ.
-    assert_eq!(token_amount(&svm, &ata), 400_000, "sole LP claims the LP cohort supply");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        400_000,
+        "sole LP claims the LP cohort supply"
+    );
     // double-claim rejected.
-    assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "double-claim must reject");
+    assert!(
+        claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(),
+        "double-claim must reject"
+    );
 }
 
 // SNAP MANIPULATION (trader cohort, NON-ZERO baseline — sweep tick D free-farm): the LP delta test above and
@@ -1532,18 +5474,43 @@ fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero
     let t = Keypair::new();
     let pf = Pubkey::new_unique();
     let stake = stake_pda(&env, &t.pubkey());
-    let pts = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&stake).unwrap().data[176..192].try_into().unwrap()) };
+    let pts = |svm: &LiteSVM| -> u128 {
+        u128::from_le_bytes(
+            svm.get_account(&stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap(),
+        )
+    };
 
     // Register at a PRE-EXISTING net loss: crystallized 8_000, spent 0 -> snap = 8_000. This history is the
     // trader's prior real loss; it must NOT be claimable (only the post-register delta earns).
     set_slot(&mut svm, 100);
-    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 8_000, 0);
-    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader at non-zero snap");
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        8_000,
+        0,
+    );
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER)
+        .expect("reg trader at non-zero snap");
 
     // A NEW real loss after register: crystallized 8_000 -> 14_000 (spent still 0) -> net counter 14_000,
     // netΔ = 14_000 - 8_000(snap) = 6_000. Crystallize at tenure = 1024 -> floor_log2 = 10.
     set_slot(&mut svm, 100 + 1024);
-    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        14_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry post-register delta");
     assert_eq!(pts(&svm), 10 * 6_000, "points credit ONLY the post-register 6_000 delta, not the full 14_000 (snap captured the pre-existing 8_000)");
 
@@ -1551,9 +5518,22 @@ fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero
     // 14_000) -> net counter = 14_000 - 6_000 = 8_000 = the snap. netΔ = 8_000 - 8_000 = 0. Re-crystallize
     // OVERWRITES the points to 0: the washed/recovered loss earns nothing even atop the non-zero baseline.
     set_slot(&mut svm, 100 + 2048);
-    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 6_000);
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        14_000,
+        6_000,
+    );
     crystallize(&mut svm, &payer, &env, &t, &pf).expect("re-cry after recovery");
-    assert_eq!(pts(&svm), 0, "net-by-spent atop a non-zero snap: recovering the post-register loss zeroes the points");
+    assert_eq!(
+        pts(&svm),
+        0,
+        "net-by-spent atop a non-zero snap: recovering the post-register loss zeroes the points"
+    );
 
     // End to end: freeze + claim pays 0 (no real net loss remained over the registration window).
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -1579,24 +5559,89 @@ fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit(
     set_slot(&mut svm, 100);
 
     // Honest trader H: a real, UNRECOVERED 6_000 loss, crystallized at tenure 1024 (floor_log2 = 10).
-    let h = Keypair::new(); let h_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &h, &h.pubkey(), &h_pf, COHORT_TRADER).expect("reg H");
+    let h = Keypair::new();
+    let h_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &h_pf,
+        &env.stub_perc,
+        &env.market,
+        &h.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &h,
+        &h.pubkey(),
+        &h_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg H");
     // Attacker A: an IDENTICAL 6_000 loss, same tenure.
-    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_TRADER).expect("reg A");
+    let a = Keypair::new();
+    let a_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg A");
 
     set_slot(&mut svm, 100 + 1024);
-    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 6_000, 0);
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &h_pf,
+        &env.stub_perc,
+        &env.market,
+        &h.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        6_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &h, &h_pf).expect("cry H (net 6_000)");
     crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A (net 6_000)");
 
     // THE ATTACK: A's loss is RECOVERED (spent 0 -> 6_000, net -> 0), but A does NOT re-crystallize. H's loss
     // stays real (unrecovered). If the frozen points are used as-is, A still counts a phantom 6_000.
     set_slot(&mut svm, 100 + 2048);
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 6_000); // A net -> 0
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        6_000,
+        6_000,
+    ); // A net -> 0
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1618,7 +5663,10 @@ fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit(
     // It is fully defended PRE-freeze by the permissionless, incentive-compatible re-crystallize (an honest
     // claimant re-crystallizes A during the finalize window -> A's points -> 0 -> H takes the full 400k), exactly
     // as pinned by trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero_baseline.
-    assert_eq!(h_got, 200_000, "H is diluted by A's frozen-denominator share (the locked half is a grief, not A's profit)");
+    assert_eq!(
+        h_got, 200_000,
+        "H is diluted by A's frozen-denominator share (the locked half is a grief, not A's profit)"
+    );
 }
 
 #[test]
@@ -1630,33 +5678,115 @@ fn trader_fresh_post_freeze_loss_cannot_revive_recovered_frozen_points() {
     let env = setup(&mut svm, &payer, 1_000_000); // trader cohort = 40% = 400_000, fee = 0
     set_slot(&mut svm, 100);
 
-    let h = Keypair::new(); let h_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &h, &h.pubkey(), &h_pf, COHORT_TRADER).expect("reg H");
-    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_TRADER).expect("reg A");
+    let h = Keypair::new();
+    let h_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &h_pf,
+        &env.stub_perc,
+        &env.market,
+        &h.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &h,
+        &h.pubkey(),
+        &h_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg H");
+    let a = Keypair::new();
+    let a_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg A");
 
     set_slot(&mut svm, 100 + 1024);
-    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 6_000, 0);
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &h_pf,
+        &env.stub_perc,
+        &env.market,
+        &h.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        6_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &h, &h_pf).expect("cry H (net 6_000)");
     crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A (net 6_000)");
 
     set_slot(&mut svm, 100 + 2048);
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 6_000);
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        6_000,
+        6_000,
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 12_000, 6_000);
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        12_000,
+        6_000,
+    );
     let h_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &h.pubkey());
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     claim(&mut svm, &payer, &env, &h, &h_ata, None).expect("H claim");
     claim(&mut svm, &payer, &env, &a, &a_ata, None).expect("A claim");
 
-    assert_eq!(token_amount(&svm, &a_ata), 0, "fresh post-freeze net must not revive stale points from a recovered frozen loss");
-    assert_eq!(token_amount(&svm, &h_ata), 200_000, "H remains limited by the frozen denominator; A's stale share stays locked");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        0,
+        "fresh post-freeze net must not revive stale points from a recovered frozen loss"
+    );
+    assert_eq!(
+        token_amount(&svm, &h_ata),
+        200_000,
+        "H remains limited by the frozen denominator; A's stale share stays locked"
+    );
 }
 
 // LIVE-CAP ONE-SIDEDNESS (the fix must not over-pay either, sweep): the claim live-cap scales points by
@@ -1675,23 +5805,79 @@ fn live_cap_never_pays_above_the_frozen_points_when_live_net_grew_without_recrys
     set_slot(&mut svm, 100);
 
     // Honest co-staker H: a 6_000 loss, crystallized and LEFT as-is (frozen == live).
-    let h = Keypair::new(); let h_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &h, &h.pubkey(), &h_pf, COHORT_TRADER).expect("reg H");
+    let h = Keypair::new();
+    let h_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &h_pf,
+        &env.stub_perc,
+        &env.market,
+        &h.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &h,
+        &h.pubkey(),
+        &h_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg H");
     // T: an IDENTICAL 6_000 loss, same crystallize, but its live net later GROWS without a re-crystallize.
-    let t = Keypair::new(); let pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 0, 0);
+    let t = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg T");
     set_slot(&mut svm, 100 + 1024); // tenure 1024 -> floor_log2 = 10 -> each frozen = 10 * 6_000 = 60_000
-    set_portfolio_full(&mut svm, &h_pf, &env.stub_perc, &env.market, &h.pubkey(), 0, 6_000, 0);
-    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 6_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &h_pf,
+        &env.stub_perc,
+        &env.market,
+        &h.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        6_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &h, &h_pf).expect("cry H");
     crystallize(&mut svm, &payer, &env, &t, &pf).expect("cry T");
 
     // T's loss GROWS to 14_000 (live net 14_000 > frozen 6_000), but T does NOT re-crystallize: the extra loss
     // is in NEITHER stake.points NOR the frozen DENOMINATOR (still 60_000 + 60_000 = 120_000).
     set_slot(&mut svm, 100 + 2048);
-    set_portfolio_full(&mut svm, &pf, &env.stub_perc, &env.market, &t.pubkey(), 0, 14_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &t.pubkey(),
+        0,
+        14_000,
+        0,
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1702,8 +5888,16 @@ fn live_cap_never_pays_above_the_frozen_points_when_live_net_grew_without_recrys
     // One-sided cap: live (14_000) > frozen (6_000) -> min(1, live/frozen) = 1 -> T is paid its FROZEN 60_000,
     // NOT scaled up to the un-crystallized 14_000. So T and H split 50/50; a pay-UP bug would let T draw
     // 140_000/120_000 (capped at the whole 400_000 cohort) and starve H.
-    assert_eq!(token_amount(&svm, &t_ata), 200_000, "T paid its FROZEN points (50%), NOT the higher un-crystallized live net");
-    assert_eq!(token_amount(&svm, &h_ata), 200_000, "the honest co-staker keeps its full 50% — T's grown live net did not steal from H");
+    assert_eq!(
+        token_amount(&svm, &t_ata),
+        200_000,
+        "T paid its FROZEN points (50%), NOT the higher un-crystallized live net"
+    );
+    assert_eq!(
+        token_amount(&svm, &h_ata),
+        200_000,
+        "the honest co-staker keeps its full 50% — T's grown live net did not steal from H"
+    );
 }
 
 // ATTACK PROBE (CROSS-COHORT double-dip: trader-loss + LP-recovery of the SAME loss). The real percolator
@@ -1726,24 +5920,89 @@ fn cross_cohort_trader_loss_then_lp_recovery_cannot_double_dip_the_same_loss() {
     set_slot(&mut svm, 100);
 
     // Attacker owns BOTH legs: a_tr (trader) and a_lp (LP).
-    let a_tr = Keypair::new(); let tr_pf = Pubkey::new_unique();
-    let a_lp = Keypair::new(); let lp_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &tr_pf, &env.stub_perc, &env.market, &a_tr.pubkey(), 0, 0, 0);
-    set_portfolio_full(&mut svm, &lp_pf, &env.stub_perc, &env.market, &a_lp.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &a_tr, &a_tr.pubkey(), &tr_pf, COHORT_TRADER).expect("reg trader leg");
-    register(&mut svm, &payer, &env, &a_lp, &a_lp.pubkey(), &lp_pf, COHORT_LP).expect("reg LP leg");
+    let a_tr = Keypair::new();
+    let tr_pf = Pubkey::new_unique();
+    let a_lp = Keypair::new();
+    let lp_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &tr_pf,
+        &env.stub_perc,
+        &env.market,
+        &a_tr.pubkey(),
+        0,
+        0,
+        0,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &a_lp.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a_tr,
+        &a_tr.pubkey(),
+        &tr_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg trader leg");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a_lp,
+        &a_lp.pubkey(),
+        &lp_pf,
+        COHORT_LP,
+    )
+    .expect("reg LP leg");
 
     // (1) trader crystallizes a 6_000 loss at PEAK (tenure 1024 -> floor_log2 = 10 -> 60_000 trader points).
     set_slot(&mut svm, 100 + 1024);
-    set_portfolio_full(&mut svm, &tr_pf, &env.stub_perc, &env.market, &a_tr.pubkey(), 0, 6_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &tr_pf,
+        &env.stub_perc,
+        &env.market,
+        &a_tr.pubkey(),
+        0,
+        6_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &a_tr, &tr_pf).expect("cry trader (net 6_000)");
 
     // (2) self-dealt LP RECOVERY of that exact loss: percolator raises trader.spent AND lp.received together.
     // (3) crystallize the LP leg so it banks the recovered 6_000 as LP points (60_000). Trader leg NOT
     //     re-crystallized -> its frozen 60_000 trader points are now STALE (live net is 0).
     set_slot(&mut svm, 100 + 2048);
-    set_portfolio_full(&mut svm, &tr_pf, &env.stub_perc, &env.market, &a_tr.pubkey(), 0, 6_000, 6_000); // trader net -> 0
-    set_portfolio_full(&mut svm, &lp_pf, &env.stub_perc, &env.market, &a_lp.pubkey(), 6_000, 0, 0);      // lp received -> 6_000
+    set_portfolio_full(
+        &mut svm,
+        &tr_pf,
+        &env.stub_perc,
+        &env.market,
+        &a_tr.pubkey(),
+        0,
+        6_000,
+        6_000,
+    ); // trader net -> 0
+    set_portfolio_full(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &a_lp.pubkey(),
+        6_000,
+        0,
+        0,
+    ); // lp received -> 6_000
     crystallize(&mut svm, &payer, &env, &a_lp, &lp_pf).expect("cry LP (received 6_000)");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -1761,7 +6020,11 @@ fn cross_cohort_trader_loss_then_lp_recovery_cannot_double_dip_the_same_loss() {
     // The points correctly LANDED in the LP cohort (the recovery's beneficiary): a_lp is the sole LP staker.
     assert_eq!(lp_got, 400_000, "the recovered loss is counted ONCE, in the LP cohort where the credit transfer attributed it");
     // Total capture from the single 6_000 loss = ONE cohort (400_000), never two (800_000).
-    assert_eq!(tr_got + lp_got, 400_000, "one loss -> one cohort's worth of COIN, not double across trader+LP");
+    assert_eq!(
+        tr_got + lp_got,
+        400_000,
+        "one loss -> one cohort's worth of COIN, not double across trader+LP"
+    );
 }
 
 // ATTACK PROBE (residual claim live-cap bypass via a SUBSTITUTED portfolio). The claim live-cap (src:1011)
@@ -1782,20 +6045,66 @@ fn residual_claim_rejects_a_substituted_portfolio_no_live_cap_bypass() {
     set_slot(&mut svm, 100);
 
     // Attacker A: a real 6_000 loss crystallized at tenure 1024 (floor_log2 = 10 -> frozen points 60_000)...
-    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 0, 0);
-    register(&mut svm, &payer, &env, &a, &a.pubkey(), &a_pf, COHORT_TRADER).expect("reg A");
+    let a = Keypair::new();
+    let a_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pf,
+        COHORT_TRADER,
+    )
+    .expect("reg A");
     set_slot(&mut svm, 100 + 1024);
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 0);
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        6_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A (net 6_000)");
     // ...then RECOVERED to net 0 (crystallized 6_000, spent 6_000) without re-crystallizing — the live-cap
     // would scale A's bound claim to 0.
     set_slot(&mut svm, 100 + 2048);
-    set_portfolio_full(&mut svm, &a_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 6_000, 6_000);
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        6_000,
+        6_000,
+    );
     // A DECOY portfolio (percolator-owned so it passes the program-owner check) carrying a high live net that A
     // will try to substitute to read live_net >= frozen_net and defeat the cap.
     let decoy_pf = Pubkey::new_unique();
-    set_portfolio_full(&mut svm, &decoy_pf, &env.stub_perc, &env.market, &a.pubkey(), 0, 99_999, 0);
+    set_portfolio_full(
+        &mut svm,
+        &decoy_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        99_999,
+        0,
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -1804,11 +6113,93 @@ fn residual_claim_rejects_a_substituted_portfolio_no_live_cap_bypass() {
     // ATTACK: A claims but appends the DECOY portfolio (net 99_999) instead of its own (now net 0) bound one.
     assert!(claim(&mut svm, &payer, &env, &a, &a_ata, Some(&decoy_pf)).is_err(),
         "a substituted portfolio is rejected (portfolio.key != stake.backing_ledger) — no live-cap bypass");
-    assert_eq!(token_amount(&svm, &a_ata), 0, "the substituted-portfolio claim paid nothing");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        0,
+        "the substituted-portfolio claim paid nothing"
+    );
 
     // (control) claiming with the CORRECT bound (now-recovered) portfolio caps to 0, as the live-cap designs.
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pf)).expect("claim with the bound portfolio");
-    assert_eq!(token_amount(&svm, &a_ata), 0, "A recovered its loss (live net 0) -> live-cap pays 0 COIN");
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        0,
+        "A recovered its loss (live net 0) -> live-cap pays 0 COIN"
+    );
+}
+
+// ATTACK PROBE (same-key portfolio reuse at residual claim): a substituted-key guard is not enough if the
+// registered portfolio key can be dematerialized and reinitialized with different provenance before claim.
+// The residual live-cap must re-check the same key still belongs to the registered owner and allow-listed
+// market; otherwise a recovered trader could replace the bound account data with a foreign-market high-net
+// portfolio and make the cap pay stale frozen points.
+#[test]
+fn residual_claim_rejects_same_key_reinitialized_market_no_live_cap_bypass() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let attacker = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &pf,
+        COHORT_TRADER,
+    )
+    .expect("register trader");
+    set_slot(&mut svm, 1_124);
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &attacker, &pf).expect("crystallize trader");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &attacker.pubkey());
+
+    set_portfolio_full(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &Pubkey::new_unique(),
+        &attacker.pubkey(),
+        0,
+        99_999,
+        0,
+    );
+    assert!(
+        claim(&mut svm, &payer, &env, &attacker, &ata, Some(&pf)).is_err(),
+        "same portfolio key reinitialized to a foreign market must not bypass the residual live-cap"
+    );
+    assert_eq!(
+        token_amount(&svm, &ata),
+        0,
+        "same-key foreign-market claim paid nothing"
+    );
 }
 
 // ATTACK PROBE (crystallize replay / denominator inflation): an LP/trader stake's points are the Δ of a
@@ -1834,39 +6225,103 @@ fn crystallize_is_idempotent_under_replay_and_tracks_full_delta_not_accumulation
     let pf = Pubkey::new_unique();
     let stake = stake_pda(&env, &lp.pubkey());
     // register at received = 5_000 (pre-existing baseline — must NOT count).
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        5_000,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
 
     // points@176 (u128) on the stake; lp_total_points@402 (u128) on the config — read both each step.
-    let pts = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&stake).unwrap().data[176..192].try_into().unwrap()) };
-    let denom = |svm: &LiteSVM| -> u128 { u128::from_le_bytes(svm.get_account(&env.rd_config).unwrap().data[402..418].try_into().unwrap()) };
+    let pts = |svm: &LiteSVM| -> u128 {
+        u128::from_le_bytes(
+            svm.get_account(&stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    let denom = |svm: &LiteSVM| -> u128 {
+        u128::from_le_bytes(
+            svm.get_account(&env.rd_config).unwrap().data[402..418]
+                .try_into()
+                .unwrap(),
+        )
+    };
 
     // Points are TIME-WEIGHTED: floor(log2(now - start_slot=100)) * netΔ. register at slot 100.
     // counter 5_000 -> 12_000 (netΔ from register = 7_000). First crystallize at slot 1_000: tenure 900,
     // floor(log2(900)) = 9, so points = 9 * 7_000 = 63_000.
     set_slot(&mut svm, 1_000);
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 12_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        12_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize 1");
-    assert_eq!(pts(&svm), 9 * 7_000, "points = floor(log2(tenure=900)) * (counter - register snapshot)");
-    assert_eq!(denom(&svm), 9 * 7_000, "cohort denominator = the single staker's weighted Δ");
+    assert_eq!(
+        pts(&svm),
+        9 * 7_000,
+        "points = floor(log2(tenure=900)) * (counter - register snapshot)"
+    );
+    assert_eq!(
+        denom(&svm),
+        9 * 7_000,
+        "cohort denominator = the single staker's weighted Δ"
+    );
 
     // REPLAY at the SAME slot+counter — idempotent: same tenure, same netΔ -> no inflation.
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize replay (same counter)");
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize replay #2");
-    assert_eq!(pts(&svm), 9 * 7_000, "replay did NOT inflate the stake's points");
-    assert_eq!(denom(&svm), 9 * 7_000, "replay did NOT inflate the cohort denominator");
+    assert_eq!(
+        pts(&svm),
+        9 * 7_000,
+        "replay did NOT inflate the stake's points"
+    );
+    assert_eq!(
+        denom(&svm),
+        9 * 7_000,
+        "replay did NOT inflate the cohort denominator"
+    );
 
     // counter advances 12_000 -> 20_000 (netΔ from register = 15_000). Re-crystallize at slot 1_800: tenure
     // 1_700, floor(log2) = 10. Tracks the FULL netΔ from register (10 * 15_000), NOT a sum of per-window Δs.
     set_slot(&mut svm, 1_800);
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 20_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        20_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize 2");
-    assert_eq!(pts(&svm), 10 * 15_000, "points = floor(log2(tenure=1700)) * cumulative netΔ from register");
-    assert_eq!(denom(&svm), 10 * 15_000, "denominator re-derived (subtract-old/add-new), still the true weighted Δ");
+    assert_eq!(
+        pts(&svm),
+        10 * 15_000,
+        "points = floor(log2(tenure=1700)) * cumulative netΔ from register"
+    );
+    assert_eq!(
+        denom(&svm),
+        10 * 15_000,
+        "denominator re-derived (subtract-old/add-new), still the true weighted Δ"
+    );
 
     // Replaying after the advance is still idempotent.
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize replay #3");
-    assert_eq!(pts(&svm), 10 * 15_000, "still idempotent after the counter advance");
+    assert_eq!(
+        pts(&svm),
+        10 * 15_000,
+        "still idempotent after the counter advance"
+    );
     assert_eq!(denom(&svm), 10 * 15_000, "denominator stable under replay");
 }
 
@@ -1881,31 +6336,89 @@ fn claim_before_freeze_is_rejected() {
     set_slot(&mut svm, 100);
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 1_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        1_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry");
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
-    assert!(claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(), "claim before freeze must reject");
+    assert!(
+        claim(&mut svm, &payer, &env, &lp, &ata, None).is_err(),
+        "claim before freeze must reject"
+    );
 }
 
 // init validation guards: reject zero supply, a cohort bps sum > 100%, an active insurance/backing cohort
 // with no pool scope, and an active LP/trader cohort with no market_group (finding IL — else an unscoped
 // genesis could mint COIN to positions from any pool / any market). init authenticates the live SPL mint
 // authority, so each case uses a fresh real coin mint. Real .so.
-fn try_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, ins: u16, back: u16, lp: u16, ins_pool: Pubkey, back_pool: Pubkey, market: Pubkey) -> Result<(), String> {
+fn try_init(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    ins: u16,
+    back: u16,
+    lp: u16,
+    ins_pool: Pubkey,
+    back_pool: Pubkey,
+    market: Pubkey,
+) -> Result<(), String> {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
-    let d = rd_init_data(supply, 2_000, ins, back, lp, 500, ins_pool, back_pool, market, &[], Some(0));
-    send(svm, payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth])
+    let d = rd_init_data(
+        supply,
+        2_000,
+        ins,
+        back,
+        lp,
+        500,
+        ins_pool,
+        back_pool,
+        market,
+        &[],
+        Some(0),
+    );
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    )
 }
 
 #[test]
@@ -1918,17 +6431,65 @@ fn init_rejects_zero_supply_overallocation_and_unscoped_cohorts() {
     let z = Pubkey::default();
 
     // zero supply -> rejected.
-    assert!(try_init(&mut svm, &payer, 0, 1_000, 1_000, 4_000, p(), p(), p()).is_err(), "zero supply");
+    assert!(
+        try_init(&mut svm, &payer, 0, 1_000, 1_000, 4_000, p(), p(), p()).is_err(),
+        "zero supply"
+    );
     // cohort bps sum > 100% (5000+4000+2000=11000) -> rejected.
-    assert!(try_init(&mut svm, &payer, 1_000_000, 5_000, 4_000, 2_000, p(), p(), p()).is_err(), "bps sum > 100%");
+    assert!(
+        try_init(
+            &mut svm,
+            &payer,
+            1_000_000,
+            5_000,
+            4_000,
+            2_000,
+            p(),
+            p(),
+            p()
+        )
+        .is_err(),
+        "bps sum > 100%"
+    );
     // insurance active (10000, trader=0) but NO insurance pool -> rejected.
-    assert!(try_init(&mut svm, &payer, 1_000_000, 10_000, 0, 0, z, z, z).is_err(), "insurance cohort without a pool scope");
+    assert!(
+        try_init(&mut svm, &payer, 1_000_000, 10_000, 0, 0, z, z, z).is_err(),
+        "insurance cohort without a pool scope"
+    );
     // backing active (10000, trader=0) but NO backing pool -> rejected.
-    assert!(try_init(&mut svm, &payer, 1_000_000, 0, 10_000, 0, z, z, z).is_err(), "backing cohort without a pool scope");
+    assert!(
+        try_init(&mut svm, &payer, 1_000_000, 0, 10_000, 0, z, z, z).is_err(),
+        "backing cohort without a pool scope"
+    );
     // LP+trader active (lp 4000, trader 4000) with pools set but NO market_group -> rejected (finding IL).
-    assert!(try_init(&mut svm, &payer, 1_000_000, 1_000, 1_000, 4_000, p(), p(), z).is_err(), "lp/trader cohort without a market scope");
+    assert!(
+        try_init(
+            &mut svm,
+            &payer,
+            1_000_000,
+            1_000,
+            1_000,
+            4_000,
+            p(),
+            p(),
+            z
+        )
+        .is_err(),
+        "lp/trader cohort without a market scope"
+    );
     // fully-valid config -> accepted.
-    try_init(&mut svm, &payer, 1_000_000, 1_000, 1_000, 4_000, p(), p(), p()).expect("a fully-scoped config initializes");
+    try_init(
+        &mut svm,
+        &payer,
+        1_000_000,
+        1_000,
+        1_000,
+        4_000,
+        p(),
+        p(),
+        p(),
+    )
+    .expect("a fully-scoped config initializes");
 }
 
 // ATTACK PROBE (init extra-market allow-list vetting bypass): the allow-list tail is a u8 count + that many
@@ -1949,46 +6510,92 @@ fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_ta
     // Build an rd init (lp 4000 / trader 4000 remainder, so the allow-list is load-bearing) with a CUSTOM
     // extra-market tail: a declared u8 count followed by the given pubkeys (which may mismatch the count to
     // exercise the exact-length check). Fresh coin_mint each call -> distinct rd_config, no reinit collision.
-    let try_tail = |svm: &mut LiteSVM, market_group: Pubkey, declared_count: u8, extras: &[Pubkey]| -> Result<(), String> {
+    let try_tail = |svm: &mut LiteSVM,
+                    market_group: Pubkey,
+                    declared_count: u8,
+                    extras: &[Pubkey]|
+     -> Result<(), String> {
         let mint_auth = Keypair::new();
         let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
-        let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+        let rd_config =
+            Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+        let dist_config = Pubkey::find_program_address(
+            &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+            &dist_id(),
+        )
+        .0;
         let mut d = vec![0u8];
         d.extend_from_slice(&1_000_000u64.to_le_bytes()); // supply
-        d.extend_from_slice(&2_000u64.to_le_bytes());     // emission_end
-        d.extend_from_slice(&1_000u16.to_le_bytes());     // insurance
-        d.extend_from_slice(&1_000u16.to_le_bytes());     // backing
-        d.extend_from_slice(&4_000u16.to_le_bytes());     // lp (trader = 4000 remainder)
-        d.extend_from_slice(&500u64.to_le_bytes());       // finalize_window
+        d.extend_from_slice(&2_000u64.to_le_bytes()); // emission_end
+        d.extend_from_slice(&1_000u16.to_le_bytes()); // insurance
+        d.extend_from_slice(&1_000u16.to_le_bytes()); // backing
+        d.extend_from_slice(&4_000u16.to_le_bytes()); // lp (trader = 4000 remainder)
+        d.extend_from_slice(&500u64.to_le_bytes()); // finalize_window
         d.extend_from_slice(Pubkey::new_unique().as_ref()); // ins_pool (non-default)
         d.extend_from_slice(Pubkey::new_unique().as_ref()); // back_pool (non-default)
         d.extend_from_slice(market_group.as_ref());
         d.push(declared_count);
-        for e in extras { d.extend_from_slice(e.as_ref()); }
-        send(svm, &payer, &[Instruction {
-            program_id: rd_id(),
-            accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, Pubkey::new_unique(), Pubkey::new_unique(), rd_config, mint_auth.pubkey()),
-            data: d,
-        }], &[&mint_auth])
+        for e in extras {
+            d.extend_from_slice(e.as_ref());
+        }
+        send(
+            svm,
+            &payer,
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: rd_init_accounts(
+                    payer.pubkey(),
+                    coin_mint,
+                    dist_config,
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    rd_config,
+                    mint_auth.pubkey(),
+                ),
+                data: d,
+            }],
+            &[&mint_auth],
+        )
     };
     let mg = Pubkey::new_unique(); // a real primary trusted market
     let u = Pubkey::new_unique;
 
     // (1) count > MAX_EXTRA_MARKETS (10 > 9) — would overrun the fixed [Pubkey; 9] config layout.
     let ten: Vec<Pubkey> = (0..10).map(|_| u()).collect();
-    assert!(try_tail(&mut svm, mg, 10, &ten).is_err(), "extra_market_count > MAX (9) must be rejected");
+    assert!(
+        try_tail(&mut svm, mg, 10, &ten).is_err(),
+        "extra_market_count > MAX (9) must be rejected"
+    );
     // (2) a default-pubkey extra — would make market_allowed(default) TRUE (any unset-market portfolio farms).
-    assert!(try_tail(&mut svm, mg, 2, &[u(), Pubkey::default()]).is_err(), "a default-pubkey extra market is rejected");
+    assert!(
+        try_tail(&mut svm, mg, 2, &[u(), Pubkey::default()]).is_err(),
+        "a default-pubkey extra market is rejected"
+    );
     // (3) an extra duplicating the primary market_group.
-    assert!(try_tail(&mut svm, mg, 2, &[u(), mg]).is_err(), "an extra equal to the primary market is rejected");
-    // (4) declared count exceeds the supplied pubkeys (truncated payload) — take_pubkey underruns.
-    assert!(try_tail(&mut svm, mg, 3, &[u(), u()]).is_err(), "count > supplied pubkeys is rejected");
-    // (5) trailing bytes: more pubkeys than declared — the exact-length check (502) rejects the remainder.
-    assert!(try_tail(&mut svm, mg, 1, &[u(), u()]).is_err(), "extra trailing pubkeys are rejected");
-    // (6) boundary: count == MAX (9) with 9 distinct valid extras -> accepted.
+    assert!(
+        try_tail(&mut svm, mg, 2, &[u(), mg]).is_err(),
+        "an extra equal to the primary market is rejected"
+    );
+    // (4) duplicate extras silently waste scarce allow-list slots and can leave a vetted market unlistable.
+    let dup = u();
+    assert!(
+        try_tail(&mut svm, mg, 2, &[dup, dup]).is_err(),
+        "duplicate extra markets are rejected"
+    );
+    // (5) declared count exceeds the supplied pubkeys (truncated payload) — take_pubkey underruns.
+    assert!(
+        try_tail(&mut svm, mg, 3, &[u(), u()]).is_err(),
+        "count > supplied pubkeys is rejected"
+    );
+    // (6) trailing bytes: more pubkeys than declared — the exact-length check (502) rejects the remainder.
+    assert!(
+        try_tail(&mut svm, mg, 1, &[u(), u()]).is_err(),
+        "extra trailing pubkeys are rejected"
+    );
+    // (7) boundary: count == MAX (9) with 9 distinct valid extras -> accepted.
     let nine: Vec<Pubkey> = (0..9).map(|_| u()).collect();
-    try_tail(&mut svm, mg, 9, &nine).expect("the maximum-size, all-distinct, all-valid allow-list initializes");
+    try_tail(&mut svm, mg, 9, &nine)
+        .expect("the maximum-size, all-distinct, all-valid allow-list initializes");
 }
 
 // CONFIG RE-INIT (un-freeze / denominator reset): the rd config is one-shot — init rejects an already-initialized
@@ -2011,10 +6618,21 @@ fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
     freeze(&mut svm, &payer, &env).expect("freeze");
     let cfg_before = svm.get_account(&env.rd_config).unwrap().data.clone();
     let freeze_slot_before = u64::from_le_bytes(cfg_before[318..326].try_into().unwrap());
-    assert!(freeze_slot_before != 0, "config is frozen (freeze_slot set)");
+    assert!(
+        freeze_slot_before != 0,
+        "config is frozen (freeze_slot set)"
+    );
 
     // ATTACK: re-init the SAME (now frozen) rd config — would reset freeze_slot -> 0 and wipe the denominators.
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", env.coin_mint.as_ref(), env.rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[
+            b"dist_config",
+            env.coin_mint.as_ref(),
+            env.rd_config.as_ref(),
+        ],
+        &dist_id(),
+    )
+    .0;
     let mut d = vec![0u8];
     d.extend_from_slice(&supply.to_le_bytes());
     d.extend_from_slice(&env.emission_end.to_le_bytes());
@@ -2026,18 +6644,37 @@ fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
     d.extend_from_slice(env.back_pool.as_ref());
     d.extend_from_slice(env.market.as_ref());
     d.extend_from_slice(&[0u8]); // extra market count
-    let res = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(env.coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(env.stub_perc, false), AccountMeta::new_readonly(env.stub_sub, false),
-        AccountMeta::new(env.rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        AccountMeta::new_readonly(env.mint_auth.pubkey(), true),
-    ], data: d }], &[&env.mint_auth]);
-    assert!(res.is_err(), "re-initializing an existing rd config must be rejected — no un-freeze / denominator reset");
+    let res = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(env.coin_mint, false),
+                AccountMeta::new_readonly(dist_id(), false),
+                AccountMeta::new_readonly(dist_config, false),
+                AccountMeta::new_readonly(env.stub_perc, false),
+                AccountMeta::new_readonly(env.stub_sub, false),
+                AccountMeta::new(env.rd_config, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(env.mint_auth.pubkey(), true),
+            ],
+            data: d,
+        }],
+        &[&env.mint_auth],
+    );
+    assert!(
+        res.is_err(),
+        "re-initializing an existing rd config must be rejected — no un-freeze / denominator reset"
+    );
 
     // The frozen config is byte-identical: freeze_slot + all denominators + the bound vault are immutable.
     let cfg_after = svm.get_account(&env.rd_config).unwrap().data.clone();
-    assert_eq!(cfg_after, cfg_before, "rd config unchanged by the rejected re-init — freeze and denominators immutable");
+    assert_eq!(
+        cfg_after, cfg_before,
+        "rd config unchanged by the rejected re-init — freeze and denominators immutable"
+    );
 }
 
 // claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
@@ -2054,9 +6691,25 @@ fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
 
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("register"); // recipient bound = lp
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 10_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        10_000,
+        0,
+    );
     set_slot(&mut svm, 1_000); // residual points are time-weighted -> need tenure > 0
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -2067,27 +6720,51 @@ fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
     let rd_config = env.rd_config;
     let coin_mint = env.coin_mint;
     let real_vault = env.vault;
-    let mut raw_claim = |svm: &mut LiteSVM, cranker: &Keypair, vault: Pubkey, recipient_ata: Pubkey| -> Result<(), String> {
-        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(cranker.pubkey(), true), AccountMeta::new_readonly(rd_config, false),
-            AccountMeta::new(stake, false), AccountMeta::new(vault, false),
-            AccountMeta::new(recipient_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
-        ], data: vec![5u8] }], &[cranker])
+    let mut raw_claim = |svm: &mut LiteSVM,
+                         cranker: &Keypair,
+                         vault: Pubkey,
+                         recipient_ata: Pubkey|
+     -> Result<(), String> {
+        send(
+            svm,
+            &payer,
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(cranker.pubkey(), true),
+                    AccountMeta::new_readonly(rd_config, false),
+                    AccountMeta::new(stake, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new(recipient_ata, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
+                ],
+                data: vec![5u8],
+            }],
+            &[cranker],
+        )
     };
 
     // (a) a third-party cranker redirecting to its OWN ata -> rejected (ra.owner != stake.recipient).
     let attacker_ata = create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
-    assert!(raw_claim(&mut svm, &attacker, real_vault, attacker_ata).is_err(),
-        "claim cannot be redirected to a non-recipient ata");
+    assert!(
+        raw_claim(&mut svm, &attacker, real_vault, attacker_ata).is_err(),
+        "claim cannot be redirected to a non-recipient ata"
+    );
     // (b) paying from a decoy vault -> rejected (vault.key != config.vault).
     let decoy_vault = create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
     let lp_ata = create_token_account(&mut svm, &payer, &coin_mint, &lp.pubkey());
-    assert!(raw_claim(&mut svm, &attacker, decoy_vault, lp_ata).is_err(),
-        "claim cannot pay from a decoy vault");
+    assert!(
+        raw_claim(&mut svm, &attacker, decoy_vault, lp_ata).is_err(),
+        "claim cannot pay from a decoy vault"
+    );
     // (control) ANY cranker may finalize the claim, but ONLY into the bound recipient from the real vault.
-    raw_claim(&mut svm, &attacker, real_vault, lp_ata).expect("permissionless cranker pays the bound recipient");
-    assert!(token_amount(&svm, &lp_ata) > 0, "the LP backer received its share");
+    raw_claim(&mut svm, &attacker, real_vault, lp_ata)
+        .expect("permissionless cranker pays the bound recipient");
+    assert!(
+        token_amount(&svm, &lp_ata) > 0,
+        "the LP backer received its share"
+    );
 }
 
 // SAME-PROGRAM TYPE CONFUSION (discriminator defense): the rd Config (RDCONFG1) and Stake (RDSTAKE1) are BOTH
@@ -2108,9 +6785,25 @@ fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
 
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0); // snap 0 at register
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    ); // snap 0 at register
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg lp");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0); // residual_received grows
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        9_000,
+        0,
+    ); // residual_received grows
     set_slot(&mut svm, 1_000); // tenure > 0 for the time-weight
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -2119,26 +6812,49 @@ fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
 
     // Build a claim with arbitrary accounts in the config/stake slots (LP cohort -> no position appended).
-    let claim_with = |svm: &mut LiteSVM, config_slot: Pubkey, stake_slot: Pubkey| -> Result<(), String> {
-        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(lp.pubkey(), true),
-            AccountMeta::new_readonly(config_slot, false),
-            AccountMeta::new(stake_slot, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new(ata, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
-        ], data: vec![5u8] }], &[&lp])
-    };
+    let claim_with =
+        |svm: &mut LiteSVM, config_slot: Pubkey, stake_slot: Pubkey| -> Result<(), String> {
+            send(
+                svm,
+                &payer,
+                &[Instruction {
+                    program_id: rd_id(),
+                    accounts: vec![
+                        AccountMeta::new(lp.pubkey(), true),
+                        AccountMeta::new_readonly(config_slot, false),
+                        AccountMeta::new(stake_slot, false),
+                        AccountMeta::new(env.vault, false),
+                        AccountMeta::new(ata, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
+                    ],
+                    data: vec![5u8],
+                }],
+                &[&lp],
+            )
+        };
     // (a) STAKE account in the config slot -> Config::deserialize sees RDSTAKE1 != RDCONFG1 -> reject.
-    assert!(claim_with(&mut svm, stake, stake).is_err(), "a stake account in the config slot must be rejected by the discriminator");
+    assert!(
+        claim_with(&mut svm, stake, stake).is_err(),
+        "a stake account in the config slot must be rejected by the discriminator"
+    );
     // (b) CONFIG account in the stake slot -> Stake::deserialize sees RDCONFG1 != RDSTAKE1 -> reject.
-    assert!(claim_with(&mut svm, env.rd_config, env.rd_config).is_err(), "a config account in the stake slot must be rejected by the discriminator");
-    assert_eq!(token_amount(&svm, &ata), 0, "no payout from the type-confused claims");
+    assert!(
+        claim_with(&mut svm, env.rd_config, env.rd_config).is_err(),
+        "a config account in the stake slot must be rejected by the discriminator"
+    );
+    assert_eq!(
+        token_amount(&svm, &ata),
+        0,
+        "no payout from the type-confused claims"
+    );
 
     // The correctly-typed claim still pays the LP its cohort share.
     claim_with(&mut svm, env.rd_config, stake).expect("honest claim with correct account types");
-    assert!(token_amount(&svm, &ata) > 0, "honest claim paid the LP its share");
+    assert!(
+        token_amount(&svm, &ata) > 0,
+        "honest claim paid the LP its share"
+    );
 }
 
 // ATTACK PROBE (cross-genesis claim: a stake from rd_config A claims rd_config B's COIN). claim binds
@@ -2159,9 +6875,25 @@ fn claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim() {
     set_slot(&mut svm, 100);
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env_a.stub_perc, &env_a.market, &lp.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env_a.stub_perc,
+        &env_a.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env_a, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("register in A");
-    set_portfolio(&mut svm, &pf, &env_a.stub_perc, &env_a.market, &lp.pubkey(), 10_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env_a.stub_perc,
+        &env_a.market,
+        &lp.pubkey(),
+        10_000,
+        0,
+    );
     set_slot(&mut svm, 1_000); // residual points are time-weighted -> need tenure > 0
     crystallize(&mut svm, &payer, &env_a, &lp, &pf).expect("crystallize in A");
 
@@ -2175,20 +6907,47 @@ fn claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim() {
     // ATTACK: present A's stake against B's real config + funded vault. recipient ata owned by lp, B's mint.
     let stake_a = stake_pda(&env_a, &lp.pubkey());
     let b_ata = create_token_account(&mut svm, &payer, &env_b.coin_mint, &lp.pubkey());
-    let cranker = Keypair::new(); svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
-    let cross = send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(cranker.pubkey(), true), AccountMeta::new_readonly(env_b.rd_config, false),
-        AccountMeta::new(stake_a, false), AccountMeta::new(env_b.vault, false),
-        AccountMeta::new(b_ata, false), AccountMeta::new_readonly(spl_token::ID, false),
-    ], data: vec![5u8] }], &[&cranker]);
-    assert!(cross.is_err(), "A's stake cannot claim B's COIN — stake.config != config bind");
-    assert_eq!(token_amount(&svm, &b_ata), 0, "no cross-genesis COIN paid out");
-    assert_eq!(token_amount(&svm, &env_b.vault), 1_000_000, "genesis B's vault is untouched");
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let cross = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(cranker.pubkey(), true),
+                AccountMeta::new_readonly(env_b.rd_config, false),
+                AccountMeta::new(stake_a, false),
+                AccountMeta::new(env_b.vault, false),
+                AccountMeta::new(b_ata, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: vec![5u8],
+        }],
+        &[&cranker],
+    );
+    assert!(
+        cross.is_err(),
+        "A's stake cannot claim B's COIN — stake.config != config bind"
+    );
+    assert_eq!(
+        token_amount(&svm, &b_ata),
+        0,
+        "no cross-genesis COIN paid out"
+    );
+    assert_eq!(
+        token_amount(&svm, &env_b.vault),
+        1_000_000,
+        "genesis B's vault is untouched"
+    );
 
     // (control) A's stake claims A's OWN vault for its real points.
     let a_ata = create_token_account(&mut svm, &payer, &env_a.coin_mint, &lp.pubkey());
     claim(&mut svm, &payer, &env_a, &lp, &a_ata, None).expect("claim in A pays from A");
-    assert!(token_amount(&svm, &a_ata) > 0, "the staker claims its own genesis's COIN");
+    assert!(
+        token_amount(&svm, &a_ata) > 0,
+        "the staker claims its own genesis's COIN"
+    );
 }
 
 // register guards distinct from the foreign-owner/pool/market tests: an out-of-range cohort, CROSS-PROGRAM
@@ -2205,28 +6964,96 @@ fn register_rejects_out_of_range_cohort_cross_program_and_double_register() {
     set_slot(&mut svm, 100);
     let alice = Keypair::new();
 
-    // (1) cohort 4 > COHORT_TRADER(3) -> rejected (the linked account isn't even read).
+    // (1) cohort 5 > COHORT_FUNDING_PAYER(4) -> rejected (the linked account isn't even read).
     let any = Pubkey::new_unique();
-    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &any, 4).is_err(),
-        "out-of-range cohort must reject");
+    assert!(
+        register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &any, 5).is_err(),
+        "out-of-range cohort must reject"
+    );
 
     // (2) cross-program type confusion: insurance cohort pointed at a PERCOLATOR-owned account is rejected
     // (owner program != subledger_program), and symmetrically an LP cohort at a SUBLEDGER position.
     let perc_acct = Pubkey::new_unique();
-    set_portfolio(&mut svm, &perc_acct, &env.stub_perc, &env.market, &alice.pubkey(), 5_000, 0);
-    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &perc_acct, COHORT_INSURANCE).is_err(),
-        "insurance cohort must reject a percolator-owned account (wrong program)");
+    set_portfolio(
+        &mut svm,
+        &perc_acct,
+        &env.stub_perc,
+        &env.market,
+        &alice.pubkey(),
+        5_000,
+        0,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &alice,
+            &alice.pubkey(),
+            &perc_acct,
+            COHORT_INSURANCE
+        )
+        .is_err(),
+        "insurance cohort must reject a percolator-owned account (wrong program)"
+    );
     let sub_acct = Pubkey::new_unique();
-    set_position(&mut svm, &sub_acct, &env.stub_sub, &env.ins_pool, &alice.pubkey(), 500, false);
-    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &sub_acct, COHORT_LP).is_err(),
-        "lp cohort must reject a subledger-owned position (wrong program)");
+    set_position(
+        &mut svm,
+        &sub_acct,
+        &env.stub_sub,
+        &env.ins_pool,
+        &alice.pubkey(),
+        500,
+        false,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &alice,
+            &alice.pubkey(),
+            &sub_acct,
+            COHORT_LP
+        )
+        .is_err(),
+        "lp cohort must reject a subledger-owned position (wrong program)"
+    );
 
     // (3) double-register for the same owner (stake PDA now initialized) -> rejected.
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &alice.pubkey(), 0, 0);
-    register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).expect("first register ok");
-    assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).is_err(),
-        "double-register (stake PDA already initialized) must reject");
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &alice.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &alice,
+        &alice.pubkey(),
+        &pf,
+        COHORT_LP,
+    )
+    .expect("first register ok");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &alice,
+            &alice.pubkey(),
+            &pf,
+            COHORT_LP
+        )
+        .is_err(),
+        "double-register (stake PDA already initialized) must reject"
+    );
 }
 
 // CROSS-COHORT DOUBLE-DIP (sweep tick D — wash/free-farm): a single percolator portfolio that BOTH
@@ -2253,11 +7080,27 @@ fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio
     // Alice's own portfolio in the allow-listed genesis market has BOTH legs populated: it received LP
     // residual (9_000) AND crystallized a directional loss (6_000) — both cohort counters are positive.
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &alice.pubkey(), 9_000, 6_000);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &alice.pubkey(),
+        9_000,
+        6_000,
+    );
 
     // She is the rightful owner, so the first registration (TRADER cohort) succeeds.
-    register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_TRADER)
-        .expect("owner registers her dual-activity portfolio once (trader cohort)");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &alice,
+        &alice.pubkey(),
+        &pf,
+        COHORT_TRADER,
+    )
+    .expect("owner registers her dual-activity portfolio once (trader cohort)");
 
     // The double-dip: register the SAME portfolio under the LP cohort to also claim the LP supply slice.
     // Cohort is not in the PDA seed, so this targets the SAME, now-occupied rd_stake PDA -> rejected. One
@@ -2267,10 +7110,30 @@ fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio
     // And the reverse order is symmetric: a fresh owner registering LP first cannot then add a trader stake.
     let bob = Keypair::new();
     let pf2 = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf2, &env.stub_perc, &env.market, &bob.pubkey(), 9_000, 6_000);
-    register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_LP).expect("bob registers LP first");
-    assert!(register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_TRADER).is_err(),
-        "and LP-first cannot be topped up with a trader stake on the same single PDA either");
+    set_portfolio(
+        &mut svm,
+        &pf2,
+        &env.stub_perc,
+        &env.market,
+        &bob.pubkey(),
+        9_000,
+        6_000,
+    );
+    register(&mut svm, &payer, &env, &bob, &bob.pubkey(), &pf2, COHORT_LP)
+        .expect("bob registers LP first");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &bob,
+            &bob.pubkey(),
+            &pf2,
+            COHORT_TRADER
+        )
+        .is_err(),
+        "and LP-first cannot be topped up with a trader stake on the same single PDA either"
+    );
 }
 
 // Self-service finalize lifecycle guards: freeze is rejected before emission_end+finalize_window (else a
@@ -2289,34 +7152,87 @@ fn self_service_lifecycle_guards_freeze_window_and_post_freeze_closure() {
     // an LP backer registers + crystallizes during the accrual phase.
     let lp = Keypair::new();
     let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("register");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 5_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        5_000,
+        0,
+    );
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize");
 
     // (1) freeze at the LAST in-window slot (emission_end + finalize_window - 1) is rejected — the check is
     // `now < emission_end + finalize_window -> reject`, so backers get the FULL finalize window to crystallize
     // their points (an off-by-one here would forfeit slow backers' final-slot points).
     set_slot(&mut svm, env.emission_end + env.finalize_window - 1);
-    assert!(freeze(&mut svm, &payer, &env).is_err(), "freeze at window_end - 1 must reject — the finalize window is still open");
+    assert!(
+        freeze(&mut svm, &payer, &env).is_err(),
+        "freeze at window_end - 1 must reject — the finalize window is still open"
+    );
 
     // EXACTLY emission_end + finalize_window is the FIRST slot freeze is permitted (inclusive cutoff), one-shot.
     set_slot(&mut svm, env.emission_end + env.finalize_window);
-    freeze(&mut svm, &payer, &env).expect("freeze succeeds at exactly emission_end + finalize_window (first valid slot)");
+    freeze(&mut svm, &payer, &env)
+        .expect("freeze succeeds at exactly emission_end + finalize_window (first valid slot)");
 
     // (2) register is closed after freeze (would dilute the frozen denominator).
     let late = Keypair::new();
     let late_pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &late_pf, &env.stub_perc, &env.market, &late.pubkey(), 9_000, 0);
-    assert!(register(&mut svm, &payer, &env, &late, &late.pubkey(), &late_pf, COHORT_LP).is_err(),
-        "register after freeze must reject");
+    set_portfolio(
+        &mut svm,
+        &late_pf,
+        &env.stub_perc,
+        &env.market,
+        &late.pubkey(),
+        9_000,
+        0,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &late,
+            &late.pubkey(),
+            &late_pf,
+            COHORT_LP
+        )
+        .is_err(),
+        "register after freeze must reject"
+    );
 
     // (3) crystallize is closed after freeze (would alter the frozen denominator).
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 99_000, 0);
-    assert!(crystallize(&mut svm, &payer, &env, &lp, &pf).is_err(), "crystallize after freeze must reject");
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        99_000,
+        0,
+    );
+    assert!(
+        crystallize(&mut svm, &payer, &env, &lp, &pf).is_err(),
+        "crystallize after freeze must reject"
+    );
 
     // (4) double-freeze is rejected (snapshot + bound vault immutable).
-    assert!(freeze(&mut svm, &payer, &env).is_err(), "double-freeze must reject");
+    assert!(
+        freeze(&mut svm, &payer, &env).is_err(),
+        "double-freeze must reject"
+    );
 }
 
 // ATTACK PROBE (cohort over-allocation -> FCFS-strand LOF at init). Each cohort's COIN budget is
@@ -2337,11 +7253,20 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
-    let (stub_sub, stub_perc, ins_pool, back_pool, market) =
-        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    );
     // ATTACK WIRE: insurance 50% + backing 50% + lp 50% = 150% (trader would saturate to 0). Sum > 100%.
     let mut d = vec![0u8];
     d.extend_from_slice(&supply.to_le_bytes());
@@ -2350,14 +7275,32 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     d.extend_from_slice(&5_000u16.to_le_bytes()); // backing 50%
     d.extend_from_slice(&5_000u16.to_le_bytes()); // lp 50% -> sum 150% > 10000
     d.extend_from_slice(&500u64.to_le_bytes());
-    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(ins_pool.as_ref());
+    d.extend_from_slice(back_pool.as_ref());
+    d.extend_from_slice(market.as_ref());
     d.extend_from_slice(&[0u8]);
-    let r = send(&mut svm, &payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]);
-    assert!(r.is_err(), "init with cohort bps summing to 150% must be rejected (no over-allocation)");
+    let r = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    );
+    assert!(
+        r.is_err(),
+        "init with cohort bps summing to 150% must be rejected (no over-allocation)"
+    );
 
     // CONTROL: the same wire with shares summing to EXACTLY 100% (50/30/20/0) initializes fine — the guard
     // rejects only the OVER-allocation, never a valid full split.
@@ -2368,14 +7311,32 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     d.extend_from_slice(&3_000u16.to_le_bytes()); // backing 30%
     d.extend_from_slice(&2_000u16.to_le_bytes()); // lp 20% -> sum 100%, trader 0
     d.extend_from_slice(&500u64.to_le_bytes());
-    d.extend_from_slice(ins_pool.as_ref()); d.extend_from_slice(back_pool.as_ref()); d.extend_from_slice(market.as_ref());
+    d.extend_from_slice(ins_pool.as_ref());
+    d.extend_from_slice(back_pool.as_ref());
+    d.extend_from_slice(market.as_ref());
     d.extend_from_slice(&[0u8]);
-    let r = send(&mut svm, &payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_auth.pubkey()),
-        data: d,
-    }], &[&mint_auth]);
-    assert!(r.is_ok(), "a valid 100% split (50/30/20/0) must initialize — the guard rejects only over-allocation");
+    let r = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_auth.pubkey(),
+            ),
+            data: d,
+        }],
+        &[&mint_auth],
+    );
+    assert!(
+        r.is_ok(),
+        "a valid 100% split (50/30/20/0) must initialize — the guard rejects only over-allocation"
+    );
 }
 
 // CONSERVATION property pin: across ALL FOUR cohorts with many stakes and deliberately NON-even point
@@ -2392,32 +7353,84 @@ fn cross_cohort_claims_never_exceed_cohort_or_total_supply() {
     set_slot(&mut svm, 100);
 
     // Deliberately non-dividing denominators -> floor dust (Σ < cohort_supply) for several cohorts.
-    let ins: Vec<(Keypair, Pubkey, u128)> =
-        vec![(Keypair::new(), Pubkey::new_unique(), 1), (Keypair::new(), Pubkey::new_unique(), 1), (Keypair::new(), Pubkey::new_unique(), 1)];
-    let back: Vec<(Keypair, Pubkey, u128)> =
-        vec![(Keypair::new(), Pubkey::new_unique(), 200), (Keypair::new(), Pubkey::new_unique(), 800)];
-    let lp: Vec<(Keypair, Pubkey, u128)> =
-        vec![(Keypair::new(), Pubkey::new_unique(), 1_000), (Keypair::new(), Pubkey::new_unique(), 3_000), (Keypair::new(), Pubkey::new_unique(), 7)];
-    let trd: Vec<(Keypair, Pubkey, u128)> =
-        vec![(Keypair::new(), Pubkey::new_unique(), 333), (Keypair::new(), Pubkey::new_unique(), 333), (Keypair::new(), Pubkey::new_unique(), 334)];
+    let ins: Vec<(Keypair, Pubkey, u128)> = vec![
+        (Keypair::new(), Pubkey::new_unique(), 1),
+        (Keypair::new(), Pubkey::new_unique(), 1),
+        (Keypair::new(), Pubkey::new_unique(), 1),
+    ];
+    let back: Vec<(Keypair, Pubkey, u128)> = vec![
+        (Keypair::new(), Pubkey::new_unique(), 200),
+        (Keypair::new(), Pubkey::new_unique(), 800),
+    ];
+    let lp: Vec<(Keypair, Pubkey, u128)> = vec![
+        (Keypair::new(), Pubkey::new_unique(), 1_000),
+        (Keypair::new(), Pubkey::new_unique(), 3_000),
+        (Keypair::new(), Pubkey::new_unique(), 7),
+    ];
+    let trd: Vec<(Keypair, Pubkey, u128)> = vec![
+        (Keypair::new(), Pubkey::new_unique(), 333),
+        (Keypair::new(), Pubkey::new_unique(), 333),
+        (Keypair::new(), Pubkey::new_unique(), 334),
+    ];
 
     for (o, pos, shares) in &ins {
-        set_position(&mut svm, pos, &env.stub_sub, &env.ins_pool, &o.pubkey(), *shares, false);
-        register(&mut svm, &payer, &env, o, &o.pubkey(), pos, COHORT_INSURANCE).unwrap();
+        set_position(
+            &mut svm,
+            pos,
+            &env.stub_sub,
+            &env.ins_pool,
+            &o.pubkey(),
+            *shares,
+            false,
+        );
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            o,
+            &o.pubkey(),
+            pos,
+            COHORT_INSURANCE,
+        )
+        .unwrap();
         crystallize(&mut svm, &payer, &env, o, pos).unwrap();
     }
     for (o, pos, shares) in &back {
-        set_position(&mut svm, pos, &env.stub_sub, &env.back_pool, &o.pubkey(), *shares, false);
+        set_position(
+            &mut svm,
+            pos,
+            &env.stub_sub,
+            &env.back_pool,
+            &o.pubkey(),
+            *shares,
+            false,
+        );
         register(&mut svm, &payer, &env, o, &o.pubkey(), pos, COHORT_BACKING).unwrap();
         crystallize(&mut svm, &payer, &env, o, pos).unwrap();
     }
     for (o, pf, recv) in &lp {
-        set_portfolio(&mut svm, pf, &env.stub_perc, &env.market, &o.pubkey(), *recv, 0);
+        set_portfolio(
+            &mut svm,
+            pf,
+            &env.stub_perc,
+            &env.market,
+            &o.pubkey(),
+            *recv,
+            0,
+        );
         register(&mut svm, &payer, &env, o, &o.pubkey(), pf, COHORT_LP).unwrap();
         crystallize(&mut svm, &payer, &env, o, pf).unwrap();
     }
     for (o, pf, cryst) in &trd {
-        set_portfolio(&mut svm, pf, &env.stub_perc, &env.market, &o.pubkey(), 0, *cryst);
+        set_portfolio(
+            &mut svm,
+            pf,
+            &env.stub_perc,
+            &env.market,
+            &o.pubkey(),
+            0,
+            *cryst,
+        );
         register(&mut svm, &payer, &env, o, &o.pubkey(), pf, COHORT_TRADER).unwrap();
         crystallize(&mut svm, &payer, &env, o, pf).unwrap();
     }
@@ -2425,15 +7438,24 @@ fn cross_cohort_claims_never_exceed_cohort_or_total_supply() {
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).unwrap();
 
-    let mut claim_cohort = |svm: &mut LiteSVM, members: &[(Keypair, Pubkey, u128)], share_value: bool| -> u64 {
-        let mut sum = 0u64;
-        for (o, linked, _) in members {
-            let ata = create_token_account(svm, &payer, &env.coin_mint, &o.pubkey());
-            claim(svm, &payer, &env, o, &ata, if share_value { Some(linked) } else { None }).expect("claim");
-            sum += token_amount(svm, &ata);
-        }
-        sum
-    };
+    let mut claim_cohort =
+        |svm: &mut LiteSVM, members: &[(Keypair, Pubkey, u128)], share_value: bool| -> u64 {
+            let mut sum = 0u64;
+            for (o, linked, _) in members {
+                let ata = create_token_account(svm, &payer, &env.coin_mint, &o.pubkey());
+                claim(
+                    svm,
+                    &payer,
+                    &env,
+                    o,
+                    &ata,
+                    if share_value { Some(linked) } else { None },
+                )
+                .expect("claim");
+                sum += token_amount(svm, &ata);
+            }
+            sum
+        };
     let ins_sum = claim_cohort(&mut svm, &ins, true);
     let back_sum = claim_cohort(&mut svm, &back, true);
     let lp_sum = claim_cohort(&mut svm, &lp, false);
@@ -2445,47 +7467,787 @@ fn cross_cohort_claims_never_exceed_cohort_or_total_supply() {
     assert!(lp_sum <= cs(4_000), "lp Σ <= cohort supply");
     assert!(trd_sum <= cs(4_000), "trader Σ <= cohort supply");
     let total = ins_sum + back_sum + lp_sum + trd_sum;
-    assert!(total <= supply, "total claims never exceed the fixed supply");
-    assert_eq!(token_amount(&svm, &env.vault), supply - total, "vault drained by EXACTLY the claimed total — never over");
+    assert!(
+        total <= supply,
+        "total claims never exceed the fixed supply"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply - total,
+        "vault drained by EXACTLY the claimed total — never over"
+    );
     // the non-even insurance split (3 equal shares, denom 3) must leave floor dust, proving Σ < cohort_supply.
-    assert!(ins_sum < cs(1_000), "floor rounding leaves dust: Σ strictly under cohort supply");
+    assert!(
+        ins_sum < cs(1_000),
+        "floor rounding leaves dust: Σ strictly under cohort supply"
+    );
+}
+
+// CROSS-COHORT 100-CASE LIFECYCLE SWEEP: mixes tiny supplies, odd bps splits, zero/100% portfolio-flow
+// fees, zero-bps cohorts, stale live caps, idle zero-point stakes, receiver-only funding canaries, foreign
+// share-value claim attempts, permissionless portfolio-flow claims, and varied claim order. This is the
+// broad "weird branch" conservation probe: each case must pay only the expected capped/fee-adjusted amount,
+// never let idle/receiver-only stakes farm, never let a foreign cranker force a share-value claim, and never
+// overdraw the vault regardless of claim order.
+#[test]
+fn cross_cohort_100_case_lifecycle_sweep_no_overdraw_or_free_farm() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 2_000_000_000_000).unwrap();
+
+    let splits: [(u16, u16, u16, u16); 10] = [
+        (0, 0, 0, 0),
+        (10_000, 0, 0, 0),
+        (0, 10_000, 0, 0),
+        (0, 0, 10_000, 0),
+        (0, 0, 0, 10_000),
+        (1, 1, 1, 1),
+        (333, 777, 1_111, 2_222),
+        (5_000, 0, 0, 5_000),
+        (2_500, 2_500, 2_500, 2_500),
+        (9_999, 0, 0, 1),
+    ];
+    let fees: [u16; 10] = [0, 1, 7, 33, 333, 2_500, 5_000, 7_777, 9_999, 10_000];
+    let supplies: [u64; 8] = [1, 2, 3, 7, 97, 10_003, 250_001, 1_000_003];
+    let cohort_supply =
+        |supply: u64, bps: u16| -> u64 { ((supply as u128) * (bps as u128) / 10_000) as u64 };
+    let ceil_fee = |amount: u64, fee_bps: u16| -> u64 {
+        (((amount as u128) * (fee_bps as u128) + 9_999) / 10_000) as u64
+    };
+    let flow_payout = |amount: u64, fee_bps: u16| -> u64 { amount - ceil_fee(amount, fee_bps) };
+
+    for case_idx in 0..100usize {
+        let (insurance_bps, backing_bps, lp_bps, funding_bps) = splits[case_idx % splits.len()];
+        let trader_bps = 10_000u16
+            .saturating_sub(insurance_bps)
+            .saturating_sub(backing_bps)
+            .saturating_sub(lp_bps)
+            .saturating_sub(funding_bps);
+        let fee_bps = fees[(case_idx / splits.len()) % fees.len()];
+        let supply = supplies[(case_idx * 3) % supplies.len()] + (case_idx as u64 % 3);
+        let extras: Vec<Pubkey> = if case_idx % 4 == 0 {
+            vec![Pubkey::new_unique(), Pubkey::new_unique()]
+        } else {
+            Vec::new()
+        };
+        let env = setup_custom_split_with_fee_and_extras(
+            &mut svm,
+            &payer,
+            supply,
+            insurance_bps,
+            backing_bps,
+            lp_bps,
+            funding_bps,
+            fee_bps,
+            &extras,
+        );
+        let market = if extras.is_empty() {
+            env.market
+        } else {
+            extras[case_idx % extras.len()]
+        };
+
+        let attacker = Keypair::new();
+        svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+        let ins = Keypair::new();
+        let ins_idle = Keypair::new();
+        let back = Keypair::new();
+        let back_idle = Keypair::new();
+        let lp = Keypair::new();
+        let lp_idle = Keypair::new();
+        let trader = Keypair::new();
+        let trader_idle = Keypair::new();
+        let funder = Keypair::new();
+        let fund_receiver = Keypair::new();
+
+        let ins_pos = Pubkey::new_unique();
+        let ins_idle_pos = Pubkey::new_unique();
+        let back_pos = Pubkey::new_unique();
+        let back_idle_pos = Pubkey::new_unique();
+        let lp_pf = Pubkey::new_unique();
+        let lp_idle_pf = Pubkey::new_unique();
+        let trader_pf = Pubkey::new_unique();
+        let trader_idle_pf = Pubkey::new_unique();
+        let funding_pf = Pubkey::new_unique();
+        let funding_receiver_pf = Pubkey::new_unique();
+
+        let start_slot = 100 + case_idx as u64;
+        set_slot(&mut svm, start_slot);
+
+        let ins_shares = ((case_idx as u128 * 13) % 5_000) + 1;
+        let back_shares = ((case_idx as u128 * 17) % 7_000) + 1;
+        set_position(
+            &mut svm,
+            &ins_pos,
+            &env.stub_sub,
+            &env.ins_pool,
+            &ins.pubkey(),
+            ins_shares,
+            false,
+        );
+        set_position(
+            &mut svm,
+            &ins_idle_pos,
+            &env.stub_sub,
+            &env.ins_pool,
+            &ins_idle.pubkey(),
+            ins_shares + 11,
+            false,
+        );
+        set_position(
+            &mut svm,
+            &back_pos,
+            &env.stub_sub,
+            &env.back_pool,
+            &back.pubkey(),
+            back_shares,
+            false,
+        );
+        set_position(
+            &mut svm,
+            &back_idle_pos,
+            &env.stub_sub,
+            &env.back_pool,
+            &back_idle.pubkey(),
+            back_shares + 13,
+            false,
+        );
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &ins,
+            &ins.pubkey(),
+            &ins_pos,
+            COHORT_INSURANCE,
+        )
+        .expect("register active insurance");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &ins_idle,
+            &ins_idle.pubkey(),
+            &ins_idle_pos,
+            COHORT_INSURANCE,
+        )
+        .expect("register idle insurance");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &back,
+            &back.pubkey(),
+            &back_pos,
+            COHORT_BACKING,
+        )
+        .expect("register active backing");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &back_idle,
+            &back_idle.pubkey(),
+            &back_idle_pos,
+            COHORT_BACKING,
+        )
+        .expect("register idle backing");
+
+        let lp_snap = ((case_idx as u128 * 19) % 1_000) + 1;
+        let lp_delta = ((case_idx as u128 * 23) % 20_000) + 1;
+        let trader_delta = ((case_idx as u128 * 29) % 15_000) + 1;
+        let funding_long_snap = ((case_idx as u128 * 31) % 3_000) + 1;
+        let funding_short_snap = ((case_idx as u128 * 37) % 3_000) + 1;
+        let funding_delta = ((case_idx as u128 * 41) % 25_000) + 1;
+        let funding_long_delta = funding_delta * (((case_idx % 5) + 1) as u128) / 6;
+        let funding_short_delta = funding_delta - funding_long_delta;
+
+        set_portfolio(
+            &mut svm,
+            &lp_pf,
+            &env.stub_perc,
+            &market,
+            &lp.pubkey(),
+            lp_snap,
+            0,
+        );
+        set_portfolio(
+            &mut svm,
+            &lp_idle_pf,
+            &env.stub_perc,
+            &market,
+            &lp_idle.pubkey(),
+            lp_snap + 77,
+            0,
+        );
+        set_portfolio_full(
+            &mut svm,
+            &trader_pf,
+            &env.stub_perc,
+            &market,
+            &trader.pubkey(),
+            0,
+            0,
+            0,
+        );
+        set_portfolio_full(
+            &mut svm,
+            &trader_idle_pf,
+            &env.stub_perc,
+            &market,
+            &trader_idle.pubkey(),
+            0,
+            trader_delta + 55,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &funding_pf,
+            &env.stub_perc,
+            &market,
+            &funder.pubkey(),
+            funding_long_snap,
+            0,
+            funding_short_snap,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &funding_receiver_pf,
+            &env.stub_perc,
+            &market,
+            &fund_receiver.pubkey(),
+            0,
+            funding_delta + 90_000,
+            0,
+            funding_delta + 80_000,
+        );
+
+        register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &lp_pf, COHORT_LP)
+            .expect("register active lp");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &lp_idle,
+            &lp_idle.pubkey(),
+            &lp_idle_pf,
+            COHORT_LP,
+        )
+        .expect("register idle lp");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &trader,
+            &trader.pubkey(),
+            &trader_pf,
+            COHORT_TRADER,
+        )
+        .expect("register active trader");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &trader_idle,
+            &trader_idle.pubkey(),
+            &trader_idle_pf,
+            COHORT_TRADER,
+        )
+        .expect("register idle trader");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &funder,
+            &funder.pubkey(),
+            &funding_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register active funding payer");
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &fund_receiver,
+            &fund_receiver.pubkey(),
+            &funding_receiver_pf,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("register receiver-only funding canary");
+
+        let tenure = 64 + ((case_idx as u64 * 17) % 512);
+        set_slot(&mut svm, start_slot + tenure);
+        set_portfolio(
+            &mut svm,
+            &lp_pf,
+            &env.stub_perc,
+            &market,
+            &lp.pubkey(),
+            lp_snap + lp_delta,
+            0,
+        );
+        set_portfolio_full(
+            &mut svm,
+            &trader_pf,
+            &env.stub_perc,
+            &market,
+            &trader.pubkey(),
+            0,
+            trader_delta,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &funding_pf,
+            &env.stub_perc,
+            &market,
+            &funder.pubkey(),
+            funding_long_snap + funding_long_delta,
+            0,
+            funding_short_snap + funding_short_delta,
+            0,
+        );
+        set_portfolio_funding(
+            &mut svm,
+            &funding_receiver_pf,
+            &env.stub_perc,
+            &market,
+            &fund_receiver.pubkey(),
+            0,
+            funding_delta + 120_000,
+            0,
+            funding_delta + 130_000,
+        );
+
+        crystallize(&mut svm, &payer, &env, &ins, &ins_pos).expect("crystallize active insurance");
+        crystallize(&mut svm, &payer, &env, &back, &back_pos).expect("crystallize active backing");
+        crystallize_as(&mut svm, &payer, &env, &attacker, &lp.pubkey(), &lp_pf)
+            .expect("permissionless lp crystallize");
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &trader.pubkey(),
+            &trader_pf,
+        )
+        .expect("permissionless trader crystallize");
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &funder.pubkey(),
+            &funding_pf,
+        )
+        .expect("permissionless funding-payer crystallize");
+        crystallize(&mut svm, &payer, &env, &fund_receiver, &funding_receiver_pf)
+            .expect("receiver-only funding crystallize");
+
+        set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+        freeze(&mut svm, &payer, &env).expect("freeze");
+
+        let ins_live = if case_idx % 5 == 0 {
+            0
+        } else if case_idx % 5 == 1 {
+            ins_shares / 2
+        } else {
+            ins_shares
+        };
+        let back_live = if case_idx % 7 == 0 {
+            0
+        } else if case_idx % 7 == 1 {
+            back_shares / 3
+        } else {
+            back_shares
+        };
+        set_position(
+            &mut svm,
+            &ins_pos,
+            &env.stub_sub,
+            &env.ins_pool,
+            &ins.pubkey(),
+            ins_live,
+            case_idx % 5 == 0,
+        );
+        set_position(
+            &mut svm,
+            &back_pos,
+            &env.stub_sub,
+            &env.back_pool,
+            &back.pubkey(),
+            back_live,
+            case_idx % 7 == 0,
+        );
+        let lp_live_delta = if case_idx % 6 == 0 {
+            lp_delta / 2
+        } else {
+            lp_delta
+        };
+        set_portfolio(
+            &mut svm,
+            &lp_pf,
+            &env.stub_perc,
+            &market,
+            &lp.pubkey(),
+            lp_snap + lp_live_delta,
+            0,
+        );
+        let trader_spent_after = if case_idx % 4 == 0 {
+            trader_delta
+        } else if case_idx % 4 == 1 {
+            trader_delta / 2
+        } else {
+            0
+        };
+        set_portfolio_full(
+            &mut svm,
+            &trader_pf,
+            &env.stub_perc,
+            &market,
+            &trader.pubkey(),
+            0,
+            trader_delta,
+            trader_spent_after,
+        );
+
+        let ins_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &ins.pubkey());
+        let ins_idle_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &ins_idle.pubkey());
+        let back_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &back.pubkey());
+        let back_idle_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &back_idle.pubkey());
+        let lp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+        let lp_idle_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp_idle.pubkey());
+        let trader_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &trader.pubkey());
+        let trader_idle_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &trader_idle.pubkey());
+        let funding_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &funder.pubkey());
+        let funding_receiver_ata =
+            create_token_account(&mut svm, &payer, &env.coin_mint, &fund_receiver.pubkey());
+
+        assert!(
+            claim_as(
+                &mut svm,
+                &payer,
+                &env,
+                &attacker,
+                &ins.pubkey(),
+                &ins_ata,
+                Some(&ins_pos),
+            )
+            .is_err(),
+            "case {case_idx}: foreign cranker cannot force an insurance claim"
+        );
+        assert_eq!(
+            token_amount(&svm, &ins_ata),
+            0,
+            "case {case_idx}: rejected forced share-value claim pays nothing"
+        );
+
+        if case_idx % 2 == 0 {
+            claim(&mut svm, &payer, &env, &ins, &ins_ata, Some(&ins_pos))
+                .expect("active insurance claim");
+            claim(
+                &mut svm,
+                &payer,
+                &env,
+                &ins_idle,
+                &ins_idle_ata,
+                Some(&ins_idle_pos),
+            )
+            .expect("idle insurance claim");
+            claim(&mut svm, &payer, &env, &back, &back_ata, Some(&back_pos))
+                .expect("active backing claim");
+            claim(
+                &mut svm,
+                &payer,
+                &env,
+                &back_idle,
+                &back_idle_ata,
+                Some(&back_idle_pos),
+            )
+            .expect("idle backing claim");
+        }
+
+        claim_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &lp.pubkey(),
+            &lp_ata,
+            None,
+        )
+        .expect("permissionless lp claim to bound recipient");
+        claim(&mut svm, &payer, &env, &lp_idle, &lp_idle_ata, None).expect("idle lp claim");
+        claim_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &trader.pubkey(),
+            &trader_ata,
+            None,
+        )
+        .expect("permissionless trader claim to bound recipient");
+        claim(&mut svm, &payer, &env, &trader_idle, &trader_idle_ata, None)
+            .expect("idle trader claim");
+        claim_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &funder.pubkey(),
+            &funding_ata,
+            None,
+        )
+        .expect("permissionless funding claim to bound recipient");
+        claim_without_linked(
+            &mut svm,
+            &payer,
+            &env,
+            &fund_receiver,
+            &funding_receiver_ata,
+        )
+        .expect("receiver-only funding claim without linked portfolio");
+
+        if case_idx % 2 == 1 {
+            claim(&mut svm, &payer, &env, &back, &back_ata, Some(&back_pos))
+                .expect("active backing claim");
+            claim(
+                &mut svm,
+                &payer,
+                &env,
+                &back_idle,
+                &back_idle_ata,
+                Some(&back_idle_pos),
+            )
+            .expect("idle backing claim");
+            claim(&mut svm, &payer, &env, &ins, &ins_ata, Some(&ins_pos))
+                .expect("active insurance claim");
+            claim(
+                &mut svm,
+                &payer,
+                &env,
+                &ins_idle,
+                &ins_idle_ata,
+                Some(&ins_idle_pos),
+            )
+            .expect("idle insurance claim");
+        }
+
+        if case_idx % 17 == 0 {
+            assert!(
+                claim(&mut svm, &payer, &env, &lp, &lp_ata, None).is_err(),
+                "case {case_idx}: active lp cannot double claim"
+            );
+            assert!(
+                claim_without_linked(&mut svm, &payer, &env, &funder, &funding_ata).is_err(),
+                "case {case_idx}: active funding payer cannot double claim"
+            );
+        }
+
+        let ins_expected = ((cohort_supply(env.supply, insurance_bps) as u128)
+            * core::cmp::min(ins_shares, ins_live)
+            / ins_shares) as u64;
+        let back_expected = ((cohort_supply(env.supply, backing_bps) as u128)
+            * core::cmp::min(back_shares, back_live)
+            / back_shares) as u64;
+        let lp_amount =
+            ((cohort_supply(env.supply, lp_bps) as u128) * lp_live_delta / lp_delta) as u64;
+        let trader_live_delta = trader_delta.saturating_sub(trader_spent_after);
+        let trader_amount = ((cohort_supply(env.supply, trader_bps) as u128) * trader_live_delta
+            / trader_delta) as u64;
+        let funding_amount = cohort_supply(env.supply, funding_bps);
+        let lp_expected = flow_payout(lp_amount, fee_bps);
+        let trader_expected = flow_payout(trader_amount, fee_bps);
+        let funding_expected = flow_payout(funding_amount, fee_bps);
+
+        assert_eq!(
+            token_amount(&svm, &ins_ata),
+            ins_expected,
+            "case {case_idx}: insurance claim follows live share cap"
+        );
+        assert_eq!(
+            token_amount(&svm, &back_ata),
+            back_expected,
+            "case {case_idx}: backing claim follows live share cap"
+        );
+        assert_eq!(
+            token_amount(&svm, &lp_ata),
+            lp_expected,
+            "case {case_idx}: lp claim follows live cap and fee"
+        );
+        assert_eq!(
+            token_amount(&svm, &trader_ata),
+            trader_expected,
+            "case {case_idx}: trader claim follows spent live cap and fee"
+        );
+        assert_eq!(
+            token_amount(&svm, &funding_ata),
+            funding_expected,
+            "case {case_idx}: funding-payer claim follows funding bps and fee"
+        );
+
+        assert_eq!(
+            token_amount(&svm, &ins_idle_ata),
+            0,
+            "case {case_idx}: idle insurance stake cannot dilute or farm"
+        );
+        assert_eq!(
+            token_amount(&svm, &back_idle_ata),
+            0,
+            "case {case_idx}: idle backing stake cannot dilute or farm"
+        );
+        assert_eq!(
+            token_amount(&svm, &lp_idle_ata),
+            0,
+            "case {case_idx}: idle lp stake cannot dilute or farm"
+        );
+        assert_eq!(
+            token_amount(&svm, &trader_idle_ata),
+            0,
+            "case {case_idx}: idle trader stake cannot dilute or farm"
+        );
+        assert_eq!(
+            token_amount(&svm, &funding_receiver_ata),
+            0,
+            "case {case_idx}: receiver-only funding stake cannot farm"
+        );
+
+        let total_paid = token_amount(&svm, &ins_ata)
+            + token_amount(&svm, &ins_idle_ata)
+            + token_amount(&svm, &back_ata)
+            + token_amount(&svm, &back_idle_ata)
+            + token_amount(&svm, &lp_ata)
+            + token_amount(&svm, &lp_idle_ata)
+            + token_amount(&svm, &trader_ata)
+            + token_amount(&svm, &trader_idle_ata)
+            + token_amount(&svm, &funding_ata)
+            + token_amount(&svm, &funding_receiver_ata);
+        assert!(
+            total_paid <= env.supply,
+            "case {case_idx}: all claims stay within fixed supply"
+        );
+        assert_eq!(
+            token_amount(&svm, &env.vault),
+            env.supply - total_paid,
+            "case {case_idx}: vault only decreases by successful payouts"
+        );
+    }
 }
 
 // --- freeze GX/EZ guards (previously only the happy path was exercised; the src comment even cited a
 // `set_authority_clears_delegate_no_vault_rug` test that never existed). These pin the negatives. ---
-fn create_mint_with_freeze(svm: &mut LiteSVM, payer: &Keypair, mint_auth: &Pubkey, freeze_auth: Option<&Pubkey>) -> Pubkey {
+fn create_mint_with_freeze(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint_auth: &Pubkey,
+    freeze_auth: Option<&Pubkey>,
+) -> Pubkey {
     let mint = Keypair::new();
     let rent = svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN);
     let ixs = [
-        system_instruction::create_account(&payer.pubkey(), &mint.pubkey(), rent, spl_token::state::Mint::LEN as u64, &spl_token::ID),
-        spl_token::instruction::initialize_mint(&spl_token::ID, &mint.pubkey(), mint_auth, freeze_auth, 6).unwrap(),
+        system_instruction::create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            rent,
+            spl_token::state::Mint::LEN as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_mint(
+            &spl_token::ID,
+            &mint.pubkey(),
+            mint_auth,
+            freeze_auth,
+            6,
+        )
+        .unwrap(),
     ];
-    let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[payer, &mint], svm.latest_blockhash());
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[payer, &mint],
+        svm.latest_blockhash(),
+    );
     svm.send_transaction(tx).unwrap();
     mint.pubkey()
 }
 // Init an rd_config for a prepared coin_mint (the vault is bound later at freeze). emission_end=2000, window=500.
-fn rd_init(svm: &mut LiteSVM, payer: &Keypair, supply: u64, coin_mint: &Pubkey, mint_authority: &Keypair) -> Pubkey {
+fn rd_init(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    coin_mint: &Pubkey,
+    mint_authority: &Keypair,
+) -> Pubkey {
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
     let d = rd_init_data(
-        supply, 2_000, 1_000, 1_000, 4_000, 500,
-        Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), &[], Some(0),
+        supply,
+        2_000,
+        1_000,
+        1_000,
+        4_000,
+        500,
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        &[],
+        Some(0),
     );
-    send(svm, payer, &[Instruction {
-        program_id: rd_id(),
-        accounts: rd_init_accounts(payer.pubkey(), *coin_mint, dist_config, stub_perc, stub_sub, rd_config, mint_authority.pubkey()),
-        data: d,
-    }], &[mint_authority]).expect("rd init");
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: rd_init_accounts(
+                payer.pubkey(),
+                *coin_mint,
+                dist_config,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                mint_authority.pubkey(),
+            ),
+            data: d,
+        }],
+        &[mint_authority],
+    )
+    .expect("rd init");
     rd_config
 }
-fn freeze_ix(svm: &mut LiteSVM, payer: &Keypair, rd_config: Pubkey, coin_mint: Pubkey, vault: Pubkey) -> Result<(), String> {
-    send(svm, payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false),
-        AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(vault, false),
-    ], data: vec![4u8] }], &[])
+fn freeze_ix(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    rd_config: Pubkey,
+    coin_mint: Pubkey,
+    vault: Pubkey,
+) -> Result<(), String> {
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(rd_config, false),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new(vault, false),
+            ],
+            data: vec![4u8],
+        }],
+        &[],
+    )
 }
 
 // DoS PROBE (non-SPL token-shaped vault at the permissionless freeze, sweep tick D): freeze BINDS config.vault
@@ -2507,24 +8269,56 @@ fn freeze_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
     set_slot(&mut svm, 100);
 
     // A real backer crystallizes, so there is genuinely a claim the brick would deny.
-    let lp = Keypair::new(); let pf = Pubkey::new_unique();
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 0, 0);
+    let lp = Keypair::new();
+    let pf = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+    );
     register(&mut svm, &payer, &env, &lp, &lp.pubkey(), &pf, COHORT_LP).expect("reg");
-    set_portfolio(&mut svm, &pf, &env.stub_perc, &env.market, &lp.pubkey(), 9_000, 0);
+    set_portfolio(
+        &mut svm,
+        &pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        9_000,
+        0,
+    );
     set_slot(&mut svm, 1_000);
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry");
 
     // Craft a SYSTEM-owned account whose data round-trips as an initialized token account: owner field =
     // rd_config, mint = coin_mint, amount = supply — passes every FIELD check, fails only on the owning program.
     let fake = spl_token::state::Account {
-        mint: env.coin_mint, owner: env.rd_config, amount: supply, delegate: COption::None,
-        state: spl_token::state::AccountState::Initialized, is_native: COption::None,
-        delegated_amount: 0, close_authority: COption::None,
+        mint: env.coin_mint,
+        owner: env.rd_config,
+        amount: supply,
+        delegate: COption::None,
+        state: spl_token::state::AccountState::Initialized,
+        is_native: COption::None,
+        delegated_amount: 0,
+        close_authority: COption::None,
     };
     let mut fake_data = vec![0u8; spl_token::state::Account::LEN];
     spl_token::state::Account::pack(fake, &mut fake_data).unwrap();
     let fake_vault = Pubkey::new_unique();
-    svm.set_account(fake_vault, Account { lamports: 10_000_000, data: fake_data, owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 }).unwrap();
+    svm.set_account(
+        fake_vault,
+        Account {
+            lamports: 10_000_000,
+            data: fake_data,
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     // ATTACK: front-run the one-shot freeze with the fake vault.
@@ -2533,10 +8327,15 @@ fn freeze_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
         "freeze must reject a token-shaped vault not owned by the SPL Token program (else a front-run binds a fake vault and bricks all claims)"
     );
     // The real vault still freezes + pays out (the rejected attempt did not consume the one-shot freeze).
-    freeze_ix(&mut svm, &payer, env.rd_config, env.coin_mint, env.vault).expect("the real SPL vault freezes");
+    freeze_ix(&mut svm, &payer, env.rd_config, env.coin_mint, env.vault)
+        .expect("the real SPL vault freezes");
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
     claim(&mut svm, &payer, &env, &lp, &ata, None).expect("claim pays from the real vault");
-    assert_eq!(token_amount(&svm, &ata), 400_000, "the LP backer claims its full cohort from the real vault");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        400_000,
+        "the LP backer claims its full cohort from the real vault"
+    );
 }
 
 // finding GX/EZ: freeze BINDS the fixed-supply COIN vault, so it must reject any mint that could still be
@@ -2560,9 +8359,15 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     let vault = create_token_account(&mut svm, &payer, &mint, &rd_config);
     mint_to(&mut svm, &payer, &mint, &ma, &vault, supply);
     set_slot(&mut svm, past);
-    assert!(freeze_ix(&mut svm, &payer, rd_config, mint, vault).is_err(), "live mint authority must be rejected (GX inflation)");
+    assert!(
+        freeze_ix(&mut svm, &payer, rd_config, mint, vault).is_err(),
+        "live mint authority must be rejected (GX inflation)"
+    );
     revoke_mint(&mut svm, &payer, &mint, &ma);
-    assert!(freeze_ix(&mut svm, &payer, rd_config, mint, vault).is_ok(), "fixed-supply mint + rd-owned full vault accepted");
+    assert!(
+        freeze_ix(&mut svm, &payer, rd_config, mint, vault).is_ok(),
+        "fixed-supply mint + rd-owned full vault accepted"
+    );
 
     // (GX) a mint that still has a FREEZE authority is rejected (claimers' COIN could be frozen = censorship);
     // after clearing it, accepted.
@@ -2574,10 +8379,24 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     mint_to(&mut svm, &payer, &mint2, &ma2, &vault2, supply);
     revoke_mint(&mut svm, &payer, &mint2, &ma2); // clear mint authority; freeze authority remains
     set_slot(&mut svm, past);
-    assert!(freeze_ix(&mut svm, &payer, rd2, mint2, vault2).is_err(), "live freeze authority must be rejected (GX freeze-claimers)");
-    let clear = spl_token::instruction::set_authority(&spl_token::ID, &mint2, None, AuthorityType::FreezeAccount, &fa.pubkey(), &[]).unwrap();
+    assert!(
+        freeze_ix(&mut svm, &payer, rd2, mint2, vault2).is_err(),
+        "live freeze authority must be rejected (GX freeze-claimers)"
+    );
+    let clear = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &mint2,
+        None,
+        AuthorityType::FreezeAccount,
+        &fa.pubkey(),
+        &[],
+    )
+    .unwrap();
     send(&mut svm, &payer, &[clear], &[&fa]).expect("clear freeze authority");
-    assert!(freeze_ix(&mut svm, &payer, rd2, mint2, vault2).is_ok(), "after clearing freeze authority, accepted");
+    assert!(
+        freeze_ix(&mut svm, &payer, rd2, mint2, vault2).is_ok(),
+        "after clearing freeze authority, accepted"
+    );
 
     // (EZ) a vault NOT owned by rd_config is rejected even when fully funded.
     let ma3 = Keypair::new();
@@ -2588,7 +8407,10 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     mint_to(&mut svm, &payer, &mint3, &ma3, &decoy, supply);
     revoke_mint(&mut svm, &payer, &mint3, &ma3);
     set_slot(&mut svm, past);
-    assert!(freeze_ix(&mut svm, &payer, rd3, mint3, decoy).is_err(), "non-rd-owned vault must be rejected (EZ)");
+    assert!(
+        freeze_ix(&mut svm, &payer, rd3, mint3, decoy).is_err(),
+        "non-rd-owned vault must be rejected (EZ)"
+    );
 
     // (EZ) an rd-owned but UNDER-funded vault is rejected (mint.supply == total, but the bound vault holds < it).
     let ma4 = Keypair::new();
@@ -2600,7 +8422,10 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     mint_to(&mut svm, &payer, &mint4, &ma4, &sink, 1); // total minted == supply, but `under` holds supply-1
     revoke_mint(&mut svm, &payer, &mint4, &ma4);
     set_slot(&mut svm, past);
-    assert!(freeze_ix(&mut svm, &payer, rd4, mint4, under).is_err(), "under-funded rd-owned vault must be rejected (EZ)");
+    assert!(
+        freeze_ix(&mut svm, &payer, rd4, mint4, under).is_err(),
+        "under-funded rd-owned vault must be rejected (EZ)"
+    );
 }
 
 // finding IL+: the LP/trader cohorts are scoped to an ALLOW-LIST of trusted-Pyth markets (the primary
@@ -2616,53 +8441,98 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()], &dist_id()).0;
+    let dist_config = Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
+        &dist_id(),
+    )
+    .0;
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
-    let (m0, m1, m2, foreign) = (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let (m0, m1, m2, foreign) = (
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+        Pubkey::new_unique(),
+    );
 
     // init: only the LP cohort active (lp=10000 -> trader=0), market allow-list = {m0 (primary), m1, m2}.
     let mut d = vec![0u8];
     d.extend_from_slice(&1_000_000u64.to_le_bytes()); // supply
-    d.extend_from_slice(&2_000u64.to_le_bytes());     // emission_end
-    d.extend_from_slice(&0u16.to_le_bytes());         // insurance
-    d.extend_from_slice(&0u16.to_le_bytes());         // backing
-    d.extend_from_slice(&10_000u16.to_le_bytes());    // lp (trader = 0)
-    d.extend_from_slice(&500u64.to_le_bytes());       // finalize_window
-    d.extend_from_slice(Pubkey::default().as_ref());  // ins_pool (ins=0)
-    d.extend_from_slice(Pubkey::default().as_ref());  // back_pool (back=0)
-    d.extend_from_slice(m0.as_ref());                 // market_group (primary)
-    d.extend_from_slice(&[2u8]);                      // extra market count
+    d.extend_from_slice(&2_000u64.to_le_bytes()); // emission_end
+    d.extend_from_slice(&0u16.to_le_bytes()); // insurance
+    d.extend_from_slice(&0u16.to_le_bytes()); // backing
+    d.extend_from_slice(&10_000u16.to_le_bytes()); // lp (trader = 0)
+    d.extend_from_slice(&500u64.to_le_bytes()); // finalize_window
+    d.extend_from_slice(Pubkey::default().as_ref()); // ins_pool (ins=0)
+    d.extend_from_slice(Pubkey::default().as_ref()); // back_pool (back=0)
+    d.extend_from_slice(m0.as_ref()); // market_group (primary)
+    d.extend_from_slice(&[2u8]); // extra market count
     d.extend_from_slice(m1.as_ref());
     d.extend_from_slice(m2.as_ref());
-    send(&mut svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-        AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(coin_mint, false),
-        AccountMeta::new_readonly(dist_id(), false), AccountMeta::new_readonly(dist_config, false),
-        AccountMeta::new_readonly(stub_perc, false), AccountMeta::new_readonly(stub_sub, false),
-        AccountMeta::new(rd_config, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        AccountMeta::new_readonly(mint_auth.pubkey(), true),
-    ], data: d }], &[&mint_auth]).expect("init with a 3-market allow-list");
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new_readonly(dist_id(), false),
+                AccountMeta::new_readonly(dist_config, false),
+                AccountMeta::new_readonly(stub_perc, false),
+                AccountMeta::new_readonly(stub_sub, false),
+                AccountMeta::new(rd_config, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(mint_auth.pubkey(), true),
+            ],
+            data: d,
+        }],
+        &[&mint_auth],
+    )
+    .expect("init with a 3-market allow-list");
     set_slot(&mut svm, 100);
 
     let reg = |svm: &mut LiteSVM, owner: &Keypair, pf: &Pubkey| -> Result<(), String> {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
-        send(svm, &payer, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false),
-            AccountMeta::new_readonly(owner.pubkey(), true), AccountMeta::new_readonly(owner.pubkey(), false),
-            AccountMeta::new_readonly(*pf, false), AccountMeta::new(stake, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ], data: vec![1u8, COHORT_LP] }], &[owner])
+        let stake = Pubkey::find_program_address(
+            &[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()],
+            &rd_id(),
+        )
+        .0;
+        send(
+            svm,
+            &payer,
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(rd_config, false),
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new_readonly(owner.pubkey(), false),
+                    AccountMeta::new_readonly(*pf, false),
+                    AccountMeta::new(stake, false),
+                    AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                ],
+                data: vec![1u8, COHORT_LP],
+            }],
+            &[owner],
+        )
     };
     // primary market -> accepted
-    let a = Keypair::new(); let a_pf = Pubkey::new_unique();
+    let a = Keypair::new();
+    let a_pf = Pubkey::new_unique();
     set_portfolio(&mut svm, &a_pf, &stub_perc, &m0, &a.pubkey(), 0, 0);
     reg(&mut svm, &a, &a_pf).expect("primary allow-listed market accepted");
     // an extra allow-listed market -> accepted
-    let b = Keypair::new(); let b_pf = Pubkey::new_unique();
+    let b = Keypair::new();
+    let b_pf = Pubkey::new_unique();
     set_portfolio(&mut svm, &b_pf, &stub_perc, &m2, &b.pubkey(), 0, 0);
     reg(&mut svm, &b, &b_pf).expect("extra allow-listed market accepted");
     // a NON-listed market -> rejected
-    let c = Keypair::new(); let c_pf = Pubkey::new_unique();
+    let c = Keypair::new();
+    let c_pf = Pubkey::new_unique();
     set_portfolio(&mut svm, &c_pf, &stub_perc, &foreign, &c.pubkey(), 0, 0);
-    assert!(reg(&mut svm, &c, &c_pf).is_err(), "a market NOT on the allow-list must be rejected");
+    assert!(
+        reg(&mut svm, &c, &c_pf).is_err(),
+        "a market NOT on the allow-list must be rejected"
+    );
 }

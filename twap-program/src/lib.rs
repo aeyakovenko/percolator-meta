@@ -395,7 +395,11 @@ pub fn process_instruction(
 // Pins the whole authority chain: the controller must be a real Squads multisig and
 // the DAO (metadao_futarchy) is recorded. The twap_authority PDA derived here is the
 // address that must hold percolator's insurance authority/operator role.
-fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_init_config(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     if !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -448,7 +452,12 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     }
 
     let (expected_config, config_bump) = Pubkey::find_program_address(
-        &config_seeds(market_slab.key, squads_multisig.key, coin_mint.key, percolator_program.key),
+        &config_seeds(
+            market_slab.key,
+            squads_multisig.key,
+            coin_mint.key,
+            percolator_program.key,
+        ),
         program_id,
     );
     if *config_account.key != expected_config {
@@ -469,7 +478,14 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
         percolator_program.key.as_ref(),
         &bump_arr,
     ];
-    create_pda_robust(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
+    create_pda_robust(
+        payer,
+        config_account,
+        system_program,
+        program_id,
+        &seeds,
+        CONFIG_SIZE,
+    )?;
 
     let config = Config {
         coin_mint: *coin_mint.key,
@@ -499,7 +515,11 @@ fn process_init_config(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // Squads -> TWAP control: only the config's Squads multisig default vault PDA may
 // reconfigure, and that PDA can only sign as the executor of a multisig
 // vault-transaction — which requires a DAO proposal to clear the 1-week timelock.
-fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_reconfigure(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -551,7 +571,11 @@ fn process_reconfigure(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 // twap_authority(operator)-owned collateral token account — percolator's tag-57 forces every insurance
 // withdrawal to an operator-owned destination — so the savings accrue in a segregated twap-owned reserve
 // the DAO governs via Squads; that owner/mint pairing is checked by percolator (and the mint by execute).
-fn process_set_economics(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_set_economics(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -580,6 +604,9 @@ fn process_set_economics(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
     if savings_bps > 0 && *savings_account.key == Pubkey::default() {
         return Err(ProgramError::InvalidAccountData);
     }
+    if savings_bps > 0 && savings_account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
     config.base_unit_savings_bps = savings_bps;
     config.buyback_bps = buyback_bps;
     config.base_unit_savings_account = *savings_account.key;
@@ -595,7 +622,11 @@ fn process_set_economics(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
 // Squads vault may call it, and only as the executor of a timelock'd vault-transaction, so
 // lowering the floor (the dangerous direction — it exposes more insurance to the
 // permissionless crank) is delayed a full week in the clear.
-fn process_set_reserved_floor(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_set_reserved_floor(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -650,7 +681,11 @@ fn process_set_reserved_floor(program_id: &Pubkey, accounts: &[AccountInfo], dat
 // The DAO proposal that performs the handoff should also set the reserved_floor (to the
 // reserved depositor principal) via set_reserved_floor and rotate the policy to surplus-mode
 // — until reserved_floor is set it is u128::MAX, so no surplus can be pulled at all.
-fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_accept_operator(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     if !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -671,17 +706,15 @@ fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: 
     if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
         return Err(ProgramError::IllegalOwner);
     }
-    if *market_slab.key != config.market_slab || *percolator_program.key != config.percolator_program {
+    if *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [
-        TWAP_AUTHORITY_SEED,
-        config_account.key.as_ref(),
-        &auth_bump,
-    ];
-    let expected_authority =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_authority {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -734,7 +767,11 @@ fn process_accept_operator(program_id: &Pubkey, accounts: &[AccountInfo], data: 
             ],
             data: auth_ix,
         },
-        &[squads_vault.clone(), market_slab.clone(), percolator_program.clone()],
+        &[
+            squads_vault.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+        ],
     )?;
     Ok(())
 }
@@ -876,8 +913,20 @@ fn cmp_rate(mut an: u128, mut ad: u128, mut bn: u128, mut bd: u128) -> core::cmp
         let br = bn % bd;
         match (ar == 0, br == 0) {
             (true, true) => return Ordering::Equal,
-            (true, false) => return if reversed { Ordering::Greater } else { Ordering::Less },
-            (false, true) => return if reversed { Ordering::Less } else { Ordering::Greater },
+            (true, false) => {
+                return if reversed {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, true) => {
+                return if reversed {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
             (false, false) => {
                 an = ad;
                 ad = ar;
@@ -921,7 +970,12 @@ fn spl_transfer<'a>(
         ],
         data,
     };
-    let infos = [from.clone(), to.clone(), authority.clone(), token_program.clone()];
+    let infos = [
+        from.clone(),
+        to.clone(),
+        authority.clone(),
+        token_program.clone(),
+    ];
     match seeds {
         Some(s) => invoke_signed(&ix, &infos, &[s]),
         None => invoke(&ix, &infos),
@@ -949,7 +1003,16 @@ fn spl_burn_signed<'a>(
         ],
         data,
     };
-    invoke_signed(&ix, &[account.clone(), mint.clone(), authority.clone(), token_program.clone()], &[seeds])
+    invoke_signed(
+        &ix,
+        &[
+            account.clone(),
+            mint.clone(),
+            authority.clone(),
+            token_program.clone(),
+        ],
+        &[seeds],
+    )
 }
 
 // Require + return the config's Squads default vault as the authoriser of a DAO-gated mutation.
@@ -1035,13 +1098,9 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     // The canonical USD holding must be a collateral token account owned by the twap_authority
     // (so percolator's WithdrawInsuranceLimited will pay into it during execute).
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [
-        TWAP_AUTHORITY_SEED,
-        config_account.key.as_ref(),
-        &auth_bump,
-    ];
-    let twap_authority =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let twap_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if holding.owner != &spl_token::ID {
         return Err(ProgramError::IllegalOwner);
     }
@@ -1080,7 +1139,14 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     }
     let bump_arr = [book_bump];
     let seeds: [&[u8]; 3] = [BOOK_SEED, config_account.key.as_ref(), &bump_arr];
-    create_pda_robust(squads_vault, book_account, system_program, program_id, &seeds, BOOK_SIZE)?;
+    create_pda_robust(
+        squads_vault,
+        book_account,
+        system_program,
+        program_id,
+        &seeds,
+        BOOK_SIZE,
+    )?;
 
     let round_end = solana_program::clock::Clock::get()?
         .slot
@@ -1110,7 +1176,11 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
 
 // set_reserve accounts: [squads_vault(signer), config, book(w)]
 // data: reserve_num (u128) || reserve_den (u128)
-fn process_set_reserve(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_set_reserve(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -1144,7 +1214,11 @@ fn process_set_reserve(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
 //
 // Futarchy-configurable: burn the bought COIN (mode 0) or send it to an account (mode 1, e.g. a
 // DAO treasury). Squads-vault-gated.
-fn process_set_coin_sink(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_set_coin_sink(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -1172,6 +1246,9 @@ fn process_set_coin_sink(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
         if *coin_sink.key == book.coin_escrow {
             return Err(ProgramError::InvalidAccountData);
         }
+        if coin_sink.owner != &spl_token::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
         let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
         if s.mint != book.coin_mint {
             return Err(ProgramError::InvalidAccountData);
@@ -1188,7 +1265,11 @@ fn process_set_coin_sink(program_id: &Pubkey, accounts: &[AccountInfo], data: &[
 
 // set_bid_fee accounts: [squads_vault(signer), config, book(w)]
 // data: bid_fee (u64) — the flat COIN amount burned on every place_bid (anti-spam). Squads-gated.
-fn process_set_bid_fee(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+fn process_set_bid_fee(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -1207,7 +1288,8 @@ fn process_set_bid_fee(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8
     if book.config != *config_account.key {
         return Err(ProgramError::InvalidAccountData);
     }
-    book_account.try_borrow_mut_data()?[BK_BID_FEE..BK_BID_FEE + 8].copy_from_slice(&bid_fee.to_le_bytes());
+    book_account.try_borrow_mut_data()?[BK_BID_FEE..BK_BID_FEE + 8]
+        .copy_from_slice(&bid_fee.to_le_bytes());
     Ok(())
 }
 
@@ -1259,6 +1341,10 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if book.config != *config_account.key || book.state != BOOK_STATE_OPEN {
         return Err(ProgramError::InvalidAccountData);
     }
+    let now = solana_program::clock::Clock::get()?.slot;
+    if now >= book.round_end {
+        return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
+    }
     if *coin_mint.key != book.coin_mint
         || *coin_mint.key != config.coin_mint
         || *collateral_mint.key != book.collateral_mint
@@ -1268,8 +1354,8 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     }
     let escrow_bump = [book.escrow_bump];
     let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
-    let expected_escrow =
-        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let expected_escrow = Pubkey::create_program_address(&escrow_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1332,7 +1418,10 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
                 {
                     return Err(ProgramError::InsufficientFunds); // book full and incoming not better
                 }
-                evicted = Some((book_rd_u128(&d, ow + SL_COIN), book_rd_key(&d, ow + SL_COIN_ATA)));
+                evicted = Some((
+                    book_rd_u128(&d, ow + SL_COIN),
+                    book_rd_key(&d, ow + SL_COIN_ATA),
+                ));
                 weakest
             }
         }
@@ -1369,12 +1458,24 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
                 ],
                 data: bd,
             },
-            &[bidder_coin_src.clone(), coin_mint.clone(), bidder.clone(), token_program.clone()],
+            &[
+                bidder_coin_src.clone(),
+                coin_mint.clone(),
+                bidder.clone(),
+                token_program.clone(),
+            ],
         )?;
     }
 
     // Escrow the incoming bid's COIN (bidder signs for their own source account).
-    spl_transfer(token_program, bidder_coin_src, coin_escrow, bidder, coin_atoms_u64, None)?;
+    spl_transfer(
+        token_program,
+        bidder_coin_src,
+        coin_escrow,
+        bidder,
+        coin_atoms_u64,
+        None,
+    )?;
 
     let mut d = book_account.try_borrow_mut_data()?;
     let o = slot_off(slot_i);
@@ -1398,7 +1499,8 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     // no last-second cancel that could manipulate a pending execute.
     let now = solana_program::clock::Clock::get()?.slot;
     d[o + SL_PLACE_SLOT..o + SL_PLACE_SLOT + 8].copy_from_slice(&now.to_le_bytes());
-    d[o + SL_PLACE_ROUND_END..o + SL_PLACE_ROUND_END + 8].copy_from_slice(&book.round_end.to_le_bytes());
+    d[o + SL_PLACE_ROUND_END..o + SL_PLACE_ROUND_END + 8]
+        .copy_from_slice(&book.round_end.to_le_bytes());
     Ok(())
 }
 
@@ -1457,13 +1559,9 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [
-        TWAP_AUTHORITY_SEED,
-        config_account.key.as_ref(),
-        &auth_bump,
-    ];
-    let expected_auth =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_auth = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_auth {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1472,8 +1570,8 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     }
     let escrow_bump = [book.escrow_bump];
     let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
-    let expected_escrow =
-        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let expected_escrow = Pubkey::create_program_address(&escrow_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1481,7 +1579,10 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         let h = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
         // Pinned: only the book's canonical holding can be used, so the rolled-over budget never
         // fragments across different twap_authority-owned accounts.
-        if *holding.key != book.holding || h.owner != expected_auth || h.mint != book.collateral_mint {
+        if *holding.key != book.holding
+            || h.owner != expected_auth
+            || h.mint != book.collateral_mint
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         let su = spl_token::state::Account::unpack(&settlement_usd.try_borrow_data()?)?;
@@ -1636,8 +1737,12 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             let mut b = a;
             while b > 0 {
                 let po = slot_off(idx[b - 1]);
-                if cmp_bid(book_rd_u128(&d, po + SL_COIN), book_rd_u128(&d, po + SL_USDC), kc, ku)
-                    == Ordering::Less
+                if cmp_bid(
+                    book_rd_u128(&d, po + SL_COIN),
+                    book_rd_u128(&d, po + SL_USDC),
+                    kc,
+                    ku,
+                ) == Ordering::Less
                 {
                     idx[b] = idx[b - 1];
                     b -= 1;
@@ -1679,12 +1784,22 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 }
                 let c = book_rd_u128(&d, o + SL_COIN);
                 let usd_i = book_rd_u128(&d, o + SL_USD_OWED);
-                let coin_i = if usd_i > 0 { mul_div_floor(usd_i, cm, um)? } else { 0 };
+                let coin_i = if usd_i > 0 {
+                    mul_div_floor(usd_i, cm, um)?
+                } else {
+                    0
+                };
                 if usd_i > 0 && coin_i > 0 {
-                    let refund = c.checked_sub(coin_i).ok_or(ProgramError::ArithmeticOverflow)?;
+                    let refund = c
+                        .checked_sub(coin_i)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
                     book_wr_u128(&mut d, o + SL_COIN_REFUND, refund);
-                    total_coin = total_coin.checked_add(coin_i).ok_or(ProgramError::ArithmeticOverflow)?;
-                    total_usd = total_usd.checked_add(usd_i).ok_or(ProgramError::ArithmeticOverflow)?;
+                    total_coin = total_coin
+                        .checked_add(coin_i)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    total_usd = total_usd
+                        .checked_add(usd_i)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
                 } else {
                     book_wr_u128(&mut d, o + SL_USD_OWED, 0);
                     book_wr_u128(&mut d, o + SL_COIN_REFUND, c);
@@ -1726,7 +1841,11 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     //    amount is burned, exactly as before. Then move the spent USD to the settlement account.
     if settled {
         let to_sink = if book.sink_mode == SINK_SEND {
-            mul_div_floor(total_coin, config.buyback_bps as u128, BPS_DENOMINATOR as u128)?
+            mul_div_floor(
+                total_coin,
+                config.buyback_bps as u128,
+                BPS_DENOMINATOR as u128,
+            )?
         } else {
             0
         };
@@ -1741,13 +1860,34 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 return Err(ProgramError::InvalidAccountData);
             }
             if to_sink > 0 {
-                spl_transfer(token_program, coin_escrow, coin_sink, book_escrow, as_u64(to_sink)?, Some(&escrow_seeds))?;
+                spl_transfer(
+                    token_program,
+                    coin_escrow,
+                    coin_sink,
+                    book_escrow,
+                    as_u64(to_sink)?,
+                    Some(&escrow_seeds),
+                )?;
             }
         }
         if to_burn > 0 {
-            spl_burn_signed(token_program, coin_escrow, coin_mint, book_escrow, as_u64(to_burn)?, &escrow_seeds)?;
+            spl_burn_signed(
+                token_program,
+                coin_escrow,
+                coin_mint,
+                book_escrow,
+                as_u64(to_burn)?,
+                &escrow_seeds,
+            )?;
         }
-        spl_transfer(token_program, holding, settlement_usd, twap_authority, as_u64(total_usd)?, Some(&auth_seeds))?;
+        spl_transfer(
+            token_program,
+            holding,
+            settlement_usd,
+            twap_authority,
+            as_u64(total_usd)?,
+            Some(&auth_seeds),
+        )?;
     }
 
     config.serialize(&mut config_account.try_borrow_mut_data()?);
@@ -1798,8 +1938,8 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     }
     let escrow_bump = [book.escrow_bump];
     let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
-    let expected_escrow =
-        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let expected_escrow = Pubkey::create_program_address(&escrow_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1821,10 +1961,24 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         return Err(ProgramError::InvalidAccountData);
     }
     if usd_owed > 0 {
-        spl_transfer(token_program, settlement_usd, usd_dest, book_escrow, as_u64(usd_owed)?, Some(&escrow_seeds))?;
+        spl_transfer(
+            token_program,
+            settlement_usd,
+            usd_dest,
+            book_escrow,
+            as_u64(usd_owed)?,
+            Some(&escrow_seeds),
+        )?;
     }
     if coin_refund > 0 {
-        spl_transfer(token_program, coin_escrow, coin_ata, book_escrow, as_u64(coin_refund)?, Some(&escrow_seeds))?;
+        spl_transfer(
+            token_program,
+            coin_escrow,
+            coin_ata,
+            book_escrow,
+            as_u64(coin_refund)?,
+            Some(&escrow_seeds),
+        )?;
     }
 
     let mut d = book_account.try_borrow_mut_data()?;
@@ -1899,8 +2053,8 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
     }
     let escrow_bump = [book.escrow_bump];
     let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
-    let expected_escrow =
-        Pubkey::create_program_address(&escrow_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let expected_escrow = Pubkey::create_program_address(&escrow_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1929,14 +2083,24 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
         if !aged {
             return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
         }
-        (book_rd_u128(&d, o + SL_COIN), book_rd_key(&d, o + SL_COIN_ATA))
+        (
+            book_rd_u128(&d, o + SL_COIN),
+            book_rd_key(&d, o + SL_COIN_ATA),
+        )
     };
     if *coin_ata.key != coin_key {
         return Err(ProgramError::InvalidAccountData);
     }
 
     if coin_atoms > 0 {
-        spl_transfer(token_program, coin_escrow, coin_ata, book_escrow, as_u64(coin_atoms)?, Some(&escrow_seeds))?;
+        spl_transfer(
+            token_program,
+            coin_escrow,
+            coin_ata,
+            book_escrow,
+            as_u64(coin_atoms)?,
+            Some(&escrow_seeds),
+        )?;
     }
     let mut d = book_account.try_borrow_mut_data()?;
     let o = slot_off(slot_index);
@@ -1973,13 +2137,9 @@ fn process_shutdown(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     require_squads_vault(squads_vault, &config)?;
     let auth_bump = [config.authority_bump];
-    let auth_seeds: [&[u8]; 3] = [
-        TWAP_AUTHORITY_SEED,
-        config_account.key.as_ref(),
-        &auth_bump,
-    ];
-    let expected_auth =
-        Pubkey::create_program_address(&auth_seeds, program_id).map_err(|_| ProgramError::InvalidSeeds)?;
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_auth = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_auth {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -1992,11 +2152,17 @@ fn process_shutdown(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
         return Err(ProgramError::InvalidAccountData);
     }
     if h.amount > 0 {
-        spl_transfer(token_program, holding, dest, twap_authority, h.amount, Some(&auth_seeds))?;
+        spl_transfer(
+            token_program,
+            holding,
+            dest,
+            twap_authority,
+            h.amount,
+            Some(&auth_seeds),
+        )?;
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2011,7 +2177,10 @@ mod tests {
         // Equal rates expressed with different denominators compare equal.
         assert_eq!(cmp_rate(6, 2, 9, 3), Ordering::Equal);
         // Fine-grained, overflow-safe comparison via continued fractions.
-        assert_eq!(cmp_rate(1_000_001, 1_000_000, 1_000_000, 1_000_000), Ordering::Greater);
+        assert_eq!(
+            cmp_rate(1_000_001, 1_000_000, 1_000_000, 1_000_000),
+            Ordering::Greater
+        );
         assert_eq!(cmp_rate(u128::MAX, 3, u128::MAX, 4), Ordering::Greater);
     }
 

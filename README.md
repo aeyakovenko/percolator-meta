@@ -40,11 +40,15 @@ are interchangeable behind the same distribution seam.
 |---|---|
 | `subledger/` | The market's **asset-0 insurance operator** during genesis (a role granted by Squads). Mediates deposits (signs Percolator `TopUpInsurance` as the insurance authority) and owner-authorized exits, tracking per-owner attribution (`owner, principal, start_slot`). Genesis pools are **share-based** (ERC4626-style): exiting redeems shares at the live balance, returning principal **plus any surplus**, pro-rata under loss. Never rotates keys — `accept_operator` only *consents* to receive the role Squads grants. Also provides reusable owner-bound pools for assets 1..N. |
 | `genesis-vote/` | The **vote decider**. Runs a log-time quorum vote weighted by each voter's subledger attribution (`floor(log2(hold_time)) × principal`), one voter → one proposal. Seals the winner into `distribution` by CPI. Holds no funds. |
-| `residual-distributor/` | The **deterministic decider** — a pluggable alternative to `genesis-vote` behind the same seam. Awards points across 4 cohorts (insurance/backing = subledger share value; LP/trader = Percolator residual counters) via self-service `register → crystallize → freeze → claim`. Requires a **market allow-list** (see below). |
+| `residual-distributor/` | The **deterministic decider** — a pluggable alternative to `genesis-vote` behind the same seam. Awards points across share-value cohorts (insurance/backing), residual cohorts (LP/trader), and an optional cumulative funding-payer cohort (`long_paid + short_paid`) via self-service `register → crystallize → freeze → claim`. Requires a **market allow-list** (see below). |
 | `distribution/` | Holds the fixed COIN pool in a vault. A proposal is one on-chain account of up to ~10k `(pubkey, amount)` entries; the sealed winner's recipients **claim** permissionlessly, **unclaimed is burned**. Never mints. The `authority` (whichever decider PDA) is bound into the config seed, making it decider-pluggable. |
 | `twap-program/` | Deployable BPF for the **authority chain** and the post-mint **uniform-price (Dutch) buy/burn auction**. After the mint, Squads rotates the asset-0 insurance operator to its PDA; it then runs permissionless rounds that pull the burn-share of insurance *surplus*, clear a ranked, uncancellable bid book at one marginal price, and burn (or treasury-send) the bought COIN. Never reaches principal. |
 | `twap/` | Reference library for the buy/burn (schedule + bid book); only its overflow-safe rate comparator is reused on-chain. |
 | `setup/` | Host-side helper: init the fixed-supply 42M COIN mint and revoke the mint authority. |
+
+The deterministic `residual-distributor` genesis path is tested with a 10% insurance / 10% backing /
+80% cumulative funding-payer split. Funding-payer points are per portfolio:
+`funding_long_paid_atoms_total + funding_short_paid_atoms_total`, with no age multiplier.
 
 ## Lifecycle
 
@@ -86,10 +90,12 @@ pre-announced exit window."
 
 ## Market allow-list (residual-distributor)
 
-The LP/trader cohorts award points from Percolator portfolio counters that **anyone who controls a market's
-oracle can manufacture for free** (stand up an auth-mark market, self-trade delta-neutral, push the mark →
-arbitrary `crystallized_loss`/`received` for the price of fees). So a portfolio counts only if its market is
-on an orchestrator-vetted allow-list of trusted-Pyth markets (`market_group` + up to 9 extras, bound at `init`).
+The portfolio-flow cohorts award points from Percolator portfolio counters that **anyone who controls a
+market's oracle can manufacture** (stand up an auth-mark market, self-trade delta-neutral, push funding/marks).
+So a portfolio counts only if its market is on an orchestrator-vetted allow-list of trusted-Pyth markets
+(`market_group` + up to 9 extras, bound at `init`). Cohort 2 is LP residual received; cohort 3 is trader
+residual loss net of spent principal; cohort 4 is the cumulative funding-payer counter:
+`funding_long_paid_atoms_total + funding_short_paid_atoms_total`, with no age multiplier. Receiver-side funding counters do not earn points.
 **Setup:** the creator holds the markets' authority key locally, stands up and vets N Pyth markets, then transfers
 that key to the PDA that rotates it to the DAO via the same 1-week Squads timelock — so listed markets can never
 be repointed at an attacker oracle once points accrue. The allow-list bounds *who can mint points at all*, not
@@ -99,6 +105,11 @@ wash-farming among already-trusted markets; see `residual-distributor/DESIGN.md`
 
 ```bash
 # build the deployable BPF programs (each self-contained)
+PERCOLATOR_MANIFEST="$(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="percolator-prog") | .manifest_path')"
+CARGO_TARGET_DIR="$PWD/target/percolator-prog-c080" cargo build-sbf \
+  --manifest-path "$PERCOLATOR_MANIFEST" \
+  --sbf-out-dir "$PWD/target/deploy" \
+  --no-default-features
 cargo build-sbf --manifest-path subledger/Cargo.toml
 cargo build-sbf --manifest-path distribution/Cargo.toml
 cargo build-sbf --manifest-path genesis-vote/Cargo.toml
@@ -117,9 +128,9 @@ RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
     --test chain e2e_full_genesis_to_buy_burn
 ```
 
-Tests load the **real** binaries (Percolator at `../percolator-prog/target/deploy/percolator_prog.so`,
+Tests load the **real** binaries (the Cargo-pinned Percolator SBF at `target/deploy/percolator_prog.so`,
 real Squads v4 at `program/tests/fixtures/squads_v4.so`, plus the locally-built crates) — CPIs run against
-the actual programs, not mocks. The e2e needs those `.so` files prebuilt and `../percolator-prog` built.
+the actual programs, not mocks. The e2e needs those `.so` files prebuilt.
 
 ## License
 
