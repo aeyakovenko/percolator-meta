@@ -36,10 +36,15 @@ struct Env {
     vault: Pubkey,
     sub_pid: Pubkey,
     sub_pool: Pubkey,
+    total_supply: u64,
 }
 
 impl Env {
     fn new() -> Self {
+        Self::with_supply(100)
+    }
+
+    fn with_supply(total_supply: u64) -> Self {
         let mut svm = LiteSVM::new();
         svm.add_program_from_file(gv_id(), so("genesis_vote_program")).unwrap();
         svm.add_program_from_file(dist_id(), so("distribution_program")).unwrap();
@@ -57,9 +62,20 @@ impl Env {
             Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
         let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
-        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
+        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, total_supply);
 
-        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool };
+        let mut env = Env {
+            svm,
+            payer,
+            coin_mint,
+            mint_auth,
+            gv_config,
+            dist_config,
+            vault,
+            sub_pid,
+            sub_pool,
+            total_supply,
+        };
         env.set_pool_outstanding(0);
         env.init_distribution();
         env.init_gv().expect("gv init");
@@ -83,7 +99,18 @@ impl Env {
         let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
-        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool };
+        let mut env = Env {
+            svm,
+            payer,
+            coin_mint,
+            mint_auth,
+            gv_config,
+            dist_config,
+            vault,
+            sub_pid,
+            sub_pool,
+            total_supply: 100,
+        };
         env.set_pool_outstanding(0);
         env.init_distribution();
         env
@@ -139,7 +166,7 @@ impl Env {
 
         let mut data = vec![0u8];
         data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
-        data.extend_from_slice(&100u64.to_le_bytes()); // total supply
+        data.extend_from_slice(&self.total_supply.to_le_bytes()); // total supply
         let ix = Instruction {
             program_id: dist_id(),
             accounts: vec![
@@ -443,6 +470,61 @@ fn trigger_seals_the_distribution_cross_program() {
 
     // Re-trigger is rejected (gv proposal already executed; distribution already sealed).
     assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "no double seal");
+}
+
+// MAX-SHAPE HANDOFF PROBE: a distribution that reaches the advertised 10,000-entry
+// shape must remain registerable and sealable through the permissionless genesis CPI.
+#[test]
+fn trigger_seals_a_full_max_capacity_distribution() {
+    const ENTRIES: u32 = 10_000;
+    const CHUNK: usize = 24;
+    let mut env = Env::with_supply(ENTRIES as u64);
+    let proposal = env.dist_proposal(99);
+
+    let mut create_data = vec![1u8];
+    create_data.extend_from_slice(&99u64.to_le_bytes());
+    create_data.extend_from_slice(&ENTRIES.to_le_bytes());
+    let create = Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.dist_config, false),
+            AccountMeta::new(proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: create_data,
+    };
+    env.send(&[create], &[]).expect("create maximum proposal");
+
+    let recipient = Pubkey::new_unique();
+    let mut appended = 0u32;
+    while appended < ENTRIES {
+        let count = core::cmp::min(CHUNK, (ENTRIES - appended) as usize);
+        let mut append_data = vec![2u8];
+        append_data.extend_from_slice(&(count as u32).to_le_bytes());
+        for _ in 0..count {
+            append_data.extend_from_slice(recipient.as_ref());
+            append_data.extend_from_slice(&1u64.to_le_bytes());
+        }
+        let append = Instruction {
+            program_id: dist_id(),
+            accounts: vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new_readonly(env.dist_config, false),
+                AccountMeta::new(proposal, false),
+            ],
+            data: append_data,
+        };
+        env.send(&[append], &[]).expect("append maximum proposal chunk");
+        appended += count as u32;
+    }
+    assert_eq!(env.svm.get_account(&proposal).unwrap().data.len(), 400_104);
+
+    let gv_proposal = env.register(&proposal);
+    env.set_pool_outstanding(1);
+    env.inject_tally(&gv_proposal, 1, 1, 1, 1, 1);
+    env.trigger(&gv_proposal, &proposal).expect("genesis trigger seals maximum proposal");
+    assert_eq!(env.dist_sealed_proposal(), proposal);
 }
 
 // SUBSTITUTED-POOL QUORUM COLLAPSE (no-capital / minority capture via account substitution). The trigger
