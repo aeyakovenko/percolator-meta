@@ -2549,6 +2549,7 @@ const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
 const DOMAIN_INSURANCE: u8 = 0;
 const DOMAIN_BACKING: u8 = 1;
+const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
 
 fn sub_pool_pda(
     collateral_mint: &Pubkey,
@@ -2561,6 +2562,15 @@ fn sub_pool_pda(
 ) -> Pubkey {
     let policy = [policy];
     let domain = [domain];
+    let deposit_window = if *slab == Pubkey::default()
+        && *perc == Pubkey::default()
+        && *coin_mint == Pubkey::default()
+    {
+        u64::MAX
+    } else {
+        DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS
+    }
+    .to_le_bytes();
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -2571,6 +2581,7 @@ fn sub_pool_pda(
             coin_mint.as_ref(),
             &policy,
             &domain,
+            &deposit_window,
         ],
         &sub_id(),
     )

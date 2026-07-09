@@ -55,8 +55,12 @@ const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // Position grows by `shares` (u128 @104). All cross-program reads (genesis-vote
 // principal@72 / start_slot@89 / outstanding@80) keep their offsets — the new fields are
 // appended, so those programs are unaffected.
-const POOL_SIZE: usize = 240;
+const POOL_SIZE: usize = 256;
 const POSITION_SIZE: usize = 120;
+// One week at ~400ms/slot. `init_insurance_pool` accepts an optional explicit
+// slot window, but defaults to this short bootstrap deposit window.
+const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
+const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
 
 // Position field byte offsets, exposed so cross-program readers (genesis-vote, residual-distributor)
 // can PIN their hardcoded reads against this canonical layout instead of guessing (finding HF: a
@@ -71,6 +75,8 @@ pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) 
 // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
 // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
 pub const POOL_OUTSTANDING_PRINCIPAL_OFF: usize = 80;
+pub const POOL_DEPOSIT_DEADLINE_SLOT_OFF: usize = 240;
+pub const POOL_DEPOSIT_WINDOW_SLOTS_OFF: usize = 248;
 
 const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
@@ -147,6 +153,8 @@ solana_program::entrypoint!(process_instruction);
 // that can exist at the legit address is bound to the legit market. Folding coin_mint into
 // the seed closes the same-market squat: a hostile init using a fake COIN mint / fake
 // genesis-vote authority lands at a different PDA instead of consuming the real one.
+// The configured deposit window is also seed material so a first writer cannot
+// consume the intended PDA with a shorter or longer schedule.
 // Own-vault pools use Pubkey::default() for the market/program/coin slots, matching what
 // they store. Policy/domain are seed material because a principal-only first-writer could
 // otherwise consume the intended share-based pool PDA and disable soft-veto rewards while
@@ -159,7 +167,8 @@ fn pool_seeds_full<'a>(
     coin_mint: &'a Pubkey,
     policy: &'a [u8; 1],
     domain: &'a [u8; 1],
-) -> [&'a [u8]; 8] {
+    deposit_window_slots: &'a [u8; 8],
+) -> [&'a [u8]; 9] {
     [
         b"subledger_pool",
         mint.as_ref(),
@@ -169,6 +178,7 @@ fn pool_seeds_full<'a>(
         coin_mint.as_ref(),
         policy,
         domain,
+        deposit_window_slots,
     ]
 }
 
@@ -210,6 +220,12 @@ struct Pool {
     /// Distributed COIN mint whose genesis-vote config may lock this pool's positions.
     /// Own-vault pools store Pubkey::default().
     coin_mint: Pubkey,
+    /// First slot at which new deposits are rejected. Own-vault pools set this to
+    /// u64::MAX; genesis insurance pools set a short bootstrap deposit deadline.
+    deposit_deadline_slot: u64,
+    /// Configured window committed into the pool PDA. Own-vault pools use the
+    /// no-close sentinel.
+    deposit_window_slots: u64,
 }
 
 impl Pool {
@@ -235,6 +251,8 @@ impl Pool {
             vote_authority: Pubkey::new_from_array(data[160..192].try_into().unwrap()),
             total_shares: u128::from_le_bytes(data[192..208].try_into().unwrap()),
             coin_mint: Pubkey::new_from_array(data[208..240].try_into().unwrap()),
+            deposit_deadline_slot: u64::from_le_bytes(data[240..248].try_into().unwrap()),
+            deposit_window_slots: u64::from_le_bytes(data[248..256].try_into().unwrap()),
         })
     }
 
@@ -253,6 +271,8 @@ impl Pool {
         data[160..192].copy_from_slice(self.vote_authority.as_ref());
         data[192..208].copy_from_slice(&self.total_shares.to_le_bytes());
         data[208..240].copy_from_slice(self.coin_mint.as_ref());
+        data[240..248].copy_from_slice(&self.deposit_deadline_slot.to_le_bytes());
+        data[248..256].copy_from_slice(&self.deposit_window_slots.to_le_bytes());
     }
 
     fn is_insurance(&self) -> bool {
@@ -536,6 +556,7 @@ fn process_init_pool(
     let asset_id_bytes = asset_id.to_le_bytes();
     let policy_seed = [policy];
     let domain_seed = [domain];
+    let deposit_window_seed = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
         &pool_seeds_full(
             mint.key,
@@ -545,6 +566,7 @@ fn process_init_pool(
             &no_market,
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
         ),
         program_id,
     );
@@ -578,7 +600,7 @@ fn process_init_pool(
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 9] = [
+    let seeds: [&[u8]; 10] = [
         b"subledger_pool",
         mint.key.as_ref(),
         &asset_id_bytes,
@@ -587,6 +609,7 @@ fn process_init_pool(
         no_market.as_ref(),
         &policy_seed,
         &domain_seed,
+        &deposit_window_seed,
         &bump_arr,
     ];
     create_pda_robust(payer, pool_account, system_program, program_id, &seeds, POOL_SIZE)?;
@@ -604,6 +627,8 @@ fn process_init_pool(
         vote_authority: Pubkey::default(),
         total_shares: 0,
         coin_mint: Pubkey::default(),
+        deposit_deadline_slot: u64::MAX,
+        deposit_window_slots: OWN_VAULT_DEPOSIT_WINDOW_SLOTS,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     Ok(())
@@ -786,6 +811,7 @@ fn process_withdraw(
     let asset_id_bytes = pool.asset_id.to_le_bytes();
     let policy_seed = [pool.policy];
     let domain_seed = [pool.domain];
+    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
         &pool_seeds_full(
             &pool.mint,
@@ -795,6 +821,7 @@ fn process_withdraw(
             &pool.coin_mint,
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
         ),
         program_id,
     );
@@ -829,7 +856,7 @@ fn process_withdraw(
 
     if paid > 0 {
         let bump_arr = [pool.bump];
-        let seeds: [&[u8]; 9] = [
+        let seeds: [&[u8]; 10] = [
             b"subledger_pool",
             pool.mint.as_ref(),
             &asset_id_bytes,
@@ -838,6 +865,7 @@ fn process_withdraw(
             pool.coin_mint.as_ref(),
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
             &bump_arr,
         ];
         invoke_signed(
@@ -921,7 +949,7 @@ fn create_pda_robust<'a>(
 
 // init_insurance_pool accounts: [payer(s,w), mint, pool(w,pda), percolator_vault,
 //   market_slab, percolator_program, system_program, vote_authority, coin_mint]
-// data: asset_id (u64), policy (u8)
+// data: asset_id (u64), policy (u8), optional deposit_window_slots (u64)
 //
 // `vote_authority` must be the canonical genesis-vote config PDA for (coin_mint,
 // pool). This keeps permissionless init from consuming the real pool PDA with a
@@ -947,7 +975,16 @@ fn process_init_insurance_pool(
 
     let asset_id = read_u64(data)?;
     let policy = read_u8(data)?;
-    if policy > POLICY_WITH_SURPLUS || !data.is_empty() {
+    let deposit_window_slots = if data.is_empty() {
+        DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS
+    } else {
+        let slots = read_u64(data)?;
+        if slots == 0 || !data.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        slots
+    };
+    if policy > POLICY_WITH_SURPLUS {
         return Err(ProgramError::InvalidInstructionData);
     }
     // This instruction is the genesis asset-0 insurance pool: deposits CPI to
@@ -966,10 +1003,14 @@ fn process_init_insurance_pool(
     if *percolator_program.key == Pubkey::default() {
         return Err(ProgramError::InvalidAccountData);
     }
+    let deposit_deadline_slot = Clock::get()?.slot
+        .checked_add(deposit_window_slots)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     let asset_id_bytes = asset_id.to_le_bytes();
     let policy_seed = [policy];
     let domain_seed = [DOMAIN_INSURANCE];
+    let deposit_window_seed = deposit_window_slots.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
         &pool_seeds_full(
             mint.key,
@@ -979,6 +1020,7 @@ fn process_init_insurance_pool(
             coin_mint.key,
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
         ),
         program_id,
     );
@@ -1019,7 +1061,7 @@ fn process_init_insurance_pool(
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 9] = [
+    let seeds: [&[u8]; 10] = [
         b"subledger_pool",
         mint.key.as_ref(),
         &asset_id_bytes,
@@ -1028,6 +1070,7 @@ fn process_init_insurance_pool(
         coin_mint.key.as_ref(),
         &policy_seed,
         &domain_seed,
+        &deposit_window_seed,
         &bump_arr,
     ];
     create_pda_robust(payer, pool_account, system_program, program_id, &seeds, POOL_SIZE)?;
@@ -1045,6 +1088,8 @@ fn process_init_insurance_pool(
         vote_authority: *vote_authority.key,
         total_shares: 0,
         coin_mint: *coin_mint.key,
+        deposit_deadline_slot,
+        deposit_window_slots,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     Ok(())
@@ -1092,10 +1137,17 @@ fn process_insurance_deposit(
     if !pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Genesis deposits close at the pool's configured deadline. This prevents
+    // late capital from inflating the live quorum denominator right before
+    // genesis-vote trigger while carrying little/no voting tenure.
+    if Clock::get()?.slot >= pool.deposit_deadline_slot {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     // Re-derive the pool PDA so the signing seeds are trusted.
     let asset_id_bytes = pool.asset_id.to_le_bytes();
     let policy_seed = [pool.policy];
     let domain_seed = [pool.domain];
+    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
         &pool_seeds_full(
             &pool.mint,
@@ -1105,6 +1157,7 @@ fn process_insurance_deposit(
             &pool.coin_mint,
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
         ),
         program_id,
     );
@@ -1194,7 +1247,7 @@ fn process_insurance_deposit(
 
     // 2) holding -> Percolator insurance vault, signed by the pool PDA as the
     //    asset-0 insurance authority (TopUpInsurance, tag 9).
-    let seeds: [&[u8]; 9] = [
+    let seeds: [&[u8]; 10] = [
         b"subledger_pool",
         pool.mint.as_ref(),
         &asset_id_bytes,
@@ -1203,6 +1256,7 @@ fn process_insurance_deposit(
         pool.coin_mint.as_ref(),
         &policy_seed,
         &domain_seed,
+        &deposit_window_seed,
         core::slice::from_ref(&pool.bump),
     ];
     let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE];
@@ -1306,6 +1360,7 @@ fn process_insurance_withdraw(
     let asset_id_bytes = pool.asset_id.to_le_bytes();
     let policy_seed = [pool.policy];
     let domain_seed = [pool.domain];
+    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
         &pool_seeds_full(
             &pool.mint,
@@ -1315,6 +1370,7 @@ fn process_insurance_withdraw(
             &pool.coin_mint,
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
         ),
         program_id,
     );
@@ -1388,7 +1444,7 @@ fn process_insurance_withdraw(
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,
     // moving Percolator insurance -> pool-PDA-owned holding.
-    let seeds: [&[u8]; 9] = [
+    let seeds: [&[u8]; 10] = [
         b"subledger_pool",
         pool.mint.as_ref(),
         &asset_id_bytes,
@@ -1397,6 +1453,7 @@ fn process_insurance_withdraw(
         pool.coin_mint.as_ref(),
         &policy_seed,
         &domain_seed,
+        &deposit_window_seed,
         core::slice::from_ref(&pool.bump),
     ];
     // A fully-impaired exit (owed == 0, insurance wiped) still retires the position below; only
@@ -1577,6 +1634,7 @@ fn process_accept_operator(
     let asset_id_bytes = pool.asset_id.to_le_bytes();
     let policy_seed = [pool.policy];
     let domain_seed = [pool.domain];
+    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
         &pool_seeds_full(
             &pool.mint,
@@ -1586,6 +1644,7 @@ fn process_accept_operator(
             &pool.coin_mint,
             &policy_seed,
             &domain_seed,
+            &deposit_window_seed,
         ),
         program_id,
     );
@@ -1593,7 +1652,7 @@ fn process_accept_operator(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let seeds: [&[u8]; 9] = [
+    let seeds: [&[u8]; 10] = [
         b"subledger_pool",
         pool.mint.as_ref(),
         &asset_id_bytes,
@@ -1602,6 +1661,7 @@ fn process_accept_operator(
         pool.coin_mint.as_ref(),
         &policy_seed,
         &domain_seed,
+        &deposit_window_seed,
         core::slice::from_ref(&pool.bump),
     ];
     // Receive BOTH the insurance authority (TopUp) and operator (Withdraw) roles for
@@ -1749,6 +1809,8 @@ mod tests {
             vote_authority: Pubkey::new_unique(),
             total_shares: 7_777,
             coin_mint,
+            deposit_deadline_slot: 42_424,
+            deposit_window_slots: 99,
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf);
@@ -1757,6 +1819,22 @@ mod tests {
             u64::from_le_bytes(buf[POOL_OUTSTANDING_PRINCIPAL_OFF..POOL_OUTSTANDING_PRINCIPAL_OFF + 8].try_into().unwrap()),
             12345,
             "Pool.outstanding_principal must serialize at POOL_OUTSTANDING_PRINCIPAL_OFF"
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                buf[POOL_DEPOSIT_DEADLINE_SLOT_OFF..POOL_DEPOSIT_DEADLINE_SLOT_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            42_424
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                buf[POOL_DEPOSIT_WINDOW_SLOTS_OFF..POOL_DEPOSIT_WINDOW_SLOTS_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            99
         );
         let d = Pool::deserialize(&buf).unwrap();
         assert_eq!(d.mint, pool.mint);
@@ -1770,6 +1848,8 @@ mod tests {
         assert_eq!(d.percolator_program, perc);
         assert_eq!(d.vote_authority, pool.vote_authority);
         assert_eq!(d.coin_mint, coin_mint);
+        assert_eq!(d.deposit_deadline_slot, 42_424);
+        assert_eq!(d.deposit_window_slots, 99);
         assert!(d.is_insurance());
 
         let pos = Position {

@@ -131,6 +131,7 @@ fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
     let no_market = Pubkey::default();
     let domain = [0u8];
     let policy = [policy];
+    let deposit_window = u64::MAX.to_le_bytes();
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -141,6 +142,7 @@ fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
             no_market.as_ref(),
             &policy,
             &domain,
+            &deposit_window,
         ],
         &program_id(),
     )
