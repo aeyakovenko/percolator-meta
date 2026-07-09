@@ -2545,13 +2545,22 @@ fn token_amount(svm: &LiteSVM, key: &Pubkey) -> u64 {
     u64::from_le_bytes(a.data[64..72].try_into().unwrap())
 }
 
+const POLICY_PRINCIPAL: u8 = 0;
+const POLICY_WITH_SURPLUS: u8 = 1;
+const DOMAIN_INSURANCE: u8 = 0;
+const DOMAIN_BACKING: u8 = 1;
+
 fn sub_pool_pda(
     collateral_mint: &Pubkey,
     asset_id: u64,
     slab: &Pubkey,
     perc: &Pubkey,
     coin_mint: &Pubkey,
+    policy: u8,
+    domain: u8,
 ) -> Pubkey {
+    let policy = [policy];
+    let domain = [domain];
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -2560,6 +2569,8 @@ fn sub_pool_pda(
             slab.as_ref(),
             perc.as_ref(),
             coin_mint.as_ref(),
+            &policy,
+            &domain,
         ],
         &sub_id(),
     )
@@ -2754,7 +2765,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
 
     // init the subledger insurance pool (permissionless; vote_authority is the canonical gv config PDA).
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
@@ -2912,7 +2923,7 @@ fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
     let perc_vault = canonical_insurance_vault(&va, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &va, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab_a, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab_a, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
@@ -3263,7 +3274,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
@@ -3697,7 +3708,7 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
@@ -3988,7 +3999,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
@@ -4270,7 +4281,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
@@ -5225,7 +5236,7 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
     let mut dp = vec![3u8];
@@ -7004,6 +7015,8 @@ fn e2e_vote_rejects_a_position_from_a_foreign_subledger_pool() {
         &Pubkey::default(),
         &Pubkey::default(),
         &Pubkey::default(),
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
     );
     let vault_b = Pubkey::new_unique();
     set_token(&mut svm, &vault_b, &env.collateral_mint, &pool_b, 0);
@@ -7232,6 +7245,8 @@ fn e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum() 
         &Pubkey::default(),
         &Pubkey::default(),
         &Pubkey::default(),
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
     );
     let vault_f = Pubkey::new_unique();
     set_token(&mut svm, &vault_f, &env.collateral_mint, &pool_f, 0);
@@ -11648,7 +11663,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
 
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
@@ -18681,7 +18696,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         .expect("market earns surplus (real topup)");
 
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
     let no_market = Pubkey::default();
     let backing_pool = sub_pool_pda(
         &collateral_mint,
@@ -18689,6 +18704,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &no_market,
         &no_market,
         &Pubkey::default(),
+        POLICY_WITH_SURPLUS,
+        DOMAIN_BACKING,
     );
 
     // subledger insurance pool, POLICY_WITH_SURPLUS (the soft-veto / tenure-fair cohort).

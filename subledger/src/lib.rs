@@ -134,7 +134,7 @@ const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates Withdr
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
-// The pool PDA commits to its market binding and the distributed COIN mint, not just
+// The pool PDA commits to its market binding, distributed COIN mint, policy, and domain, not just
 // (collateral mint, asset_id). Keying it on (mint, asset_id) alone made init_insurance_pool
 // (permissionless) front-run squattable:
 // the genesis pool PDA = f(COIN_mint, 0) and the gv config PDA = f(COIN_mint) are both
@@ -148,14 +148,18 @@ solana_program::entrypoint!(process_instruction);
 // the seed closes the same-market squat: a hostile init using a fake COIN mint / fake
 // genesis-vote authority lands at a different PDA instead of consuming the real one.
 // Own-vault pools use Pubkey::default() for the market/program/coin slots, matching what
-// they store. (finding Q; same class as finding P.)
-fn pool_seeds<'a>(
+// they store. Policy/domain are seed material because a principal-only first-writer could
+// otherwise consume the intended share-based pool PDA and disable soft-veto rewards while
+// still passing all market/vault/authority checks. (finding Q; same class as finding P.)
+fn pool_seeds_full<'a>(
     mint: &'a Pubkey,
     asset_id: &'a [u8; 8],
     market_slab: &'a Pubkey,
     percolator_program: &'a Pubkey,
     coin_mint: &'a Pubkey,
-) -> [&'a [u8]; 6] {
+    policy: &'a [u8; 1],
+    domain: &'a [u8; 1],
+) -> [&'a [u8]; 8] {
     [
         b"subledger_pool",
         mint.as_ref(),
@@ -163,6 +167,8 @@ fn pool_seeds<'a>(
         market_slab.as_ref(),
         percolator_program.as_ref(),
         coin_mint.as_ref(),
+        policy,
+        domain,
     ]
 }
 
@@ -528,8 +534,18 @@ fn process_init_pool(
     // are the default key (matching what the Pool stores below).
     let no_market = Pubkey::default();
     let asset_id_bytes = asset_id.to_le_bytes();
+    let policy_seed = [policy];
+    let domain_seed = [domain];
     let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds(mint.key, &asset_id_bytes, &no_market, &no_market, &no_market),
+        &pool_seeds_full(
+            mint.key,
+            &asset_id_bytes,
+            &no_market,
+            &no_market,
+            &no_market,
+            &policy_seed,
+            &domain_seed,
+        ),
         program_id,
     );
     if *pool_account.key != expected_pool {
@@ -562,13 +578,15 @@ fn process_init_pool(
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 7] = [
+    let seeds: [&[u8]; 9] = [
         b"subledger_pool",
         mint.key.as_ref(),
         &asset_id_bytes,
         no_market.as_ref(),
         no_market.as_ref(),
         no_market.as_ref(),
+        &policy_seed,
+        &domain_seed,
         &bump_arr,
     ];
     create_pda_robust(payer, pool_account, system_program, program_id, &seeds, POOL_SIZE)?;
@@ -766,13 +784,17 @@ fn process_withdraw(
     // Re-derive the pool PDA so the recorded vault and signing seeds are trusted.
     // (own-vault: market_slab/percolator_program are the default key it stored.)
     let asset_id_bytes = pool.asset_id.to_le_bytes();
+    let policy_seed = [pool.policy];
+    let domain_seed = [pool.domain];
     let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds(
+        &pool_seeds_full(
             &pool.mint,
             &asset_id_bytes,
             &pool.market_slab,
             &pool.percolator_program,
             &pool.coin_mint,
+            &policy_seed,
+            &domain_seed,
         ),
         program_id,
     );
@@ -807,13 +829,15 @@ fn process_withdraw(
 
     if paid > 0 {
         let bump_arr = [pool.bump];
-        let seeds: [&[u8]; 7] = [
+        let seeds: [&[u8]; 9] = [
             b"subledger_pool",
             pool.mint.as_ref(),
             &asset_id_bytes,
             pool.market_slab.as_ref(),
             pool.percolator_program.as_ref(),
             pool.coin_mint.as_ref(),
+            &policy_seed,
+            &domain_seed,
             &bump_arr,
         ];
         invoke_signed(
@@ -944,13 +968,17 @@ fn process_init_insurance_pool(
     }
 
     let asset_id_bytes = asset_id.to_le_bytes();
+    let policy_seed = [policy];
+    let domain_seed = [DOMAIN_INSURANCE];
     let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds(
+        &pool_seeds_full(
             mint.key,
             &asset_id_bytes,
             market_slab.key,
             percolator_program.key,
             coin_mint.key,
+            &policy_seed,
+            &domain_seed,
         ),
         program_id,
     );
@@ -991,13 +1019,15 @@ fn process_init_insurance_pool(
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 7] = [
+    let seeds: [&[u8]; 9] = [
         b"subledger_pool",
         mint.key.as_ref(),
         &asset_id_bytes,
         market_slab.key.as_ref(),
         percolator_program.key.as_ref(),
         coin_mint.key.as_ref(),
+        &policy_seed,
+        &domain_seed,
         &bump_arr,
     ];
     create_pda_robust(payer, pool_account, system_program, program_id, &seeds, POOL_SIZE)?;
@@ -1064,13 +1094,17 @@ fn process_insurance_deposit(
     }
     // Re-derive the pool PDA so the signing seeds are trusted.
     let asset_id_bytes = pool.asset_id.to_le_bytes();
+    let policy_seed = [pool.policy];
+    let domain_seed = [pool.domain];
     let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds(
+        &pool_seeds_full(
             &pool.mint,
             &asset_id_bytes,
             &pool.market_slab,
             &pool.percolator_program,
             &pool.coin_mint,
+            &policy_seed,
+            &domain_seed,
         ),
         program_id,
     );
@@ -1160,13 +1194,15 @@ fn process_insurance_deposit(
 
     // 2) holding -> Percolator insurance vault, signed by the pool PDA as the
     //    asset-0 insurance authority (TopUpInsurance, tag 9).
-    let seeds: [&[u8]; 7] = [
+    let seeds: [&[u8]; 9] = [
         b"subledger_pool",
         pool.mint.as_ref(),
         &asset_id_bytes,
         pool.market_slab.as_ref(),
         pool.percolator_program.as_ref(),
         pool.coin_mint.as_ref(),
+        &policy_seed,
+        &domain_seed,
         core::slice::from_ref(&pool.bump),
     ];
     let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE];
@@ -1268,13 +1304,17 @@ fn process_insurance_withdraw(
     }
 
     let asset_id_bytes = pool.asset_id.to_le_bytes();
+    let policy_seed = [pool.policy];
+    let domain_seed = [pool.domain];
     let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds(
+        &pool_seeds_full(
             &pool.mint,
             &asset_id_bytes,
             &pool.market_slab,
             &pool.percolator_program,
             &pool.coin_mint,
+            &policy_seed,
+            &domain_seed,
         ),
         program_id,
     );
@@ -1348,13 +1388,15 @@ fn process_insurance_withdraw(
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,
     // moving Percolator insurance -> pool-PDA-owned holding.
-    let seeds: [&[u8]; 7] = [
+    let seeds: [&[u8]; 9] = [
         b"subledger_pool",
         pool.mint.as_ref(),
         &asset_id_bytes,
         pool.market_slab.as_ref(),
         pool.percolator_program.as_ref(),
         pool.coin_mint.as_ref(),
+        &policy_seed,
+        &domain_seed,
         core::slice::from_ref(&pool.bump),
     ];
     // A fully-impaired exit (owed == 0, insurance wiped) still retires the position below; only
@@ -1533,13 +1575,17 @@ fn process_accept_operator(
     }
     // Re-derive the pool PDA so the signing seeds are trusted.
     let asset_id_bytes = pool.asset_id.to_le_bytes();
+    let policy_seed = [pool.policy];
+    let domain_seed = [pool.domain];
     let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds(
+        &pool_seeds_full(
             &pool.mint,
             &asset_id_bytes,
             &pool.market_slab,
             &pool.percolator_program,
             &pool.coin_mint,
+            &policy_seed,
+            &domain_seed,
         ),
         program_id,
     );
@@ -1547,13 +1593,15 @@ fn process_accept_operator(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let seeds: [&[u8]; 7] = [
+    let seeds: [&[u8]; 9] = [
         b"subledger_pool",
         pool.mint.as_ref(),
         &asset_id_bytes,
         pool.market_slab.as_ref(),
         pool.percolator_program.as_ref(),
         pool.coin_mint.as_ref(),
+        &policy_seed,
+        &domain_seed,
         core::slice::from_ref(&pool.bump),
     ];
     // Receive BOTH the insurance authority (TopUp) and operator (Withdraw) roles for

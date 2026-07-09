@@ -70,6 +70,8 @@ fn clone_kp(kp: &Keypair) -> Keypair {
 
 const ASSET_ID: u64 = 0;
 const POLICY_PRINCIPAL: u8 = 0;
+const POLICY_WITH_SURPLUS: u8 = 1;
+const DOMAIN_INSURANCE: u8 = 0;
 
 struct Env {
     svm: LiteSVM,
@@ -89,6 +91,10 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
+        Self::new_for_policy(POLICY_PRINCIPAL)
+    }
+
+    fn new_for_policy(pool_policy: u8) -> Self {
         let mut svm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
             heap_size: 256 * 1024,
@@ -111,7 +117,9 @@ impl Env {
         let slab = Pubkey::new_unique();
 
         // The subledger insurance pool PDA: asset-0 insurance authority + operator,
-        // bound to (mint, asset_id, market_slab, percolator_program, coin_mint).
+        // bound to (mint, asset_id, market_slab, percolator_program, coin_mint, policy, domain).
+        let policy_seed = [pool_policy];
+        let domain_seed = [DOMAIN_INSURANCE];
         let pool = Pubkey::find_program_address(
             &[
                 b"subledger_pool",
@@ -120,6 +128,8 @@ impl Env {
                 slab.as_ref(),
                 perc_id().as_ref(),
                 coin_mint.as_ref(),
+                &policy_seed,
+                &domain_seed,
             ],
             &sub_id(),
         )
@@ -1163,8 +1173,8 @@ fn principal_policy_partial_insurance_withdraw_burns_proportional_shares_issue_4
 // only covered POLICY_PRINCIPAL). It also confirms the exit does NOT revert when a surplus exists (no DoS).
 #[test]
 fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative_to_principal_only() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (shares; surplus is distributed pro-rata)
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS); // shares; surplus is distributed pro-rata
 
     let amount = 1_000_000u64;
     let (alice, alice_ata) = new_depositor(&mut env, amount);
@@ -1211,8 +1221,8 @@ fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative
 // the risk while it built, not to a last-second joiner. Previously untested on the insurance path.
 #[test]
 fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
 
     let amount = 1_000_000u64;
     let (alice, alice_ata) = new_depositor(&mut env, amount);
@@ -1261,8 +1271,8 @@ fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
 // the impaired balance. Real percolator slab + subledger .so.
 #[test]
 fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (share redemption)
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS); // share redemption
 
     let amount = 1_000_000u64;
     let (alice, alice_ata) = new_depositor(&mut env, amount);
@@ -1305,8 +1315,8 @@ fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
 // overflowing product to fit in u128.
 #[test]
 fn large_insurance_share_position_can_exit_after_repeated_impairment() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
 
     let tranche = 1_000_000_000u64;
     let total_deposit = tranche * 3;
@@ -1365,8 +1375,8 @@ fn large_insurance_share_position_can_exit_after_repeated_impairment() {
 // deposit through — verified), so HB is the SOLE rejecter, not a slab-shape CPI error. Previously untested.
 #[test]
 fn share_inflation_first_depositor_donation_cannot_strand_a_later_depositor_finding_hb() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (share-priced)
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS); // share-priced
 
     // Attacker is the FIRST (dust) depositor: 2 atoms -> 2*VIRTUAL_SHARES = 2e6 shares, insurance = 2.
     let (attacker, attacker_ata) = new_depositor(&mut env, 2);
@@ -3475,7 +3485,7 @@ fn only_the_proposal_creator_can_register_it() {
 // (= f(COIN_mint, asset 0)) FIRST, bound to a percolator market THEY control, with
 // vote_authority set to the predictable real gv config PDA — passing the gv binding
 // check and routing every depositor's principal into the attacker's market (LOF). Now
-// the pool PDA commits to (mint, asset_id, market_slab, percolator_program, coin_mint),
+// the pool PDA commits to (mint, asset_id, market_slab, percolator_program, coin_mint, policy, domain),
 // so an attacker's pool lands at a DIFFERENT address and the genesis pool PDA — bound
 // to the real market and COIN — stays free and untouched.
 #[test]
@@ -3503,8 +3513,19 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
 
     // The attacker's pool PDA is bound to THEIR market — a different address from the
     // genesis pool (env.pool), which is bound to the real market (env.slab).
+    let attacker_policy = [POLICY_PRINCIPAL];
+    let attacker_domain = [DOMAIN_INSURANCE];
     let attacker_pool = Pubkey::find_program_address(
-        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), attacker_slab.as_ref(), perc_id().as_ref(), env.coin_mint.as_ref()],
+        &[
+            b"subledger_pool",
+            env.mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            attacker_slab.as_ref(),
+            perc_id().as_ref(),
+            env.coin_mint.as_ref(),
+            &attacker_policy,
+            &attacker_domain,
+        ],
         &sub_id(),
     ).0;
     assert_ne!(attacker_pool, env.pool, "the market binding is part of the pool PDA");
@@ -3600,6 +3621,9 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
             &asset_id.to_le_bytes(),
             env.slab.as_ref(),
             perc_id().as_ref(),
+            env.coin_mint.as_ref(),
+            &[POLICY_PRINCIPAL],
+            &[DOMAIN_INSURANCE],
         ],
         &sub_id(),
     )
@@ -3619,6 +3643,7 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3640,10 +3665,52 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
     env.insurance_withdraw(&alice, &alice_ata, &hold, &alice, 1_000_000).expect("asset-0 exit remains usable");
 }
 
+// FIRST-WRITER POLICY SQUAT (soft-veto bypass): the intended genesis pool is share-based
+// (POLICY_WITH_SURPLUS). If the policy byte is not part of the pool PDA namespace, a front-runner can
+// initialize the exact canonical pool with POLICY_PRINCIPAL, consuming it before the orchestrator creates
+// the share-based pool. Deposits/votes still work, but exits no longer redeem surplus, so the residual
+// distributor's soft-veto design is silently disabled. The wrong in-range policy must land at a different
+// PDA, leaving the intended share-based pool free.
+#[test]
+fn wrong_in_range_policy_cannot_squat_the_share_based_genesis_pool() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let squat = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+    assert!(
+        env.send(&[squat], &[]).is_err(),
+        "a principal-policy init must not consume the intended share-based genesis pool PDA"
+    );
+    assert!(
+        env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()),
+        "intended share-based genesis pool PDA remains free"
+    );
+
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+    let pool_acc = env.svm.get_account(&env.pool).unwrap();
+    assert_eq!(pool_acc.data[88], POLICY_WITH_SURPLUS, "real genesis pool is POLICY_WITH_SURPLUS");
+}
+
 // CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)
 // and init_insurance_pool (tag 3) derive their pool PDA from pool_seeds(mint, asset_id, market_slab,
-// percolator_program, coin_mint). The genesis insurance pool lives at
-// (mint, 0, REAL_market, REAL_program, REAL_coin). If
+// percolator_program, coin_mint, policy, domain). The genesis insurance pool lives at
+// (mint, 0, REAL_market, REAL_program, REAL_coin, policy, INSURANCE). If
 // init_pool let the caller supply the market/program seed parts, an attacker could derive that exact
 // address with a BACKING-domain own-vault pool, seize the PDA (legit init then fails
 // AccountAlreadyInitialized), and brick the genesis (genesis-vote needs is_insurance() == true).
@@ -3658,8 +3725,19 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
 
     // The own-vault namespace for the same (mint, asset_id) is a DIFFERENT address than the genesis
     // insurance pool — the market/program seed parts differ (default vs the real market).
+    let own_policy = [POLICY_PRINCIPAL];
+    let own_domain = [1u8]; // DOMAIN_BACKING
     let own_vault_pda = Pubkey::find_program_address(
-        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), Pubkey::default().as_ref(), Pubkey::default().as_ref(), Pubkey::default().as_ref()],
+        &[
+            b"subledger_pool",
+            env.mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            Pubkey::default().as_ref(),
+            Pubkey::default().as_ref(),
+            Pubkey::default().as_ref(),
+            &own_policy,
+            &own_domain,
+        ],
         &sub_id(),
     ).0;
     assert_ne!(own_vault_pda, env.pool, "own-vault and insurance pool PDAs are structurally disjoint");
