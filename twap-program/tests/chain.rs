@@ -10,6 +10,8 @@ use solana_sdk::{
     account::Account,
     clock::Clock,
     instruction::{AccountMeta, Instruction},
+    program_option::COption,
+    program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_program,
@@ -2539,6 +2541,58 @@ fn set_token(svm: &mut LiteSVM, key: &Pubkey, mint: &Pubkey, owner: &Pubkey, amo
         },
     )
     .unwrap();
+}
+fn set_freezeable_mint(
+    svm: &mut LiteSVM,
+    key: &Pubkey,
+    mint_authority: &Pubkey,
+    freeze_authority: &Pubkey,
+) {
+    let mut data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint {
+        mint_authority: COption::Some(*mint_authority),
+        supply: 0,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::Some(*freeze_authority),
+    }
+    .pack_into_slice(&mut data);
+    svm.set_account(
+        *key,
+        Account {
+            lamports: 2_000_000,
+            data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+fn freeze_token_account(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    account: &Pubkey,
+    freeze_authority: &Keypair,
+) {
+    let ix = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        account,
+        mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer, freeze_authority],
+        bh,
+    ))
+    .expect("freeze token account");
 }
 fn token_amount(svm: &LiteSVM, key: &Pubkey) -> u64 {
     let a = svm.get_account(key).unwrap();
@@ -14760,6 +14814,141 @@ fn e2e_closing_usd_dest_cannot_permanently_brick_the_book() {
     let _ = (winner, late);
 }
 
+// ADVERSARIAL DOS (frozen USD-side payout brick): the closed-ATA case is recoverable by recreating
+// the canonical account, but an initialized token account can also become unable to receive transfers.
+// A winning bidder on a freezeable collateral mint can leave the book permanently SETTLED by freezing
+// their canonical USD ATA after execute. The safe relaxation is only on the USD side: claim may pay any
+// initialized collateral account owned by the recorded bidder; COIN refunds stay pinned to the canonical
+// COIN ATA because the fixed COIN mint has no freeze authority.
+#[test]
+fn e2e_frozen_usd_dest_can_claim_to_another_bidder_owned_collateral_account() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let freeze_auth = Keypair::new();
+    set_freezeable_mint(
+        &mut svm,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        &freeze_auth.pubkey(),
+    );
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let (winner, w_src, w_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(
+        &mut svm,
+        &[&winner],
+        place_bid_ix(
+            &winner.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &w_src,
+            &w_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            400_000,
+            400_000,
+            None,
+        ),
+    )
+    .expect("winner bid");
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute");
+
+    freeze_token_account(&mut svm, &payer, &env.collateral_mint, &w_usd, &freeze_auth);
+    assert!(
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &w_usd,
+                &w_src,
+                0
+            )
+        )
+        .is_err(),
+        "claim to the frozen canonical USD ATA cannot drain the settled slot"
+    );
+
+    let alt_usd = Pubkey::new_unique();
+    set_token(&mut svm, &alt_usd, &env.collateral_mint, &winner.pubkey(), 0);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &alt_usd,
+            &w_src,
+            0,
+        ),
+    )
+    .expect("claim can recover through another bidder-owned collateral account");
+    assert_eq!(
+        token_amount(&svm, &alt_usd),
+        400_000,
+        "winner receives USD despite the frozen canonical payout ATA"
+    );
+
+    let (late, l_src, l_usd) = new_bidder(&mut svm, &payer, &env, 5_000);
+    send(
+        &mut svm,
+        &[&late],
+        place_bid_ix(
+            &late.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &l_src,
+            &l_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            5_000,
+            5_000,
+            None,
+        ),
+    )
+    .expect("book reopened after the recovered claim");
+}
+
 // ADVERSARIAL CU-DOS (finding AC): the bid ranking is O(N^2) comparisons. When bid-vs-bid used the
 // continued-fraction (Euclidean) cmp_rate over attacker-controlled rates, a full 32-slot book of
 // close, long-continued-fraction (Fibonacci-ratio) bids made execute EXCEED the 1.4M compute budget
@@ -18753,8 +18942,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     .expect("revoke coin mint authority");
 
     // register: alice (insurance), bob (backing), both funding payers, and both receiver-only canaries.
+    let insurance_cohort_seed = [0u8];
     let a_stake = Pubkey::find_program_address(
-        &[b"rd_stake", rd_config.as_ref(), alice.pubkey().as_ref()],
+        &[
+            b"rd_stake",
+            rd_config.as_ref(),
+            alice.pubkey().as_ref(),
+            &insurance_cohort_seed,
+        ],
         &rd_id(),
     )
     .0;
@@ -18771,8 +18966,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         ],
         data: vec![1u8, 0u8],
     }; // COHORT_INSURANCE
+    let backing_cohort_seed = [1u8];
     let bob_stake = Pubkey::find_program_address(
-        &[b"rd_stake", rd_config.as_ref(), bob.pubkey().as_ref()],
+        &[
+            b"rd_stake",
+            rd_config.as_ref(),
+            bob.pubkey().as_ref(),
+            &backing_cohort_seed,
+        ],
         &rd_id(),
     )
     .0;

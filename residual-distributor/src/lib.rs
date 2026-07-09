@@ -902,21 +902,46 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
     };
     let start_slot = now;
-    let (expected, bump) = Pubkey::find_program_address(
-        &[b"rd_stake", config_account.key.as_ref(), owner.key.as_ref()],
-        program_id,
-    );
+    let share_value_stake = matches!(cohort, COHORT_INSURANCE | COHORT_BACKING);
+    let cohort_seed = [cohort];
+    let (expected, bump) = if share_value_stake {
+        Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                config_account.key.as_ref(),
+                owner.key.as_ref(),
+                &cohort_seed,
+            ],
+            program_id,
+        )
+    } else {
+        Pubkey::find_program_address(
+            &[b"rd_stake", config_account.key.as_ref(), owner.key.as_ref()],
+            program_id,
+        )
+    };
     if *stake_account.key != expected || stake_account.data_len() != 0 {
         return Err(ProgramError::InvalidSeeds);
     }
     let bump_arr = [bump];
-    let seeds: [&[u8]; 4] = [
-        b"rd_stake",
-        config_account.key.as_ref(),
-        owner.key.as_ref(),
-        &bump_arr,
-    ];
-    create_pda(payer, stake_account, system, program_id, &seeds, STAKE_SIZE)?;
+    if share_value_stake {
+        let seeds: [&[u8]; 5] = [
+            b"rd_stake",
+            config_account.key.as_ref(),
+            owner.key.as_ref(),
+            &cohort_seed,
+            &bump_arr,
+        ];
+        create_pda(payer, stake_account, system, program_id, &seeds, STAKE_SIZE)?;
+    } else {
+        let seeds: [&[u8]; 4] = [
+            b"rd_stake",
+            config_account.key.as_ref(),
+            owner.key.as_ref(),
+            &bump_arr,
+        ];
+        create_pda(payer, stake_account, system, program_id, &seeds, STAKE_SIZE)?;
+    }
     Stake {
         config: *config_account.key,
         owner: *owner.key,

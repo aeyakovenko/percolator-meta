@@ -1898,8 +1898,10 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 //   coin_escrow(w), usd_dest(w), coin_ata(w), token_program]
 // data: slot_index (u8)
 //
-// PERMISSIONLESS (no bidder signature — pays the destinations recorded at placement), so anyone
-// may crank every claim and reopen the book. Pays the bid's won USD and refunds its unsold COIN.
+// PERMISSIONLESS (no bidder signature) so anyone may crank every claim and reopen the book. Pays the
+// bid's won USD to any initialized collateral token account owned by the recorded bidder (so a frozen
+// canonical payout account cannot permanently brick the settled book), and refunds unsold COIN only to
+// the recorded canonical COIN ATA.
 fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -1944,7 +1946,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let (usd_owed, coin_refund, dest_key, coin_key) = {
+    let (usd_owed, coin_refund, bidder_key, coin_key) = {
         let d = book_account.try_borrow_data()?;
         let o = slot_off(slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 1 {
@@ -1953,14 +1955,21 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         (
             book_rd_u128(&d, o + SL_USD_OWED),
             book_rd_u128(&d, o + SL_COIN_REFUND),
-            book_rd_key(&d, o + SL_USD_DEST),
+            book_rd_key(&d, o + SL_BIDDER),
             book_rd_key(&d, o + SL_COIN_ATA),
         )
     };
-    if *usd_dest.key != dest_key || *coin_ata.key != coin_key {
+    if *coin_ata.key != coin_key {
         return Err(ProgramError::InvalidAccountData);
     }
     if usd_owed > 0 {
+        if usd_dest.owner != &spl_token::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let ud = spl_token::state::Account::unpack(&usd_dest.try_borrow_data()?)?;
+        if ud.owner != bidder_key || ud.mint != book.collateral_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
         spl_transfer(
             token_program,
             settlement_usd,

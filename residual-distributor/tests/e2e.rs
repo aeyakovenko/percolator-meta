@@ -2120,6 +2120,40 @@ fn stake_pda(env: &Env, owner: &Pubkey) -> Pubkey {
     )
     .0
 }
+
+fn stake_pda_for_cohort(env: &Env, owner: &Pubkey, cohort: u8) -> Pubkey {
+    if matches!(cohort, COHORT_INSURANCE | COHORT_BACKING) {
+        let cohort_seed = [cohort];
+        Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                env.rd_config.as_ref(),
+                owner.as_ref(),
+                &cohort_seed,
+            ],
+            &rd_id(),
+        )
+        .0
+    } else {
+        stake_pda(env, owner)
+    }
+}
+
+fn stake_pda_for_linked(svm: &LiteSVM, env: &Env, owner: &Pubkey, linked: &Pubkey) -> Pubkey {
+    if let Some(acc) = svm.get_account(linked) {
+        if acc.owner == env.stub_sub && acc.data.len() >= 40 {
+            let pool = Pubkey::new_from_array(acc.data[8..40].try_into().unwrap());
+            if pool == env.ins_pool {
+                return stake_pda_for_cohort(env, owner, COHORT_INSURANCE);
+            }
+            if pool == env.back_pool {
+                return stake_pda_for_cohort(env, owner, COHORT_BACKING);
+            }
+        }
+    }
+    stake_pda(env, owner)
+}
+
 fn register(
     svm: &mut LiteSVM,
     payer: &Keypair,
@@ -2129,7 +2163,7 @@ fn register(
     linked: &Pubkey,
     cohort: u8,
 ) -> Result<(), String> {
-    let stake = stake_pda(env, &owner.pubkey());
+    let stake = stake_pda_for_cohort(env, &owner.pubkey(), cohort);
     send(
         svm,
         payer,
@@ -2159,7 +2193,7 @@ fn crystallize_as(
     owner: &Pubkey,
     linked: &Pubkey,
 ) -> Result<(), String> {
-    let stake = stake_pda(env, owner);
+    let stake = stake_pda_for_linked(svm, env, owner, linked);
     send(
         svm,
         payer,
@@ -2218,7 +2252,9 @@ fn claim_as(
     recipient_ata: &Pubkey,
     position: Option<&Pubkey>,
 ) -> Result<(), String> {
-    let stake = stake_pda(env, owner);
+    let stake = position
+        .map(|linked| stake_pda_for_linked(svm, env, owner, linked))
+        .unwrap_or_else(|| stake_pda(env, owner));
     // The bound linked account is now REQUIRED at claim for EVERY cohort (share-value: the subledger position;
     // LP/trader: the percolator portfolio — both == stake.backing_ledger). Use the explicit (possibly decoy)
     // account if a test gives one; otherwise derive it from the stake's recorded backing_ledger (offset 72..104).
@@ -5201,6 +5237,93 @@ fn register_rejects_cross_cohort_pool_scope_insurance_vs_backing() {
         COHORT_BACKING,
     )
     .expect("back pos -> back cohort ok");
+}
+
+// LoF PROBE (share-value cohorts, distinct capital positions): the portfolio-flow cohorts intentionally
+// use a single per-owner stake PDA to block one portfolio from double-dipping LP/trader slices. That rule must
+// not spill into the share-value cohorts: subledger positions are one-per-owner-per-pool, so the same owner can
+// legitimately have separate insurance and backing capital at risk. If rd_stake is keyed only by (config, owner),
+// the first registration consumes the PDA and the second real deposit can never earn or claim its cohort share.
+// Public path: two valid subledger positions -> register_start for insurance -> register_start for backing.
+#[test]
+fn same_owner_can_register_and_claim_distinct_insurance_and_backing_positions() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let ins_pos = Pubkey::new_unique();
+    let back_pos = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &ins_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &owner.pubkey(),
+        1_000,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &back_pos,
+        &env.stub_sub,
+        &env.back_pool,
+        &owner.pubkey(),
+        1_000,
+        false,
+    );
+
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &ins_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("same owner registers insurance capital");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &back_pos,
+        COHORT_BACKING,
+    )
+    .expect("same owner registers distinct backing capital");
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &owner.pubkey(),
+            &ins_pos,
+            COHORT_INSURANCE,
+        )
+        .is_err(),
+        "the split does not allow duplicate same-cohort insurance stakes"
+    );
+
+    crystallize(&mut svm, &payer, &env, &owner, &ins_pos).expect("crystallize insurance");
+    crystallize(&mut svm, &payer, &env, &owner, &back_pos).expect("crystallize backing");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    claim(&mut svm, &payer, &env, &owner, &ata, Some(&ins_pos)).expect("claim insurance");
+    claim(&mut svm, &payer, &env, &owner, &ata, Some(&back_pos)).expect("claim backing");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        200_000,
+        "the owner receives both independent 10% share-value slices"
+    );
 }
 
 // finding IL: the LP/trader cohorts must be scoped to the ONE allow-listed (trusted-Pyth) genesis
