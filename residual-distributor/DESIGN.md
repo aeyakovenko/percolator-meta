@@ -3,8 +3,8 @@
 Deterministic, points-based COIN rewards. The same program handles fixed-supply genesis and
 post-genesis TWAP-funded epochs. It supports five cohorts, each split pro-rata to points:
 
-- insurance deposits       (subledger share value; exit forfeits points)
-- backing deposits         (subledger share value; exit forfeits points)
+- insurance deposits       (subledger share value x log tenure; exit forfeits points)
+- backing deposits         (subledger share value x log tenure; exit forfeits points)
 - LP residual received     (`residual_received_atoms_total` delta, log-time weighted)
 - trader residual losses   (`residual_crystallized_loss_atoms_total - residual_spent_principal_atoms_total`, log-time weighted)
 - cumulative funding payers (`funding_long_paid_atoms_total + funding_short_paid_atoms_total` delta, no age multiplier; optional bps)
@@ -37,7 +37,9 @@ redirect, lock, or confiscate insurance/backing principal.
 ## Anti-capture stack (defence in depth, weakest-to-strongest)
 
 1. **Weak log-time weight** `floor(log2(hold))` — a late whale is only ~1.15x behind an early
-   backer. Necessary but not sufficient.
+   backer. Insurance/backing use the later of reward registration and the subledger position's
+   resettable top-up clock, and claim rechecks that clock against crystallization. Necessary but
+   not sufficient.
 2. **Funding-payer counters** — points are paid to the side that actually paid funding, never the receiving side.
    A self-owned payer/receiver pair can internalize the funding transfer, so these cohorts still pay the
    configured claim fee retained in the vault.
@@ -80,17 +82,11 @@ redirect, lock, or confiscate insurance/backing principal.
   short-pays-long funding, fixed-supply genesis payout, DAO handoff, three consecutive 15-day TWAP
   auctions, a per-round 50% reward / 50% burn split, and one cumulative 10/10/80 dynamic reward epoch
   across two selected markets.
-- Done + unit-tested: SOFT-VETO forfeiture. `insurance_points(seal_slot, principal, start_slot,
-  withdrawn)` reads the LIVE subledger position; a withdrawn / zero-principal position yields 0,
-  so a depositor that exited with the surplus forfeits its COIN (the share is never allocated and
-  is burned as unclaimed by distribution::burn_unclaimed). `read_subledger_position` reads the
-  stable Position offsets (principal@72 / withdrawn@88 / start_slot@89).
-- Done: share-value cohort path. Supply splits insurance/backing/LP/funding-payer explicitly
-  and assigns the remainder to trader; insurance
-  points = capital*log-time crystallized from the LIVE subledger position into an authoritative
-  insurance_total_points (subtract-old/add-new); seal verifies each insurance entry against it AND
-  reads the live position to FORFEIT (amount must be 0) a withdrawn depositor — the forfeited share
-  stays in the total and is burned as unclaimed, never redistributed. e2e: insurance_cohort_split_and_exit_forfeiture.
+- Done + unit/e2e-tested: share-value soft veto and top-up clock. Insurance/backing points are
+  `live_shares * floor(log2(crystallized_slot - max(registration_slot, position.start_slot)))`.
+  Crystallization updates the authoritative denominator by subtract-old/add-new. Claim rechecks
+  live shares, `withdrawn`, and the resettable position clock; exits and later top-ups can only lower
+  a payout. Forfeited COIN remains in the immutable epoch vault and is never redistributed.
 - Done: Percolator portfolio residual and funding-counter offsets pinned with offset_of! (tests/offsets.rs).
 
 ## Market allow-list (portfolio-flow cohorts) — finding IL+

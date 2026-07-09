@@ -130,9 +130,7 @@ fn pinned_distribution_program_id_matches_the_real_program() {
 
 // The subledger Position offsets residual-distributor reads MUST match the subledger's canonical
 // layout (finding HF: a wrong owner offset slipped past mocked tests). Cross-pinned to the
-// subledger's exported POS_* consts (themselves canaried against Position::serialize there). Only the
-// LIVE share-value reads (pool/owner/withdrawn/shares) remain — the old principal*log-time model reads
-// were removed (finding KO-followup dead-code cleanup).
+// subledger's exported POS_* consts (themselves canaried against Position::serialize there).
 #[test]
 fn subledger_position_offsets_match_the_real_subledger_layout() {
     use residual_distributor as rd;
@@ -150,6 +148,11 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         rd::SUB_POS_WITHDRAWN,
         subledger_program::POS_WITHDRAWN_OFF,
         "Position.withdrawn offset"
+    );
+    assert_eq!(
+        rd::SUB_POS_START_SLOT,
+        subledger_program::POS_START_SLOT_OFF,
+        "Position.start_slot (top-up reset clock) offset"
     );
     assert_eq!(
         rd::SUB_POS_SHARES,

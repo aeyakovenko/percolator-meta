@@ -363,6 +363,12 @@ fn set_position(
     )
     .unwrap();
 }
+
+fn set_position_start_slot(svm: &mut LiteSVM, key: &Pubkey, start_slot: u64) {
+    let mut account = svm.get_account(key).expect("position");
+    account.data[89..97].copy_from_slice(&start_slot.to_le_bytes());
+    svm.set_account(*key, account).unwrap();
+}
 // Mock percolator PortfolioAccount at the pinned offsets: market_group@16, owner@116, crystallized@196,
 // spent@212, received@228. market_group is the trusted-Pyth scope portfolio-flow cohorts enforce.
 fn set_portfolio(
@@ -1891,7 +1897,7 @@ fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
     );
     set_slot(&mut svm, 1_000); // tenure = 900 -> floor(log2) = 9 > 0
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
-    // sole INSURANCE staker (share-value cohort -> NO fee, NOT time-weighted).
+    // sole INSURANCE staker (share-value cohort -> log-time weighted, but NO claim fee).
     let ins = Keypair::new();
     let ins_pos = Pubkey::new_unique();
     set_position(
@@ -1913,6 +1919,7 @@ fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
         COHORT_INSURANCE,
     )
     .expect("reg ins");
+    set_slot(&mut svm, 1_124);
     crystallize(&mut svm, &payer, &env, &ins, &ins_pos).expect("cry ins");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -4924,6 +4931,7 @@ fn one_owner_can_register_and_claim_insurance_and_backing_cohorts() {
     )
     .expect("same owner also registers backing");
 
+    set_slot(&mut svm, 1_124);
     crystallize(&mut svm, &payer, &env, &owner, &ins_pos).expect("crystallize insurance");
     crystallize(&mut svm, &payer, &env, &owner, &back_pos).expect("crystallize backing");
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -5135,10 +5143,11 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
         COHORT_INSURANCE,
     )
     .expect("reg b");
-    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
-    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts (denom 400)
+    set_slot(&mut svm, 1_124); // equal multiplier 10; pro-rata remains 3:1
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 3_000 pts
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 1_000 pts
 
-    // b EXITS before claim: redeems all shares -> withdrawn. (Denominator stays 400 -> b's 100 share burns.)
+    // b EXITS before claim. The frozen 4_000-point denominator remains, so b's term is forfeited.
     set_position(
         &mut svm,
         &b_pos,
@@ -5162,6 +5171,189 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
         token_amount(&svm, &b_ata),
         0,
         "b exited -> soft-veto forfeit"
+    );
+}
+
+// ATTACK PROBE: registering dust early must not let capital deposited immediately before
+// crystallization inherit the stake account's full tenure. The real subledger resets a Position's
+// start_slot on every top-up, so the distributor must use that later clock for share-value points.
+#[test]
+fn share_value_top_up_near_end_cannot_borrow_early_stake_tenure() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let honest = Keypair::new();
+    let farmer = Keypair::new();
+    let honest_pos = Pubkey::new_unique();
+    let farmer_pos = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &honest_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &honest.pubkey(),
+        1_000_000,
+        false,
+    );
+    set_position_start_slot(&mut svm, &honest_pos, 100);
+    set_position(
+        &mut svm,
+        &farmer_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &farmer.pubkey(),
+        1,
+        false,
+    );
+    set_position_start_slot(&mut svm, &farmer_pos, 100);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &honest,
+        &honest.pubkey(),
+        &honest_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("register honest");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer.pubkey(),
+        &farmer_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("register farmer");
+
+    set_slot(&mut svm, 1_124);
+    set_position(
+        &mut svm,
+        &farmer_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &farmer.pubkey(),
+        1_000_000,
+        false,
+    );
+    set_position_start_slot(&mut svm, &farmer_pos, 1_123);
+    crystallize(&mut svm, &payer, &env, &honest, &honest_pos).expect("crystallize honest");
+    crystallize(&mut svm, &payer, &env, &farmer, &farmer_pos).expect("crystallize farmer");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let honest_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &honest.pubkey());
+    let farmer_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &farmer.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &honest,
+        &honest_ata,
+        Some(&honest_pos),
+    )
+    .expect("claim honest");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer_ata,
+        Some(&farmer_pos),
+    )
+    .expect("claim farmer");
+
+    assert_eq!(token_amount(&svm, &honest_ata), 100_000);
+    assert_eq!(token_amount(&svm, &farmer_ata), 0);
+}
+
+// ATTACK PROBE: a post-crystallization partial exit followed by a restoring top-up must not
+// resurrect the frozen points. A top-up resets Position.start_slot, so claim must recheck that
+// live clock against the slot at which the points were crystallized.
+#[test]
+fn share_value_post_freeze_top_up_cannot_restore_withdrawn_tenure() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64; // insurance cohort = 10% = 100_000
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let farmer = Keypair::new();
+    let farmer_pos = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &farmer_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &farmer.pubkey(),
+        1_000_000,
+        false,
+    );
+    set_position_start_slot(&mut svm, &farmer_pos, 100);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer.pubkey(),
+        &farmer_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("register farmer");
+
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &farmer, &farmer_pos).expect("crystallize farmer");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // A real partial withdrawal leaves the position live with fewer shares. A subsequent top-up
+    // can restore the share count, but necessarily resets this position clock to the current slot.
+    set_position(
+        &mut svm,
+        &farmer_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &farmer.pubkey(),
+        1,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &farmer_pos,
+        &env.stub_sub,
+        &env.ins_pool,
+        &farmer.pubkey(),
+        1_000_000,
+        false,
+    );
+    set_position_start_slot(
+        &mut svm,
+        &farmer_pos,
+        env.emission_end + env.finalize_window + 1,
+    );
+
+    let farmer_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &farmer.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer_ata,
+        Some(&farmer_pos),
+    )
+    .expect("claim farmer");
+    assert_eq!(
+        token_amount(&svm, &farmer_ata),
+        0,
+        "restoring shares cannot restore the old tenure"
     );
 }
 
@@ -5203,7 +5395,8 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
         COHORT_INSURANCE,
     )
     .expect("reg a");
-    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // frozen points = 300 (sole staker -> denom 300)
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // frozen points = 3_000
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -5221,7 +5414,7 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
 
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
-    // min(frozen 300, live 150) = 150 -> 100_000 * 150 / 300 = 50_000; the other 50_000 stays locked (forfeited).
+    // The common multiplier cancels: 100_000 * (10*150)/(10*300) = 50_000.
     assert_eq!(
         token_amount(&svm, &a_ata),
         50_000,
@@ -5235,7 +5428,7 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
 }
 
 // ATTACK PROBE (post-freeze share inflation of a share-value claim): the insurance/backing claim pays
-// cohort_supply * min(stake.points, live_share_points) / frozen_denominator (src:claim, min-cap at line ~64).
+// cohort_supply * min(frozen_points, live tenure*shares) / frozen_denominator.
 // The exit direction (live < frozen -> forfeit) is pinned by share_value_is_pro_rata_and_exit_forfeits. The
 // UPPER direction is the over-draw vector: the cohort supply is FIXED and the denominator is FROZEN, so if the
 // claim used LIVE (not min) points, a claimant who TOPS UP their subledger position AFTER freeze (live shares
@@ -5293,14 +5486,15 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
         COHORT_INSURANCE,
     )
     .expect("reg b");
-    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
-    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts (frozen denom 400)
+    set_slot(&mut svm, 1_124); // equal multiplier 10; frozen denominator = 4_000
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a");
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
-    freeze(&mut svm, &payer, &env).expect("freeze"); // denominator frozen at 400
+    freeze(&mut svm, &payer, &env).expect("freeze"); // denominator frozen at 4_000
 
     // ATTACK: AFTER freeze, b tops up their subledger position 100x (100 -> 10_000 live shares), trying to
-    // claim cohort_supply * 10_000 / 400 = 2_500_000 — 25x the WHOLE cohort supply.
+    // inflate its numerator above the frozen denominator.
     set_position(
         &mut svm,
         &b_pos,
@@ -5310,16 +5504,17 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
         10_000,
         false,
     );
+    set_position_start_slot(&mut svm, &b_pos, env.emission_end + env.finalize_window + 1);
 
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
     claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim b");
-    // b is capped at its FROZEN-time 100 points: 100_000 * min(100, 10_000)/400 = 25_000 — NOT inflated.
+    // The top-up reset b's clock after crystallization, so it cannot inherit the frozen tenure.
     assert_eq!(
         token_amount(&svm, &b_ata),
-        25_000,
-        "post-freeze top-up cannot inflate the claim above frozen points"
+        0,
+        "post-freeze top-up cannot inherit or inflate frozen tenure"
     );
     assert_eq!(
         token_amount(&svm, &a_ata),
@@ -5329,8 +5524,8 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
     // Conservation: the fixed cohort supply is not over-drawn by the inflation attempt.
     assert_eq!(
         token_amount(&svm, &a_ata) + token_amount(&svm, &b_ata),
-        100_000,
-        "claims sum to the fixed cohort supply, no over-draw"
+        75_000,
+        "unearned rewards remain in the vault; no over-draw"
     );
 }
 
@@ -5393,8 +5588,9 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
         COHORT_INSURANCE,
     )
     .expect("reg b");
-    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 300 pts
-    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 100 pts
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 3_000 pts
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 1_000 pts
 
     // a EXITS its bound position (live shares 0) — the soft veto must now forfeit a's claim.
     set_position(
@@ -5510,6 +5706,7 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
     )
     .expect("reg b");
 
+    set_slot(&mut svm, 1_124);
     // A decoy position with HIGH live shares (subledger-owned), which a will try to crystallize INSTEAD of
     // its bound a_pos to inflate its points + the cohort denominator.
     let decoy = Pubkey::new_unique();
@@ -5527,7 +5724,7 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
         "a substituted ledger at crystallize is rejected (backing_ledger != stake.backing_ledger)"
     );
 
-    // Honest crystallize of the BOUND ledgers -> denominator = 100 + 100 = 200 (NOT inflated by the decoy).
+    // Honest crystallize of the bound ledgers -> 10 * (100 + 100) = 2_000 points.
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("a crystallizes its bound ledger");
     crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("b crystallizes its bound ledger");
     let denom = u128::from_le_bytes(
@@ -5536,7 +5733,7 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
             .unwrap(),
     );
     assert_eq!(
-        denom, 200,
+        denom, 2_000,
         "insurance denominator reflects the real bound shares, not the 9_999 decoy"
     );
 
@@ -5598,7 +5795,8 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
         COHORT_INSURANCE,
     )
     .expect("reg");
-    crystallize(&mut svm, &payer, &env, &victim, &pos).expect("cry"); // 300 pts, denom 300
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &victim, &pos).expect("cry"); // 3_000 pts
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
@@ -5689,7 +5887,8 @@ fn share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_mome
         COHORT_INSURANCE,
     )
     .expect("reg");
-    crystallize(&mut svm, &payer, &env, &victim, &pos).expect("owner crystallizes at 300");
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &victim, &pos).expect("owner crystallizes at 3_000");
 
     // victim mid partial-withdraw -> live shares transiently 30. The attacker tries to force the points down.
     set_position(

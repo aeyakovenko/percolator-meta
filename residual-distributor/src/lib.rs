@@ -166,10 +166,10 @@ fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey, ProgramError> {
 pub const SUB_POS_POOL: usize = 8; // Position.pool @ 8 (real layout: disc@0, pool@8..40, owner@40..72).
 pub const SUB_POS_OWNER: usize = 40; // Position.owner @ 40. The depositor owed this position's COIN.
 pub const SUB_POS_WITHDRAWN: usize = 88;
-// Position.shares (POLICY_WITH_SURPLUS) @104 — the SHARE-VALUE points source for the insurance AND
-// backing cohorts. Within one pool the share price (balance/total_shares) is common, so pro-rata by
-// share value == pro-rata by shares; shares also encode the fee/time weighting (an earlier depositor
-// holds more shares per dollar) and give the soft-veto for free (exit redeems shares -> 0 -> forfeit).
+pub const SUB_POS_START_SLOT: usize = 89;
+// Position.shares (POLICY_WITH_SURPLUS) @104 - the SHARE-VALUE source for insurance and backing.
+// Within one pool the share price is common, so pro-rata share value equals pro-rata shares. The
+// resettable start_slot supplies log-time weighting; exit redeems shares -> 0 -> forfeit.
 pub const SUB_POS_SHARES: usize = 104;
 
 /// (shares, withdrawn) from a live subledger Position — the SHARE-VALUE points for the insurance &
@@ -184,7 +184,16 @@ pub fn read_subledger_shares(data: &[u8]) -> Result<(u128, bool), ProgramError> 
     Ok((shares, withdrawn))
 }
 
-/// Share-value points: just the live shares (0 if exited). Pro-rata across the cohort's pool.
+/// The subledger resets this clock whenever capital is added to the position. Reward tenure must
+/// therefore start no earlier than this slot, even if the distributor stake was registered before it.
+pub fn read_subledger_start_slot(data: &[u8]) -> Result<u64, ProgramError> {
+    let bytes = data
+        .get(SUB_POS_START_SLOT..SUB_POS_START_SLOT + 8)
+        .ok_or(ProgramError::AccountDataTooSmall)?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// Live share value before the separate tenure multiplier (0 if exited).
 pub fn share_value_points(shares: u128, withdrawn: bool) -> u128 {
     if withdrawn {
         0
@@ -612,10 +621,9 @@ struct Stake {
     backing_ledger: Pubkey,
     recipient: Pubkey,
     residual_snap: u128,
-    // LOAD-BEARING (anti-wash live-cap): crystallize stores the realized `net_delta` here; claim reads it
-    // as `frozen_net` and scales the payout by min(1, live_net/frozen_net) so a recovered loss (live_net <
-    // frozen_net) pays proportionally less — closing the stale-points bypass of net-by-spent. Repurposed
-    // from the superseded fee-cap design (see eligible_accum). MUST be preserved across crystallize/freeze.
+    // LOAD-BEARING live-cap snapshot. For share cohorts this is the crystallized live share count. For
+    // residual cohorts it is the realized `net_delta`; claim scales the payout down if the live value fell.
+    // Repurposed from the superseded fee-cap design. MUST be preserved across crystallize/freeze.
     earnings_snap: u128,
     start_slot: u64,
     points: u128,
@@ -623,8 +631,8 @@ struct Stake {
     // `backing_ledger` is the linked subledger position for insurance/backing, or the linked Percolator
     // portfolio for LP/trader/funding-payer cohorts.
     cohort: u8,
-    // Retired scratch field for the old residual-spent cap. Held at 0 for the funding-payer cohort; kept for
-    // serialized layout stability.
+    // Share cohorts store their crystallization slot here so claim can reject tenure restored by a later
+    // top-up. Trader residual stores the spent-counter snapshot. Funding-payer holds 0.
     eligible_accum: u128,
     // Self-service claim: set true when this stake's COIN share has been paid, so it can't be
     // double-claimed.
@@ -1308,8 +1316,9 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // subtract-old/add-new keeps the cohort denominator authoritative as points are re-derived.
     match stake.cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
-            // Share-value cohort: points = LIVE Position.shares (0 if exited — soft veto). The share
-            // price is common within the pool, so shares == pro-rata share value, fee-weighted.
+            // Share-value cohort: points = floor(log2(tenure)) * LIVE Position.shares (0 if exited).
+            // The position clock resets on every top-up, so use the later of registration and position
+            // start. This prevents dust registration from lending old tenure to late capital.
             // OWNER-GATED (finding KO, KM parity): crystallize OVERWRITES stake.points from the live
             // shares NOW, and freeze then locks that value as the frozen denominator term — which the
             // claim-time min-cap can only ever LOWER, never raise. So a permissionless caller could
@@ -1323,11 +1332,19 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             if *backing_ledger.owner != config.subledger_program {
                 return Err(ProgramError::IllegalOwner);
             }
-            let (shares, withdrawn) = read_subledger_shares(&backing_ledger.try_borrow_data()?)?;
-            let new_pts = share_value_points(shares, withdrawn);
+            let data = backing_ledger.try_borrow_data()?;
+            let (shares, withdrawn) = read_subledger_shares(&data)?;
+            let live_shares = share_value_points(shares, withdrawn);
+            let position_start_slot = read_subledger_start_slot(&data)?;
+            let now = Clock::get()?.slot;
+            let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
+            let multiplier = floor_log2(now.saturating_sub(effective_start));
+            let new_pts = multiplier.saturating_mul(live_shares);
             let slot = config.cohort_points_mut(stake.cohort);
             *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
             stake.points = new_pts;
+            stake.earnings_snap = live_shares;
+            stake.eligible_accum = now as u128;
         }
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
@@ -1558,17 +1575,24 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let frozen_denom = config.frozen_cohort_points(stake.cohort);
     let amount = match stake.cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
-            // Share-value cohort: read the LIVE Position shares NOW and cap by them ATOMICALLY (finding
-            // HE/JC + soft veto). A depositor who redeemed shares after freeze -> fewer live shares ->
-            // claims less; a full exit -> 0 shares -> 0 COIN (forfeit). The appended account is the
-            // bound subledger position. read+cap+pay in ONE tx, so there is no finalize/claim over-claim gap.
+            // Share-value cohort: read the LIVE Position shares and resettable start clock atomically.
+            // Fewer shares lower the payout; a full exit pays zero. A later top-up cannot restore frozen
+            // tenure because the live clock is measured at the stored crystallization slot.
             let position = next_account_info(iter)?;
             if *position.key != stake.backing_ledger || *position.owner != config.subledger_program
             {
                 return Err(ProgramError::InvalidAccountData);
             }
-            let (shares, withdrawn) = read_subledger_shares(&position.try_borrow_data()?)?;
-            let live_pts = share_value_points(shares, withdrawn);
+            let data = position.try_borrow_data()?;
+            let (shares, withdrawn) = read_subledger_shares(&data)?;
+            let live_shares = share_value_points(shares, withdrawn);
+            let position_start_slot = read_subledger_start_slot(&data)?;
+            let crystallized_slot = u64::try_from(stake.eligible_accum)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
+            let live_multiplier = floor_log2(crystallized_slot.saturating_sub(effective_start));
+            let capped_shares = core::cmp::min(stake.earnings_snap, live_shares);
+            let live_pts = live_multiplier.saturating_mul(capped_shares);
             let pts = if stake.points < live_pts {
                 stake.points
             } else {
@@ -1710,10 +1734,12 @@ mod tests {
     fn reads_live_subledger_shares_offsets() {
         let mut d = [0u8; 120];
         d[88] = 1; // withdrawn
+        d[89..97].copy_from_slice(&4242u64.to_le_bytes()); // resettable deposit clock
         d[104..120].copy_from_slice(&777u128.to_le_bytes()); // shares
         let (shares, w) = read_subledger_shares(&d).unwrap();
         assert_eq!(shares, 777);
         assert!(w);
+        assert_eq!(read_subledger_start_slot(&d).unwrap(), 4242);
         assert_eq!(share_value_points(777, true), 0, "withdrawn -> forfeit");
         assert_eq!(share_value_points(777, false), 777, "live -> shares");
     }
