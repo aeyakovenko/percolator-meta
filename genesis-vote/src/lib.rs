@@ -44,10 +44,11 @@ declare_id!("GenesisVote11111111111111111111111111111111");
 const CONFIG_DISC: [u8; 8] = *b"GVCONFG1";
 const BALLOT_DISC: [u8; 8] = *b"GVBALOT1";
 const PROPOSAL_DISC: [u8; 8] = *b"GVPROPV1";
-const CONFIG_SIZE: usize = 248; // total_cast_weight widened u64->u128 (GG fix)
+const CONFIG_SIZE: usize = 264; // total_cast_weight widened u64->u128 (GG fix)
 const BALLOT_SIZE: usize = 120; // voted_weight widened u64->u128 (GG fix)
 const PROPOSAL_SIZE: usize = 112; // support_weight widened u64->u128 (GG fix)
 const DEFAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 38_880_000;
+const DEFAULT_BOOTSTRAP_START_SLOT: u64 = 0;
 
 // Subledger position/pool discriminators + layout (read-only mirror of the
 // subledger program's serialization). Used to read principal/start_slot and the
@@ -104,8 +105,13 @@ solana_program::entrypoint!(process_instruction);
 // the wrong pool (DOS). Folding subledger_pool into the seed means the only gv config
 // that can exist at the legit address is bound to the real pool; an attacker's pool
 // lands at a different gv PDA the genesis ignores. (finding R; same class as P/Q.)
-fn config_seeds<'a>(coin_mint: &'a Pubkey, subledger_pool: &'a Pubkey) -> [&'a [u8]; 3] {
-    [b"gv_config", coin_mint.as_ref(), subledger_pool.as_ref()]
+fn config_seeds<'a>(
+    coin_mint: &'a Pubkey,
+    subledger_pool: &'a Pubkey,
+    bootstrap_delay_slots: &'a [u8; 8],
+    bootstrap_start_slot: &'a [u8; 8],
+) -> [&'a [u8]; 5] {
+    [b"gv_config", coin_mint.as_ref(), subledger_pool.as_ref(), bootstrap_delay_slots, bootstrap_start_slot]
 }
 fn ballot_seeds<'a>(config: &'a Pubkey, owner: &'a Pubkey) -> [&'a [u8]; 3] {
     [b"gv_ballot", config.as_ref(), owner.as_ref()]
@@ -148,6 +154,8 @@ struct Config {
     outstanding_principal: u64,
     bump: u8,
     bootstrap_end_slot: u64,
+    bootstrap_delay_slots: u64,
+    bootstrap_start_slot: u64,
 }
 
 impl Config {
@@ -167,6 +175,8 @@ impl Config {
             outstanding_principal: u64::from_le_bytes(d[224..232].try_into().unwrap()),
             bump: d[232],
             bootstrap_end_slot: u64::from_le_bytes(d[233..241].try_into().unwrap()),
+            bootstrap_delay_slots: u64::from_le_bytes(d[241..249].try_into().unwrap()),
+            bootstrap_start_slot: u64::from_le_bytes(d[249..257].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -182,19 +192,23 @@ impl Config {
         d[224..232].copy_from_slice(&self.outstanding_principal.to_le_bytes());
         d[232] = self.bump;
         d[233..241].copy_from_slice(&self.bootstrap_end_slot.to_le_bytes());
-        d[241..CONFIG_SIZE].fill(0);
+        d[241..249].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        d[249..257].copy_from_slice(&self.bootstrap_start_slot.to_le_bytes());
+        d[257..CONFIG_SIZE].fill(0);
     }
 }
 
-fn read_optional_bootstrap_delay(data: &[u8]) -> Result<u64, ProgramError> {
+fn read_bootstrap_schedule(data: &[u8]) -> Result<(u64, u64), ProgramError> {
     match data.len() {
-        0 => Ok(DEFAULT_BOOTSTRAP_DELAY_SLOTS),
-        8 => {
-            let delay = u64::from_le_bytes(data.try_into().unwrap());
+        0 => Ok((DEFAULT_BOOTSTRAP_DELAY_SLOTS, DEFAULT_BOOTSTRAP_START_SLOT)),
+        16 => {
+            let delay = u64::from_le_bytes(data[..8].try_into().unwrap());
+            let start = u64::from_le_bytes(data[8..16].try_into().unwrap());
             if delay == 0 {
                 return Err(ProgramError::InvalidInstructionData);
             }
-            Ok(delay)
+            start.checked_add(delay).ok_or(ProgramError::ArithmeticOverflow)?;
+            Ok((delay, start))
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -370,7 +384,9 @@ fn create_pda<'a>(
 
 // init_config accounts: [payer(s,w), coin_mint, config(pda,w), distribution_program,
 //   distribution_config, subledger_program, subledger_pool, reserved, system]
-// data: optional bootstrap_delay_slots(u64); absent defaults to six months.
+// data: absent = default schedule; otherwise bootstrap_delay_slots(u64),
+// bootstrap_start_slot(u64). The schedule is part of the config PDA so a
+// permissionless first writer cannot shorten or early-start the bootstrap clock.
 fn init_config<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -386,7 +402,10 @@ fn init_config<'a>(
     let subledger_pool = next_account_info(iter)?;
     let reserved = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
-    let bootstrap_delay_slots = read_optional_bootstrap_delay(data)?;
+    let (bootstrap_delay_slots, bootstrap_start_slot) = read_bootstrap_schedule(data)?;
+    let bootstrap_end_slot = bootstrap_start_slot
+        .checked_add(bootstrap_delay_slots)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -394,13 +413,20 @@ fn init_config<'a>(
     if *system_program.key != solana_program::system_program::ID {
         return Err(ProgramError::IncorrectProgramId);
     }
-    let (expected, bump) =
-        Pubkey::find_program_address(&config_seeds(coin_mint.key, subledger_pool.key), program_id);
+    let delay_bytes = bootstrap_delay_slots.to_le_bytes();
+    let start_bytes = bootstrap_start_slot.to_le_bytes();
+    let (expected, bump) = Pubkey::find_program_address(
+        &config_seeds(coin_mint.key, subledger_pool.key, &delay_bytes, &start_bytes),
+        program_id,
+    );
     if *config_account.key != expected {
         return Err(ProgramError::InvalidSeeds);
     }
     if config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if bootstrap_end_slot <= Clock::get()?.slot {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
     // Bind the wired dependencies back to THIS config so a genesis can never be
@@ -446,8 +472,7 @@ fn init_config<'a>(
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 4] =
-        [b"gv_config", coin_mint.key.as_ref(), subledger_pool.key.as_ref(), &bump_arr];
+    let seeds: [&[u8]; 6] = [b"gv_config", coin_mint.key.as_ref(), subledger_pool.key.as_ref(), &delay_bytes, &start_bytes, &bump_arr];
     create_pda(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
 
     let config = Config {
@@ -461,10 +486,9 @@ fn init_config<'a>(
         total_cast_weight: 0,
         outstanding_principal: 0,
         bump,
-        bootstrap_end_slot: Clock::get()?
-            .slot
-            .checked_add(bootstrap_delay_slots)
-            .ok_or(ProgramError::ArithmeticOverflow)?,
+        bootstrap_end_slot,
+        bootstrap_delay_slots,
+        bootstrap_start_slot,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -708,8 +732,9 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     // pool's vote_authority; it can only toggle the lock, never move funds.
     let lock_val: u8 = if ballot.has_live_ballot() { 1 } else { 0 };
     let bump_arr = [config.bump];
-    let seeds: [&[u8]; 4] =
-        [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &bump_arr];
+    let delay_bytes = config.bootstrap_delay_slots.to_le_bytes();
+    let start_bytes = config.bootstrap_start_slot.to_le_bytes();
+    let seeds: [&[u8]; 6] = [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &delay_bytes, &start_bytes, &bump_arr];
     invoke_signed(
         &Instruction {
             program_id: config.subledger_program,
@@ -810,8 +835,9 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
 
     // Seal the distribution. The config PDA is the distribution's seal authority.
     let bump_arr = [config.bump];
-    let seeds: [&[u8]; 4] =
-        [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &bump_arr];
+    let delay_bytes = config.bootstrap_delay_slots.to_le_bytes();
+    let start_bytes = config.bootstrap_start_slot.to_le_bytes();
+    let seeds: [&[u8]; 6] = [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &delay_bytes, &start_bytes, &bump_arr];
     invoke_signed(
         &Instruction {
             program_id: *distribution_program.key,
@@ -861,6 +887,8 @@ mod tests {
             outstanding_principal: 12,
             bump: 250,
             bootstrap_end_slot: 1234,
+            bootstrap_delay_slots: 100,
+            bootstrap_start_slot: 1134,
         };
         let mut b = [0u8; CONFIG_SIZE];
         c.serialize(&mut b);
@@ -869,6 +897,8 @@ mod tests {
         assert_eq!(d.outstanding_principal, 12);
         assert_eq!(d.bump, 250);
         assert_eq!(d.bootstrap_end_slot, 1234);
+        assert_eq!(d.bootstrap_delay_slots, 100);
+        assert_eq!(d.bootstrap_start_slot, 1134);
         assert_eq!(d.subledger_program, sub_program);
         assert_eq!(d.subledger_pool, sub_pool);
 

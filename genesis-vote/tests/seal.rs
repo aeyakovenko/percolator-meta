@@ -28,11 +28,36 @@ fn clone_kp(kp: &Keypair) -> Keypair {
 }
 
 const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
+const TEST_BOOTSTRAP_START_SLOT: u64 = 0;
 
 fn gv_init_data(delay_slots: u64) -> Vec<u8> {
+    gv_init_schedule_data(delay_slots, TEST_BOOTSTRAP_START_SLOT)
+}
+
+fn gv_init_schedule_data(delay_slots: u64, start_slot: u64) -> Vec<u8> {
     let mut data = vec![0u8];
     data.extend_from_slice(&delay_slots.to_le_bytes());
+    data.extend_from_slice(&start_slot.to_le_bytes());
     data
+}
+
+fn gv_config_for_schedule(
+    coin_mint: &Pubkey,
+    sub_pool: &Pubkey,
+    delay_slots: u64,
+    start_slot: u64,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"gv_config",
+            coin_mint.as_ref(),
+            sub_pool.as_ref(),
+            &delay_slots.to_le_bytes(),
+            &start_slot.to_le_bytes(),
+        ],
+        &gv_id(),
+    )
+    .0
 }
 
 struct Env {
@@ -67,8 +92,12 @@ impl Env {
         // config PDA now commits to the pool (finding R), so derive it after.
         let sub_pid = Pubkey::new_from_array([7u8; 32]);
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
-        let gv_config =
-            Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
+        let gv_config = gv_config_for_schedule(
+            &coin_mint,
+            &sub_pool,
+            TEST_BOOTSTRAP_DELAY_SLOTS,
+            TEST_BOOTSTRAP_START_SLOT,
+        );
         let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, total_supply);
@@ -103,8 +132,32 @@ impl Env {
         let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
         let sub_pid = Pubkey::new_from_array([7u8; 32]);
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
-        let gv_config =
-            Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
+        let gv_config = gv_config_for_schedule(
+            &coin_mint,
+            &sub_pool,
+            TEST_BOOTSTRAP_DELAY_SLOTS,
+            TEST_BOOTSTRAP_START_SLOT,
+        );
+        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
+        let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
+        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
+        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool, total_supply: 100 };
+        env.set_pool_outstanding(0);
+        env.init_distribution();
+        env
+    }
+
+    fn new_unwired_with_schedule(delay_slots: u64, start_slot: u64) -> Self {
+        let mut svm = LiteSVM::new();
+        svm.add_program_from_file(gv_id(), so("genesis_vote_program")).unwrap();
+        svm.add_program_from_file(dist_id(), so("distribution_program")).unwrap();
+        let payer = Keypair::new();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+        let mint_auth = Keypair::new();
+        let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+        let sub_pid = Pubkey::new_from_array([7u8; 32]);
+        let sub_pool = Pubkey::new_from_array([8u8; 32]);
+        let gv_config = gv_config_for_schedule(&coin_mint, &sub_pool, delay_slots, start_slot);
         let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
@@ -260,6 +313,26 @@ impl Env {
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: gv_init_data(delay_slots),
+        };
+        self.send(&[ix], &[])
+    }
+
+    fn init_gv_with_schedule(&mut self, delay_slots: u64, start_slot: u64) -> Result<(), String> {
+        let dummy = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: gv_id(),
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new(self.gv_config, false),
+                AccountMeta::new_readonly(dist_id(), false),
+                AccountMeta::new_readonly(self.dist_config, false),
+                AccountMeta::new_readonly(self.sub_pid, false),
+                AccountMeta::new_readonly(self.sub_pool, false),
+                AccountMeta::new_readonly(dummy, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: gv_init_schedule_data(delay_slots, start_slot),
         };
         self.send(&[ix], &[])
     }
@@ -552,7 +625,7 @@ fn trigger_seals_a_full_max_capacity_distribution() {
 
 #[test]
 fn trigger_rejects_before_configured_bootstrap_delay_elapsed() {
-    let mut env = Env::new_unwired();
+    let mut env = Env::new_unwired_with_schedule(100, 0);
     env.init_gv_with_delay(100).expect("gv init with configured bootstrap delay");
 
     let alice = Pubkey::new_unique();
@@ -571,6 +644,44 @@ fn trigger_rejects_before_configured_bootstrap_delay_elapsed() {
     env.set_slot(100);
     env.trigger(&gv_proposal, &dist_proposal).expect("trigger after bootstrap delay");
     assert_eq!(env.dist_sealed_proposal(), dist_proposal, "sealed once bootstrap delay elapsed");
+}
+
+#[test]
+fn init_config_schedule_cannot_be_first_writer_shortened_or_started_early() {
+    let intended_delay = 100u64;
+    let intended_start = 1_000u64;
+    let mut env = Env::new_unwired_with_schedule(intended_delay, intended_start);
+
+    assert!(
+        env.init_gv_with_schedule(1, intended_start).is_err(),
+        "a short-delay first writer must land outside the intended schedule-bound config"
+    );
+    assert!(
+        env.init_gv_with_schedule(intended_delay, 0).is_err(),
+        "an early-start first writer must land outside the intended schedule-bound config"
+    );
+    assert!(
+        env.svm.get_account(&env.gv_config).is_none(),
+        "the intended config PDA remains uninitialized after wrong-schedule attempts"
+    );
+    env.init_gv_with_schedule(intended_delay, intended_start)
+        .expect("the intended schedule initializes the intended config PDA");
+
+    let recipient = Pubkey::new_unique();
+    let dist_proposal = env.create_dist_proposal(1, &[(recipient, 100)]);
+    let gv_proposal = env.register(&dist_proposal);
+    env.set_pool_outstanding(10);
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
+
+    env.set_slot(intended_start + intended_delay - 1);
+    assert!(
+        env.trigger(&gv_proposal, &dist_proposal).is_err(),
+        "trigger must wait until the explicit bootstrap start plus delay"
+    );
+    env.set_slot(intended_start + intended_delay);
+    env.trigger(&gv_proposal, &dist_proposal)
+        .expect("trigger succeeds at the explicit bootstrap end");
+    assert_eq!(env.dist_sealed_proposal(), dist_proposal, "the scheduled genesis seals");
 }
 
 // SUBSTITUTED-POOL QUORUM COLLAPSE (no-capital / minority capture via account substitution). The trigger
@@ -1103,17 +1214,24 @@ fn gv_config_cannot_be_bound_to_a_substituted_pool() {
 
     // The gv config PDA now commits to the pool: it is NOT the old market-only address.
     // (This assertion would fail before the finding-R fix, where gv config = f(COIN).)
-    let old_style = Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id()).0;
-    assert_ne!(env.gv_config, old_style, "gv config PDA commits to the subledger_pool (finding R)");
+    let coin_only = Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id()).0;
+    assert_ne!(env.gv_config, coin_only, "gv config PDA commits to the subledger_pool (finding R)");
+    let unscheduled = Pubkey::find_program_address(
+        &[b"gv_config", env.coin_mint.as_ref(), env.sub_pool.as_ref()],
+        &gv_id(),
+    )
+    .0;
+    assert_ne!(env.gv_config, unscheduled, "gv config PDA commits to the bootstrap schedule");
 
     // An attacker's OWN valid insurance pool at a different address, with vote_authority
     // set to the gv PDA *that* pool would imply — so the pool's own binding check passes.
     let attacker_pool = Pubkey::new_from_array([9u8; 32]);
-    let attacker_gv = Pubkey::find_program_address(
-        &[b"gv_config", env.coin_mint.as_ref(), attacker_pool.as_ref()],
-        &gv_id(),
-    )
-    .0;
+    let attacker_gv = gv_config_for_schedule(
+        &env.coin_mint,
+        &attacker_pool,
+        TEST_BOOTSTRAP_DELAY_SLOTS,
+        TEST_BOOTSTRAP_START_SLOT,
+    );
     let mut data = vec![0u8; 192];
     data[..8].copy_from_slice(b"SUBPOOL1");
     data[8..40].copy_from_slice(env.coin_mint.as_ref());

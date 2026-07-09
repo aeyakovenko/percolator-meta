@@ -15,6 +15,7 @@ use solana_sdk::{
 
 const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
 const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
 fn program_id() -> Pubkey {
     subledger_program::id()
 }
@@ -135,6 +136,7 @@ fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
     let policy = [policy];
     let window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
     let start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
+    let delay = OWN_VAULT_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -147,6 +149,7 @@ fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
             &domain,
             &window,
             &start,
+            &delay,
         ],
         &program_id(),
     )
