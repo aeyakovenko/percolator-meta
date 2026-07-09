@@ -38,6 +38,9 @@ cohorts of the fixed COIN supply, each split pro-rata to Sybil/wash/JIT-resistan
 - `IX_FREEZE` snapshots cohort denominators after the finalize window; `IX_CLAIM` then pays
   `floor(cohort_supply * stake.points / frozen_total_points)` to the stake's bound recipient.
   Nothing is trusted from a cranker; users self-claim their deterministic share.
+- Stake PDAs are derived as `[b"rd_stake", config, owner, linked_account]`. One wallet can register
+  multiple legitimate linked accounts (for example insurance and backing positions), while one linked
+  portfolio cannot double-register across LP/trader cohorts.
 - Percolator stays subledger-free: this program snapshot-deltas its monotonic portfolio counters
   (LP/trader residual counters plus optional funding-paid counters). Offsets are pinned with
   `offset_of!` against the real Percolator structs.
