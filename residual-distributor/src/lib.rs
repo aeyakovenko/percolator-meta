@@ -524,8 +524,9 @@ struct Stake {
     start_slot: u64,
     points: u128,
     bump: u8,
-    cohort: u8, // COHORT_RESIDUAL | COHORT_INSURANCE. For insurance, `backing_ledger` is the
-    // subledger position and `recipient` is the depositor.
+    // `backing_ledger` is the linked subledger position for insurance/backing, or the linked Percolator
+    // portfolio for LP/trader/funding-payer cohorts.
+    cohort: u8,
     // Retired scratch field for the old residual-spent cap. Held at 0 for the funding-payer cohort; kept for
     // serialized layout stability.
     eligible_accum: u128,
@@ -576,6 +577,15 @@ fn pk(d: &[u8], off: usize) -> Pubkey {
 
 fn config_seeds<'a>(coin_mint: &'a Pubkey) -> [&'a [u8]; 2] {
     [b"rd_config", coin_mint.as_ref()]
+}
+
+fn stake_seeds<'a>(config: &'a Pubkey, owner: &'a Pubkey, linked: &'a Pubkey) -> [&'a [u8]; 4] {
+    [
+        b"rd_stake",
+        config.as_ref(),
+        owner.as_ref(),
+        linked.as_ref(),
+    ]
 }
 
 // ===========================================================================
@@ -903,17 +913,18 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     };
     let start_slot = now;
     let (expected, bump) = Pubkey::find_program_address(
-        &[b"rd_stake", config_account.key.as_ref(), owner.key.as_ref()],
+        &stake_seeds(config_account.key, owner.key, linked.key),
         program_id,
     );
     if *stake_account.key != expected || stake_account.data_len() != 0 {
         return Err(ProgramError::InvalidSeeds);
     }
     let bump_arr = [bump];
-    let seeds: [&[u8]; 4] = [
+    let seeds: [&[u8]; 5] = [
         b"rd_stake",
         config_account.key.as_ref(),
         owner.key.as_ref(),
+        linked.key.as_ref(),
         &bump_arr,
     ];
     create_pda(payer, stake_account, system, program_id, &seeds, STAKE_SIZE)?;
@@ -957,6 +968,13 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     if stake.config != *config_account.key || stake.backing_ledger != *backing_ledger.key {
         return Err(ProgramError::InvalidAccountData);
+    }
+    let (expected_stake, _) = Pubkey::find_program_address(
+        &stake_seeds(config_account.key, &stake.owner, &stake.backing_ledger),
+        program_id,
+    );
+    if *stake_account.key != expected_stake {
+        return Err(ProgramError::InvalidSeeds);
     }
     // subtract-old/add-new keeps the cohort denominator authoritative as points are re-derived.
     match stake.cohort {
@@ -1155,6 +1173,13 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     if stake.config != *config_account.key {
         return Err(ProgramError::InvalidAccountData);
+    }
+    let (expected_stake, _) = Pubkey::find_program_address(
+        &stake_seeds(config_account.key, &stake.owner, &stake.backing_ledger),
+        program_id,
+    );
+    if *stake_account.key != expected_stake {
+        return Err(ProgramError::InvalidSeeds);
     }
     if stake.claimed {
         return Err(ProgramError::InvalidAccountData); // double-claim
