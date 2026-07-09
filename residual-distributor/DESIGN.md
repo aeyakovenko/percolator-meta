@@ -3,8 +3,8 @@
 Deterministic, points-based COIN rewards. The same program handles fixed-supply genesis and
 post-genesis TWAP-funded epochs. It supports five cohorts, each split pro-rata to points:
 
-- insurance deposits       (subledger share value x log tenure; exit forfeits points)
-- backing deposits         (subledger share value x log tenure; exit forfeits points)
+- insurance deposits       (live base-unit principal x log tenure; exit forfeits points)
+- backing deposits         (live base-unit principal x log tenure; exit forfeits points)
 - LP residual received     (`residual_received_atoms_total` delta, log-time weighted)
 - trader residual losses   (`residual_crystallized_loss_atoms_total - residual_spent_principal_atoms_total`, log-time weighted)
 - cumulative funding payers (`funding_long_paid_atoms_total + funding_short_paid_atoms_total` delta, no age multiplier; optional bps)
@@ -54,11 +54,10 @@ redirect, lock, or confiscate insurance/backing principal.
 
 ## What the soft veto requires of this program
 
-- An exited insurance position MUST forfeit its points: the seal must not allocate COIN to a
-  position that has withdrawn. Mechanism: exit (subledger withdraw) invalidates the PointStake,
-  or the seal cross-checks the live position and skips/zeros withdrawn ones. Forfeited COIN is
-  not minted (floor rounding / unallocated supply is burned by distribution's burn_unclaimed).
-- Symmetric for backing depositors if they exit before crystallization: live shares drop, so their points drop.
+- An exited insurance position MUST forfeit its points. Claim atomically rechecks the bound live
+  position and caps by its current principal; a full withdrawal therefore pays zero. Forfeited COIN
+  remains in the immutable reward vault and cannot be redirected or redistributed.
+- Symmetric for backing depositors: partial/full exits lower live principal and therefore points.
 
 ## Trust / determinism
 - `IX_FREEZE` snapshots cohort denominators and the reward supply after the finalize window; `IX_CLAIM` then pays
@@ -82,10 +81,13 @@ redirect, lock, or confiscate insurance/backing principal.
   short-pays-long funding, fixed-supply genesis payout, DAO handoff, three consecutive 15-day TWAP
   auctions, a per-round 50% reward / 50% burn split, and one cumulative 10/10/80 dynamic reward epoch
   across two selected markets.
-- Done + unit/e2e-tested: share-value soft veto and top-up clock. Insurance/backing points are
-  `live_shares * floor(log2(crystallized_slot - max(registration_slot, position.start_slot)))`.
+- Done + unit/e2e-tested: capital soft veto and top-up clock. Insurance/backing points are
+  `live_principal * floor(log2(crystallized_slot - max(registration_slot, position.start_slot)))`.
+  Principal is the common base-unit measure across selected pools; raw shares are deliberately not
+  summed because independent pool share prices diverge with their own loss/surplus histories. Pools
+  grouped into one epoch must use the same underlying denomination; use separate epochs otherwise.
   Crystallization updates the authoritative denominator by subtract-old/add-new. Claim rechecks
-  live shares, `withdrawn`, and the resettable position clock; exits and later top-ups can only lower
+  live principal, `withdrawn`, and the resettable position clock; exits and later top-ups can only lower
   a payout. Forfeited COIN remains in the immutable epoch vault and is never redistributed.
 - Done: Percolator portfolio residual and funding-counter offsets pinned with offset_of! (tests/offsets.rs).
 

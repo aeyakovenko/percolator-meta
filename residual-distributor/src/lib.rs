@@ -90,8 +90,9 @@ const CONFIG_EXTRA_BACKING_POOLS_OFF: usize =
     CONFIG_EXTRA_INSURANCE_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const CONFIG_SIZE: usize = CONFIG_EXTRA_BACKING_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
-                               // Share cohorts + portfolio-flow cohorts. Insurance/backing reward SHARE VALUE; LP/trader reward residual
-                               // counters; optional funding-payer cohort rewards the sum of Percolator funding-paid counters. See tests/offsets.rs.
+                               // Capital + portfolio-flow cohorts. Insurance/backing reward base-unit principal;
+                               // LP/trader reward residual counters; optional funding-payer rewards the sum of
+                               // Percolator funding-paid counters. See tests/offsets.rs.
 const COHORT_INSURANCE: u8 = 0;
 const COHORT_BACKING: u8 = 1;
 const COHORT_LP: u8 = 2;
@@ -165,23 +166,22 @@ fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey, ProgramError> {
 // tests/offsets.rs (finding HF: a wrong owner offset here slipped past mocked tests).
 pub const SUB_POS_POOL: usize = 8; // Position.pool @ 8 (real layout: disc@0, pool@8..40, owner@40..72).
 pub const SUB_POS_OWNER: usize = 40; // Position.owner @ 40. The depositor owed this position's COIN.
+pub const SUB_POS_PRINCIPAL: usize = 72;
 pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
-// Position.shares (POLICY_WITH_SURPLUS) @104 - the SHARE-VALUE source for insurance and backing.
-// Within one pool the share price is common, so pro-rata share value equals pro-rata shares. The
-// resettable start_slot supplies log-time weighting; exit redeems shares -> 0 -> forfeit.
-pub const SUB_POS_SHARES: usize = 104;
 
-/// (shares, withdrawn) from a live subledger Position — the SHARE-VALUE points for the insurance &
-/// backing cohorts. A withdrawn (or zero-share) position yields 0 (soft veto): an exiter redeemed its
-/// shares, forfeiting its COIN. Read LIVE at claim so a partial redeem can't over-claim.
-pub fn read_subledger_shares(data: &[u8]) -> Result<(u128, bool), ProgramError> {
-    let shares = read_u128(data, SUB_POS_SHARES)?;
+/// Comparable base-unit principal from a live subledger Position. Raw shares cannot be summed across
+/// pools because each pool has an independent loss/surplus-dependent share price.
+pub fn read_subledger_principal(data: &[u8]) -> Result<(u128, bool), ProgramError> {
+    let bytes = data
+        .get(SUB_POS_PRINCIPAL..SUB_POS_PRINCIPAL + 8)
+        .ok_or(ProgramError::AccountDataTooSmall)?;
+    let principal = u64::from_le_bytes(bytes.try_into().unwrap()) as u128;
     let withdrawn = *data
         .get(SUB_POS_WITHDRAWN)
         .ok_or(ProgramError::AccountDataTooSmall)?
         == 1;
-    Ok((shares, withdrawn))
+    Ok((principal, withdrawn))
 }
 
 /// The subledger resets this clock whenever capital is added to the position. Reward tenure must
@@ -193,12 +193,12 @@ pub fn read_subledger_start_slot(data: &[u8]) -> Result<u64, ProgramError> {
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-/// Live share value before the separate tenure multiplier (0 if exited).
-pub fn share_value_points(shares: u128, withdrawn: bool) -> u128 {
+/// Live capital-at-risk before the separate tenure multiplier (0 if exited).
+pub fn capital_points(principal: u128, withdrawn: bool) -> u128 {
     if withdrawn {
         0
     } else {
-        shares
+        principal
     }
 }
 
@@ -621,8 +621,8 @@ struct Stake {
     backing_ledger: Pubkey,
     recipient: Pubkey,
     residual_snap: u128,
-    // LOAD-BEARING live-cap snapshot. For share cohorts this is the crystallized live share count. For
-    // residual cohorts it is the realized `net_delta`; claim scales the payout down if the live value fell.
+    // LOAD-BEARING live-cap snapshot. For capital cohorts this is crystallized live principal. For residual
+    // cohorts it is the realized `net_delta`; claim scales the payout down if the live value fell.
     // Repurposed from the superseded fee-cap design. MUST be preserved across crystallize/freeze.
     earnings_snap: u128,
     start_slot: u64,
@@ -631,7 +631,7 @@ struct Stake {
     // `backing_ledger` is the linked subledger position for insurance/backing, or the linked Percolator
     // portfolio for LP/trader/funding-payer cohorts.
     cohort: u8,
-    // Share cohorts store their crystallization slot here so claim can reject tenure restored by a later
+    // Capital cohorts store their crystallization slot here so claim can reject tenure restored by a later
     // top-up. Trader residual stores the spent-counter snapshot. Funding-payer holds 0.
     eligible_accum: u128,
     // Self-service claim: set true when this stake's COIN share has been paid, so it can't be
@@ -1193,11 +1193,11 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     {
         return Err(ProgramError::InvalidInstructionData);
     }
-    // `snap` is the register-time counter snapshot: 0 for the share-value cohorts (insurance/backing),
+    // `snap` is the register-time counter snapshot: 0 for capital cohorts (insurance/backing),
     // and the relevant portfolio-flow counter for portfolio cohorts (delta measured at crystallize).
     let snap: u128 = match cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
-            // Share-value cohort: `linked` is a subledger Position in this cohort's pool.
+            // Capital cohort: `linked` is a subledger Position in this cohort's pool.
             if *linked.owner != config.subledger_program {
                 return Err(ProgramError::IllegalOwner);
             }
@@ -1316,15 +1316,17 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // subtract-old/add-new keeps the cohort denominator authoritative as points are re-derived.
     match stake.cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
-            // Share-value cohort: points = floor(log2(tenure)) * LIVE Position.shares (0 if exited).
+            // Capital cohort: points = floor(log2(tenure)) * LIVE Position.principal (0 if exited).
+            // Principal is a comparable base-unit amount across the DAO-selected pools; raw shares are
+            // not comparable because every pool has its own loss/surplus-dependent share price.
             // The position clock resets on every top-up, so use the later of registration and position
             // start. This prevents dust registration from lending old tenure to late capital.
-            // OWNER-GATED (finding KO, KM parity): crystallize OVERWRITES stake.points from the live
-            // shares NOW, and freeze then locks that value as the frozen denominator term — which the
+            // OWNER-GATED (finding KO, KM parity): crystallize OVERWRITES stake.points from live
+            // principal NOW, and freeze then locks that value as the frozen denominator term - which the
             // claim-time min-cap can only ever LOWER, never raise. So a permissionless caller could
-            // force-crystallize a victim at a transient low-share moment (mid partial-withdraw:
-            // withdrawn=false, shares reduced) and `freeze` to lock the victim's COIN share permanently
-            // low. A share-value re-crystallize must therefore be authorized by the stake's own owner.
+            // force-crystallize a victim after a partial withdrawal (withdrawn=false, principal reduced)
+            // and `freeze` to lock the victim's COIN share permanently
+            // low. A capital-cohort re-crystallize must therefore be authorized by the stake's owner.
             // (portfolio-flow cohorts stay permissionless).
             if cranker.key != &stake.owner {
                 return Err(ProgramError::MissingRequiredSignature);
@@ -1333,17 +1335,17 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 return Err(ProgramError::IllegalOwner);
             }
             let data = backing_ledger.try_borrow_data()?;
-            let (shares, withdrawn) = read_subledger_shares(&data)?;
-            let live_shares = share_value_points(shares, withdrawn);
+            let (principal, withdrawn) = read_subledger_principal(&data)?;
+            let live_principal = capital_points(principal, withdrawn);
             let position_start_slot = read_subledger_start_slot(&data)?;
             let now = Clock::get()?.slot;
             let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
             let multiplier = floor_log2(now.saturating_sub(effective_start));
-            let new_pts = multiplier.saturating_mul(live_shares);
+            let new_pts = multiplier.saturating_mul(live_principal);
             let slot = config.cohort_points_mut(stake.cohort);
             *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
             stake.points = new_pts;
-            stake.earnings_snap = live_shares;
+            stake.earnings_snap = live_principal;
             stake.eligible_accum = now as u128;
         }
         COHORT_LP | COHORT_TRADER => {
@@ -1503,7 +1505,7 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 // (floor math), so the vault can never be over-drawn. Funding-payer claims use the crystallized,
 // now-frozen `stake.points` from monotonic paid counters, so there is no live-position dependency and
 // no HE concern and deliberately do not require the Percolator portfolio at claim time; users may
-// close or dematerialize flat portfolios after crystallize/freeze. The share-value and residual cohorts
+// close or dematerialize flat portfolios after crystallize/freeze. The capital and residual cohorts
 // (live, HE-capped) are handled separately.
 fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
@@ -1555,13 +1557,13 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.claimed {
         return Err(ProgramError::InvalidAccountData); // double-claim
     }
-    // Share-value cohorts (insurance/backing) cap the payout by LIVE shares at claim time, so the claim
+    // Capital cohorts (insurance/backing) cap the payout by LIVE principal at claim time, so the claim
     // SLOT is value-relevant. claim is otherwise permissionless; if a third party could trigger a
-    // share-value claim they could force it during a transient low-share moment — e.g. mid partial
-    // insurance-withdraw, which leaves the Position withdrawn=false but shares reduced — and the
+    // capital claim they could force it during a transient low-principal moment after a partial
+    // insurance-withdraw, which leaves the Position withdrawn=false but principal reduced - and the
     // irreversible claimed-flag would lock in the reduced (or zero) payout, stranding the remainder
-    // (finding KM). So a share-value claim must be authorized by the stake's OWN owner (the depositor who
-    // controls the shares and bears the soft-veto timing). Portfolio-flow cohorts pay frozen points from
+    // (finding KM). So a capital claim must be authorized by the stake's OWN owner (the depositor who
+    // controls the position and bears the soft-veto timing). Portfolio-flow cohorts pay frozen points from
     // account counters, so their claim slot is irrelevant and stays permissionless.
     if matches!(stake.cohort, COHORT_INSURANCE | COHORT_BACKING) && cranker.key != &stake.owner {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1575,8 +1577,8 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let frozen_denom = config.frozen_cohort_points(stake.cohort);
     let amount = match stake.cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
-            // Share-value cohort: read the LIVE Position shares and resettable start clock atomically.
-            // Fewer shares lower the payout; a full exit pays zero. A later top-up cannot restore frozen
+            // Capital cohort: read LIVE Position principal and its resettable start clock atomically.
+            // Less principal lowers the payout; a full exit pays zero. A later top-up cannot restore frozen
             // tenure because the live clock is measured at the stored crystallization slot.
             let position = next_account_info(iter)?;
             if *position.key != stake.backing_ledger || *position.owner != config.subledger_program
@@ -1584,15 +1586,15 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 return Err(ProgramError::InvalidAccountData);
             }
             let data = position.try_borrow_data()?;
-            let (shares, withdrawn) = read_subledger_shares(&data)?;
-            let live_shares = share_value_points(shares, withdrawn);
+            let (principal, withdrawn) = read_subledger_principal(&data)?;
+            let live_principal = capital_points(principal, withdrawn);
             let position_start_slot = read_subledger_start_slot(&data)?;
             let crystallized_slot = u64::try_from(stake.eligible_accum)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
             let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
             let live_multiplier = floor_log2(crystallized_slot.saturating_sub(effective_start));
-            let capped_shares = core::cmp::min(stake.earnings_snap, live_shares);
-            let live_pts = live_multiplier.saturating_mul(capped_shares);
+            let capped_principal = core::cmp::min(stake.earnings_snap, live_principal);
+            let live_pts = live_multiplier.saturating_mul(capped_principal);
             let pts = if stake.points < live_pts {
                 stake.points
             } else {
@@ -1636,7 +1638,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         }
     };
     // ANTI-WASH FEE (finding NZ): portfolio-flow cohorts are farmable by synthetic/wash flow on allow-listed
-    // markets, so they pay a fee retained in the vault. Share-value cohorts are capital-at-risk and pay no fee.
+    // markets, so they pay a fee retained in the vault. Capital cohorts are at risk and pay no fee.
     let fee = if matches!(
         stake.cohort,
         COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER
@@ -1731,17 +1733,18 @@ mod tests {
     }
 
     #[test]
-    fn reads_live_subledger_shares_offsets() {
+    fn reads_live_subledger_capital_offsets() {
         let mut d = [0u8; 120];
+        d[72..80].copy_from_slice(&555u64.to_le_bytes()); // principal
         d[88] = 1; // withdrawn
         d[89..97].copy_from_slice(&4242u64.to_le_bytes()); // resettable deposit clock
-        d[104..120].copy_from_slice(&777u128.to_le_bytes()); // shares
-        let (shares, w) = read_subledger_shares(&d).unwrap();
-        assert_eq!(shares, 777);
+        d[104..120].copy_from_slice(&777u128.to_le_bytes()); // unrelated pool-local shares
+        let (principal, w) = read_subledger_principal(&d).unwrap();
+        assert_eq!(principal, 555);
         assert!(w);
         assert_eq!(read_subledger_start_slot(&d).unwrap(), 4242);
-        assert_eq!(share_value_points(777, true), 0, "withdrawn -> forfeit");
-        assert_eq!(share_value_points(777, false), 777, "live -> shares");
+        assert_eq!(capital_points(555, true), 0, "withdrawn -> forfeit");
+        assert_eq!(capital_points(555, false), 555, "live -> principal");
     }
 
     #[test]
