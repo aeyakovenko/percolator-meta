@@ -43,7 +43,7 @@ split bought COIN between burn and another residual-distributor reward epoch.
 |---|---|
 | `subledger/` | The market's **asset-0 insurance operator** during genesis (a role granted by Squads). Mediates deposits (signs Percolator `TopUpInsurance` as the insurance authority) and owner-authorized exits, tracking per-owner attribution (`owner, principal, start_slot`). Genesis pools are **share-based** (ERC4626-style): exiting redeems shares at the live balance, returning principal **plus any surplus**, pro-rata under loss. Never rotates keys — `accept_operator` only *consents* to receive the role Squads grants. Also provides reusable owner-bound pools for assets 1..N. |
 | `genesis-vote/` | The **vote decider**. Runs a log-time quorum vote weighted by each voter's subledger attribution (`floor(log2(hold_time)) × principal`), one voter → one proposal. Seals the winner into `distribution` by CPI. Holds no funds. |
-| `residual-distributor/` | Reusable deterministic **COIN reward epochs**. Fixed mode distributes the whole genesis mint; dynamic mode snapshots COIN accumulated from TWAP. Both reuse `register → crystallize → freeze → claim` across log-time-weighted insurance/backing shares, LP/trader residual, and cumulative funding-payer (`long_paid + short_paid`, no age multiplier) cohorts. |
+| `residual-distributor/` | Reusable deterministic **COIN reward epochs**. Fixed mode distributes the whole genesis mint; dynamic mode snapshots COIN accumulated from TWAP. Both reuse `register → crystallize → freeze → claim` across log-time-weighted insurance/backing base-unit principal, LP/trader residual, and cumulative funding-payer (`long_paid + short_paid`, no age multiplier) cohorts. |
 | `distribution/` | Holds the fixed COIN pool in a vault. A proposal is one on-chain account of up to ~10k `(pubkey, amount)` entries; the sealed winner's recipients **claim** permissionlessly, **unclaimed is burned**. Never mints. The `authority` (whichever decider PDA) is bound into the config seed, making it decider-pluggable. |
 | `twap-program/` | Deployable BPF for the **authority chain** and post-mint uniform-price auction. It pulls only insurance *surplus*, clears at one marginal price, and splits bought COIN between burn and a DAO-pinned sink such as a reward-epoch vault. Never reaches the configured principal floor. |
 | `twap/` | Reference library for the buy/burn (schedule + bid book); only its overflow-safe rate comparator is reused on-chain. |
@@ -96,9 +96,12 @@ seller, and reopens the book. At day 45 the cumulative vault pays 10% insurance,
 cumulative funding-payer points across a DAO-selected market set. Insurance/backing balances and
 attribution remain unchanged by reward finalization and claims. The book binds the epoch's final sink
 slot: later permissionless rounds burn the stale sink share instead of depositing COIN outside the
-frozen reward snapshot. Their reward points are live shares
-times `floor(log2(tenure))`; because a subledger top-up resets the position clock, late capital cannot
-inherit an early registration's tenure. Percolator oracle/crank maintenance is external.
+frozen reward snapshot. Their reward points are live base-unit
+principal times `floor(log2(tenure))`; this is comparable across selected pools and independent of each
+pool's share price. Because a subledger top-up resets the position clock, late capital cannot inherit an
+early registration's tenure. Capital pools in one epoch must use the same underlying base-unit
+denomination; heterogeneous collateral belongs in separate epochs. Percolator oracle/crank maintenance
+is external.
 
 ## Authority chain & the 1-week timelock
 

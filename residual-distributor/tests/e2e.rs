@@ -1,6 +1,6 @@
 //! LiteSVM e2e: fixed-supply and TWAP-funded deterministic reward epochs.
-//! (10/10/40/40). Insurance + backing reward SUBLEDGER SHARE VALUE (Position.shares — pro-rata with
-//! fees, soft-veto on exit); LP/trader reward residual counters; optional funding-payer cohort rewards
+//! (10/10/40/40). Insurance + backing reward SUBLEDGER CAPITAL (Position.principal - comparable
+//! base units, log tenure, soft-veto on exit); LP/trader reward residual counters; funding-payer rewards
 //! cumulative Percolator funding-paid counters. Self-service flow:
 //! register -> crystallize -> freeze -> claim, against mock dependency accounts at the offset-pinned
 //! layouts (tests/offsets.rs pins every offset vs the real percolator/subledger structs).
@@ -336,7 +336,8 @@ fn rd_config_fee_bps(svm: &LiteSVM, rd_config: Pubkey) -> u16 {
     )
 }
 
-// Mock subledger Position at the pinned offsets: pool@8, owner@40, withdrawn@88, shares@104.
+// Mock subledger Position at the pinned offsets: pool@8, owner@40, principal@72,
+// withdrawn@88, start_slot@89, shares@104.
 fn set_position(
     svm: &mut LiteSVM,
     key: &Pubkey,
@@ -349,6 +350,11 @@ fn set_position(
     let mut data = vec![0u8; 160];
     data[8..40].copy_from_slice(pool.as_ref());
     data[40..72].copy_from_slice(owner.as_ref());
+    data[72..80].copy_from_slice(
+        &u64::try_from(shares)
+            .expect("mock principal fits u64")
+            .to_le_bytes(),
+    );
     data[88] = withdrawn as u8;
     data[104..120].copy_from_slice(&shares.to_le_bytes());
     svm.set_account(
@@ -367,6 +373,12 @@ fn set_position(
 fn set_position_start_slot(svm: &mut LiteSVM, key: &Pubkey, start_slot: u64) {
     let mut account = svm.get_account(key).expect("position");
     account.data[89..97].copy_from_slice(&start_slot.to_le_bytes());
+    svm.set_account(*key, account).unwrap();
+}
+
+fn set_position_principal(svm: &mut LiteSVM, key: &Pubkey, principal: u64) {
+    let mut account = svm.get_account(key).expect("position");
+    account.data[72..80].copy_from_slice(&principal.to_le_bytes());
     svm.set_account(*key, account).unwrap();
 }
 // Mock percolator PortfolioAccount at the pinned offsets: market_group@16, owner@116, crystallized@196,
@@ -689,7 +701,7 @@ fn setup_share_value_and_funding_split(
         }],
         &[&mint_auth],
     )
-    .expect("rd init with share-value/funding split");
+    .expect("rd init with capital/funding split");
     revoke_mint(svm, payer, &coin_mint, &mint_auth);
     Env {
         rd_config,
@@ -1246,6 +1258,149 @@ fn reward_epoch_rejects_funding_points_created_after_emission_end() {
     assert_eq!(token_amount(&svm, &vault), supply);
 }
 
+// ATTACK PROBE: shares from distinct pools are not fungible units. Equal base-unit deposits can
+// receive different share counts solely because each pool has a different loss/surplus history.
+// A multi-market epoch must reward comparable capital at risk, not sum raw cross-pool shares.
+#[test]
+fn equal_principal_across_pools_is_not_diluted_by_unrelated_share_prices() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let epoch_id = 77u64;
+    let rd_config = reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let primary = RewardEpochMarket {
+        market: Pubkey::new_unique(),
+        insurance_pool: Pubkey::new_unique(),
+        backing_pool: Pubkey::default(),
+    };
+    let second = RewardEpochMarket {
+        market: Pubkey::new_unique(),
+        insurance_pool: Pubkey::new_unique(),
+        backing_pool: Pubkey::default(),
+    };
+    let supply = 1_000_000u64;
+    let emission_end = 2_000u64;
+    let finalize_window = 10u64;
+    set_slot(&mut svm, 50);
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                100,
+                emission_end,
+                supply,
+                10_000,
+                0,
+                0,
+                0,
+                finalize_window,
+                0,
+                &[primary, second],
+            ),
+        }],
+        &[&dao],
+    )
+    .expect("initialize two-pool reward epoch");
+    mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+    let env = Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth: Keypair::new(),
+        stub_sub,
+        stub_perc,
+        ins_pool: primary.insurance_pool,
+        back_pool: Pubkey::default(),
+        market: primary.market,
+        supply,
+        emission_end,
+        finalize_window,
+    };
+
+    set_slot(&mut svm, 100);
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let a_pos = Pubkey::new_unique();
+    let b_pos = Pubkey::new_unique();
+    // Both positions risk 100 base units. Pool B's pre-existing 2x share price means the real
+    // subledger mints half as many shares for the same new deposit.
+    set_position(
+        &mut svm,
+        &a_pos,
+        &stub_sub,
+        &primary.insurance_pool,
+        &a.pubkey(),
+        100_000_000,
+        false,
+    );
+    set_position_principal(&mut svm, &a_pos, 100);
+    set_position_start_slot(&mut svm, &a_pos, 100);
+    set_position(
+        &mut svm,
+        &b_pos,
+        &stub_sub,
+        &second.insurance_pool,
+        &b.pubkey(),
+        50_000_000,
+        false,
+    );
+    set_position_principal(&mut svm, &b_pos, 100);
+    set_position_start_slot(&mut svm, &b_pos, 100);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &a,
+        &a.pubkey(),
+        &a_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("register primary-pool depositor");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &b,
+        &b.pubkey(),
+        &b_pos,
+        COHORT_INSURANCE,
+    )
+    .expect("register second-pool depositor");
+
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("crystallize primary");
+    crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("crystallize second");
+    set_slot(&mut svm, emission_end + finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let a_ata = create_token_account(&mut svm, &payer, &coin_mint, &a.pubkey());
+    let b_ata = create_token_account(&mut svm, &payer, &coin_mint, &b.pubkey());
+    claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim primary");
+    claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim second");
+    assert_eq!(token_amount(&svm, &a_ata), 500_000);
+    assert_eq!(token_amount(&svm, &b_ata), 500_000);
+}
+
 // DoS PROBE (lamport-prefund front-run brick, sweep tick D): the rd creates its rd_config (and every stake) PDA
 // via create_pda. If that used a naive system create_account, a front-runner could transfer 1 lamport to the
 // canonical rd_config PDA (system-owned, empty) BEFORE the genesis inits — create_account fails on a funded
@@ -1786,7 +1941,7 @@ fn init_rejects_a_malformed_or_overlong_extra_market_allow_list() {
 }
 
 // FINDING NZ: the anti-wash fee is skimmed from LP/trader (PnL-flow) claims and RETAINED in the vault, but
-// NOT from the share-value (insurance/backing, capital-at-risk) cohorts. A sole LP staker with a 20% fee
+// NOT from the capital (insurance/backing, capital-at-risk) cohorts. A sole LP staker with a 20% fee
 // claims 80% of its cohort; the 20% stays locked in the vault. A sole insurance staker pays nothing.
 // ANTI-WASH FEE DUST-DODGE (surface D, follow-up: last tick established the claim fee is the SOLE economic bound
 // on the cross-margin delta-neutral wash). The fee = amount * fee_bps / 10000. If that FLOORS, a claim small
@@ -1897,7 +2052,7 @@ fn lp_trader_claim_pays_the_anti_wash_fee_share_value_cohorts_dont() {
     );
     set_slot(&mut svm, 1_000); // tenure = 900 -> floor(log2) = 9 > 0
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("cry lp");
-    // sole INSURANCE staker (share-value cohort -> log-time weighted, but NO claim fee).
+    // sole INSURANCE staker (capital cohort -> log-time weighted, but NO claim fee).
     let ins = Keypair::new();
     let ins_pos = Pubkey::new_unique();
     set_position(
@@ -2155,8 +2310,8 @@ fn trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consume
 }
 
 // PERMISSIONLESS CRYSTALLIZE (LP/trader, sweep tick D): share_value_crystallize_cannot_be_forced_by_a_third_party
-// pins that share-value (insurance/backing) crystallize is OWNER-GATED (finding KO) — a forced crystallize at a
-// transient low-share moment would grief. The COMPLEMENT, untested: LP/trader crystallize is PERMISSIONLESS — any
+// pins that capital (insurance/backing) crystallize is OWNER-GATED (finding KO) — a forced crystallize at a
+// transient low-principal moment would grief. The COMPLEMENT, untested: LP/trader crystallize is PERMISSIONLESS — any
 // cranker may finalize a staker's points, because the percolator residual counters are MONOTONIC, so a forced
 // crystallize can only RAISE the netΔ, never grief. Pin that a third-party cranker successfully crystallizes a
 // trader stake and the points are recorded (the owner then claims its full cohort).
@@ -4817,7 +4972,7 @@ fn ten_ten_eighty_split_pays_insurance_backing_and_cumulative_funding() {
     )
     .expect("register funding-payer");
 
-    set_slot(&mut svm, 1_124); // same tenure for every cohort; share-value cohorts ignore tenure in current points.
+    set_slot(&mut svm, 1_124); // capital cohorts get equal log tenure; funding stays age-neutral.
     set_portfolio_funding(
         &mut svm,
         &funding_pf,
@@ -4854,12 +5009,12 @@ fn ten_ten_eighty_split_pays_insurance_backing_and_cumulative_funding() {
     assert_eq!(
         token_amount(&svm, &ins_ata),
         100_000,
-        "insurance share-value cohort receives 10%"
+        "insurance capital cohort receives 10%"
     );
     assert_eq!(
         token_amount(&svm, &back_ata),
         100_000,
-        "backing share-value cohort receives 10%"
+        "backing capital cohort receives 10%"
     );
     assert_eq!(
         token_amount(&svm, &funding_ata),
@@ -4947,7 +5102,7 @@ fn one_owner_can_register_and_claim_insurance_and_backing_cohorts() {
 }
 
 // HEADLINE: all four legacy cohorts in one genesis, one staker each -> each claims its full cohort_supply
-// (10/10/40/40). Insurance/backing from subledger share value; LP/trader portfolios from residual counters.
+// (10/10/40/40). Insurance/backing from subledger capital; LP/trader portfolios from residual counters.
 #[test]
 fn full_four_way_split_pays_each_cohort_its_share() {
     let mut svm = LiteSVM::new();
@@ -4968,7 +5123,7 @@ fn full_four_way_split_pays_each_cohort_its_share() {
     let back_pos = Pubkey::new_unique();
     let lp_pf = Pubkey::new_unique();
     let trd_pf = Pubkey::new_unique();
-    // Insurance + backing positions (share value); LP/trader portfolios (residual counters, start 0).
+    // Insurance + backing positions (capital); LP/trader portfolios (residual counters, start 0).
     set_position(
         &mut svm,
         &ins_pos,
@@ -5090,7 +5245,7 @@ fn full_four_way_split_pays_each_cohort_its_share() {
     assert_eq!(100_000 + 100_000 + 400_000 + 400_000, supply);
 }
 
-// SHARE VALUE is pro-rata by shares, and the soft veto: an insurance depositor who EXITS (shares -> 0
+// Capital rewards are pro-rata by principal, and the soft veto: an insurance depositor who EXITS (principal -> 0
 // at claim) forfeits its COIN even if it had crystallized points; the survivor still claims its own.
 #[test]
 fn share_value_is_pro_rata_and_exit_forfeits() {
@@ -5165,8 +5320,12 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
     let b_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &b.pubkey());
     claim(&mut svm, &payer, &env, &a, &a_ata, Some(&a_pos)).expect("claim a");
     claim(&mut svm, &payer, &env, &b, &b_ata, Some(&b_pos)).expect("claim b");
-    // a: 100_000 * 300/400 = 75_000. b: exited -> live shares 0 -> 0 (forfeit; its 25_000 stays in the vault).
-    assert_eq!(token_amount(&svm, &a_ata), 75_000, "a pro-rata by shares");
+    // a: 100_000 * 300/400 = 75_000. b: exited -> live principal 0 -> 0 (forfeit; its 25_000 stays in the vault).
+    assert_eq!(
+        token_amount(&svm, &a_ata),
+        75_000,
+        "a pro-rata by principal"
+    );
     assert_eq!(
         token_amount(&svm, &b_ata),
         0,
@@ -5176,7 +5335,7 @@ fn share_value_is_pro_rata_and_exit_forfeits() {
 
 // ATTACK PROBE: registering dust early must not let capital deposited immediately before
 // crystallization inherit the stake account's full tenure. The real subledger resets a Position's
-// start_slot on every top-up, so the distributor must use that later clock for share-value points.
+// start_slot on every top-up, so the distributor must use that later clock for capital points.
 #[test]
 fn share_value_top_up_near_end_cannot_borrow_early_stake_tenure() {
     let mut svm = LiteSVM::new();
@@ -5314,8 +5473,8 @@ fn share_value_post_freeze_top_up_cannot_restore_withdrawn_tenure() {
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
-    // A real partial withdrawal leaves the position live with fewer shares. A subsequent top-up
-    // can restore the share count, but necessarily resets this position clock to the current slot.
+    // A real partial withdrawal leaves less live principal. A subsequent top-up can restore the
+    // principal, but necessarily resets this position clock to the current slot.
     set_position(
         &mut svm,
         &farmer_pos,
@@ -5353,15 +5512,15 @@ fn share_value_post_freeze_top_up_cannot_restore_withdrawn_tenure() {
     assert_eq!(
         token_amount(&svm, &farmer_ata),
         0,
-        "restoring shares cannot restore the old tenure"
+        "restoring principal cannot restore the old tenure"
     );
 }
 
-// SOFT-VETO PARTIAL DIRECTION (sweep tick D): the exit-forfeit test above covers a FULL exit (shares 0 +
-// withdrawn=TRUE -> the withdrawn-flag path of share_value_points). The post-freeze-deposit test covers the
-// inflation cap (live > frozen -> capped at frozen). The untested MIDDLE case is a PARTIAL post-freeze withdraw:
-// withdrawn stays FALSE, shares drop but stay non-zero -> the SHARES-based path with live strictly between 0 and
-// frozen. The claim min-cap `min(stake.points, live_share_points)` must then pay the LIVE (reduced) amount, so a
+// SOFT-VETO PARTIAL DIRECTION (sweep tick D): the exit-forfeit test above covers a FULL exit (principal 0 +
+// withdrawn=TRUE). The post-freeze-deposit test covers the inflation cap (live > frozen -> capped at frozen).
+// The untested MIDDLE case is a PARTIAL post-freeze withdraw: withdrawn stays FALSE, principal drops but stays
+// non-zero -> the live-cap path with a value strictly between 0 and
+// frozen. The claim min-cap must then pay the LIVE reduced amount, so a
 // depositor that de-risks half its capital after freeze claims half its COIN; the rest stays locked (the genuine
 // partial soft-veto). Pins that the min-cap pays `live` (not the frozen snapshot, not 0) on a partial reduction.
 #[test]
@@ -5401,7 +5560,7 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
-    // PARTIAL post-freeze withdraw: shares 300 -> 150, still NOT fully withdrawn (withdrawn=false).
+    // PARTIAL post-freeze withdraw: principal 300 -> 150, still live (withdrawn=false).
     set_position(
         &mut svm,
         &a_pos,
@@ -5418,7 +5577,7 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
     assert_eq!(
         token_amount(&svm, &a_ata),
         50_000,
-        "partial post-freeze withdraw pays the REDUCED live shares, not the frozen snapshot"
+        "partial post-freeze withdraw pays the REDUCED live principal, not the frozen snapshot"
     );
     assert_eq!(
         token_amount(&svm, &env.vault),
@@ -5427,11 +5586,11 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
     );
 }
 
-// ATTACK PROBE (post-freeze share inflation of a share-value claim): the insurance/backing claim pays
-// cohort_supply * min(frozen_points, live tenure*shares) / frozen_denominator.
+// ATTACK PROBE (post-freeze capital inflation): the insurance/backing claim pays
+// cohort_supply * min(frozen_points, live tenure*principal) / frozen_denominator.
 // The exit direction (live < frozen -> forfeit) is pinned by share_value_is_pro_rata_and_exit_forfeits. The
 // UPPER direction is the over-draw vector: the cohort supply is FIXED and the denominator is FROZEN, so if the
-// claim used LIVE (not min) points, a claimant who TOPS UP their subledger position AFTER freeze (live shares
+// claim used LIVE (not min) points, a claimant who TOPS UP their subledger position AFTER freeze (live principal
 // >> frozen) would mint a numerator far above their frozen contribution against the frozen denominator —
 // claiming more than their share, draining the fixed cohort supply and diluting honest claimants. The min-cap
 // blocks it: a post-freeze deposit can never raise the payout above the frozen-time contribution.
@@ -5493,7 +5652,7 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze"); // denominator frozen at 4_000
 
-    // ATTACK: AFTER freeze, b tops up their subledger position 100x (100 -> 10_000 live shares), trying to
+    // ATTACK: AFTER freeze, b tops up their subledger position 100x (100 -> 10_000 live principal), trying to
     // inflate its numerator above the frozen denominator.
     set_position(
         &mut svm,
@@ -5529,13 +5688,13 @@ fn share_value_claim_caps_at_frozen_points_post_freeze_deposit_cannot_inflate() 
     );
 }
 
-// ATTACK PROBE (soft-veto bypass via a SUBSTITUTED position at claim). A share-value (insurance/backing) claim
-// caps the payout by LIVE shares read from a position account passed at claim time; the soft veto rests on
+// ATTACK PROBE (soft-veto bypass via a SUBSTITUTED position at claim). A capital (insurance/backing) claim
+// caps the payout by LIVE principal read from a position account passed at claim time; the soft veto rests on
 // that being the OWNER'S OWN bound position (so exiting it really forfeits). claim binds position.key ==
-// stake.backing_ledger (src:902). Without it, an owner who EXITED their bound position (live shares 0 -> should
+// stake.backing_ledger (src:902). Without it, an owner who EXITED their bound position (live principal 0 -> should
 // forfeit) could pass a DIFFERENT high-share position to read a high live_pts -> min(frozen, high) = frozen ->
 // claim the FULL COIN while their capital is no longer at risk — defeating the soft veto entirely. None of the
-// share-value tests pass a substituted position; this pins the bind. Real rd .so.
+// capital tests pass a substituted position; this pins the bind. Real rd .so.
 #[test]
 fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
     let mut svm = LiteSVM::new();
@@ -5592,7 +5751,7 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
     crystallize(&mut svm, &payer, &env, &a, &a_pos).expect("cry a"); // 3_000 pts
     crystallize(&mut svm, &payer, &env, &b, &b_pos).expect("cry b"); // 1_000 pts
 
-    // a EXITS its bound position (live shares 0) — the soft veto must now forfeit a's claim.
+    // a EXITS its bound position (live principal 0) — the soft veto must now forfeit a's claim.
     set_position(
         &mut svm,
         &a_pos,
@@ -5602,7 +5761,7 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
         0,
         true,
     );
-    // A decoy position with HIGH live shares (subledger-owned so it passes the program-owner check) that a
+    // A decoy position with HIGH live principal (subledger-owned so it passes the program-owner check) that a
     // will try to substitute to read a high live_pts and dodge the forfeit.
     let decoy_pos = Pubkey::new_unique();
     set_position(
@@ -5619,7 +5778,7 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
     freeze(&mut svm, &payer, &env).expect("freeze");
 
     let a_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &a.pubkey());
-    // ATTACK: a claims but appends the DECOY position (9_999 shares) instead of its own (now-empty) bound one.
+    // ATTACK: a claims with a 9_999-principal DECOY instead of its own empty bound position.
     assert!(claim(&mut svm, &payer, &env, &a, &a_ata, Some(&decoy_pos)).is_err(),
         "a substituted position is rejected (position.key != stake.backing_ledger) — no soft-veto bypass");
     assert_eq!(
@@ -5645,8 +5804,8 @@ fn share_value_claim_rejects_a_substituted_position_no_soft_veto_bypass() {
     );
 }
 
-// ATTACK PROBE (denominator inflation via a SUBSTITUTED ledger at CRYSTALLIZE). crystallize for a share-value
-// (insurance/backing) stake OVERWRITES stake.points from the LIVE shares of the passed ledger AND updates the
+// ATTACK PROBE (denominator inflation via a SUBSTITUTED ledger at CRYSTALLIZE). crystallize for a capital
+// (insurance/backing) stake OVERWRITES stake.points from LIVE principal in the passed ledger AND updates the
 // cohort denominator (subtract-old/add-new). It binds backing_ledger == stake.backing_ledger (src:726). This
 // is the crystallize-side complement of the claim-side position bind (902): without 726, an owner could
 // crystallize a DECOY high-share ledger to push their points (and the frozen cohort denominator) far above
@@ -5707,7 +5866,7 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
     .expect("reg b");
 
     set_slot(&mut svm, 1_124);
-    // A decoy position with HIGH live shares (subledger-owned), which a will try to crystallize INSTEAD of
+    // A decoy position with HIGH live principal (subledger-owned), which a will try to crystallize INSTEAD of
     // its bound a_pos to inflate its points + the cohort denominator.
     let decoy = Pubkey::new_unique();
     set_position(
@@ -5734,7 +5893,7 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
     );
     assert_eq!(
         denom, 2_000,
-        "insurance denominator reflects the real bound shares, not the 9_999 decoy"
+        "insurance denominator reflects the real bound principal, not the 9_999 decoy"
     );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -5758,9 +5917,9 @@ fn crystallize_rejects_a_substituted_ledger_no_denominator_inflation() {
     );
 }
 
-// finding KM: a share-value claim must be authorized by the stake's OWN owner. claim caps the payout by
-// LIVE shares, so a permissionless trigger would let an attacker force the victim's claim during a
-// transient low-share moment (mid partial-withdraw: withdrawn=false, shares reduced) and the irreversible
+// finding KM: a capital claim must be authorized by the stake's OWN owner. claim caps the payout by
+// LIVE principal, so a permissionless trigger would let an attacker force the victim's claim during a
+// transient low-principal moment (mid partial-withdraw: withdrawn=false, principal reduced) and the irreversible
 // claimed-flag would lock in the reduced payout. Here the attacker's forced claim is rejected, so the
 // victim re-deposits and claims their FULL share themselves.
 #[test]
@@ -5800,7 +5959,7 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
 
-    // victim is mid partial-withdraw: still a live backer (withdrawn=false) but shares transiently at 30.
+    // victim has partially withdrawn: still live (withdrawn=false), but principal is now 30.
     set_position(
         &mut svm,
         &pos,
@@ -5811,7 +5970,7 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
         false,
     );
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &victim.pubkey());
-    // the attacker cannot force the victim's claim at the low-share moment.
+    // the attacker cannot force the victim's claim at the low-principal moment.
     assert!(
         claim_as(
             &mut svm,
@@ -5823,7 +5982,7 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
             Some(&pos)
         )
         .is_err(),
-        "a third party must not be able to force a share-value claim"
+        "a third party must not be able to force a capital claim"
     );
     assert_eq!(
         token_amount(&svm, &ata),
@@ -5831,7 +5990,7 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
         "nothing was paid out by the forced attempt"
     );
 
-    // the victim re-deposits to full shares and claims THEMSELVES -> full 100_000 (grief avoided).
+    // the victim re-deposits to full principal and claims THEMSELVES -> full 100_000 (grief avoided).
     set_position(
         &mut svm,
         &pos,
@@ -5849,12 +6008,12 @@ fn share_value_claim_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
     );
 }
 
-// finding KO (KM parity, one step earlier): crystallize OVERWRITES a share-value stake's points from the
-// live shares NOW, and freeze locks that as the frozen denominator term — which the claim-time min-cap can
+// finding KO (KM parity, one step earlier): crystallize OVERWRITES a capital stake's points from the
+// live principal NOW, and freeze locks that as the frozen denominator term — which the claim-time min-cap can
 // only lower, never raise. So a permissionless crystallize would let an attacker force a victim's points
-// down at a transient low-share moment, then freeze to lock it. crystallize for share-value cohorts is
+// down at a transient low-principal moment, then freeze to lock it. crystallize for capital cohorts is
 // therefore owner-gated. Here the attacker's forced crystallize is rejected; the owner re-crystallizes at
-// full shares and claims their full share.
+// full principal and claims their full share.
 #[test]
 fn share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment() {
     let mut svm = LiteSVM::new();
@@ -5890,7 +6049,7 @@ fn share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_mome
     set_slot(&mut svm, 1_124);
     crystallize(&mut svm, &payer, &env, &victim, &pos).expect("owner crystallizes at 3_000");
 
-    // victim mid partial-withdraw -> live shares transiently 30. The attacker tries to force the points down.
+    // victim mid partial-withdraw -> live principal transiently 30. The attacker tries to force the points down.
     set_position(
         &mut svm,
         &pos,
@@ -5902,10 +6061,10 @@ fn share_value_crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_mome
     );
     assert!(
         crystallize_as(&mut svm, &payer, &env, &attacker, &victim.pubkey(), &pos).is_err(),
-        "a third party must not be able to force a share-value crystallize"
+        "a third party must not be able to force a capital crystallize"
     );
 
-    // victim restores shares and the genesis freezes; the victim claims their FULL 100_000 (grief avoided).
+    // victim restores principal and genesis freezes; the victim claims the full 100_000 (grief avoided).
     set_position(
         &mut svm,
         &pos,
@@ -6424,7 +6583,7 @@ fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero
 // FREE-FARM PROBE (stale frozen points bypass net-by-spent, sweep weird-state): the net-by-spent defense assumes
 // a stake's frozen points reflect the FINAL net (crystallized - spent). But the trader net is NOT monotonic
 // (spent rises -> net drops), and the LP/trader CLAIM uses the FROZEN stake.points with NO live re-read (unlike
-// the share-value cohorts' live-cap). So: crystallize at PEAK net -> raise spent to recover the loss (net -> 0)
+// the capital cohorts' live-cap). So: crystallize at PEAK net -> raise spent to recover the loss (net -> 0)
 // -> do NOT re-crystallize -> freeze -> claim the STALE-HIGH points. An honest co-trader is diluted by the
 // attacker's recovered-but-still-counted loss. This probes whether that bypass pays out.
 #[test]
@@ -7829,7 +7988,7 @@ fn claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim() {
 }
 
 // register guards distinct from the foreign-owner/pool/market tests: an out-of-range cohort, CROSS-PROGRAM
-// type confusion (a share-value cohort pointed at a percolator account, or an LP/trader cohort at a subledger
+// type confusion (a capital cohort pointed at a percolator account, or an LP/trader cohort at a subledger
 // position — the owner-PROGRAM check blocks reading the wrong struct at the bound offsets), and a
 // double-register (the per-owner stake PDA already exists). Real .so.
 #[test]
@@ -8575,9 +8734,9 @@ fn cross_cohort_claims_never_exceed_cohort_or_total_supply() {
 
 // CROSS-COHORT 100-CASE LIFECYCLE SWEEP: mixes tiny supplies, odd bps splits, zero/100% portfolio-flow
 // fees, zero-bps cohorts, stale live caps, idle zero-point stakes, receiver-only funding canaries, foreign
-// share-value claim attempts, permissionless portfolio-flow claims, and varied claim order. This is the
+// capital claim attempts, permissionless portfolio-flow claims, and varied claim order. This is the
 // broad "weird branch" conservation probe: each case must pay only the expected capped/fee-adjusted amount,
-// never let idle/receiver-only stakes farm, never let a foreign cranker force a share-value claim, and never
+// never let idle/receiver-only stakes farm, never let a foreign cranker force a capital claim, and never
 // overdraw the vault regardless of claim order.
 #[test]
 fn cross_cohort_100_case_lifecycle_sweep_no_overdraw_or_free_farm() {
@@ -9034,7 +9193,7 @@ fn cross_cohort_100_case_lifecycle_sweep_no_overdraw_or_free_farm() {
         assert_eq!(
             token_amount(&svm, &ins_ata),
             0,
-            "case {case_idx}: rejected forced share-value claim pays nothing"
+            "case {case_idx}: rejected forced capital claim pays nothing"
         );
 
         if case_idx % 2 == 0 {

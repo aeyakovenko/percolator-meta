@@ -145,6 +145,11 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         "Position.owner offset"
     );
     assert_eq!(
+        rd::SUB_POS_PRINCIPAL,
+        subledger_program::POS_PRINCIPAL_OFF,
+        "Position.principal (cross-pool base-unit points) offset"
+    );
+    assert_eq!(
         rd::SUB_POS_WITHDRAWN,
         subledger_program::POS_WITHDRAWN_OFF,
         "Position.withdrawn offset"
@@ -153,10 +158,5 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         rd::SUB_POS_START_SLOT,
         subledger_program::POS_START_SLOT_OFF,
         "Position.start_slot (top-up reset clock) offset"
-    );
-    assert_eq!(
-        rd::SUB_POS_SHARES,
-        subledger_program::POS_SHARES_OFF,
-        "Position.shares (share-value) offset"
     );
 }
