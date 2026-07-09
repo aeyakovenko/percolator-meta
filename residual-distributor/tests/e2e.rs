@@ -1,4 +1,4 @@
-//! [branch-only, DO NOT PUSH] e2e: residual-distributor 4-cohort deterministic distribution
+//! LiteSVM e2e: fixed-supply and TWAP-funded deterministic reward epochs.
 //! (10/10/40/40). Insurance + backing reward SUBLEDGER SHARE VALUE (Position.shares — pro-rata with
 //! fees, soft-veto on exit); LP/trader reward residual counters; optional funding-payer cohort rewards
 //! cumulative Percolator funding-paid counters. Self-service flow:
@@ -38,6 +38,7 @@ const COHORT_BACKING: u8 = 1;
 const COHORT_LP: u8 = 2;
 const COHORT_TRADER: u8 = 3;
 const COHORT_FUNDING_PAYER: u8 = 4;
+const IX_INIT_REWARD_EPOCH: u8 = 6;
 
 thread_local! {
     static REGISTERED_LINKS: RefCell<HashMap<(Pubkey, Pubkey), Vec<Pubkey>>> =
@@ -249,6 +250,81 @@ fn rd_init_accounts(
         AccountMeta::new(rd_config, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         AccountMeta::new_readonly(coin_mint_authority, true),
+    ]
+}
+
+#[derive(Clone, Copy)]
+struct RewardEpochMarket {
+    market: Pubkey,
+    insurance_pool: Pubkey,
+    backing_pool: Pubkey,
+}
+
+fn reward_epoch_pda(authority: &Pubkey, coin_mint: &Pubkey, epoch_id: u64) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"rd_epoch",
+            authority.as_ref(),
+            coin_mint.as_ref(),
+            &epoch_id.to_le_bytes(),
+        ],
+        &rd_id(),
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reward_epoch_init_data(
+    epoch_id: u64,
+    start_slot: u64,
+    emission_end_slot: u64,
+    expected_reward_supply: u64,
+    insurance_bps: u16,
+    backing_bps: u16,
+    lp_bps: u16,
+    funding_payer_bps: u16,
+    finalize_window: u64,
+    fee_bps: u16,
+    markets: &[RewardEpochMarket],
+) -> Vec<u8> {
+    let mut data = vec![IX_INIT_REWARD_EPOCH];
+    data.extend_from_slice(&epoch_id.to_le_bytes());
+    data.extend_from_slice(&start_slot.to_le_bytes());
+    data.extend_from_slice(&emission_end_slot.to_le_bytes());
+    data.extend_from_slice(&expected_reward_supply.to_le_bytes());
+    data.extend_from_slice(&insurance_bps.to_le_bytes());
+    data.extend_from_slice(&backing_bps.to_le_bytes());
+    data.extend_from_slice(&lp_bps.to_le_bytes());
+    data.extend_from_slice(&funding_payer_bps.to_le_bytes());
+    data.extend_from_slice(&finalize_window.to_le_bytes());
+    data.extend_from_slice(&fee_bps.to_le_bytes());
+    data.push(markets.len() as u8);
+    for scope in markets {
+        data.extend_from_slice(scope.market.as_ref());
+        data.extend_from_slice(scope.insurance_pool.as_ref());
+        data.extend_from_slice(scope.backing_pool.as_ref());
+    }
+    data
+}
+
+fn reward_epoch_init_accounts(
+    payer: Pubkey,
+    authority: Pubkey,
+    coin_mint: Pubkey,
+    percolator_program: Pubkey,
+    subledger_program: Pubkey,
+    config: Pubkey,
+    vault: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new_readonly(authority, true),
+        AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(percolator_program, false),
+        AccountMeta::new_readonly(subledger_program, false),
+        AccountMeta::new(config, false),
+        AccountMeta::new_readonly(vault, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
     ]
 }
 
@@ -773,6 +849,269 @@ fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16)
         emission_end,
         finalize_window,
     }
+}
+
+#[test]
+fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let epoch_ids = [41u64, 42u64];
+    let configs = epoch_ids.map(|epoch_id| reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id));
+    let vaults = configs.map(|config| create_token_account(&mut svm, &payer, &coin_mint, &config));
+
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let scope = RewardEpochMarket {
+        market: Pubkey::new_unique(),
+        insurance_pool: Pubkey::new_unique(),
+        backing_pool: Pubkey::new_unique(),
+    };
+    let oi_only_scope = RewardEpochMarket {
+        market: Pubkey::new_unique(),
+        insurance_pool: Pubkey::default(),
+        backing_pool: Pubkey::default(),
+    };
+    let start_slot = 100u64;
+    let emission_end = 200u64;
+    let finalize_window = 10u64;
+    set_slot(&mut svm, 50);
+
+    for ((epoch_id, config), vault) in epoch_ids.into_iter().zip(configs).zip(vaults) {
+        let ix = Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                stub_perc,
+                stub_sub,
+                config,
+                vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                start_slot,
+                emission_end,
+                0, // dynamic: freeze the COIN actually accumulated in this epoch vault
+                1_000,
+                1_000,
+                0,
+                8_000,
+                finalize_window,
+                0,
+                &[scope, oi_only_scope],
+            ),
+        };
+        send(&mut svm, &payer, &[ix], &[&dao]).expect("DAO initializes reward epoch");
+    }
+
+    let epoch_supplies = [1_000_000u64, 2_000_000u64];
+    for (vault, supply) in vaults.into_iter().zip(epoch_supplies) {
+        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+    }
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+
+    let envs =
+        configs
+            .into_iter()
+            .zip(vaults)
+            .zip(epoch_supplies)
+            .map(|((rd_config, vault), supply)| Env {
+                rd_config,
+                coin_mint,
+                vault,
+                mint_auth: Keypair::new(),
+                stub_sub,
+                stub_perc,
+                ins_pool: scope.insurance_pool,
+                back_pool: scope.backing_pool,
+                market: scope.market,
+                supply,
+                emission_end,
+                finalize_window,
+            });
+    let envs = envs.collect::<Vec<_>>();
+
+    let insurance_owner = Keypair::new();
+    let backing_owner = Keypair::new();
+    let funding_owner = Keypair::new();
+    let insurance_position = Pubkey::new_unique();
+    let backing_position = Pubkey::new_unique();
+    let funding_portfolio = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &insurance_position,
+        &stub_sub,
+        &scope.insurance_pool,
+        &insurance_owner.pubkey(),
+        100,
+        false,
+    );
+    set_position(
+        &mut svm,
+        &backing_position,
+        &stub_sub,
+        &scope.backing_pool,
+        &backing_owner.pubkey(),
+        100,
+        false,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &funding_portfolio,
+        &stub_perc,
+        &oi_only_scope.market,
+        &funding_owner.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+
+    let insurance_ata =
+        create_token_account(&mut svm, &payer, &coin_mint, &insurance_owner.pubkey());
+    let backing_ata = create_token_account(&mut svm, &payer, &coin_mint, &backing_owner.pubkey());
+    let funding_ata = create_token_account(&mut svm, &payer, &coin_mint, &funding_owner.pubkey());
+
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &envs[0],
+            &insurance_owner,
+            &insurance_owner.pubkey(),
+            &insurance_position,
+            COHORT_INSURANCE,
+        )
+        .is_err(),
+        "registration cannot begin before the immutable epoch start"
+    );
+
+    set_slot(&mut svm, start_slot);
+    for env in &envs {
+        register(
+            &mut svm,
+            &payer,
+            env,
+            &insurance_owner,
+            &insurance_owner.pubkey(),
+            &insurance_position,
+            COHORT_INSURANCE,
+        )
+        .expect("insurance registers in epoch");
+        register(
+            &mut svm,
+            &payer,
+            env,
+            &backing_owner,
+            &backing_owner.pubkey(),
+            &backing_position,
+            COHORT_BACKING,
+        )
+        .expect("backing registers in epoch");
+        register(
+            &mut svm,
+            &payer,
+            env,
+            &funding_owner,
+            &funding_owner.pubkey(),
+            &funding_portfolio,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("funding payer registers in epoch");
+    }
+
+    set_portfolio_funding(
+        &mut svm,
+        &funding_portfolio,
+        &stub_perc,
+        &oi_only_scope.market,
+        &funding_owner.pubkey(),
+        7,
+        100,
+        3,
+        100,
+    );
+    set_slot(&mut svm, emission_end);
+    let late_owner = Keypair::new();
+    let late_position = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &late_position,
+        &stub_sub,
+        &scope.insurance_pool,
+        &late_owner.pubkey(),
+        1_000_000,
+        false,
+    );
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &envs[0],
+            &late_owner,
+            &late_owner.pubkey(),
+            &late_position,
+            COHORT_INSURANCE,
+        )
+        .is_err(),
+        "registration closes exactly at emission_end; late capital cannot dilute the epoch"
+    );
+    for env in &envs {
+        crystallize(&mut svm, &payer, env, &insurance_owner, &insurance_position)
+            .expect("insurance crystallizes");
+        crystallize(&mut svm, &payer, env, &backing_owner, &backing_position)
+            .expect("backing crystallizes");
+        crystallize(&mut svm, &payer, env, &funding_owner, &funding_portfolio)
+            .expect("funding payer crystallizes");
+    }
+
+    set_slot(&mut svm, emission_end + finalize_window);
+    assert!(
+        freeze_ix(
+            &mut svm,
+            &payer,
+            envs[0].rd_config,
+            coin_mint,
+            envs[1].vault,
+        )
+        .is_err(),
+        "a cranker cannot swap another epoch's same-mint vault into the one-shot freeze"
+    );
+    for env in &envs {
+        freeze(&mut svm, &payer, env).expect("dynamic reward pool freezes");
+        claim(
+            &mut svm,
+            &payer,
+            env,
+            &insurance_owner,
+            &insurance_ata,
+            Some(&insurance_position),
+        )
+        .expect("insurance claims epoch reward");
+        claim(
+            &mut svm,
+            &payer,
+            env,
+            &backing_owner,
+            &backing_ata,
+            Some(&backing_position),
+        )
+        .expect("backing claims epoch reward");
+        claim(&mut svm, &payer, env, &funding_owner, &funding_ata, None)
+            .expect("funding payer claims epoch reward");
+        assert_eq!(token_amount(&svm, &env.vault), 0);
+    }
+
+    assert_eq!(token_amount(&svm, &insurance_ata), 300_000);
+    assert_eq!(token_amount(&svm, &backing_ata), 300_000);
+    assert_eq!(token_amount(&svm, &funding_ata), 2_400_000);
 }
 
 // DoS PROBE (lamport-prefund front-run brick, sweep tick D): the rd creates its rd_config (and every stake) PDA
@@ -8822,6 +9161,58 @@ fn freeze_enforces_fixed_supply_and_vault_integrity() {
     assert!(
         freeze_ix(&mut svm, &payer, rd2, mint2, vault2).is_ok(),
         "after clearing freeze authority, accepted"
+    );
+
+    // A vault frozen BEFORE freeze authority is revoked remains frozen forever. Authority revocation
+    // alone is therefore insufficient: accepting this one-shot vault would brick every later claim.
+    let ma_frozen = Keypair::new();
+    let fa_frozen = Keypair::new();
+    let frozen_mint = create_mint_with_freeze(
+        &mut svm,
+        &payer,
+        &ma_frozen.pubkey(),
+        Some(&fa_frozen.pubkey()),
+    );
+    let frozen_rd = rd_init(&mut svm, &payer, supply, &frozen_mint, &ma_frozen);
+    let frozen_vault = create_token_account(&mut svm, &payer, &frozen_mint, &frozen_rd);
+    mint_to(
+        &mut svm,
+        &payer,
+        &frozen_mint,
+        &ma_frozen,
+        &frozen_vault,
+        supply,
+    );
+    let freeze_vault = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &frozen_vault,
+        &frozen_mint,
+        &fa_frozen.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &payer, &[freeze_vault], &[&fa_frozen]).expect("freeze reward vault");
+    revoke_mint(&mut svm, &payer, &frozen_mint, &ma_frozen);
+    let revoke_freeze = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &frozen_mint,
+        None,
+        AuthorityType::FreezeAccount,
+        &fa_frozen.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &payer, &[revoke_freeze], &[&fa_frozen])
+        .expect("revoke freeze authority after freezing vault");
+    set_slot(&mut svm, past);
+    assert!(
+        freeze_ix(&mut svm, &payer, frozen_rd, frozen_mint, frozen_vault,).is_err(),
+        "an already-frozen vault must not consume the one-shot reward freeze"
+    );
+    assert_eq!(
+        &svm.get_account(&frozen_rd).unwrap().data[318..326],
+        &0u64.to_le_bytes(),
+        "rejected frozen vault leaves the reward config unfrozen"
     );
 
     // (EZ) a vault NOT owned by rd_config is rejected even when fully funded.

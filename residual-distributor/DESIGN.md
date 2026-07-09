@@ -1,14 +1,32 @@
-# residual-distributor — design
+# residual-distributor — reusable reward epochs
 
-Deterministic, points-based COIN distribution decider. Replaces winner-take-all voting
-(`genesis-vote`) behind the `distribution` program's pluggable-decider seam. It supports five
-cohorts of the fixed COIN supply, each split pro-rata to Sybil/wash/JIT-resistant points:
+Deterministic, points-based COIN rewards. The same program handles fixed-supply genesis and
+post-genesis TWAP-funded epochs. It supports five cohorts, each split pro-rata to points:
 
 - insurance deposits       (subledger share value; exit forfeits points)
 - backing deposits         (subledger share value; exit forfeits points)
 - LP residual received     (`residual_received_atoms_total` delta, log-time weighted)
 - trader residual losses   (`residual_crystallized_loss_atoms_total - residual_spent_principal_atoms_total`, log-time weighted)
 - cumulative funding payers (`funding_long_paid_atoms_total + funding_short_paid_atoms_total` delta, no age multiplier; optional bps)
+
+## Reusable epoch model
+
+`IX_INIT_REWARD_EPOCH` creates a canonical config PDA for
+`(authority, COIN mint, epoch id)`. The authority signs only creation; the schedule, bps, canonical
+COIN vault, and up to six `(market, insurance pool, backing pool)` scopes are immutable afterward.
+The regular `register -> crystallize -> freeze -> claim` instructions are shared with genesis.
+
+- **Fixed mode:** `expected_reward_supply > 0`; freeze requires that amount to equal the immutable
+  mint supply and be present in the vault. This is deterministic genesis.
+- **Vault-balance mode:** `expected_reward_supply == 0`; freeze snapshots the canonical vault's
+  actual balance. TWAP can send its retained share of bought COIN into that vault during the epoch.
+- A scope may omit insurance/backing pools and contribute only portfolio-flow points. This lets a
+  handed-off genesis market provide capital cohorts while other DAO-vetted live markets provide OI.
+
+No reward instruction can move collateral. Subledger positions and Percolator portfolios are
+read-only inputs. The only token CPI transfers the configured COIN mint from the epoch PDA's bound
+vault to the stake's bound recipient. A rewards bug can affect COIN allocation; it cannot withdraw,
+redirect, lock, or confiscate insurance/backing principal.
 
 ## Anti-capture stack (defence in depth, weakest-to-strongest)
 
@@ -35,7 +53,7 @@ cohorts of the fixed COIN supply, each split pro-rata to Sybil/wash/JIT-resistan
 - Symmetric for backing depositors if they exit before crystallization: live shares drop, so their points drop.
 
 ## Trust / determinism
-- `IX_FREEZE` snapshots cohort denominators after the finalize window; `IX_CLAIM` then pays
+- `IX_FREEZE` snapshots cohort denominators and the reward supply after the finalize window; `IX_CLAIM` then pays
   `floor(cohort_supply * stake.points / frozen_total_points)` to the stake's bound recipient.
   Nothing is trusted from a cranker; users self-claim their deterministic share.
 - Stake PDAs are derived as `[b"rd_stake", config, owner, linked_account, reward_family]`. Insurance,
@@ -49,11 +67,13 @@ cohorts of the fixed COIN supply, each split pro-rata to Sybil/wash/JIT-resistan
 ## Status
 - Done + unit/e2e-tested: point math (residual log2 / window / pro-rata); Config + Stake state;
   init / register_start / crystallize / freeze / claim.
-- Done + e2e (real SBF binary): funding-payer points go to cumulative paid funding
+- Done + e2e (real SBF binaries): funding-payer points go to cumulative paid funding
   (`funding_long_paid_atoms_total + funding_short_paid_atoms_total`), not `*_received_atoms_total`
   deltas, with no age multiplier. The tested genesis split is 10% insurance + 10% backing + 80% cumulative funding-payer.
   The chain test drives a live Percolator market through EWMA mark config, long-pays-short and
-  short-pays-long funding, residual-distributor payout, DAO handoff, TWAP init, and surplus pull.
+  short-pays-long funding, fixed-supply genesis payout, DAO handoff, three consecutive 15-day TWAP
+  auctions, a per-round 50% reward / 50% burn split, and one cumulative 10/10/80 dynamic reward epoch
+  across two selected markets.
 - Done + unit-tested: SOFT-VETO forfeiture. `insurance_points(seal_slot, principal, start_slot,
   withdrawn)` reads the LIVE subledger position; a withdrawn / zero-principal position yields 0,
   so a depositor that exited with the surplus forfeits its COIN (the share is never allocated and
@@ -76,8 +96,9 @@ residual or funding flow while internalizing the other side. So a portfolio is c
 provenance market is on an orchestrator-vetted allow-list of trusted-Pyth markets whose oracle the public
 cannot move.**
 
-**Config.** `market_group` (primary) + up to `MAX_EXTRA_MARKETS` (9) extras, fixed at init
-(`extra_market_count` + `extra_markets[..]`, appended config tail so existing offsets don't shift).
+**Config.** Legacy configs use `market_group` (primary) + up to `MAX_EXTRA_MARKETS` (9) extras.
+Reward epochs atomically bind up to six full market/pool scopes; six is conservative under Solana's
+transaction-size limit with two signatures. All scope fields are fixed at init.
 `register_start` for the portfolio-flow cohorts requires `portfolio.provenance.market_group ∈ allow-list`
 (`Config::market_allowed`). Pinned by allow-list e2e tests;
 the single-market form is finding IL (`register_rejects_portfolio_from_a_foreign_market`).

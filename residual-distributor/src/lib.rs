@@ -1,12 +1,10 @@
-//! Deterministic, points-based COIN distribution decider.
+//! Deterministic, points-based COIN reward epochs.
 //!
-//! **Branch `risidual_genesis_never_push_upstream` — do NOT push upstream.**
-//!
-//! Drop-in alternative to `genesis-vote` behind the `distribution` program's
-//! pluggable-decider seam (see distribution/src/lib.rs "Decider seam"). The winning
-//! COIN allocation is computed **deterministically** from residual-backing points,
-//! so there is nothing for a late whale to capture: every backer's share is fixed
-//! by the risk it actually bore.
+//! Fixed mode allocates the immutable genesis supply; vault-balance mode allocates COIN
+//! accumulated from later TWAP buybacks. Both modes reuse the same register, counter-delta,
+//! freeze, and self-claim implementation. Percolator and subledger accounts are read-only;
+//! the only token CPI moves the configured COIN mint from a canonical epoch vault to a
+//! stake's bound recipient.
 //!
 //! ## Points source — percolator counters via snapshot-delta (zero ledgers in percolator)
 //!
@@ -80,9 +78,17 @@ const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
 // The creator stands up N trusted-Pyth markets while holding the market-auth key locally, vets them, then
 // transfers that key to the PDA that rotates it to the DAO — so the allow-listed markets cannot later be
 // repointed at an attacker oracle. See DESIGN.md "Market allow-list".
-const MAX_EXTRA_MARKETS: usize = 9; // 10 total allow-listed markets (market_group + 9 extras)
+// Ten total allow-listed markets: market_group plus nine extras.
+const MAX_EXTRA_MARKETS: usize = 9;
+// Reward-epoch init carries a full (market, insurance pool, backing pool) tuple atomically. Six
+// tuples leave room for two signatures and all account keys under Solana's transaction-size limit.
+const MAX_REWARD_EPOCH_MARKETS: usize = 6;
 const CONFIG_FUNDING_TAIL_OFF: usize = 466 + 1 + MAX_EXTRA_MARKETS * 32;
-const CONFIG_SIZE: usize = CONFIG_FUNDING_TAIL_OFF + 68;
+const CONFIG_EPOCH_TAIL_OFF: usize = CONFIG_FUNDING_TAIL_OFF + 68;
+const CONFIG_EXTRA_INSURANCE_POOLS_OFF: usize = CONFIG_EPOCH_TAIL_OFF + 50;
+const CONFIG_EXTRA_BACKING_POOLS_OFF: usize =
+    CONFIG_EXTRA_INSURANCE_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
+const CONFIG_SIZE: usize = CONFIG_EXTRA_BACKING_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
                                // Share cohorts + portfolio-flow cohorts. Insurance/backing reward SHARE VALUE; LP/trader reward residual
                                // counters; optional funding-payer cohort rewards the sum of Percolator funding-paid counters. See tests/offsets.rs.
@@ -100,6 +106,12 @@ const IX_CRYSTALLIZE: u8 = 2;
 // cohort denominators and closes register/crystallize; backers then finalize/claim their own share.
 const IX_FREEZE: u8 = 4;
 const IX_CLAIM: u8 = 5;
+const IX_INIT_REWARD_EPOCH: u8 = 6;
+
+const CONFIG_KIND_LEGACY: u8 = 0;
+const CONFIG_KIND_REWARD_EPOCH: u8 = 1;
+const REWARD_SUPPLY_FIXED: u8 = 0;
+const REWARD_SUPPLY_VAULT_BALANCE: u8 = 1;
 
 // ===========================================================================
 // Deterministic, gaming-resistant point math  (pure — unit-tested below)
@@ -328,13 +340,23 @@ struct Config {
     reserved_funding_payer_total_points: u128,
     frozen_funding_payer_total_points: u128,
     reserved_frozen_funding_payer_total_points: u128,
+    // Multi-epoch tail. Legacy genesis configs leave authority default and kind=0. Reward epochs are
+    // canonical per (authority, coin_mint, epoch_id), bind their COIN vault at init, and may snapshot
+    // either a fixed whole-mint supply or the vault balance accumulated from TWAP buybacks.
+    epoch_authority: Pubkey,
+    epoch_id: u64,
+    emission_start_slot: u64,
+    reward_supply_mode: u8,
+    config_kind: u8,
+    extra_insurance_pools: Vec<Pubkey>,
+    extra_backing_pools: Vec<Pubkey>,
 }
 impl Config {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
         if d.len() < CONFIG_SIZE || d[..8] != CONFIG_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
-        Ok(Config {
+        let config = Config {
             coin_mint: pk(d, 8),
             distribution_program: pk(d, 40),
             distribution_config: pk(d, 72),
@@ -402,7 +424,45 @@ impl Config {
                     .try_into()
                     .unwrap(),
             ),
-        })
+            epoch_authority: pk(d, CONFIG_EPOCH_TAIL_OFF),
+            epoch_id: u64::from_le_bytes(
+                d[CONFIG_EPOCH_TAIL_OFF + 32..CONFIG_EPOCH_TAIL_OFF + 40]
+                    .try_into()
+                    .unwrap(),
+            ),
+            emission_start_slot: u64::from_le_bytes(
+                d[CONFIG_EPOCH_TAIL_OFF + 40..CONFIG_EPOCH_TAIL_OFF + 48]
+                    .try_into()
+                    .unwrap(),
+            ),
+            reward_supply_mode: d[CONFIG_EPOCH_TAIL_OFF + 48],
+            config_kind: d[CONFIG_EPOCH_TAIL_OFF + 49],
+            extra_insurance_pools: {
+                let mut pools = Vec::with_capacity(MAX_EXTRA_MARKETS);
+                for i in 0..MAX_EXTRA_MARKETS {
+                    pools.push(pk(d, CONFIG_EXTRA_INSURANCE_POOLS_OFF + i * 32));
+                }
+                pools
+            },
+            extra_backing_pools: {
+                let mut pools = Vec::with_capacity(MAX_EXTRA_MARKETS);
+                for i in 0..MAX_EXTRA_MARKETS {
+                    pools.push(pk(d, CONFIG_EXTRA_BACKING_POOLS_OFF + i * 32));
+                }
+                pools
+            },
+        };
+        if config.config_kind > CONFIG_KIND_REWARD_EPOCH
+            || config.reward_supply_mode > REWARD_SUPPLY_VAULT_BALANCE
+            || config.extra_market_count as usize > MAX_EXTRA_MARKETS
+            || (config.config_kind == CONFIG_KIND_LEGACY
+                && config.reward_supply_mode != REWARD_SUPPLY_FIXED)
+            || (config.config_kind == CONFIG_KIND_REWARD_EPOCH
+                && config.epoch_authority == Pubkey::default())
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(config)
     }
     fn serialize(&self, d: &mut [u8]) {
         d[..8].copy_from_slice(&CONFIG_DISC);
@@ -453,6 +513,28 @@ impl Config {
                 .reserved_frozen_funding_payer_total_points
                 .to_le_bytes(),
         );
+        d[CONFIG_EPOCH_TAIL_OFF..CONFIG_EPOCH_TAIL_OFF + 32]
+            .copy_from_slice(self.epoch_authority.as_ref());
+        d[CONFIG_EPOCH_TAIL_OFF + 32..CONFIG_EPOCH_TAIL_OFF + 40]
+            .copy_from_slice(&self.epoch_id.to_le_bytes());
+        d[CONFIG_EPOCH_TAIL_OFF + 40..CONFIG_EPOCH_TAIL_OFF + 48]
+            .copy_from_slice(&self.emission_start_slot.to_le_bytes());
+        d[CONFIG_EPOCH_TAIL_OFF + 48] = self.reward_supply_mode;
+        d[CONFIG_EPOCH_TAIL_OFF + 49] = self.config_kind;
+        for i in 0..MAX_EXTRA_MARKETS {
+            let insurance_pool = self
+                .extra_insurance_pools
+                .get(i)
+                .copied()
+                .unwrap_or_default();
+            d[CONFIG_EXTRA_INSURANCE_POOLS_OFF + i * 32
+                ..CONFIG_EXTRA_INSURANCE_POOLS_OFF + (i + 1) * 32]
+                .copy_from_slice(insurance_pool.as_ref());
+            let backing_pool = self.extra_backing_pools.get(i).copied().unwrap_or_default();
+            d[CONFIG_EXTRA_BACKING_POOLS_OFF + i * 32
+                ..CONFIG_EXTRA_BACKING_POOLS_OFF + (i + 1) * 32]
+                .copy_from_slice(backing_pool.as_ref());
+        }
     }
     /// Is `m` an allow-listed (orchestrator-vetted trusted-Pyth) market for the funding-payer cohort? The
     /// primary `market_group` plus the first `extra_market_count` extras. Default is never allowed.
@@ -465,6 +547,21 @@ impl Config {
         }
         let count = core::cmp::min(self.extra_market_count as usize, self.extra_markets.len());
         self.extra_markets[..count].contains(m)
+    }
+    fn pool_allowed(&self, cohort: u8, pool: &Pubkey) -> bool {
+        if *pool == Pubkey::default() {
+            return false;
+        }
+        let (primary, extras) = match cohort {
+            COHORT_INSURANCE => (self.subledger_pool, &self.extra_insurance_pools),
+            COHORT_BACKING => (self.backing_pool, &self.extra_backing_pools),
+            _ => return false,
+        };
+        if *pool == primary {
+            return true;
+        }
+        let count = core::cmp::min(self.extra_market_count as usize, extras.len());
+        extras[..count].contains(pool)
     }
     /// Trader bps = the remainder after all explicit cohort bps.
     fn trader_bps(&self) -> u16 {
@@ -622,6 +719,7 @@ pub fn process_instruction(
         IX_CRYSTALLIZE => crystallize(program_id, accounts),
         IX_FREEZE => freeze(program_id, accounts),
         IX_CLAIM => claim(program_id, accounts),
+        IX_INIT_REWARD_EPOCH => init_reward_epoch(program_id, accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -838,6 +936,207 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
         reserved_funding_payer_total_points: 0,
         frozen_funding_payer_total_points: 0,
         reserved_frozen_funding_payer_total_points: 0,
+        epoch_authority: Pubkey::default(),
+        epoch_id: 0,
+        emission_start_slot: 0,
+        reward_supply_mode: REWARD_SUPPLY_FIXED,
+        config_kind: CONFIG_KIND_LEGACY,
+        extra_insurance_pools: Vec::new(),
+        extra_backing_pools: Vec::new(),
+    }
+    .serialize(&mut config_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
+// init_reward_epoch accounts:
+// [payer(s,w), authority(s), coin_mint, percolator_program, subledger_program,
+//  config(pda,w), vault, system]
+//
+// data: epoch_id(u64), emission_start(u64), emission_end(u64), expected_reward_supply(u64),
+// insurance_bps(u16), backing_bps(u16), lp_bps(u16), funding_payer_bps(u16),
+// finalize_window(u64), fee_bps(u16), market_count(u8),
+// market_count * [market, insurance_pool, backing_pool].
+//
+// `expected_reward_supply == 0` selects a TWAP-funded epoch: freeze snapshots the canonical
+// vault's actual COIN balance. A nonzero value selects the genesis/full-mint invariant. Both modes
+// share every subsequent instruction and can never move Percolator collateral or subledger assets.
+fn init_reward_epoch(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    mut data: &[u8],
+) -> ProgramResult {
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let authority = next_account_info(iter)?;
+    let coin_mint = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let subledger_program = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let vault = next_account_info(iter)?;
+    let system = next_account_info(iter)?;
+
+    let epoch_id = take_u64(&mut data)?;
+    let emission_start_slot = take_u64(&mut data)?;
+    let emission_end_slot = take_u64(&mut data)?;
+    let expected_reward_supply = take_u64(&mut data)?;
+    let insurance_bps = take_u16(&mut data)?;
+    let backing_bps = take_u16(&mut data)?;
+    let lp_bps = take_u16(&mut data)?;
+    let funding_payer_bps = take_u16(&mut data)?;
+    let finalize_window = take_u64(&mut data)?;
+    let fee_support_bps = take_u16(&mut data)?;
+    let market_count = *data.first().ok_or(ProgramError::InvalidInstructionData)? as usize;
+    data = &data[1..];
+
+    if !payer.is_signer
+        || !authority.is_signer
+        || *authority.key == Pubkey::default()
+        || *system.key != solana_program::system_program::ID
+        || market_count == 0
+        || market_count > MAX_REWARD_EPOCH_MARKETS
+        || finalize_window == 0
+        || fee_support_bps > BPS_DENOMINATOR as u16
+        || emission_end_slot <= emission_start_slot
+        || emission_end_slot.checked_add(finalize_window).is_none()
+        || Clock::get()?.slot > emission_start_slot
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let explicit_bps_sum = (insurance_bps as u32)
+        .checked_add(backing_bps as u32)
+        .and_then(|v| v.checked_add(lp_bps as u32))
+        .and_then(|v| v.checked_add(funding_payer_bps as u32))
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if explicit_bps_sum > BPS_DENOMINATOR as u32 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut markets = Vec::with_capacity(market_count);
+    let mut insurance_pools = Vec::with_capacity(market_count);
+    let mut backing_pools = Vec::with_capacity(market_count);
+    for _ in 0..market_count {
+        let market = take_pubkey(&mut data)?;
+        let insurance_pool = take_pubkey(&mut data)?;
+        let backing_pool = take_pubkey(&mut data)?;
+        if market == Pubkey::default()
+            || markets.contains(&market)
+            || (insurance_pool != Pubkey::default() && insurance_pools.contains(&insurance_pool))
+            || (backing_pool != Pubkey::default() && backing_pools.contains(&backing_pool))
+            || (insurance_pool != Pubkey::default() && insurance_pool == backing_pool)
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        markets.push(market);
+        insurance_pools.push(insurance_pool);
+        backing_pools.push(backing_pool);
+    }
+    if !data.is_empty()
+        || (insurance_bps > 0
+            && !insurance_pools
+                .iter()
+                .any(|pool| *pool != Pubkey::default()))
+        || (backing_bps > 0 && !backing_pools.iter().any(|pool| *pool != Pubkey::default()))
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let epoch_bytes = epoch_id.to_le_bytes();
+    let (expected_config, bump) = Pubkey::find_program_address(
+        &[
+            b"rd_epoch",
+            authority.key.as_ref(),
+            coin_mint.key.as_ref(),
+            &epoch_bytes,
+        ],
+        program_id,
+    );
+    if *config_account.key != expected_config || config_account.data_len() != 0 {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if coin_mint.owner != &spl_token::ID || vault.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let _mint = spl_token::state::Mint::unpack(&coin_mint.try_borrow_data()?)?;
+    let vault_state = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
+    if vault_state.state != spl_token::state::AccountState::Initialized
+        || vault_state.owner != expected_config
+        || vault_state.mint != *coin_mint.key
+        || vault_state.delegate.is_some()
+        || vault_state.delegated_amount != 0
+        || vault_state.close_authority.is_some()
+        || vault_state.is_native.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let bump_arr = [bump];
+    let seeds: [&[u8]; 5] = [
+        b"rd_epoch",
+        authority.key.as_ref(),
+        coin_mint.key.as_ref(),
+        &epoch_bytes,
+        &bump_arr,
+    ];
+    create_pda(
+        payer,
+        config_account,
+        system,
+        program_id,
+        &seeds,
+        CONFIG_SIZE,
+    )?;
+
+    let primary_market = markets[0];
+    let primary_insurance_pool = insurance_pools[0];
+    let primary_backing_pool = backing_pools[0];
+    let extra_market_count = (market_count - 1) as u8;
+    Config {
+        coin_mint: *coin_mint.key,
+        distribution_program: DISTRIBUTION_PROGRAM_ID,
+        distribution_config: Pubkey::default(),
+        percolator_program: *percolator_program.key,
+        total_supply: expected_reward_supply,
+        fee_support_bps,
+        emission_end_slot,
+        total_points: 0,
+        sealed: 0,
+        bump,
+        insurance_bps,
+        insurance_total_points: 0,
+        subledger_program: *subledger_program.key,
+        subledger_pool: primary_insurance_pool,
+        market_group: primary_market,
+        frozen_total_points: 0,
+        frozen_insurance_total_points: 0,
+        freeze_slot: 0,
+        vault: *vault.key,
+        finalize_window,
+        backing_pool: primary_backing_pool,
+        backing_bps,
+        lp_bps,
+        lp_total_points: 0,
+        trader_total_points: 0,
+        frozen_lp_total_points: 0,
+        frozen_trader_total_points: 0,
+        extra_market_count,
+        extra_markets: markets.into_iter().skip(1).collect(),
+        funding_payer_bps,
+        reserved_funding_payer_bps: 0,
+        funding_payer_total_points: 0,
+        reserved_funding_payer_total_points: 0,
+        frozen_funding_payer_total_points: 0,
+        reserved_frozen_funding_payer_total_points: 0,
+        epoch_authority: *authority.key,
+        epoch_id,
+        emission_start_slot,
+        reward_supply_mode: if expected_reward_supply == 0 {
+            REWARD_SUPPLY_VAULT_BALANCE
+        } else {
+            REWARD_SUPPLY_FIXED
+        },
+        config_kind: CONFIG_KIND_REWARD_EPOCH,
+        extra_insurance_pools: insurance_pools.into_iter().skip(1).collect(),
+        extra_backing_pools: backing_pools.into_iter().skip(1).collect(),
     }
     .serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -882,6 +1181,11 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(ProgramError::InvalidAccountData); // denominators frozen — no new registrations
     }
     let now = Clock::get()?.slot;
+    if config.config_kind == CONFIG_KIND_REWARD_EPOCH
+        && (now < config.emission_start_slot || now >= config.emission_end_slot)
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     // `snap` is the register-time counter snapshot: 0 for the share-value cohorts (insurance/backing),
     // and the relevant portfolio-flow counter for portfolio cohorts (delta measured at crystallize).
     let snap: u128 = match cohort {
@@ -895,13 +1199,9 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             if pk(&data, SUB_POS_OWNER) != *owner.key {
                 return Err(ProgramError::IllegalOwner);
             }
-            // Scope to THIS genesis's pool (finding HG): insurance -> subledger_pool, backing -> backing_pool.
-            let scope_pool = if cohort == COHORT_INSURANCE {
-                config.subledger_pool
-            } else {
-                config.backing_pool
-            };
-            if pk(&data, SUB_POS_POOL) != scope_pool {
+            // Scope to one immutable pool in this epoch's DAO-selected market set. Legacy genesis
+            // configs have only the primary pool, so they traverse this same check.
+            if !config.pool_allowed(cohort, &pk(&data, SUB_POS_POOL)) {
                 return Err(ProgramError::IllegalOwner);
             }
             0
@@ -979,6 +1279,16 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     if config.sealed != 0 || config.freeze_slot != 0 {
         return Err(ProgramError::InvalidAccountData); // sealed or frozen -> denominators are final
+    }
+    if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
+        let cutoff = config
+            .emission_end_slot
+            .checked_add(config.finalize_window)
+            .ok_or(ProgramError::InvalidInstructionData)?;
+        let now = Clock::get()?.slot;
+        if now < config.emission_start_slot || now > cutoff {
+            return Err(ProgramError::InvalidInstructionData);
+        }
     }
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
@@ -1079,9 +1389,9 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 // (register/crystallize) to the self-service claim phase. It (1) snapshots the cohort denominators
 // (total_points, insurance_total_points) and stamps freeze_slot, after which register/crystallize are
 // closed so the denominators are final; and (2) BINDS + verifies the COIN vault claims pay from: it
-// must be a token account OWNED BY this rd_config PDA, holding the full fixed supply (EZ), with the
-// coin_mint carrying NO mint or freeze authority (GX) so the supply can't be inflated or frozen under
-// the claimers. double-freeze is rejected so neither the snapshot nor the vault can be moved.
+// must be the initialized token account owned by this config PDA, with the coin_mint carrying NO
+// mint or freeze authority. Fixed mode requires the whole mint; reward-epoch mode snapshots the
+// pre-bound vault balance. Double-freeze is rejected so neither supply nor denominators can move.
 fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -1108,6 +1418,9 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if *coin_mint.key != config.coin_mint {
         return Err(ProgramError::InvalidAccountData);
     }
+    if config.config_kind == CONFIG_KIND_REWARD_EPOCH && *vault.key != config.vault {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // Require SPL Token ownership BEFORE unpacking (parity with distribution::init_config:342): Pack::unpack
     // verifies bytes + length but NOT the owning program, so a NON-SPL account with token/mint-shaped bytes
     // would otherwise pass every field check below. freeze is permissionless + one-shot and BINDS config.vault,
@@ -1118,23 +1431,39 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::IllegalOwner);
     }
     let mint = spl_token::state::Mint::unpack(&coin_mint.try_borrow_data()?)?;
-    if mint.mint_authority.is_some()
-        || mint.freeze_authority.is_some()
-        || mint.supply != config.total_supply
-    {
+    if mint.mint_authority.is_some() || mint.freeze_authority.is_some() {
         return Err(ProgramError::InvalidAccountData);
     }
     let v = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
-    // owner == rd_config + funded with the whole supply (EZ). No delegate/close_authority check is
-    // needed: SPL's set_authority(AccountOwner) clears delegate + delegated_amount + close_authority,
-    // and rd_config (a PDA with no approve instruction) can never set them — so a vault handed to
-    // rd_config is SOLELY rd-controlled. The freeze vault/mint guards (owner, full funding, no mint/freeze
-    // authority) are pinned by the e2e test `freeze_enforces_fixed_supply_and_vault_integrity`.
-    if v.owner != *config_account.key
+    // The vault must be initialized, solely PDA-owned, non-native, and free of delegate/close paths.
+    // AccountState::Initialized is load-bearing: an account frozen before freeze-authority revocation
+    // stays frozen forever and would otherwise consume this one-shot transition while bricking claims.
+    if v.state != spl_token::state::AccountState::Initialized
+        || v.owner != *config_account.key
         || v.mint != config.coin_mint
-        || v.amount < config.total_supply
+        || v.delegate.is_some()
+        || v.delegated_amount != 0
+        || v.close_authority.is_some()
+        || v.is_native.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
+    }
+    match config.reward_supply_mode {
+        REWARD_SUPPLY_FIXED => {
+            if config.total_supply == 0
+                || mint.supply != config.total_supply
+                || v.amount < config.total_supply
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        REWARD_SUPPLY_VAULT_BALANCE => {
+            if config.config_kind != CONFIG_KIND_REWARD_EPOCH || v.amount == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            config.total_supply = v.amount;
+        }
+        _ => return Err(ProgramError::InvalidAccountData),
     }
     config.vault = *vault.key;
     // Snapshot all cohort denominators.
@@ -1310,24 +1639,43 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     stake.serialize(&mut stake_account.try_borrow_mut_data()?);
     if payout > 0 {
         let bump_arr = [config.bump];
-        let signer_seeds: [&[u8]; 3] = [b"rd_config", config.coin_mint.as_ref(), &bump_arr];
-        invoke_signed(
-            &spl_token::instruction::transfer(
-                token_program.key,
-                vault.key,
-                recipient_ata.key,
-                config_account.key,
-                &[],
-                payout,
-            )?,
-            &[
-                vault.clone(),
-                recipient_ata.clone(),
-                config_account.clone(),
-                token_program.clone(),
-            ],
-            &[&signer_seeds],
+        let transfer = spl_token::instruction::transfer(
+            token_program.key,
+            vault.key,
+            recipient_ata.key,
+            config_account.key,
+            &[],
+            payout,
         )?;
+        let infos = [
+            vault.clone(),
+            recipient_ata.clone(),
+            config_account.clone(),
+            token_program.clone(),
+        ];
+        match config.config_kind {
+            CONFIG_KIND_LEGACY => {
+                let signer_seeds: [&[u8]; 3] = [b"rd_config", config.coin_mint.as_ref(), &bump_arr];
+                invoke_signed(&transfer, &infos, &[&signer_seeds])?;
+            }
+            CONFIG_KIND_REWARD_EPOCH => {
+                let epoch_bytes = config.epoch_id.to_le_bytes();
+                let signer_seeds: [&[u8]; 5] = [
+                    b"rd_epoch",
+                    config.epoch_authority.as_ref(),
+                    config.coin_mint.as_ref(),
+                    &epoch_bytes,
+                    &bump_arr,
+                ];
+                let expected = Pubkey::create_program_address(&signer_seeds, program_id)
+                    .map_err(|_| ProgramError::InvalidSeeds)?;
+                if expected != *config_account.key {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                invoke_signed(&transfer, &infos, &[&signer_seeds])?;
+            }
+            _ => return Err(ProgramError::InvalidAccountData),
+        }
     }
     Ok(())
 }
@@ -1413,6 +1761,13 @@ mod tests {
             reserved_funding_payer_total_points: 0,
             frozen_funding_payer_total_points: 0,
             reserved_frozen_funding_payer_total_points: 0,
+            epoch_authority: Pubkey::default(),
+            epoch_id: 0,
+            emission_start_slot: 0,
+            reward_supply_mode: REWARD_SUPPLY_FIXED,
+            config_kind: CONFIG_KIND_LEGACY,
+            extra_insurance_pools: Vec::new(),
+            extra_backing_pools: Vec::new(),
         };
         let owner = Pubkey::new_unique();
         let result =
