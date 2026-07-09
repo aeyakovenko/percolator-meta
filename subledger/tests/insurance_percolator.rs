@@ -42,11 +42,10 @@ use solana_sdk::{
 
 const ATA_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
-const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
-
-fn gv_init_data() -> Vec<u8> {
+fn gv_init_data(delay_slots: u64, start_slot: u64) -> Vec<u8> {
     let mut data = vec![0u8];
-    data.extend_from_slice(&TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes());
+    data.extend_from_slice(&delay_slots.to_le_bytes());
+    data.extend_from_slice(&start_slot.to_le_bytes());
     data
 }
 
@@ -81,8 +80,10 @@ const POLICY_WITH_SURPLUS: u8 = 1;
 const DOMAIN_INSURANCE: u8 = 0;
 const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
 const DEFAULT_GENESIS_DEPOSIT_START_SLOT: u64 = 0;
+const DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS: u64 = 38_880_000;
 const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
 const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
 
 fn insurance_pool_pda_with_schedule(
     mint: &Pubkey,
@@ -91,6 +92,7 @@ fn insurance_pool_pda_with_schedule(
     policy: u8,
     deposit_window_slots: u64,
     deposit_start_slot: u64,
+    bootstrap_delay_slots: u64,
 ) -> Pubkey {
     let policy_seed = [policy];
     let domain_seed = [DOMAIN_INSURANCE];
@@ -106,6 +108,7 @@ fn insurance_pool_pda_with_schedule(
             &domain_seed,
             &deposit_window_slots.to_le_bytes(),
             &deposit_start_slot.to_le_bytes(),
+            &bootstrap_delay_slots.to_le_bytes(),
         ],
         &sub_id(),
     )
@@ -126,6 +129,9 @@ struct Env {
     vault_authority: Pubkey,
     perc_vault: Pubkey,
     pool: Pubkey,
+    deposit_window_slots: u64,
+    bootstrap_start_slot: u64,
+    bootstrap_delay_slots: u64,
 }
 
 impl Env {
@@ -134,10 +140,11 @@ impl Env {
     }
 
     fn new_for_policy(pool_policy: u8) -> Self {
-        Self::new_for_policy_with_schedule(
+        Self::new_for_policy_with_bootstrap_schedule(
             pool_policy,
             DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS,
             DEFAULT_GENESIS_DEPOSIT_START_SLOT,
+            DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS,
         )
     }
 
@@ -149,6 +156,20 @@ impl Env {
         pool_policy: u8,
         deposit_window_slots: u64,
         deposit_start_slot: u64,
+    ) -> Self {
+        Self::new_for_policy_with_bootstrap_schedule(
+            pool_policy,
+            deposit_window_slots,
+            deposit_start_slot,
+            DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS,
+        )
+    }
+
+    fn new_for_policy_with_bootstrap_schedule(
+        pool_policy: u8,
+        deposit_window_slots: u64,
+        bootstrap_start_slot: u64,
+        bootstrap_delay_slots: u64,
     ) -> Self {
         let mut svm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -173,14 +194,16 @@ impl Env {
 
         // The subledger insurance pool PDA: asset-0 insurance authority + operator,
         // bound to (mint, asset_id, market_slab, percolator_program, coin_mint,
-        // policy, domain, deposit_window_slots, deposit_start_slot).
+        // policy, domain, deposit_window_slots, bootstrap_start_slot,
+        // bootstrap_delay_slots).
         let pool = insurance_pool_pda_with_schedule(
             &mint,
             &coin_mint,
             &slab,
             pool_policy,
             deposit_window_slots,
-            deposit_start_slot,
+            bootstrap_start_slot,
+            bootstrap_delay_slots,
         );
 
         // Build the real Live market-0 slab with marketauth = pool PDA and the
@@ -235,7 +258,25 @@ impl Env {
             vault_authority,
             perc_vault,
             pool,
+            deposit_window_slots,
+            bootstrap_start_slot,
+            bootstrap_delay_slots,
         }
+    }
+
+    fn gv_config_pda(&self) -> Pubkey {
+        gv_config_pda_for_schedule(
+            &self.coin_mint,
+            &self.pool,
+            self.bootstrap_delay_slots,
+            self.bootstrap_start_slot,
+        )
+    }
+
+    fn bootstrap_end_slot(&self) -> u64 {
+        self.bootstrap_start_slot
+            .checked_add(self.bootstrap_delay_slots)
+            .expect("test bootstrap schedule must fit")
     }
 
     fn send(&mut self, ixs: &[Instruction], extra: &[&Keypair]) -> Result<(), String> {
@@ -297,12 +338,15 @@ impl Env {
         data.extend_from_slice(&ASSET_ID.to_le_bytes());
         data.push(policy);
         if let Some(window_slots) = window_slots {
+            assert_eq!(window_slots, self.deposit_window_slots);
+            assert_eq!(start_slot, Some(self.bootstrap_start_slot));
             data.extend_from_slice(&window_slots.to_le_bytes());
             data.extend_from_slice(
                 &start_slot
                     .expect("custom deposit window requires an explicit start slot")
                     .to_le_bytes(),
             );
+            data.extend_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
         }
         let ix = Instruction {
             program_id: sub_id(),
@@ -315,7 +359,7 @@ impl Env {
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 // vote_authority = the genesis-vote config PDA (keyed by the COIN).
-                AccountMeta::new_readonly(gv_config_pda(&self.coin_mint, &self.pool), false),
+                AccountMeta::new_readonly(self.gv_config_pda(), false),
                 AccountMeta::new_readonly(self.coin_mint, false),
             ],
             data,
@@ -415,8 +459,8 @@ impl Env {
 // deposit-deadline that would bound BOTH are tracked in SECURITY_LOG as off-harness orchestration work.
 #[test]
 fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
-    let mut env = Env::new();
-    env.init_insurance_pool();
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, 1_200, 0, 1_200);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(1_200), Some(0));
     let ve = setup_vote(&mut env);
 
     let (alice, alice_ata) = new_depositor(&mut env, 20_000); // 2%
@@ -820,8 +864,23 @@ struct VoteEnv {
     coin_vault: Pubkey,
 }
 
-fn gv_config_pda(mint: &Pubkey, subledger_pool: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"gv_config", mint.as_ref(), subledger_pool.as_ref()], &gv_id()).0
+fn gv_config_pda_for_schedule(
+    mint: &Pubkey,
+    subledger_pool: &Pubkey,
+    bootstrap_delay_slots: u64,
+    bootstrap_start_slot: u64,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"gv_config",
+            mint.as_ref(),
+            subledger_pool.as_ref(),
+            &bootstrap_delay_slots.to_le_bytes(),
+            &bootstrap_start_slot.to_le_bytes(),
+        ],
+        &gv_id(),
+    )
+    .0
 }
 fn dist_config_pda(mint: &Pubkey, authority: &Pubkey) -> Pubkey {
     // finding AA: the distribution config PDA binds its seal AUTHORITY (the gv config) into the
@@ -847,7 +906,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
     // gv + distribution are keyed by the COIN (a fixed-supply mint, distinct from
     // the collateral `env.mint` the subledger pool holds).
     let coin_mint = env.coin_mint;
-    let gv_config = gv_config_pda(&coin_mint, &env.pool);
+    let gv_config = env.gv_config_pda();
     let dist_config = dist_config_pda(&coin_mint, &gv_config);
 
     // distribution InitConfig with seal authority = the gv config PDA. Fund the COIN
@@ -887,7 +946,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
             AccountMeta::new_readonly(Pubkey::default(), false), // reserved
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: gv_init_data(),
+        data: gv_init_data(env.bootstrap_delay_slots, env.bootstrap_start_slot),
     };
     env.send(&[ix], &[]).expect("gv init");
 
@@ -974,7 +1033,26 @@ fn gv_vote(
 
 // Permissionless winner-take-all trigger: seals the distribution to the winning
 // proposal. One voter holding 100% trivially clears quorum + majority.
-fn gv_trigger(env: &mut Env, ve: &VoteEnv, gv_proposal: &Pubkey, dist_proposal: &Pubkey) -> Result<(), String> {
+fn gv_trigger(
+    env: &mut Env,
+    ve: &VoteEnv,
+    gv_proposal: &Pubkey,
+    dist_proposal: &Pubkey,
+) -> Result<(), String> {
+    // Genesis gates on slots. Keep the fixture's oracle wall-clock fresh because
+    // production cranks update it continuously during the six-month bootstrap.
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.slot = env.bootstrap_end_slot();
+    env.svm.set_sysvar(&clock);
+    gv_trigger_now(env, ve, gv_proposal, dist_proposal)
+}
+
+fn gv_trigger_now(
+    env: &mut Env,
+    ve: &VoteEnv,
+    gv_proposal: &Pubkey,
+    dist_proposal: &Pubkey,
+) -> Result<(), String> {
     let ix = Instruction {
         program_id: gv_id(),
         accounts: vec![
@@ -1798,7 +1876,7 @@ fn insurance_pool_cannot_be_reinitialized_after_funding() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -2965,8 +3043,8 @@ fn register_rejects_foreign_distribution_proposal() {
 // voters who carried the winning proposal would have their capital frozen forever.
 #[test]
 fn winning_voter_can_retract_and_exit_after_finalize() {
-    let mut env = Env::new();
-    env.init_insurance_pool();
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, 1_200, 0, 1_200);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(1_200), Some(0));
     let ve = setup_vote(&mut env);
 
     let amount = 1_000_000u64;
@@ -3115,7 +3193,12 @@ fn hostile_vote_authority_cannot_squat_the_genesis_pool() {
     // at the real pool PDA. This must also reject; otherwise a fake-coin squat could
     // pass the vote-authority check and consume the real pool address.
     let fake_coin = Pubkey::new_unique();
-    let fake_vote_authority = gv_config_pda(&fake_coin, &env.pool);
+    let fake_vote_authority = gv_config_pda_for_schedule(
+        &fake_coin,
+        &env.pool,
+        env.bootstrap_delay_slots,
+        env.bootstrap_start_slot,
+    );
     let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
     data.extend_from_slice(&ASSET_ID.to_le_bytes());
     data.push(POLICY_PRINCIPAL);
@@ -3147,7 +3230,7 @@ fn hostile_vote_authority_cannot_squat_the_genesis_pool() {
     let ve = setup_vote(&mut env);
     assert_eq!(
         ve.gv_config,
-        gv_config_pda(&env.coin_mint, &env.pool),
+        env.gv_config_pda(),
         "the legitimate genesis-vote config still initializes against the canonical pool"
     );
 }
@@ -3392,7 +3475,7 @@ fn init_insurance_pool_rejects_non_canonical_vault() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -3587,6 +3670,7 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     let attacker_domain = [DOMAIN_INSURANCE];
     let attacker_window = DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
     let attacker_start = DEFAULT_GENESIS_DEPOSIT_START_SLOT.to_le_bytes();
+    let attacker_delay = DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
     let attacker_pool = Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -3599,6 +3683,7 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
             &attacker_domain,
             &attacker_window,
             &attacker_start,
+            &attacker_delay,
         ],
         &sub_id(),
     ).0;
@@ -3619,7 +3704,15 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
             AccountMeta::new_readonly(attacker_slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &attacker_pool), false),
+            AccountMeta::new_readonly(
+                gv_config_pda_for_schedule(
+                    &env.coin_mint,
+                    &attacker_pool,
+                    env.bootstrap_delay_slots,
+                    env.bootstrap_start_slot,
+                ),
+                false,
+            ),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -3662,7 +3755,7 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -3700,6 +3793,7 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
             &[DOMAIN_INSURANCE],
             &DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes(),
             &DEFAULT_GENESIS_DEPOSIT_START_SLOT.to_le_bytes(),
+            &DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS.to_le_bytes(),
         ],
         &sub_id(),
     )
@@ -3718,7 +3812,15 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+            AccountMeta::new_readonly(
+                gv_config_pda_for_schedule(
+                    &env.coin_mint,
+                    &pool,
+                    env.bootstrap_delay_slots,
+                    env.bootstrap_start_slot,
+                ),
+                false,
+            ),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -3764,7 +3866,7 @@ fn wrong_in_range_policy_cannot_squat_the_share_based_genesis_pool() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -3867,6 +3969,160 @@ fn configured_deposit_start_cannot_be_opened_early_by_permissionless_init() {
     assert_eq!(env.token_amount(&late_ata), 10);
 }
 
+#[test]
+fn bootstrap_schedule_is_one_pda_bound_contract_across_pool_and_vote() {
+    let window = 3u64;
+    let start = 110u64;
+    let delay = 10u64;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+
+    // A permissionless first writer using a different bootstrap delay derives a
+    // different pool and cannot consume the intended schedule's PDA.
+    let hostile_delay = delay + 1;
+    let mut hostile_data = vec![3u8];
+    hostile_data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    hostile_data.push(POLICY_PRINCIPAL);
+    hostile_data.extend_from_slice(&window.to_le_bytes());
+    hostile_data.extend_from_slice(&start.to_le_bytes());
+    hostile_data.extend_from_slice(&hostile_delay.to_le_bytes());
+    let hostile_vote_authority =
+        gv_config_pda_for_schedule(&env.coin_mint, &env.pool, hostile_delay, start);
+    let hostile_init = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(hostile_vote_authority, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data: hostile_data,
+    };
+    assert!(env.send(&[hostile_init], &[]).is_err());
+    assert!(env
+        .svm
+        .get_account(&env.pool)
+        .map_or(true, |a| a.data.is_empty()));
+
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(window), Some(start));
+    let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        u64::from_le_bytes(pool_data[248..256].try_into().unwrap()),
+        window
+    );
+    assert_eq!(
+        u64::from_le_bytes(pool_data[256..264].try_into().unwrap()),
+        start
+    );
+    assert_eq!(
+        u64::from_le_bytes(pool_data[264..272].try_into().unwrap()),
+        delay
+    );
+    assert_eq!(
+        env.gv_config_pda(),
+        gv_config_pda_for_schedule(&env.coin_mint, &env.pool, delay, start)
+    );
+}
+
+#[test]
+fn deposit_window_cannot_outlive_the_bootstrap() {
+    let window = 11u64;
+    let start = 110u64;
+    let delay = 10u64;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&window.to_le_bytes());
+    data.extend_from_slice(&start.to_le_bytes());
+    data.extend_from_slice(&delay.to_le_bytes());
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+    assert!(
+        env.send(&[ix], &[]).is_err(),
+        "genesis cannot become triggerable while insurance deposits remain open"
+    );
+    assert!(env
+        .svm
+        .get_account(&env.pool)
+        .map_or(true, |a| a.data.is_empty()));
+}
+
+#[test]
+fn exact_schedule_boundaries_complete_real_percolator_genesis_and_return_principal() {
+    let window = 3u64;
+    let start = 110u64;
+    let delay = 10u64;
+    let end = start + delay;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(window), Some(start));
+    let ve = setup_vote(&mut env);
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    let alice_hold = create_holding(&mut env, &pool);
+
+    env.warp_slot(start - 1);
+    assert!(env
+        .insurance_deposit(&alice, &alice_ata, &alice_hold, 1)
+        .is_err());
+    env.warp_slot(start);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 1)
+        .expect("exact bootstrap start accepts the one-base-unit deposit");
+
+    let recipient = Pubkey::new_unique();
+    let (dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &recipient);
+    env.warp_slot(start + 2);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("one base unit gives one principal vote");
+
+    let (late, late_ata) = new_depositor(&mut env, 1);
+    let late_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start + window);
+    assert!(env
+        .insurance_deposit(&late, &late_ata, &late_hold, 1)
+        .is_err());
+    assert_eq!(
+        env.token_amount(&late_ata),
+        1,
+        "deadline rejection moves no funds"
+    );
+
+    env.warp_slot(end - 1);
+    assert!(
+        gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
+        "genesis cannot seal one slot before bootstrap end"
+    );
+    env.warp_slot(end);
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("genesis seals at the exact configured end");
+
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("winner retract releases vote lock");
+    env.insurance_withdraw(&alice, &alice_ata, &alice_hold, &alice, 1)
+        .expect("initial risk capital remains owner-withdrawable");
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 // FIRST-WRITER DEPOSIT-WINDOW SQUAT: the window is part of the depositor contract.
 // A hostile short window can make normal depositors miss genesis; a hostile long
 // window re-opens the late-capital quorum grief the on-chain window is supposed
@@ -3883,6 +4139,7 @@ fn wrong_deposit_window_cannot_squat_the_genesis_pool() {
     data.push(POLICY_PRINCIPAL);
     data.extend_from_slice(&hostile_window.to_le_bytes());
     data.extend_from_slice(&100u64.to_le_bytes());
+    data.extend_from_slice(&env.bootstrap_delay_slots.to_le_bytes());
     let squat = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -3893,7 +4150,7 @@ fn wrong_deposit_window_cannot_squat_the_genesis_pool() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
             AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
@@ -3939,6 +4196,7 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
     let own_domain = [1u8]; // DOMAIN_BACKING
     let own_window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
     let own_start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
+    let own_delay = OWN_VAULT_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
     let own_vault_pda = Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -3951,6 +4209,7 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
             &own_domain,
             &own_window,
             &own_start,
+            &own_delay,
         ],
         &sub_id(),
     ).0;

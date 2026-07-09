@@ -32,12 +32,30 @@ const SEED_PROGRAM_CONFIG: &[u8] = b"program_config";
 const SEED_MULTISIG: &[u8] = b"multisig";
 const PERM_ALL: u8 = 7;
 const TIMELOCK_1_WEEK_SECS: u32 = 7 * 24 * 60 * 60;
-const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
+const TEST_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_200;
+const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1_200;
+const TEST_BOOTSTRAP_START_SLOT: u64 = 0;
 
 fn gv_init_data() -> Vec<u8> {
     let mut data = vec![0u8];
     data.extend_from_slice(&TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes());
+    data.extend_from_slice(&TEST_BOOTSTRAP_START_SLOT.to_le_bytes());
     data
+}
+
+fn append_test_genesis_schedule(data: &mut Vec<u8>) {
+    data.extend_from_slice(&TEST_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes());
+    data.extend_from_slice(&TEST_BOOTSTRAP_START_SLOT.to_le_bytes());
+    data.extend_from_slice(&TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes());
+}
+
+fn advance_to_test_bootstrap_end(svm: &mut LiteSVM) {
+    let end = TEST_BOOTSTRAP_START_SLOT + TEST_BOOTSTRAP_DELAY_SLOTS;
+    let mut clock = svm.get_sysvar::<Clock>();
+    if clock.slot < end {
+        clock.slot = end;
+        svm.set_sysvar(&clock);
+    }
 }
 
 fn squads_program_bytes() -> Vec<u8> {
@@ -2556,10 +2574,9 @@ const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
 const DOMAIN_INSURANCE: u8 = 0;
 const DOMAIN_BACKING: u8 = 1;
-const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
-const DEFAULT_GENESIS_DEPOSIT_START_SLOT: u64 = 0;
 const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
 const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
 
 fn sub_pool_pda(
     collateral_mint: &Pubkey,
@@ -2577,16 +2594,23 @@ fn sub_pool_pda(
         if *slab == no_market && *perc == no_market && *coin_mint == no_market {
             OWN_VAULT_DEPOSIT_WINDOW_SLOTS
         } else {
-            DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS
+            TEST_GENESIS_DEPOSIT_WINDOW_SLOTS
         };
     let deposit_start_slot = if *slab == no_market && *perc == no_market && *coin_mint == no_market
     {
         OWN_VAULT_DEPOSIT_START_SLOT
     } else {
-        DEFAULT_GENESIS_DEPOSIT_START_SLOT
+        TEST_BOOTSTRAP_START_SLOT
     };
+    let bootstrap_delay_slots =
+        if *slab == no_market && *perc == no_market && *coin_mint == no_market {
+            OWN_VAULT_BOOTSTRAP_DELAY_SLOTS
+        } else {
+            TEST_BOOTSTRAP_DELAY_SLOTS
+        };
     let deposit_window_seed = deposit_window_slots.to_le_bytes();
     let deposit_start_seed = deposit_start_slot.to_le_bytes();
+    let bootstrap_delay_seed = bootstrap_delay_slots.to_le_bytes();
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -2599,6 +2623,7 @@ fn sub_pool_pda(
             &domain,
             &deposit_window_seed,
             &deposit_start_seed,
+            &bootstrap_delay_seed,
         ],
         &sub_id(),
     )
@@ -2800,6 +2825,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     let mut d = vec![3u8]; // IX_INIT_INSURANCE_POOL
     d.extend_from_slice(&0u64.to_le_bytes()); // asset_id 0
     d.push(1); // POLICY_WITH_SURPLUS (genesis pool = shares; exit returns principal+surplus)
+    append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -2956,6 +2982,7 @@ fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // init insurance pool, POLICY_WITH_SURPLUS
+    append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -3021,7 +3048,13 @@ fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
 
 fn gv_config_pda_e2e(coin_mint: &Pubkey, pool: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
-        &[b"gv_config", coin_mint.as_ref(), pool.as_ref()],
+        &[
+            b"gv_config",
+            coin_mint.as_ref(),
+            pool.as_ref(),
+            &TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes(),
+            &TEST_BOOTSTRAP_START_SLOT.to_le_bytes(),
+        ],
         &gv_id_e2e(),
     )
     .0
@@ -3307,6 +3340,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // POLICY_WITH_SURPLUS
+    append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -3741,6 +3775,7 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
     dpool.push(0);
+    append_test_genesis_schedule(&mut dpool);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -4032,6 +4067,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
     dpool.push(0);
+    append_test_genesis_schedule(&mut dpool);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -4316,6 +4352,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
     let mut dp = vec![3u8];
     dp.extend_from_slice(&0u64.to_le_bytes());
     dp.push(0);
+    append_test_genesis_schedule(&mut dp);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -5270,6 +5307,7 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
     let mut dp = vec![3u8];
     dp.extend_from_slice(&0u64.to_le_bytes());
     dp.push(0);
+    append_test_genesis_schedule(&mut dp);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -6127,6 +6165,7 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
         ],
         data: vec![4u8],
     };
+    advance_to_test_bootstrap_end(&mut svm);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     assert!(
@@ -6481,6 +6520,7 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
         ],
         data: vec![4u8],
     };
+    advance_to_test_bootstrap_end(&mut svm);
     send(&mut svm, &[trigger], &[]).expect("sole voter seals her own proposal");
     assert_eq!(
         Pubkey::new_from_array(
@@ -6807,6 +6847,7 @@ fn e2e_minority_turnout_cannot_reach_quorum() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -7352,6 +7393,7 @@ fn e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum() 
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -7507,6 +7549,7 @@ fn e2e_only_the_winning_proposal_can_be_claimed() {
         ],
         data: vec![4u8],
     };
+    advance_to_test_bootstrap_end(&mut svm);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -7683,13 +7726,13 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
         .expect("vote");
     };
 
-    // Early small voter: 100k deposited at slot 1000, holds a LONG time (large age — but we
+    // Early small voter: 100k deposited at slot 1000, holds longer (large age — but we
     // stay inside the percolator oracle-staleness window so the late deposit still lands).
     let early = Keypair::new();
     let early_pos = deposit(&mut svm, &early, 100_000);
     let mut c = svm.get_sysvar::<Clock>();
-    c.slot += 1500;
-    svm.set_sysvar::<Clock>(&c); // floor(log2(1500)) = 10
+    c.slot += 128;
+    svm.set_sysvar::<Clock>(&c); // floor(log2(128)) = 7
     vote(&mut svm, &early, &early_pos, &gv_early);
 
     // Later large voter: 1,000,000 (10x) deposited now, holds only a short time.
@@ -7699,7 +7742,7 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
     c.slot += 16;
     svm.set_sysvar::<Clock>(&c); // floor(log2(16)) = 4
     vote(&mut svm, &late, &late_pos, &gv_late);
-    // early weight ~= 10 * 100k = 1,000,000 ; late weight ~= 4 * 1,000,000 = 4,000,000 (capital wins).
+    // early weight = 7 * 100k = 700,000; late weight = 4 * 1,000,000 = 4,000,000 (capital wins).
 
     let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
         let ix = Instruction {
@@ -7715,6 +7758,7 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -7857,17 +7901,17 @@ fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
     deposit(&mut svm, &bob, &bob_holding, 1_000_000);
     deposit(&mut svm, &alice, &alice_holding, 1); // alice's position: principal 1, start_slot 1000
                                                   // Age accrues, then alice tops up to the SAME 1_000_000 total (999_999 more) — which RESETS her start_slot
-                                                  // to the top-up slot (1512), forfeiting the squatted age. (Both deposits route through insurance_deposit,
+                                                  // to the top-up slot (1064), forfeiting the squatted age. (Both deposits route through insurance_deposit,
                                                   // the genesis POLICY_WITH_SURPLUS pool path; the last-write reset lives at subledger lib.rs:1100.)
-    warp(&mut svm, 512);
+    warp(&mut svm, 64);
     deposit(&mut svm, &alice, &alice_holding, 999_999);
-    // More age, then both back their own proposals at the same slot. bob age = 1024 (log2 10); alice age = 512
-    // (log2 9) because her top-up reset the clock — despite her dust having sat since the very start.
-    warp(&mut svm, 512);
+    // More age, then both back their own proposals at the same slot. bob age = 128 (log2 7); alice age = 64
+    // (log2 6) because her top-up reset the clock — despite her dust having sat since the very start.
+    warp(&mut svm, 64);
     vote(&mut svm, &bob, &gv_bob);
     vote(&mut svm, &alice, &gv_alice);
-    // bob weight = floor(log2(1024)) * 1_000_000 = 10_000_000 ; alice = floor(log2(512)) * 1_000_000 =
-    // 9_000_000 (her reset clock). Without the reset both would be 10_000_000 -> a tie that seals neither.
+    // bob weight = floor(log2(128)) * 1_000_000 = 7_000_000; alice = floor(log2(64)) * 1_000_000 =
+    // 6_000_000 (her reset clock). Without the reset both would be 7_000_000 -> a tie that seals neither.
 
     let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
         let ix = Instruction {
@@ -7883,6 +7927,7 @@ fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -8430,6 +8475,7 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -8559,6 +8605,7 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -8576,6 +8623,10 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
     let a_pos = deposit(&mut svm, &a, 500_000);
     let b = Keypair::new();
     let b_pos = deposit(&mut svm, &b, 500_000);
+    // Carol also commits during the deposit window, but withholds her vote until
+    // after the two-way tie is demonstrated.
+    let carol = Keypair::new();
+    let carol_pos = deposit(&mut svm, &carol, 100_000);
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 16;
     svm.set_sysvar::<Clock>(&c);
@@ -8590,9 +8641,7 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
         "a 50/50 weight tie cannot seal proposal B either"
     );
 
-    // A third voter tips A over half -> A now has a strict weighted majority and seals.
-    let carol = Keypair::new();
-    let carol_pos = deposit(&mut svm, &carol, 100_000);
+    // The third committed voter tips A over half -> A now has a strict weighted majority and seals.
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 16;
     svm.set_sysvar::<Clock>(&c);
@@ -8706,6 +8755,7 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -8890,6 +8940,7 @@ fn e2e_non_voter_exit_recomputes_quorum_stayers_decide() {
             ],
             data: vec![4u8],
         };
+        advance_to_test_bootstrap_end(svm);
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -9210,6 +9261,7 @@ fn e2e_no_new_proposal_after_genesis_finalizes() {
         ],
         data: vec![4u8],
     };
+    advance_to_test_bootstrap_end(&mut svm);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -11699,6 +11751,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // POLICY_WITH_SURPLUS (genesis vote pool = shares)
+    append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -12031,6 +12084,7 @@ fn e2e_full_genesis_to_buy_burn() {
         ],
         data: vec![4u8],
     };
+    advance_to_test_bootstrap_end(&mut svm);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -12231,7 +12285,7 @@ fn e2e_full_genesis_to_buy_burn() {
     // ratchets the retained 100k into the principal counter, clears the bid at the uniform price,
     // and BURNS the bought COIN.
     let mut c = svm.get_sysvar::<Clock>();
-    c.slot = 1140;
+    c.slot += 20;
     svm.set_sysvar(&c);
     let supply_before = mint_supply(&svm, &coin_mint);
     assert_eq!(
@@ -14732,6 +14786,7 @@ fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
         ],
         data: vec![4u8],
     };
+    advance_to_test_bootstrap_end(&mut svm);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     assert!(
@@ -18741,6 +18796,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // POLICY_WITH_SURPLUS
+    append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
         accounts: vec![
