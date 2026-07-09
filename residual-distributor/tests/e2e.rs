@@ -8046,6 +8046,25 @@ fn init_rejects_zero_supply_overallocation_and_unscoped_cohorts() {
         .is_err(),
         "overflowing freeze cutoff must be rejected at init"
     );
+    // A zero finalize window lets a permissionless cranker freeze immediately at emission_end,
+    // before slower backers get any post-emission slot to crystallize their final points.
+    assert!(
+        try_init_with_timing(
+            &mut svm,
+            &payer,
+            1_000_000,
+            2_000,
+            0,
+            1_000,
+            1_000,
+            4_000,
+            p(),
+            p(),
+            p(),
+        )
+        .is_err(),
+        "zero finalize window must be rejected at init"
+    );
     // fully-valid config -> accepted.
     try_init(
         &mut svm,

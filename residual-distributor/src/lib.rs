@@ -888,7 +888,7 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     if residual_fee_bps > BPS_DENOMINATOR as u16 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    if !data.is_empty() || !payer.is_signer || total_supply == 0 {
+    if !data.is_empty() || !payer.is_signer || total_supply == 0 || finalize_window == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
     if emission_end_slot.checked_add(finalize_window).is_none() {
