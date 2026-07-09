@@ -13879,6 +13879,45 @@ fn e2e_init_book_rejects_degenerate_params() {
         svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
         "book never created with the zero reserve denominator"
     );
+
+    // Oversized round length: init's current-slot + round_length check can still pass at normal slots, but
+    // cancel's 2*round_length cooldown would saturate to u64::MAX and make committed bids practically
+    // non-cancellable. Reject before the book exists.
+    let msg3 = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        1,
+        1,
+        u64::MAX / 2 + 1,
+        0,
+        0,
+        None,
+    );
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            7,
+            &msg3,
+            &rem
+        )
+        .is_err(),
+        "init_book must reject round_length values whose 2x cancel cooldown overflows"
+    );
+    assert!(
+        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
+        "book never created with an overflowing cancel cooldown"
+    );
 }
 
 // INIT_BOOK OVER A PRE-FUNDED ESCROW (stranded-COIN anti-strand): init_book binds the coin_escrow + settlement_usd

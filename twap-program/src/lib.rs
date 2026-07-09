@@ -1066,7 +1066,11 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     } else {
         u64::MAX
     };
-    if reserve_den == 0 || round_length == 0 || sink_mode > SINK_SEND {
+    if reserve_den == 0
+        || round_length == 0
+        || round_length.checked_mul(2).is_none()
+        || sink_mode > SINK_SEND
+    {
         return Err(ProgramError::InvalidInstructionData);
     }
     if *system_program.key != solana_program::system_program::ID {
@@ -2111,7 +2115,14 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
         // alone (eviction by a strictly-better bid remains the only other early exit).
         let place_slot = book_rd_u64(&d, o + SL_PLACE_SLOT);
         let now = solana_program::clock::Clock::get()?.slot;
-        let aged = now >= place_slot.saturating_add(book.round_length.saturating_mul(2));
+        let cooldown_slots = book
+            .round_length
+            .checked_mul(2)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let cooldown_end = place_slot
+            .checked_add(cooldown_slots)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let aged = now >= cooldown_end;
         if !aged {
             return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
         }
