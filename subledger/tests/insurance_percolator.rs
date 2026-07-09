@@ -42,6 +42,13 @@ use solana_sdk::{
 
 const ATA_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
+
+fn gv_init_data() -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(&TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes());
+    data
+}
 
 fn sub_id() -> Pubkey {
     subledger_program::id()
@@ -880,7 +887,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
             AccountMeta::new_readonly(Pubkey::default(), false), // reserved
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(),
     };
     env.send(&[ix], &[]).expect("gv init");
 

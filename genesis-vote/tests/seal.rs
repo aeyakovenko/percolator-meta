@@ -5,6 +5,7 @@
 
 use litesvm::LiteSVM;
 use solana_sdk::{
+    clock::Clock,
     instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     pubkey::Pubkey,
@@ -24,6 +25,14 @@ fn so(name: &str) -> String {
 }
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
+}
+
+const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
+
+fn gv_init_data(delay_slots: u64) -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(&delay_slots.to_le_bytes());
+    data
 }
 
 struct Env {
@@ -149,6 +158,12 @@ impl Env {
         self.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
     }
 
+    fn set_slot(&mut self, slot: u64) {
+        let mut clock = self.svm.get_sysvar::<Clock>();
+        clock.slot = slot;
+        self.svm.set_sysvar::<Clock>(&clock);
+    }
+
     // distribution InitConfig with authority = the genesis-vote config PDA.
     fn init_distribution(&mut self) {
         // Fixed-supply COIN (Safety §4): revoke the mint authority before init.
@@ -222,6 +237,14 @@ impl Env {
     }
 
     fn init_gv(&mut self) -> Result<(), String> {
+        let result = self.init_gv_with_delay(TEST_BOOTSTRAP_DELAY_SLOTS);
+        if result.is_ok() {
+            self.set_slot(TEST_BOOTSTRAP_DELAY_SLOTS);
+        }
+        result
+    }
+
+    fn init_gv_with_delay(&mut self, delay_slots: u64) -> Result<(), String> {
         let dummy = Pubkey::new_unique();
         let ix = Instruction {
             program_id: gv_id(),
@@ -236,7 +259,7 @@ impl Env {
                 AccountMeta::new_readonly(dummy, false),         // _reserved
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![0u8],
+            data: gv_init_data(delay_slots),
         };
         self.send(&[ix], &[])
     }
@@ -259,7 +282,7 @@ impl Env {
                 AccountMeta::new_readonly(dummy, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![0u8],
+            data: gv_init_data(TEST_BOOTSTRAP_DELAY_SLOTS),
         };
         self.send(&[ix], &[])
     }
@@ -282,7 +305,7 @@ impl Env {
                 AccountMeta::new_readonly(dummy, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![0u8],
+            data: gv_init_data(TEST_BOOTSTRAP_DELAY_SLOTS),
         };
         self.send(&[ix], &[])
     }
@@ -525,6 +548,29 @@ fn trigger_seals_a_full_max_capacity_distribution() {
     env.inject_tally(&gv_proposal, 1, 1, 1, 1, 1);
     env.trigger(&gv_proposal, &proposal).expect("genesis trigger seals maximum proposal");
     assert_eq!(env.dist_sealed_proposal(), proposal);
+}
+
+#[test]
+fn trigger_rejects_before_configured_bootstrap_delay_elapsed() {
+    let mut env = Env::new_unwired();
+    env.init_gv_with_delay(100).expect("gv init with configured bootstrap delay");
+
+    let alice = Pubkey::new_unique();
+    let dist_proposal = env.create_dist_proposal(1, &[(alice, 100)]);
+    let gv_proposal = env.register(&dist_proposal);
+    env.set_pool_outstanding(10);
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
+
+    env.set_slot(99);
+    assert!(
+        env.trigger(&gv_proposal, &dist_proposal).is_err(),
+        "quorum and majority must not seal before the bootstrap delay"
+    );
+    assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "not sealed before bootstrap end");
+
+    env.set_slot(100);
+    env.trigger(&gv_proposal, &dist_proposal).expect("trigger after bootstrap delay");
+    assert_eq!(env.dist_sealed_proposal(), dist_proposal, "sealed once bootstrap delay elapsed");
 }
 
 // SUBSTITUTED-POOL QUORUM COLLAPSE (no-capital / minority capture via account substitution). The trigger
@@ -1103,7 +1149,7 @@ fn gv_config_cannot_be_bound_to_a_substituted_pool() {
             AccountMeta::new_readonly(dummy, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(TEST_BOOTSTRAP_DELAY_SLOTS),
     };
     assert!(
         env.send(&[ix], &[]).is_err(),
