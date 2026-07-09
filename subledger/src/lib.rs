@@ -904,6 +904,13 @@ fn process_init_insurance_pool(
     if policy > POLICY_WITH_SURPLUS || !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
+    // This instruction is the genesis asset-0 insurance pool: deposits CPI to
+    // Percolator TopUpInsurance (asset 0), while exits use an asset-indexed
+    // withdraw. Nonzero asset IDs would make deposits and exits address different
+    // insurance domains, potentially stranding depositors.
+    if asset_id != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }

@@ -3555,6 +3555,61 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
     assert_eq!(env.token_amount(&alice_ata), 1_000_000, "principal fully recovered — the pool works");
 }
 
+// The genesis insurance pool path is asset-0 only: deposits CPI into Percolator's
+// TopUpInsurance instruction, while exits use the asset-indexed withdraw. Accepting
+// a nonzero asset_id would create a pool whose deposits top up asset 0 but whose
+// exits try to withdraw a different asset, stranding that pool's depositors.
+#[test]
+fn init_insurance_pool_rejects_nonzero_asset_id() {
+    let mut env = Env::new();
+    let asset_id = 1u64;
+    let pool = Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            env.mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            env.slab.as_ref(),
+            perc_id().as_ref(),
+        ],
+        &sub_id(),
+    )
+    .0;
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&asset_id.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+        ],
+        data,
+    };
+
+    assert!(
+        env.send(&[ix], &[]).is_err(),
+        "asset-0 genesis insurance init must reject nonzero asset_id"
+    );
+    assert!(
+        env.svm.get_account(&pool).map_or(true, |a| a.data.is_empty()),
+        "nonzero-asset pool PDA remains uninitialized"
+    );
+
+    env.init_insurance_pool();
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    let hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &hold, 1_000_000).expect("asset-0 pool remains usable");
+    env.insurance_withdraw(&alice, &alice_ata, &hold, &alice, 1_000_000).expect("asset-0 exit remains usable");
+}
+
 // CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)
 // and init_insurance_pool (tag 3) derive their pool PDA from pool_seeds(mint, asset_id, market_slab,
 // percolator_program). The genesis insurance pool lives at (mint, 0, REAL_market, REAL_program). If
