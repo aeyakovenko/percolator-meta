@@ -126,9 +126,11 @@ fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypai
     svm.send_transaction(tx).unwrap();
 }
 
-fn pool_pda(mint: &Pubkey, asset_id: u64) -> Pubkey {
+fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
     // Own-vault pools commit to the default market binding (no percolator market).
     let no_market = Pubkey::default();
+    let domain = [0u8];
+    let policy = [policy];
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -137,6 +139,8 @@ fn pool_pda(mint: &Pubkey, asset_id: u64) -> Pubkey {
             no_market.as_ref(),
             no_market.as_ref(),
             no_market.as_ref(),
+            &policy,
+            &domain,
         ],
         &program_id(),
     )
@@ -231,7 +235,7 @@ fn clone_kp(kp: &Keypair) -> Keypair {
 fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
     let mut env = Env::new();
     let asset_id = 13;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
 
     // SYSTEM-owned account with token-shaped data: mint = env.mint, owner field = the pool PDA. Passes the
     // field checks, fails only on the owning program.
@@ -263,7 +267,7 @@ fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
 fn init_pool_rejects_a_vault_with_an_external_close_authority() {
     let mut env = Env::new();
     let asset_id = 18;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let attacker = Keypair::new();
     let prepared_vault = create_token_account(
         &mut env.svm,
@@ -333,7 +337,7 @@ fn exported_position_and_pool_offset_consts_match_the_real_serialized_layout() {
     let mut env = Env::new();
     env.svm.set_sysvar(&solana_sdk::clock::Clock { slot: 100, unix_timestamp: 100, ..Default::default() });
     let asset_id = 17;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init WITH_SURPLUS pool"); // policy 1 -> shares
     let (alice, alice_ata) = new_depositor(&mut env, 12_345);
@@ -357,7 +361,7 @@ fn exported_position_and_pool_offset_consts_match_the_real_serialized_layout() {
 fn principal_policy_healthy_pays_principal_and_keeps_surplus() {
     let mut env = Env::new();
     let asset_id = 1;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
 
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[])
@@ -392,7 +396,7 @@ fn principal_policy_healthy_pays_principal_and_keeps_surplus() {
 fn with_surplus_policy_returns_yield_pro_rata() {
     let mut env = Env::new();
     let asset_id = 2;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
 
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
@@ -427,7 +431,7 @@ fn with_surplus_policy_returns_yield_pro_rata() {
 fn with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
     let mut env = Env::new();
     let asset_id = 7;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
 
@@ -459,7 +463,7 @@ fn with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
 fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
     let mut env = Env::new();
     let asset_id = 9;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
 
@@ -495,7 +499,7 @@ fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
 fn a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss() {
     let mut env = Env::new();
     let asset_id = 11;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
 
@@ -530,7 +534,7 @@ fn set_token_amount(svm: &mut LiteSVM, account: &Pubkey, amount: u64) {
 fn impaired_pool_is_pro_rata_and_order_independent() {
     let mut env = Env::new();
     let asset_id = 3;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
 
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[])
@@ -561,7 +565,7 @@ fn impaired_pool_is_pro_rata_and_order_independent() {
 fn non_owner_cannot_withdraw_another_position() {
     let mut env = Env::new();
     let asset_id = 4;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[]).unwrap();
 
@@ -591,7 +595,7 @@ fn non_owner_cannot_withdraw_another_position() {
 fn init_pool_rejects_a_vault_not_owned_by_the_pool() {
     let mut env = Env::new();
     let asset_id = 0u64;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
 
     // A vault owned by an ATTACKER rather than the pool PDA.
     let attacker = Pubkey::new_unique();
@@ -616,10 +620,10 @@ fn init_pool_rejects_a_vault_not_owned_by_the_pool() {
 fn cannot_drain_a_foreign_pool_with_a_position_from_another_pool() {
     let mut env = Env::new();
     // Two independent own-vault pools (same mint, different asset_ids), each with its own vault.
-    let pool_a = pool_pda(&env.mint, 1);
+    let pool_a = pool_pda(&env.mint, 1, 0);
     let vault_a = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool_a);
     env.send(&[init_pool_ix(&env, &pool_a, &vault_a, 1, 0)], &[]).expect("init pool A");
-    let pool_b = pool_pda(&env.mint, 2);
+    let pool_b = pool_pda(&env.mint, 2, 0);
     let vault_b = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool_b);
     env.send(&[init_pool_ix(&env, &pool_b, &vault_b, 2, 0)], &[]).expect("init pool B");
 
@@ -662,7 +666,7 @@ fn cannot_drain_a_foreign_pool_with_a_position_from_another_pool() {
 fn large_with_surplus_deposit_can_withdraw_without_intermediate_mul_overflow() {
     let mut env = Env::new();
     let asset_id = 21;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
         .expect("init with-surplus backing pool");
@@ -694,7 +698,7 @@ fn large_with_surplus_deposit_can_withdraw_without_intermediate_mul_overflow() {
 fn large_with_surplus_second_deposit_can_mint_representable_shares() {
     let mut env = Env::new();
     let asset_id = 22;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
         .expect("init with-surplus backing pool");
