@@ -308,6 +308,50 @@ fn mul_div_floor(a: u64, b: u64, denom: u64) -> Option<u64> {
     Some((a as u128 * b as u128 / denom as u128) as u64)
 }
 
+/// Exact `floor(a * b / denom)` without requiring the product to fit in `u128`.
+/// Returns `None` only for a zero denominator or a quotient above `u128::MAX`.
+fn wide_mul_div_floor(a: u128, b: u128, denom: u128) -> Option<u128> {
+    if denom == 0 {
+        return None;
+    }
+
+    // a = whole * denom + rem. The whole-number contribution is exact, and
+    // overflow here proves that the final non-negative quotient cannot fit.
+    let whole = a / denom;
+    let rem = a % denom;
+    let mut quotient = whole.checked_mul(b)?;
+
+    // Compute floor(rem * b / denom) one bit of b at a time. `remainder`
+    // always stays below denom, and add_mod avoids overflowing its u128 sum.
+    let mut fractional = 0u128;
+    let mut remainder = 0u128;
+    for bit in (0..128).rev() {
+        fractional = fractional.checked_mul(2)?;
+        let (next_remainder, carry) = add_mod(remainder, remainder, denom);
+        remainder = next_remainder;
+        fractional = fractional.checked_add(carry)?;
+
+        if ((b >> bit) & 1) != 0 {
+            let (next_remainder, carry) = add_mod(remainder, rem, denom);
+            remainder = next_remainder;
+            fractional = fractional.checked_add(carry)?;
+        }
+    }
+
+    quotient = quotient.checked_add(fractional)?;
+    Some(quotient)
+}
+
+/// `(x + y) mod denom` and `floor((x + y) / denom)` for `x,y < denom`.
+fn add_mod(x: u128, y: u128, denom: u128) -> (u128, u128) {
+    debug_assert!(denom > 0 && x < denom && y < denom);
+    if x >= denom - y {
+        (x - (denom - y), 1)
+    } else {
+        (x + y, 0)
+    }
+}
+
 // Tenure-fair share accounting for POLICY_WITH_SURPLUS (branch residual-genesis).
 // Shares are priced by the LIVE balance so a deposit only ever redeems the surplus that accrued
 // during its own tenure. VIRTUAL-OFFSET inflation defense (finding HU): the pricing uses
@@ -320,18 +364,30 @@ const VIRTUAL_SHARES: u128 = 1_000_000;
 
 /// Shares minted for `amount`, priced by the pre-deposit `balance` with the virtual offset.
 fn mint_shares(amount: u64, total_shares: u128, balance: u64) -> Result<u128, ProgramError> {
-    (amount as u128)
-        .checked_mul(total_shares.checked_add(VIRTUAL_SHARES).ok_or(ProgramError::ArithmeticOverflow)?)
-        .and_then(|v| v.checked_div((balance as u128).checked_add(1)?))
-        .ok_or(ProgramError::ArithmeticOverflow)
+    wide_mul_div_floor(
+        amount as u128,
+        total_shares
+            .checked_add(VIRTUAL_SHARES)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+        (balance as u128)
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    )
+    .ok_or(ProgramError::ArithmeticOverflow)
 }
 
 /// Tokens redeemed for `shares`: `shares * (balance + 1) / (total_shares + VIRTUAL_SHARES)` (floor).
 fn redeem_shares(shares: u128, balance: u64, total_shares: u128) -> Result<u64, ProgramError> {
-    let owed = shares
-        .checked_mul((balance as u128).checked_add(1).ok_or(ProgramError::ArithmeticOverflow)?)
-        .and_then(|v| v.checked_div(total_shares.checked_add(VIRTUAL_SHARES)?))
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let owed = wide_mul_div_floor(
+        shares,
+        (balance as u128)
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+        total_shares
+            .checked_add(VIRTUAL_SHARES)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    )
+    .ok_or(ProgramError::ArithmeticOverflow)?;
     u64::try_from(owed).map_err(|_| ProgramError::ArithmeticOverflow)
 }
 
@@ -1516,6 +1572,41 @@ mod tests {
         assert!(payout(POLICY_PRINCIPAL, 100, 0, 10).is_err());
         assert!(payout(POLICY_PRINCIPAL, 100, 100, 0).is_err());
         assert!(payout(POLICY_PRINCIPAL, 100, 100, 101).is_err());
+    }
+
+    #[test]
+    fn wide_mul_div_floor_is_exact_across_overflow_boundaries() {
+        for a in [0, 1, 2, 17, u64::MAX as u128, u128::MAX / 2] {
+            for b in [0, 1, 3, 19, u64::MAX as u128] {
+                for denom in [1, 2, 7, u64::MAX as u128] {
+                    if let Some(product) = a.checked_mul(b) {
+                        assert_eq!(wide_mul_div_floor(a, b, denom), Some(product / denom));
+                    }
+                }
+            }
+        }
+
+        let amount = 20_000_000_000_000_000u128;
+        let shares = amount * VIRTUAL_SHARES;
+        assert!(shares.checked_mul(amount + 1).is_none());
+        assert_eq!(
+            wide_mul_div_floor(shares, amount + 1, shares + VIRTUAL_SHARES),
+            Some(amount)
+        );
+        assert_eq!(
+            wide_mul_div_floor(
+                amount,
+                shares + VIRTUAL_SHARES,
+                amount + 1,
+            ),
+            Some(shares)
+        );
+        assert_eq!(
+            wide_mul_div_floor(u128::MAX, u128::MAX, u128::MAX),
+            Some(u128::MAX)
+        );
+        assert_eq!(wide_mul_div_floor(u128::MAX, u128::MAX, 1), None);
+        assert_eq!(wide_mul_div_floor(1, 1, 0), None);
     }
 
     #[test]

@@ -587,3 +587,78 @@ fn cannot_drain_a_foreign_pool_with_a_position_from_another_pool() {
     env.send(&[withdraw_ix(&pool_a, &attacker.pubkey(), &attacker_ata, &vault_a)], &[&attacker]).expect("attacker exits their OWN pool A");
     assert_eq!(env.token_amount(&attacker_ata), 1_000_000, "attacker recovers only their own pool-A principal, never pool-B's");
 }
+
+// LIVENESS/LOF BOUNDARY: share redemption is mathematically
+// `shares * (balance + 1) / (total_shares + VIRTUAL_SHARES)`. Each input and the
+// final quotient fit their serialized types here, but the direct u128 product does
+// not. A valid deposit must not become permanently unwithdrawable because only an
+// intermediate representation overflows.
+#[test]
+fn large_with_surplus_deposit_can_withdraw_without_intermediate_mul_overflow() {
+    let mut env = Env::new();
+    let asset_id = 21;
+    let pool = pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus backing pool");
+
+    // First-deposit shares are amount * 1_000_000 and fit u128. Multiplying those
+    // shares by the live balance exceeds u128, although the exact redemption is
+    // simply the original u64 amount.
+    let amount = 20_000_000_000_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    env.send(
+        &[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, amount)],
+        &[&alice],
+    )
+    .expect("large public backing deposit");
+    assert_eq!(env.token_amount(&alice_ata), 0);
+    assert_eq!(env.token_amount(&vault), amount);
+
+    env.send(
+        &[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)],
+        &[&alice],
+    )
+    .expect("representable redemption must not overflow an intermediate product");
+
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+}
+
+#[test]
+fn large_with_surplus_second_deposit_can_mint_representable_shares() {
+    let mut env = Env::new();
+    let asset_id = 22;
+    let pool = pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus backing pool");
+
+    let amount = 20_000_000_000_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    env.send(
+        &[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, amount)],
+        &[&alice],
+    )
+    .expect("first large deposit");
+    env.send(
+        &[deposit_ix(&env, &pool, &bob.pubkey(), &bob_ata, &vault, amount)],
+        &[&bob],
+    )
+    .expect("second deposit's representable share quotient must not overflow its product");
+
+    env.send(
+        &[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)],
+        &[&alice],
+    )
+    .expect("first depositor exits");
+    env.send(
+        &[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)],
+        &[&bob],
+    )
+    .expect("second depositor exits");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&bob_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+}
