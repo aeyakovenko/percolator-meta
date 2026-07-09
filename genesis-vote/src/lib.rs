@@ -44,9 +44,10 @@ declare_id!("GenesisVote11111111111111111111111111111111");
 const CONFIG_DISC: [u8; 8] = *b"GVCONFG1";
 const BALLOT_DISC: [u8; 8] = *b"GVBALOT1";
 const PROPOSAL_DISC: [u8; 8] = *b"GVPROPV1";
-const CONFIG_SIZE: usize = 240; // total_cast_weight widened u64->u128 (GG fix)
+const CONFIG_SIZE: usize = 248; // total_cast_weight widened u64->u128 (GG fix)
 const BALLOT_SIZE: usize = 120; // voted_weight widened u64->u128 (GG fix)
 const PROPOSAL_SIZE: usize = 112; // support_weight widened u64->u128 (GG fix)
+const DEFAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 38_880_000;
 
 // Subledger position/pool discriminators + layout (read-only mirror of the
 // subledger program's serialization). Used to read principal/start_slot and the
@@ -146,6 +147,7 @@ struct Config {
     total_cast_weight: u128, // GG fix: widened so summed log-weights cannot overflow
     outstanding_principal: u64,
     bump: u8,
+    bootstrap_end_slot: u64,
 }
 
 impl Config {
@@ -164,6 +166,7 @@ impl Config {
             total_cast_weight: u128::from_le_bytes(d[208..224].try_into().unwrap()),
             outstanding_principal: u64::from_le_bytes(d[224..232].try_into().unwrap()),
             bump: d[232],
+            bootstrap_end_slot: u64::from_le_bytes(d[233..241].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -178,7 +181,22 @@ impl Config {
         d[208..224].copy_from_slice(&self.total_cast_weight.to_le_bytes());
         d[224..232].copy_from_slice(&self.outstanding_principal.to_le_bytes());
         d[232] = self.bump;
-        d[233..CONFIG_SIZE].fill(0);
+        d[233..241].copy_from_slice(&self.bootstrap_end_slot.to_le_bytes());
+        d[241..CONFIG_SIZE].fill(0);
+    }
+}
+
+fn read_optional_bootstrap_delay(data: &[u8]) -> Result<u64, ProgramError> {
+    match data.len() {
+        0 => Ok(DEFAULT_BOOTSTRAP_DELAY_SLOTS),
+        8 => {
+            let delay = u64::from_le_bytes(data.try_into().unwrap());
+            if delay == 0 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            Ok(delay)
+        }
+        _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
@@ -306,7 +324,7 @@ pub fn process_instruction<'a>(
         .split_first()
         .ok_or(ProgramError::InvalidInstructionData)?;
     match *tag {
-        IX_INIT_CONFIG => init_config(program_id, accounts),
+        IX_INIT_CONFIG => init_config(program_id, accounts, data),
         IX_REGISTER_PROPOSAL => register_proposal(program_id, accounts),
         IX_VOTE => vote(program_id, accounts, data),
         IX_TRIGGER => trigger(program_id, accounts, data),
@@ -352,7 +370,12 @@ fn create_pda<'a>(
 
 // init_config accounts: [payer(s,w), coin_mint, config(pda,w), distribution_program,
 //   distribution_config, subledger_program, subledger_pool, reserved, system]
-fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
+// data: optional bootstrap_delay_slots(u64); absent defaults to six months.
+fn init_config<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let payer = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
@@ -363,6 +386,7 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
     let subledger_pool = next_account_info(iter)?;
     let reserved = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let bootstrap_delay_slots = read_optional_bootstrap_delay(data)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -437,6 +461,10 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
         total_cast_weight: 0,
         outstanding_principal: 0,
         bump,
+        bootstrap_end_slot: Clock::get()?
+            .slot
+            .checked_add(bootstrap_delay_slots)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -734,6 +762,10 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     if pv.config != *config_account.key || pv.executed {
         return Err(ProgramError::InvalidAccountData);
     }
+    if Clock::get()?.slot < config.bootstrap_end_slot {
+        msg!("bootstrap delay has not elapsed");
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if *distribution_program.key != config.distribution_program
         || *distribution_config.key != config.distribution_config
         || *distribution_proposal.key != pv.distribution_proposal
@@ -828,6 +860,7 @@ mod tests {
             total_cast_weight: 70,
             outstanding_principal: 12,
             bump: 250,
+            bootstrap_end_slot: 1234,
         };
         let mut b = [0u8; CONFIG_SIZE];
         c.serialize(&mut b);
@@ -835,6 +868,7 @@ mod tests {
         assert_eq!(d.total_voted_principal, 7);
         assert_eq!(d.outstanding_principal, 12);
         assert_eq!(d.bump, 250);
+        assert_eq!(d.bootstrap_end_slot, 1234);
         assert_eq!(d.subledger_program, sub_program);
         assert_eq!(d.subledger_pool, sub_pool);
 

@@ -42,7 +42,7 @@ split bought COIN between burn and another residual-distributor reward epoch.
 | Crate | Role |
 |---|---|
 | `subledger/` | The market's **asset-0 insurance operator** during genesis (a role granted by Squads). Mediates deposits (signs Percolator `TopUpInsurance` as the insurance authority) and owner-authorized exits, tracking per-owner attribution (`owner, principal, start_slot`). Genesis pool PDAs bind the market, COIN mint, policy, domain, configured deposit start, and configured deposit window, so permissionless init cannot consume the intended pool with hostile settings or open deposits early. Genesis pools are **share-based** (ERC4626-style): exiting redeems shares at the live balance, returning principal **plus any surplus**, pro-rata under loss. Never rotates keys — `accept_operator` only *consents* to receive the role Squads grants. Also provides reusable owner-bound pools for assets 1..N. |
-| `genesis-vote/` | The **vote decider**. Runs a log-time quorum vote weighted by each voter's subledger attribution (`floor(log2(hold_time)) × principal`), one voter → one proposal. Seals the winner into `distribution` by CPI. Holds no funds. |
+| `genesis-vote/` | The **vote decider**. Runs a log-time quorum vote weighted by each voter's subledger attribution (`floor(log2(hold_time)) × principal`), one voter → one proposal. After a configurable bootstrap delay (default: six 30-day months), seals the winner into `distribution` by CPI. Holds no funds. |
 | `residual-distributor/` | Reusable deterministic **COIN reward epochs**. Fixed mode distributes the whole genesis mint; dynamic mode snapshots COIN accumulated from TWAP. Both reuse `register → crystallize → freeze → claim` across log-time-weighted insurance/backing base-unit principal, LP/trader residual, and cumulative funding-payer (`long_paid + short_paid`, no age multiplier) cohorts. |
 | `distribution/` | Holds the fixed COIN pool in a vault. A proposal is one incrementally grown on-chain account of up to ~10k `(pubkey, amount)` entries; the sealed winner's recipients **claim** permissionlessly, **unclaimed is burned**. Never mints. The `authority` (whichever decider PDA) is bound into the config seed, making it decider-pluggable. |
 | `twap-program/` | Deployable BPF for the **authority chain** and post-mint uniform-price auction. It pulls only insurance *surplus*, clears at one marginal price, and splits bought COIN between burn and a DAO-pinned sink such as a reward-epoch vault. Never reaches the configured principal floor. |
@@ -66,8 +66,8 @@ The deterministic `residual-distributor` genesis path is tested with a 10% insur
    a retract, so a voter exits via a single atomic `[retract, withdraw]` transaction. Exiting shrinks
    `outstanding`, recomputing quorum against whoever stays — *those who stay decide*. This makes leaving
    the depositor's veto on a capture attempt.
-4. **Trigger (permissionless)** — the first proposal to clear quorum + weighted majority is sealed into
-   `distribution` by CPI. No mint.
+4. **Trigger (permissionless, after bootstrap)** — once the configured bootstrap delay has elapsed,
+   the first proposal to clear quorum + weighted majority is sealed into `distribution` by CPI. No mint.
 5. **Claim / burn** — winning recipients claim their entry from the fixed COIN vault; unclaimed is burned.
 6. **Handoff (post-mint)** — control rotates `DAO → Squads (1-week timelock) → twap-program → Percolator`;
    the insurance authority moves from the principal-safe subledger to the surplus-only twap-program.

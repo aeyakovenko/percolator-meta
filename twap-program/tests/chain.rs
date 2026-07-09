@@ -32,6 +32,13 @@ const SEED_PROGRAM_CONFIG: &[u8] = b"program_config";
 const SEED_MULTISIG: &[u8] = b"multisig";
 const PERM_ALL: u8 = 7;
 const TIMELOCK_1_WEEK_SECS: u32 = 7 * 24 * 60 * 60;
+const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
+
+fn gv_init_data() -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(&TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes());
+    data
+}
 
 fn squads_program_bytes() -> Vec<u8> {
     // Squads v4 fixture (dumped from mainnet) used by the genesis->handoff chain tests.
@@ -4416,7 +4423,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
             AccountMeta::new_readonly(Pubkey::default(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -5368,7 +5375,7 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
             AccountMeta::new_readonly(Pubkey::default(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -11904,7 +11911,7 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new_readonly(Pubkey::default(), false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
