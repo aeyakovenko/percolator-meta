@@ -221,9 +221,16 @@ impl Env {
     }
 
     fn init_insurance_pool_policy(&mut self, policy: u8) {
+        self.init_insurance_pool_policy_with_window(policy, None);
+    }
+
+    fn init_insurance_pool_policy_with_window(&mut self, policy: u8, window_slots: Option<u64>) {
         let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
         data.extend_from_slice(&ASSET_ID.to_le_bytes());
         data.push(policy);
+        if let Some(window_slots) = window_slots {
+            data.extend_from_slice(&window_slots.to_le_bytes());
+        }
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -3501,6 +3508,45 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
     env.insurance_deposit(&alice, &alice_ata, &hold, 1_000_000).expect("deposit into the real pool");
     env.insurance_withdraw(&alice, &alice_ata, &hold, &alice, 1_000_000).expect("exit is not bricked");
     assert_eq!(env.token_amount(&alice_ata), 1_000_000, "principal fully recovered — the pool works");
+}
+
+// The genesis deposit window must close on-chain. Without this, late capital can
+// inflate the live outstanding quorum denominator right before trigger without
+// carrying comparable voting tenure, turning the bootstrap into a late-deposit DOS.
+#[test]
+fn genesis_insurance_deposit_window_rejects_late_capital_but_not_exits() {
+    let mut env = Env::new();
+    env.init_insurance_pool_policy_with_window(POLICY_PRINCIPAL, Some(3));
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let alice_hold = create_holding(&mut env, &pool);
+
+    env.warp_slot(101);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 10)
+        .expect("deposit before the short genesis window closes");
+    assert_eq!(env.pool_outstanding(), 10);
+
+    let (bob, bob_ata) = new_depositor(&mut env, 10);
+    let bob_hold = create_holding(&mut env, &pool);
+    env.warp_slot(104);
+    assert!(
+        env.insurance_deposit(&bob, &bob_ata, &bob_hold, 10).is_err(),
+        "late capital must not be able to inflate the genesis quorum denominator"
+    );
+    assert_eq!(
+        env.token_amount(&bob_ata),
+        10,
+        "rejected late deposit moved no funds"
+    );
+    assert_eq!(
+        env.pool_outstanding(),
+        10,
+        "late rejected deposit did not change outstanding principal"
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &alice_hold, &alice, 10)
+        .expect("existing depositors can exit after deposits close");
+    assert_eq!(env.token_amount(&alice_ata), 10);
 }
 
 // CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)

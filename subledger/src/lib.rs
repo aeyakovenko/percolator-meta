@@ -54,8 +54,11 @@ const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // Position grows by `shares` (u128 @104). All cross-program reads (genesis-vote
 // principal@72 / start_slot@89 / outstanding@80) keep their offsets — the new fields are
 // appended, so those programs are unaffected.
-const POOL_SIZE: usize = 208;
+const POOL_SIZE: usize = 216;
 const POSITION_SIZE: usize = 120;
+// One week at ~400ms/slot. `init_insurance_pool` accepts an optional explicit
+// slot window, but defaults to this short bootstrap deposit window.
+const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
 
 // Position field byte offsets, exposed so cross-program readers (genesis-vote, residual-distributor)
 // can PIN their hardcoded reads against this canonical layout instead of guessing (finding HF: a
@@ -70,6 +73,7 @@ pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) 
 // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
 // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
 pub const POOL_OUTSTANDING_PRINCIPAL_OFF: usize = 80;
+pub const POOL_DEPOSIT_DEADLINE_SLOT_OFF: usize = 208;
 
 const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
@@ -193,6 +197,9 @@ struct Pool {
     /// withdraw redeems `shares * insurance_balance / total_shares`. The share price
     /// = balance/total_shares moves with market PnL, so exit is tenure-fair.
     total_shares: u128,
+    /// First slot at which new deposits are rejected. Own-vault pools set this to
+    /// u64::MAX; genesis insurance pools set a short bootstrap deposit deadline.
+    deposit_deadline_slot: u64,
 }
 
 impl Pool {
@@ -217,6 +224,7 @@ impl Pool {
             percolator_program: Pubkey::new_from_array(data[128..160].try_into().unwrap()),
             vote_authority: Pubkey::new_from_array(data[160..192].try_into().unwrap()),
             total_shares: u128::from_le_bytes(data[192..208].try_into().unwrap()),
+            deposit_deadline_slot: u64::from_le_bytes(data[208..216].try_into().unwrap()),
         })
     }
 
@@ -234,6 +242,7 @@ impl Pool {
         data[128..160].copy_from_slice(self.percolator_program.as_ref());
         data[160..192].copy_from_slice(self.vote_authority.as_ref());
         data[192..208].copy_from_slice(&self.total_shares.to_le_bytes());
+        data[208..216].copy_from_slice(&self.deposit_deadline_slot.to_le_bytes());
     }
 
     fn is_insurance(&self) -> bool {
@@ -507,6 +516,7 @@ fn process_init_pool(
         percolator_program: Pubkey::default(),
         vote_authority: Pubkey::default(),
         total_shares: 0,
+        deposit_deadline_slot: u64::MAX,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     Ok(())
@@ -811,7 +821,7 @@ fn create_pda_robust<'a>(
 
 // init_insurance_pool accounts: [payer(s,w), mint, pool(w,pda), percolator_vault,
 //   market_slab, percolator_program, system_program, vote_authority]
-// data: asset_id (u64), policy (u8)
+// data: asset_id (u64), policy (u8), optional deposit_window_slots (u64)
 //
 // `vote_authority` is the genesis-vote config PDA permitted to toggle a position's
 // vote-lock (Pubkey::default() to disable). It is recorded as-is, not validated
@@ -837,7 +847,16 @@ fn process_init_insurance_pool(
 
     let asset_id = read_u64(data)?;
     let policy = read_u8(data)?;
-    if policy > POLICY_WITH_SURPLUS || !data.is_empty() {
+    let deposit_window_slots = if data.is_empty() {
+        DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS
+    } else {
+        let slots = read_u64(data)?;
+        if slots == 0 || !data.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        slots
+    };
+    if policy > POLICY_WITH_SURPLUS {
         return Err(ProgramError::InvalidInstructionData);
     }
     if !payer.is_signer {
@@ -849,6 +868,9 @@ fn process_init_insurance_pool(
     if *percolator_program.key == Pubkey::default() {
         return Err(ProgramError::InvalidAccountData);
     }
+    let deposit_deadline_slot = Clock::get()?.slot
+        .checked_add(deposit_window_slots)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     let asset_id_bytes = asset_id.to_le_bytes();
     let (expected_pool, bump) = Pubkey::find_program_address(
@@ -906,6 +928,7 @@ fn process_init_insurance_pool(
         percolator_program: *percolator_program.key,
         vote_authority: *vote_authority.key,
         total_shares: 0,
+        deposit_deadline_slot,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?);
     Ok(())
@@ -952,6 +975,12 @@ fn process_insurance_deposit(
     let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     if !pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
+    }
+    // Genesis deposits close at the pool's configured deadline. This prevents
+    // late capital from inflating the live quorum denominator right before
+    // genesis-vote trigger while carrying little/no voting tenure.
+    if Clock::get()?.slot >= pool.deposit_deadline_slot {
+        return Err(ProgramError::InvalidInstructionData);
     }
     // Re-derive the pool PDA so the signing seeds are trusted.
     let asset_id_bytes = pool.asset_id.to_le_bytes();
@@ -1533,6 +1562,7 @@ mod tests {
             percolator_program: perc,
             vote_authority: Pubkey::new_unique(),
             total_shares: 7_777,
+            deposit_deadline_slot: 42_424,
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf);
@@ -1553,6 +1583,7 @@ mod tests {
         assert_eq!(d.market_slab, slab);
         assert_eq!(d.percolator_program, perc);
         assert_eq!(d.vote_authority, pool.vote_authority);
+        assert_eq!(d.deposit_deadline_slot, 42_424);
         assert!(d.is_insurance());
 
         let pos = Position {
