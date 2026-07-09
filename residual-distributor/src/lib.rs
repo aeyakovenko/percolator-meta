@@ -579,12 +579,28 @@ fn config_seeds<'a>(coin_mint: &'a Pubkey) -> [&'a [u8]; 2] {
     [b"rd_config", coin_mint.as_ref()]
 }
 
-fn stake_seeds<'a>(config: &'a Pubkey, owner: &'a Pubkey, linked: &'a Pubkey) -> [&'a [u8]; 4] {
+fn stake_family(cohort: u8) -> Result<u8, ProgramError> {
+    match cohort {
+        COHORT_INSURANCE | COHORT_BACKING | COHORT_LP | COHORT_FUNDING_PAYER => Ok(cohort),
+        // LP and trader are alternative views of the same residual-flow economics,
+        // so they deliberately collide for one linked portfolio.
+        COHORT_TRADER => Ok(COHORT_LP),
+        _ => Err(ProgramError::InvalidInstructionData),
+    }
+}
+
+fn stake_seeds<'a>(
+    config: &'a Pubkey,
+    owner: &'a Pubkey,
+    linked: &'a Pubkey,
+    family: &'a [u8; 1],
+) -> [&'a [u8]; 5] {
     [
         b"rd_stake",
         config.as_ref(),
         owner.as_ref(),
         linked.as_ref(),
+        family,
     ]
 }
 
@@ -912,19 +928,21 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
     };
     let start_slot = now;
+    let family_seed = [stake_family(cohort)?];
     let (expected, bump) = Pubkey::find_program_address(
-        &stake_seeds(config_account.key, owner.key, linked.key),
+        &stake_seeds(config_account.key, owner.key, linked.key, &family_seed),
         program_id,
     );
     if *stake_account.key != expected || stake_account.data_len() != 0 {
         return Err(ProgramError::InvalidSeeds);
     }
     let bump_arr = [bump];
-    let seeds: [&[u8]; 5] = [
+    let seeds: [&[u8]; 6] = [
         b"rd_stake",
         config_account.key.as_ref(),
         owner.key.as_ref(),
         linked.key.as_ref(),
+        &family_seed,
         &bump_arr,
     ];
     create_pda(payer, stake_account, system, program_id, &seeds, STAKE_SIZE)?;
@@ -969,8 +987,14 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.config != *config_account.key || stake.backing_ledger != *backing_ledger.key {
         return Err(ProgramError::InvalidAccountData);
     }
+    let family_seed = [stake_family(stake.cohort)?];
     let (expected_stake, _) = Pubkey::find_program_address(
-        &stake_seeds(config_account.key, &stake.owner, &stake.backing_ledger),
+        &stake_seeds(
+            config_account.key,
+            &stake.owner,
+            &stake.backing_ledger,
+            &family_seed,
+        ),
         program_id,
     );
     if *stake_account.key != expected_stake {
@@ -1174,8 +1198,14 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.config != *config_account.key {
         return Err(ProgramError::InvalidAccountData);
     }
+    let family_seed = [stake_family(stake.cohort)?];
     let (expected_stake, _) = Pubkey::find_program_address(
-        &stake_seeds(config_account.key, &stake.owner, &stake.backing_ledger),
+        &stake_seeds(
+            config_account.key,
+            &stake.owner,
+            &stake.backing_ledger,
+            &family_seed,
+        ),
         program_id,
     );
     if *stake_account.key != expected_stake {

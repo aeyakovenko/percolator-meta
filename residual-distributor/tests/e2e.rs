@@ -2120,16 +2120,43 @@ fn init_rejects_an_anti_wash_fee_above_100pct_no_claim_underflow_dos() {
 }
 
 fn stake_pda(env: &Env, owner: &Pubkey, linked: &Pubkey) -> Pubkey {
+    stake_pda_for_cohort(env, owner, linked, COHORT_LP)
+}
+
+fn stake_family(cohort: u8) -> u8 {
+    if cohort == COHORT_TRADER {
+        COHORT_LP
+    } else {
+        cohort
+    }
+}
+
+fn stake_pda_for_cohort(env: &Env, owner: &Pubkey, linked: &Pubkey, cohort: u8) -> Pubkey {
+    let family = [stake_family(cohort)];
     Pubkey::find_program_address(
         &[
             b"rd_stake",
             env.rd_config.as_ref(),
             owner.as_ref(),
             linked.as_ref(),
+            &family,
         ],
         &rd_id(),
     )
     .0
+}
+
+fn stakes_for_link(svm: &LiteSVM, env: &Env, owner: &Pubkey, linked: &Pubkey) -> Vec<Pubkey> {
+    [
+        COHORT_INSURANCE,
+        COHORT_BACKING,
+        COHORT_LP,
+        COHORT_FUNDING_PAYER,
+    ]
+    .into_iter()
+    .map(|cohort| stake_pda_for_cohort(env, owner, linked, cohort))
+    .filter(|stake| svm.get_account(stake).is_some())
+    .collect()
 }
 
 fn remember_registered_link(env: &Env, owner: &Pubkey, linked: &Pubkey) {
@@ -2142,15 +2169,18 @@ fn remember_registered_link(env: &Env, owner: &Pubkey, linked: &Pubkey) {
     });
 }
 
-fn registered_link_for_claim(
+fn registered_stake_for_claim(
     svm: &LiteSVM,
     env: &Env,
     owner: &Pubkey,
     requested: Option<&Pubkey>,
-) -> Pubkey {
+) -> (Pubkey, Pubkey) {
     if let Some(linked) = requested {
-        if svm.get_account(&stake_pda(env, owner, linked)).is_some() {
-            return *linked;
+        let candidates = stakes_for_link(svm, env, owner, linked);
+        match candidates.as_slice() {
+            [stake] => return (*stake, *linked),
+            [] => {}
+            _ => panic!("ambiguous reward family; pass the cohort explicitly"),
         }
     }
     REGISTERED_LINKS.with(|links| {
@@ -2160,12 +2190,16 @@ fn registered_link_for_claim(
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|linked| svm.get_account(&stake_pda(env, owner, linked)).is_some())
+            .flat_map(|linked| {
+                stakes_for_link(svm, env, owner, &linked)
+                    .into_iter()
+                    .map(move |stake| (stake, linked))
+            })
             .collect::<Vec<_>>();
         match candidates.as_slice() {
-            [linked] => *linked,
+            [(stake, linked)] => (*stake, *linked),
             [] => panic!("no registered stake for owner"),
-            _ => panic!("ambiguous registered stake; pass the bound linked account"),
+            _ => panic!("ambiguous registered stake; pass the cohort explicitly"),
         }
     })
 }
@@ -2179,7 +2213,7 @@ fn register(
     linked: &Pubkey,
     cohort: u8,
 ) -> Result<(), String> {
-    let stake = stake_pda(env, &owner.pubkey(), linked);
+    let stake = stake_pda_for_cohort(env, &owner.pubkey(), linked, cohort);
     let result = send(
         svm,
         payer,
@@ -2213,7 +2247,12 @@ fn crystallize_as(
     owner: &Pubkey,
     linked: &Pubkey,
 ) -> Result<(), String> {
-    let stake = stake_pda(env, owner, linked);
+    let candidates = stakes_for_link(svm, env, owner, linked);
+    let stake = match candidates.as_slice() {
+        [stake] => *stake,
+        [] => registered_stake_for_claim(svm, env, owner, None).0,
+        _ => panic!("ambiguous reward family; pass the cohort explicitly"),
+    };
     send(
         svm,
         payer,
@@ -2239,6 +2278,32 @@ fn crystallize(
     linked: &Pubkey,
 ) -> Result<(), String> {
     crystallize_as(svm, payer, env, owner, &owner.pubkey(), linked)
+}
+fn crystallize_cohort(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    cranker: &Keypair,
+    owner: &Pubkey,
+    linked: &Pubkey,
+    cohort: u8,
+) -> Result<(), String> {
+    let stake = stake_pda_for_cohort(env, owner, linked, cohort);
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(cranker.pubkey(), true),
+                AccountMeta::new(env.rd_config, false),
+                AccountMeta::new(stake, false),
+                AccountMeta::new_readonly(*linked, false),
+            ],
+            data: vec![2u8],
+        }],
+        &[cranker],
+    )
 }
 fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
     send(
@@ -2272,8 +2337,7 @@ fn claim_as(
     recipient_ata: &Pubkey,
     position: Option<&Pubkey>,
 ) -> Result<(), String> {
-    let stake_linked = registered_link_for_claim(svm, env, owner, position);
-    let stake = stake_pda(env, owner, &stake_linked);
+    let (stake, stake_linked) = registered_stake_for_claim(svm, env, owner, position);
     let claim_linked = position.copied().unwrap_or(stake_linked);
     let mut accounts = vec![
         AccountMeta::new(cranker.pubkey(), true),
@@ -2321,8 +2385,7 @@ fn claim_without_linked(
     owner: &Keypair,
     recipient_ata: &Pubkey,
 ) -> Result<(), String> {
-    let stake_linked = registered_link_for_claim(svm, env, &owner.pubkey(), None);
-    let stake = stake_pda(env, &owner.pubkey(), &stake_linked);
+    let (stake, _) = registered_stake_for_claim(svm, env, &owner.pubkey(), None);
     let accounts = vec![
         AccountMeta::new(owner.pubkey(), true),
         AccountMeta::new_readonly(env.rd_config, false),
@@ -2330,6 +2393,37 @@ fn claim_without_linked(
         AccountMeta::new(env.vault, false),
         AccountMeta::new(*recipient_ata, false),
         AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts,
+            data: vec![5u8],
+        }],
+        &[owner],
+    )
+}
+
+fn claim_cohort(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    owner: &Keypair,
+    recipient_ata: &Pubkey,
+    linked: &Pubkey,
+    cohort: u8,
+) -> Result<(), String> {
+    let stake = stake_pda_for_cohort(env, &owner.pubkey(), linked, cohort);
+    let accounts = vec![
+        AccountMeta::new(owner.pubkey(), true),
+        AccountMeta::new_readonly(env.rd_config, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new(*recipient_ata, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(*linked, false),
     ];
     send(
         svm,
@@ -7181,9 +7275,9 @@ fn register_rejects_out_of_range_cohort_cross_program_and_double_register() {
 // (`crystallized - spent` > 0, the trader-cohort counter) represents activity the LP and trader cohorts
 // each reward from a SEPARATE supply slice (10%/40%). If the SAME owner could register that one portfolio
 // under BOTH cohorts, they'd farm two cohort shares for one portfolio's economics — a free extra slice with
-// no extra capital at risk. The defense is structural: the stake PDA seed is
-// [b"rd_stake", config, owner, linked_account] with NO cohort byte, so one linked portfolio can only have one
-// stake regardless of cohort; the second register lands on the already-initialized PDA and is rejected by the
+// no extra capital at risk. The defense is structural: LP and trader map to the SAME residual reward-family
+// byte in `[b"rd_stake", config, owner, linked_account, reward_family]`, so one linked portfolio can only have
+// one residual stake; the second register lands on the already-initialized PDA and is rejected by the
 // data_len()!=0 guard. Pin that an owner who legitimately registers their own dual-activity portfolio as
 // TRADER cannot then also register it as LP (the economically-distinct cross-cohort case the same-cohort
 // double-register above does not exercise). Real .so.
@@ -7223,9 +7317,9 @@ fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio
     .expect("owner registers her dual-activity portfolio once (trader cohort)");
 
     // The double-dip: register the SAME portfolio under the LP cohort to also claim the LP supply slice.
-    // Cohort is not in the PDA seed, so this targets the SAME, now-occupied rd_stake PDA -> rejected. One
-    // linked portfolio = one cohort = one supply slice; the LP `received` leg cannot be farmed on top of the
-    // trader leg.
+    // LP and trader share the residual-family seed, so this targets the SAME, now-occupied rd_stake PDA ->
+    // rejected. One linked portfolio gets one residual supply slice; the LP `received` leg cannot be farmed
+    // on top of the trader leg.
     assert!(register(&mut svm, &payer, &env, &alice, &alice.pubkey(), &pf, COHORT_LP).is_err(),
         "same owner cannot register one portfolio under BOTH the trader and LP cohorts (cross-cohort double-dip)");
     // And the reverse order is symmetric: a fresh owner registering LP first cannot then add a trader stake.
@@ -7254,6 +7348,217 @@ fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio
         )
         .is_err(),
         "and LP-first cannot be topped up with a trader stake on the same single PDA either"
+    );
+}
+
+// REWARD-LOSS / LIVENESS PROBE: LP/trader residual flow and paid funding are
+// independent reward families. A normal portfolio can legitimately have both a
+// residual-loss counter and paid-funding counters, so choosing one family must not
+// make the other configured supply slice unreachable. LP and trader still share a
+// family and remain mutually exclusive for the same linked portfolio.
+#[test]
+fn one_portfolio_can_register_residual_and_funding_reward_families() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env =
+        setup_custom_split_with_fee_and_extras(&mut svm, &payer, 1_000_000, 0, 0, 0, 8_000, 0, &[]); // trader remainder = 20%, funding-payer = 80%
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_TRADER,
+    )
+    .expect("portfolio registers its residual reward family");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("the same portfolio also registers its independent funding reward family");
+
+    set_slot(&mut svm, 1_500);
+    let mut live = svm.get_account(&portfolio).unwrap();
+    live.data[196..212].copy_from_slice(&10_000u128.to_le_bytes()); // crystallized loss
+    live.data[244..260].copy_from_slice(&40_000u128.to_le_bytes()); // long funding paid
+    svm.set_account(portfolio, live).unwrap();
+    crystallize_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_TRADER,
+    )
+    .expect("residual family crystallizes");
+    crystallize_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("funding family crystallizes");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze both reward families");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    claim_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &ata,
+        &portfolio,
+        COHORT_TRADER,
+    )
+    .expect("claim the 20% residual slice");
+    claim_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &ata,
+        &portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("claim the 80% funding slice");
+    assert_eq!(
+        token_amount(&svm, &ata),
+        1_000_000,
+        "one portfolio receives both independently configured reward families"
+    );
+}
+
+// REWARD-LOSS / LIVENESS PROBE: the market allow-list permits one owner to have
+// legitimate portfolios in multiple markets. Stake identity must include the linked
+// portfolio as well as the reward family, or the second funding portfolio collides
+// with the first and its paid-funding points become unclaimable.
+#[test]
+fn one_owner_can_claim_one_funding_family_across_two_linked_portfolios() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let extra_market = Pubkey::new_unique();
+    let env = setup_funding_payer_only_with_fee_and_extras(
+        &mut svm,
+        &payer,
+        1_000_000,
+        0,
+        &[extra_market],
+    );
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let primary = Pubkey::new_unique();
+    let extra = Pubkey::new_unique();
+    for (portfolio, market) in [(primary, env.market), (extra, extra_market)] {
+        set_portfolio_funding(
+            &mut svm,
+            &portfolio,
+            &env.stub_perc,
+            &market,
+            &owner.pubkey(),
+            0,
+            0,
+            0,
+            0,
+        );
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &owner.pubkey(),
+            &portfolio,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("each allow-listed linked portfolio gets its own funding stake");
+    }
+
+    set_slot(&mut svm, 1_500);
+    set_portfolio_funding(
+        &mut svm,
+        &primary,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        10_000,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &extra,
+        &env.stub_perc,
+        &extra_market,
+        &owner.pubkey(),
+        0,
+        0,
+        10_000,
+        0,
+    );
+    for portfolio in [primary, extra] {
+        crystallize_cohort(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &owner.pubkey(),
+            &portfolio,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("both funding stakes crystallize independently");
+    }
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze both linked contributions");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    for portfolio in [primary, extra] {
+        claim_cohort(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &ata,
+            &portfolio,
+            COHORT_FUNDING_PAYER,
+        )
+        .expect("both linked stakes claim independently");
+    }
+    assert_eq!(
+        token_amount(&svm, &ata),
+        1_000_000,
+        "equal paid-funding points across two portfolios split and exhaust the cohort"
     );
 }
 
@@ -8620,6 +8925,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
                 rd_config.as_ref(),
                 owner.pubkey().as_ref(),
                 pf.as_ref(),
+                &[COHORT_LP],
             ],
             &rd_id(),
         )
