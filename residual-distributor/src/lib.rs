@@ -891,6 +891,9 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     if !data.is_empty() || !payer.is_signer || total_supply == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
+    if emission_end_slot.checked_add(finalize_window).is_none() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     // Explicit cohort shares must not exceed 100%; trader takes the remainder.
     let explicit_bps_sum = (insurance_bps as u32)
         + (backing_bps as u32)
@@ -1487,11 +1490,11 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData); // already frozen — snapshot + vault are immutable
     }
     let now = Clock::get()?.slot;
-    if now
-        < config
-            .emission_end_slot
-            .saturating_add(config.finalize_window)
-    {
+    let freeze_cutoff = config
+        .emission_end_slot
+        .checked_add(config.finalize_window)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if now < freeze_cutoff {
         return Err(ProgramError::InvalidInstructionData); // emission + finalize window still open
     }
     // GX: the COIN is a fixed pool — no mint authority (can't inflate) and no freeze authority (can't

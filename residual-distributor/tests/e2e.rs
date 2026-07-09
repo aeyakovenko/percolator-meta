@@ -7909,6 +7909,25 @@ fn try_init(
     back_pool: Pubkey,
     market: Pubkey,
 ) -> Result<(), String> {
+    try_init_with_timing(
+        svm, payer, supply, 2_000, 500, ins, back, lp, ins_pool, back_pool, market,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_init_with_timing(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    supply: u64,
+    emission_end: u64,
+    finalize_window: u64,
+    ins: u16,
+    back: u16,
+    lp: u16,
+    ins_pool: Pubkey,
+    back_pool: Pubkey,
+    market: Pubkey,
+) -> Result<(), String> {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
@@ -7921,11 +7940,11 @@ fn try_init(
     let stub_sub = Pubkey::new_unique();
     let d = rd_init_data(
         supply,
-        2_000,
+        emission_end,
         ins,
         back,
         lp,
-        500,
+        finalize_window,
         ins_pool,
         back_pool,
         market,
@@ -8007,6 +8026,25 @@ fn init_rejects_zero_supply_overallocation_and_unscoped_cohorts() {
         )
         .is_err(),
         "lp/trader cohort without a market scope"
+    );
+    // Overflowing emission_end + finalize_window would make the permissionless one-shot freeze unreachable
+    // for any practical slot, permanently blocking self-service claims.
+    assert!(
+        try_init_with_timing(
+            &mut svm,
+            &payer,
+            1_000_000,
+            u64::MAX - 9,
+            10,
+            1_000,
+            1_000,
+            4_000,
+            p(),
+            p(),
+            p(),
+        )
+        .is_err(),
+        "overflowing freeze cutoff must be rejected at init"
     );
     // fully-valid config -> accepted.
     try_init(
