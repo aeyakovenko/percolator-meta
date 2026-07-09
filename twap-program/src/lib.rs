@@ -253,19 +253,19 @@ fn create_pda_robust<'a>(
     Ok(())
 }
 
-// Byte offset of the asset-0 `insurance` u128 inside a percolator market slab. Solana
+// Byte offsets inside the pinned percolator market slab. Solana
 // account data is globally readable, so we read it straight from the slab bytes — no
 // accessor API, no percolator linkage. The slab's zero-copy MarketGroupV16 header is a
 // repr(C) Pod of `[u8;N]` newtypes (align 1, no padding) at MARKET_GROUP_OFF =
-// HEADER_LEN(16)+WRAPPER_CONFIG_LEN(432)=448; `insurance` sits at +301 within it
+// HEADER_LEN(16)+WRAPPER_CONFIG_LEN(448)=464; `insurance` sits at +301 within it
 // (== offset_of!(MarketGroupV16HeaderAccount, insurance)). CRITICAL: the adjacent `vault`
-// field at +285 (slab 733) holds total tokens (insurance + trader capital + pnl) — reading
+// field at +285 (slab 749) holds total tokens (insurance + trader capital + pnl) — reading
 // vault here would let the surplus pull treat live trader/depositor capital as "surplus"
 // (the finding-O failure class). The `insurance_offset_matches_real_percolator_slab` canary
-// pins this exactly against the real percolator struct via offset_of!.
-// pub so the offset canary test pins THIS const (not a re-declared copy) against the real percolator struct —
-// a src-const drift on the surplus-pull insurance read would over-pull into depositor principal (LOF).
-pub const INSURANCE_OFFSET: usize = 448 + 301;
+// pins both the wrapper base and field offset against the real pinned program + engine structs.
+// These are pub so the canary pins the actual production constants rather than re-declared copies.
+pub const PERC_MARKET_GROUP_OFFSET: usize = 464;
+pub const INSURANCE_OFFSET: usize = PERC_MARKET_GROUP_OFFSET + 301;
 
 /// Read the market's asset-0 insurance balance directly from the slab account bytes.
 fn read_asset0_insurance(slab_data: &[u8]) -> Result<u128, ProgramError> {

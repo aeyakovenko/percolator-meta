@@ -4,8 +4,8 @@ A **non-custodial, Sybil-resistant governance bootstrap** for Percolator markets
 Depositors put capital at risk in a Percolator market's insurance to earn time-weighted
 voting power over how a **fixed, pre-existing COIN supply** is distributed. The winning
 distribution *is* the MetaDAO token; control of the market keys then transfers to it
-through a time-locked Squads handover. No program here ever custodies user funds or sits
-in the withdrawal path beyond a tightly-constrained, time-locked authority.
+through a time-locked Squads handover. Reward programs custody COIN only; depositor collateral
+stays in Percolator or owner-bound subledger vaults.
 
 > **Status.** Experimental, **educational-use-only**, provided **AS IS** with no warranties
 > (see [LICENSE](LICENSE)). Participants put real capital **at risk** in a live market and
@@ -27,22 +27,25 @@ in the withdrawal path beyond a tightly-constrained, time-locked authority.
   in a genesis-owned vault. The genesis programs do attribution/accounting only; the one path to
   unconstrained authority is a key rotation that runs through a **1-week Squads timelock**, giving
   every depositor a pre-announced window to exit first.
+- **Post-genesis rewards reuse the same points engine.** Each immutable reward epoch selects up to
+  six DAO-vetted markets and their insurance/backing pools. TWAP may send bought COIN into the
+  epoch's canonical vault; the points engine can only read principal-bearing accounts and transfer
+  COIN to bound recipients.
 
 ## Modules
 
-How they fit: a depositor's stake is recorded by **subledger**; **genesis-vote** (or the
-alternative **residual-distributor**) reads that stake to decide a winner and seals it into
-**distribution**, which pays out the fixed COIN pool; post-mint, **Squads** rotates the market's
-insurance authority to **twap-program**, which buys and burns COIN from surplus. The two deciders
-are interchangeable behind the same distribution seam.
+How they fit: a depositor's stake is recorded by **subledger**. The proposal path uses
+**genesis-vote + distribution**; the deterministic path uses **residual-distributor** directly.
+Post-genesis, **Squads** rotates the market's insurance authority to **twap-program**, which can
+split bought COIN between burn and another residual-distributor reward epoch.
 
 | Crate | Role |
 |---|---|
 | `subledger/` | The market's **asset-0 insurance operator** during genesis (a role granted by Squads). Mediates deposits (signs Percolator `TopUpInsurance` as the insurance authority) and owner-authorized exits, tracking per-owner attribution (`owner, principal, start_slot`). Genesis pools are **share-based** (ERC4626-style): exiting redeems shares at the live balance, returning principal **plus any surplus**, pro-rata under loss. Never rotates keys — `accept_operator` only *consents* to receive the role Squads grants. Also provides reusable owner-bound pools for assets 1..N. |
 | `genesis-vote/` | The **vote decider**. Runs a log-time quorum vote weighted by each voter's subledger attribution (`floor(log2(hold_time)) × principal`), one voter → one proposal. Seals the winner into `distribution` by CPI. Holds no funds. |
-| `residual-distributor/` | The **deterministic decider** — a pluggable alternative to `genesis-vote` behind the same seam. Awards points across share-value cohorts (insurance/backing), residual cohorts (LP/trader), and an optional cumulative funding-payer cohort (`long_paid + short_paid`) via self-service `register → crystallize → freeze → claim`. Requires a **market allow-list** (see below). |
+| `residual-distributor/` | Reusable deterministic **COIN reward epochs**. Fixed mode distributes the whole genesis mint; dynamic mode snapshots COIN accumulated from TWAP. Both reuse `register → crystallize → freeze → claim` across insurance/backing shares, LP/trader residual, and cumulative funding-payer (`long_paid + short_paid`) cohorts. |
 | `distribution/` | Holds the fixed COIN pool in a vault. A proposal is one on-chain account of up to ~10k `(pubkey, amount)` entries; the sealed winner's recipients **claim** permissionlessly, **unclaimed is burned**. Never mints. The `authority` (whichever decider PDA) is bound into the config seed, making it decider-pluggable. |
-| `twap-program/` | Deployable BPF for the **authority chain** and the post-mint **uniform-price (Dutch) buy/burn auction**. After the mint, Squads rotates the asset-0 insurance operator to its PDA; it then runs permissionless rounds that pull the burn-share of insurance *surplus*, clear a ranked, uncancellable bid book at one marginal price, and burn (or treasury-send) the bought COIN. Never reaches principal. |
+| `twap-program/` | Deployable BPF for the **authority chain** and post-mint uniform-price auction. It pulls only insurance *surplus*, clears at one marginal price, and splits bought COIN between burn and a DAO-pinned sink such as a reward-epoch vault. Never reaches the configured principal floor. |
 | `twap/` | Reference library for the buy/burn (schedule + bid book); only its overflow-safe rate comparator is reused on-chain. |
 | `setup/` | Host-side helper: init the fixed-supply 42M COIN mint and revoke the mint authority. |
 
@@ -74,7 +77,24 @@ The deterministic `residual-distributor` genesis path is tested with a 10% insur
    anyone calls `execute`: it pulls the burn-share (DAO-set, default 80%) of the current surplus, ratchets
    the retained share into the protected principal counter (so it compounds in insurance), clears the book
    at one marginal price (every winner pays the same; better bidders give less COIN, surplus refunded),
-   and burns the bought COIN (or sends it to a DAO sink). Winners then `claim` their USD.
+   and splits bought COIN between burn and a DAO-configured sink. Winners then `claim` their USD.
+8. **Reward epoch (self-service)** — a DAO-authorized config immutably binds `(authority, COIN mint,
+   epoch id)`, schedule, cohort bps, canonical COIN vault, and market/pool set. At the deadline,
+   `freeze` snapshots the vault balance and cohort denominators; users claim their own pro-rata COIN.
+
+## Reward-fund boundary
+
+`residual-distributor` has no instruction that withdraws insurance, backing, or portfolio collateral.
+Those accounts are always read-only. Its only token CPI transfers the configured COIN mint from the
+epoch PDA's canonical vault to the stake's pre-bound recipient. The DAO can choose future market scopes
+and reward percentages, but cannot mutate an active epoch, redirect a claim, or sweep user principal.
+
+The full LiteSVM chain test runs fixed-supply genesis, then three consecutive 15-day TWAP rounds into
+one dynamic reward epoch. Every round sends 50% of bought COIN to the epoch vault, burns 50%, pays the
+seller, and reopens the book. At day 45 the cumulative vault pays 10% insurance, 10% backing, and 80%
+cumulative funding-payer points across a DAO-selected market set. Insurance/backing balances and
+attribution remain unchanged by reward finalization and claims; Percolator oracle/crank maintenance is
+external.
 
 ## Authority chain & the 1-week timelock
 
@@ -93,7 +113,8 @@ pre-announced exit window."
 The portfolio-flow cohorts award points from Percolator portfolio counters that **anyone who controls a
 market's oracle can manufacture** (stand up an auth-mark market, self-trade delta-neutral, push funding/marks).
 So a portfolio counts only if its market is on an orchestrator-vetted allow-list of trusted-Pyth markets
-(`market_group` + up to 9 extras, bound at `init`). Cohort 2 is LP residual received; cohort 3 is trader
+(`market_group` + up to 9 extras for legacy configs). A reward epoch atomically binds up to six
+`(market, insurance pool, backing pool)` scopes; a market may be OI-only. Cohort 2 is LP residual received; cohort 3 is trader
 residual loss net of spent principal; cohort 4 is the cumulative funding-payer counter:
 `funding_long_paid_atoms_total + funding_short_paid_atoms_total`, with no age multiplier. Receiver-side funding counters do not earn points.
 **Setup:** the creator holds the markets' authority key locally, stands up and vets N Pyth markets, then transfers
@@ -106,7 +127,7 @@ wash-farming among already-trusted markets; see `residual-distributor/DESIGN.md`
 ```bash
 # build the deployable BPF programs (each self-contained)
 PERCOLATOR_MANIFEST="$(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="percolator-prog") | .manifest_path')"
-CARGO_TARGET_DIR="$PWD/target/percolator-prog-c080" cargo build-sbf \
+CARGO_TARGET_DIR="$PWD/target/percolator-prog-pinned" cargo build-sbf \
   --manifest-path "$PERCOLATOR_MANIFEST" \
   --sbf-out-dir "$PWD/target/deploy" \
   --no-default-features
@@ -126,6 +147,10 @@ RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml
 #   deposit -> vote -> distribute -> claim -> DAO/Squads handoff -> buy/burn auction:
 RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
     --test chain e2e_full_genesis_to_buy_burn
+
+# deterministic genesis -> three 15-day TWAP 50/50 rounds -> cumulative 10/10/80 claims:
+RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
+    --test chain e2e_market_genesis_traders_residual_decider_then_handoff_twap
 ```
 
 Tests load the **real** binaries (the Cargo-pinned Percolator SBF at `target/deploy/percolator_prog.so`,

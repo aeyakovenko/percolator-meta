@@ -354,15 +354,16 @@ fn payout(policy: u8, balance: u64, outstanding: u64, principal: u64) -> Result<
     }
 }
 
-// Byte offset of the asset-0 `insurance` u128 inside a percolator market slab. Solana
+// Byte offsets inside the pinned percolator market slab. Solana
 // account data is globally readable, so the LIVE insurance is read straight from the slab
 // bytes — no accessor API. The zero-copy MarketGroupV16 header is a repr(C) Pod of `[u8;N]`
-// newtypes (align 1) at MARKET_GROUP_OFF = HEADER_LEN(16)+WRAPPER_CONFIG_LEN(432)=448;
+// newtypes (align 1) at MARKET_GROUP_OFF = HEADER_LEN(16)+WRAPPER_CONFIG_LEN(448)=464;
 // `insurance` sits at +301 within it (== offset_of!(MarketGroupV16HeaderAccount, insurance)).
-// NOTE: the adjacent `vault` field is at +285 (slab 733) and holds total tokens (insurance +
+// NOTE: the adjacent `vault` field is at +285 (slab 749) and holds total tokens (insurance +
 // trader capital + pnl); reading vault would over-count the fund and under-charge the haircut.
-// Pinned exactly against the real percolator struct by the insurance_offset canary in the tests.
-pub const PERC_INSURANCE_OFFSET: usize = 448 + 301;
+// The canary pins both constants against the real pinned wrapper and engine layouts.
+pub const PERC_MARKET_GROUP_OFFSET: usize = 464;
+pub const PERC_INSURANCE_OFFSET: usize = PERC_MARKET_GROUP_OFFSET + 301;
 
 /// The market's LIVE asset-0 insurance, read straight from the slab account bytes. This is
 /// the authoritative figure (not the shared vault token balance) — it shrinks when the

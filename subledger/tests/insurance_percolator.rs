@@ -2,7 +2,7 @@
 //! deposit / vote / exit flow.
 //!
 //! Proves, against the REAL percolator binary
-//! (`../percolator-prog/target/deploy/percolator_prog.so`, loaded into litesvm):
+//! (the Cargo-pinned `target/deploy/percolator_prog.so`, loaded into LiteSVM):
 //!
 //! 1. A user deposits into market-0 INSURANCE through the `subledger` program (the
 //!    subledger pool PDA is asset-0's insurance authority + operator). Funds land in
@@ -60,10 +60,9 @@ fn so(name: &str) -> String {
     format!("{}/../target/deploy/{}.so", env!("CARGO_MANIFEST_DIR"), name)
 }
 fn perc_so() -> String {
-    format!(
-        "{}/../../percolator-prog/target/deploy/percolator_prog.so",
-        env!("CARGO_MANIFEST_DIR")
-    )
+    let pinned = format!("{}/../target/deploy/percolator_prog.so", env!("CARGO_MANIFEST_DIR"));
+    assert!(std::path::Path::new(&pinned).exists(), "missing Cargo-pinned Percolator SBF at {pinned}");
+    pinned
 }
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
@@ -532,8 +531,8 @@ fn create_holding(env: &mut Env, owner_pool: &Pubkey) -> Pubkey {
 }
 
 /// Slab base offset of the percolator `MarketGroupV16` header
-/// (HEADER_LEN 16 + WRAPPER_CONFIG_LEN 432).
-const MARKET_GROUP_OFF: usize = 448;
+/// from the pinned wrapper API. Never duplicate this number in the canary.
+const MARKET_GROUP_OFF: usize = percolator_prog::constants::MARKET_GROUP_OFF;
 
 /// Drive the live asset-0 insurance down to `new_insurance` *consistently*, exactly as a real
 /// venue loss would: insurance, vault, the per-domain budgets and the remaining-budget total
@@ -549,9 +548,11 @@ fn impair_market(env: &mut Env, new_insurance: u128) {
     // of the pro-rata feature is reading the insurance fund, NOT the (larger) vault total.
     assert_eq!(off_ins, MARKET_GROUP_OFF + 301, "insurance offset drifted from real percolator struct");
     assert_ne!(off_ins, off_vault, "insurance must not alias vault");
+    assert_eq!(subledger_program::PERC_MARKET_GROUP_OFFSET, percolator_prog::constants::MARKET_GROUP_OFF,
+        "Percolator wrapper growth shifted the market-group base");
     // Pin the SUBLEDGER's shipped src constant against the real struct too. The functional haircut tests
     // below set vault == insurance (a consistent loss), so they CANNOT distinguish a src offset that
-    // accidentally reads vault@733 instead of insurance@749 — only this assertion catches a regression of
+    // accidentally reads vault@749 instead of insurance@765 — only this assertion catches a regression of
     // PERC_INSURANCE_OFFSET itself (the canary above only pins offset_of!, not what the program ships).
     assert_eq!(subledger_program::PERC_INSURANCE_OFFSET, off_ins,
         "subledger PERC_INSURANCE_OFFSET drifted from real percolator insurance field (would read vault as insurance)");
