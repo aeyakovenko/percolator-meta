@@ -136,6 +136,7 @@ fn pool_pda(mint: &Pubkey, asset_id: u64) -> Pubkey {
             &asset_id.to_le_bytes(),
             no_market.as_ref(),
             no_market.as_ref(),
+            no_market.as_ref(),
         ],
         &program_id(),
     )

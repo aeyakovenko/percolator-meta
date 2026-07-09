@@ -111,7 +111,7 @@ impl Env {
         let slab = Pubkey::new_unique();
 
         // The subledger insurance pool PDA: asset-0 insurance authority + operator,
-        // bound to (mint, asset_id, market_slab, percolator_program).
+        // bound to (mint, asset_id, market_slab, percolator_program, coin_mint).
         let pool = Pubkey::find_program_address(
             &[
                 b"subledger_pool",
@@ -119,6 +119,7 @@ impl Env {
                 &ASSET_ID.to_le_bytes(),
                 slab.as_ref(),
                 perc_id().as_ref(),
+                coin_mint.as_ref(),
             ],
             &sub_id(),
         )
@@ -235,6 +236,7 @@ impl Env {
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 // vote_authority = the genesis-vote config PDA (keyed by the COIN).
                 AccountMeta::new_readonly(gv_config_pda(&self.coin_mint, &self.pool), false),
+                AccountMeta::new_readonly(self.coin_mint, false),
             ],
             data,
         };
@@ -1717,6 +1719,7 @@ fn insurance_pool_cannot_be_reinitialized_after_funding() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -2987,19 +2990,20 @@ fn veto_exit_retract_and_withdraw_in_one_atomic_tx() {
     assert_eq!(env.pool_outstanding(), 0, "alice's principal left the pool outstanding accounting");
 }
 
-// Griefing-freeze: init_insurance_pool is permissionless and records vote_authority
-// as-is, so an attacker could front-run pool creation with a hostile vote_authority.
-// That must NOT let them freeze depositors: set_vote_lock requires the position
-// OWNER to sign, so a position can only be (un)locked when its owner is acting on
-// their own vote. Here a hostile authority tries to lock a victim and fails; the
-// victim's funds stay withdrawable.
+// SAME-MARKET INIT SQUAT: init_insurance_pool is permissionless and the canonical
+// genesis pool PDA is first-writer-wins. A hostile vote_authority on the real pool
+// would permanently consume that PDA; genesis-vote then refuses to bind because the
+// pool does not point back at the canonical gv_config. The program must reject that
+// init before creating the account.
 #[test]
-fn hostile_vote_authority_cannot_freeze_a_depositor() {
+fn hostile_vote_authority_cannot_squat_the_genesis_pool() {
     let mut env = Env::new();
     let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
 
-    // Pool created with the ATTACKER as vote_authority (the front-run scenario).
+    // ATTACK: initialize the REAL genesis pool PDA for the REAL market, but bind
+    // vote_authority to an attacker key instead of the canonical genesis-vote config.
+    // If this succeeds, the pool PDA is consumed forever and genesis-vote InitConfig
+    // rejects it later because pool.vote_authority != gv_config.
     let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
     data.extend_from_slice(&ASSET_ID.to_le_bytes());
     data.push(POLICY_PRINCIPAL);
@@ -3013,41 +3017,64 @@ fn hostile_vote_authority_cannot_freeze_a_depositor() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(attacker.pubkey(), false), // hostile vote_authority
+            AccountMeta::new_readonly(attacker.pubkey(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
-    env.send(&[init], &[]).expect("init pool with hostile authority");
+    assert!(
+        env.send(&[init], &[]).is_err(),
+        "same-market genesis pool init must reject a noncanonical vote authority"
+    );
+    assert!(
+        env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()),
+        "the rejected hostile init must leave the canonical pool PDA free"
+    );
 
-    let amount = 1_000_000u64;
-    let (victim, victim_ata) = new_depositor(&mut env, amount);
-    let pool = env.pool;
-    let holding = create_holding(&mut env, &pool);
-    env.insurance_deposit(&victim, &victim_ata, &holding, amount).expect("deposit");
-
-    // Attacker signs as the vote_authority and tries to lock the victim's position
-    // WITHOUT the victim's signature (victim passed as a non-signer account).
-    let attack = Instruction {
+    // ATTACK 2: use a fake COIN mint and its matching gv_config while still pointing
+    // at the real pool PDA. This must also reject; otherwise a fake-coin squat could
+    // pass the vote-authority check and consume the real pool address.
+    let fake_coin = Pubkey::new_unique();
+    let fake_vote_authority = gv_config_pda(&fake_coin, &env.pool);
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let fake_coin_init = Instruction {
         program_id: sub_id(),
         accounts: vec![
-            AccountMeta::new_readonly(attacker.pubkey(), true),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new(env.position_pda(&victim.pubkey()), false),
-            AccountMeta::new_readonly(victim.pubkey(), false), // owner NOT signing
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(fake_vote_authority, false),
+            AccountMeta::new_readonly(fake_coin, false),
         ],
-        data: vec![6u8, 1u8], // IX_SET_VOTE_LOCK, locked=1
+        data,
     };
-    let res = env.send(&[attack], &[&attacker]);
-    assert!(res.is_err(), "cannot lock a position the owner did not sign for");
+    assert!(
+        env.send(&[fake_coin_init], &[]).is_err(),
+        "fake-coin matching gv_config must not squat the real coin's pool PDA"
+    );
+    assert!(
+        env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()),
+        "the rejected fake-coin init must leave the canonical pool PDA free"
+    );
 
-    // The victim is not frozen — their principal is still withdrawable.
-    env.insurance_withdraw(&victim, &victim_ata, &holding, &victim, amount).expect("victim can still exit");
-    assert_eq!(env.token_amount(&victim_ata), amount, "depositor funds were never frozen");
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    assert_eq!(
+        ve.gv_config,
+        gv_config_pda(&env.coin_mint, &env.pool),
+        "the legitimate genesis-vote config still initializes against the canonical pool"
+    );
 }
 
 // SYBIL HOLE (vote outlives capital): set_vote_lock requires BOTH the owner AND the vote_authority
-// (the gv config PDA) to sign. The freeze test above pins the owner-sig half. THIS pins the
-// vote_authority-sig half — the one that stops an owner from SELF-UNLOCKING. The lock is only ever
+// (the gv config PDA) to sign. This pins the vote_authority-sig half — the one that stops an owner
+// from SELF-UNLOCKING. The lock is only ever
 // cleared by the gv vote-RETRACT CPI (which makes the config PDA sign and also removes the ballot's
 // weight/principal). If an owner could clear the lock directly — by naming the gv config as a
 // read-only (unsigned) account — they would withdraw their principal while their ballot stays live:
@@ -3286,6 +3313,7 @@ fn init_insurance_pool_rejects_non_canonical_vault() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3447,9 +3475,9 @@ fn only_the_proposal_creator_can_register_it() {
 // (= f(COIN_mint, asset 0)) FIRST, bound to a percolator market THEY control, with
 // vote_authority set to the predictable real gv config PDA — passing the gv binding
 // check and routing every depositor's principal into the attacker's market (LOF). Now
-// the pool PDA commits to (mint, asset_id, market_slab, percolator_program), so an
-// attacker's pool lands at a DIFFERENT address and the genesis pool PDA — bound to the
-// real market — stays free and untouched.
+// the pool PDA commits to (mint, asset_id, market_slab, percolator_program, coin_mint),
+// so an attacker's pool lands at a DIFFERENT address and the genesis pool PDA — bound
+// to the real market and COIN — stays free and untouched.
 #[test]
 fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     let mut env = Env::new();
@@ -3476,7 +3504,7 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     // The attacker's pool PDA is bound to THEIR market — a different address from the
     // genesis pool (env.pool), which is bound to the real market (env.slab).
     let attacker_pool = Pubkey::find_program_address(
-        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), attacker_slab.as_ref(), perc_id().as_ref()],
+        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), attacker_slab.as_ref(), perc_id().as_ref(), env.coin_mint.as_ref()],
         &sub_id(),
     ).0;
     assert_ne!(attacker_pool, env.pool, "the market binding is part of the pool PDA");
@@ -3496,7 +3524,8 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
             AccountMeta::new_readonly(attacker_slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &attacker_pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3539,6 +3568,7 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3612,12 +3642,13 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
 
 // CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)
 // and init_insurance_pool (tag 3) derive their pool PDA from pool_seeds(mint, asset_id, market_slab,
-// percolator_program). The genesis insurance pool lives at (mint, 0, REAL_market, REAL_program). If
+// percolator_program, coin_mint). The genesis insurance pool lives at
+// (mint, 0, REAL_market, REAL_program, REAL_coin). If
 // init_pool let the caller supply the market/program seed parts, an attacker could derive that exact
 // address with a BACKING-domain own-vault pool, seize the PDA (legit init then fails
 // AccountAlreadyInitialized), and brick the genesis (genesis-vote needs is_insurance() == true).
 // init_pool defends by HARDCODING the market/program seed components to Pubkey::default() (lib.rs:394),
-// so own-vault pools are confined to the (mint, asset_id, default, default) namespace — provably
+// so own-vault pools are confined to the (mint, asset_id, default, default, default) namespace — provably
 // disjoint from any real-market insurance pool. This pins that isolation: init_pool cannot be pointed
 // at the genesis insurance PDA. (The init_insurance_pool foreign-market + bad-policy squats are pinned
 // separately; this closes the wrong-instruction angle.)
@@ -3628,7 +3659,7 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
     // The own-vault namespace for the same (mint, asset_id) is a DIFFERENT address than the genesis
     // insurance pool — the market/program seed parts differ (default vs the real market).
     let own_vault_pda = Pubkey::find_program_address(
-        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), Pubkey::default().as_ref(), Pubkey::default().as_ref()],
+        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), Pubkey::default().as_ref(), Pubkey::default().as_ref(), Pubkey::default().as_ref()],
         &sub_id(),
     ).0;
     assert_ne!(own_vault_pda, env.pool, "own-vault and insurance pool PDAs are structurally disjoint");

@@ -2545,7 +2545,13 @@ fn token_amount(svm: &LiteSVM, key: &Pubkey) -> u64 {
     u64::from_le_bytes(a.data[64..72].try_into().unwrap())
 }
 
-fn sub_pool_pda(collateral_mint: &Pubkey, asset_id: u64, slab: &Pubkey, perc: &Pubkey) -> Pubkey {
+fn sub_pool_pda(
+    collateral_mint: &Pubkey,
+    asset_id: u64,
+    slab: &Pubkey,
+    perc: &Pubkey,
+    coin_mint: &Pubkey,
+) -> Pubkey {
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -2553,6 +2559,7 @@ fn sub_pool_pda(collateral_mint: &Pubkey, asset_id: u64, slab: &Pubkey, perc: &P
             &asset_id.to_le_bytes(),
             slab.as_ref(),
             perc.as_ref(),
+            coin_mint.as_ref(),
         ],
         &sub_id(),
     )
@@ -2746,10 +2753,11 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
 
-    // init the subledger insurance pool (permissionless; vote_authority is a placeholder here).
-    let vote_auth = Pubkey::new_unique();
+    // init the subledger insurance pool (permissionless; vote_authority is the canonical gv config PDA).
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8]; // IX_INIT_INSURANCE_POOL
     d.extend_from_slice(&0u64.to_le_bytes()); // asset_id 0
     d.push(1); // POLICY_WITH_SURPLUS (genesis pool = shares; exit returns principal+surplus)
@@ -2764,6 +2772,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: d,
     };
@@ -2902,8 +2911,9 @@ fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
     let va = perc_vault_authority(&slab_a, &perc_id());
     let perc_vault = canonical_insurance_vault(&va, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &va, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab_a, &perc_id());
-    let vote_auth = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab_a, &perc_id(), &coin_mint);
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // init insurance pool, POLICY_WITH_SURPLUS
@@ -2918,6 +2928,7 @@ fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: d,
     };
@@ -3251,8 +3262,9 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
-    let vote_auth = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // POLICY_WITH_SURPLUS
@@ -3267,6 +3279,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: d,
     };
@@ -3512,7 +3525,6 @@ fn e2e_attacker_cannot_lower_surplus_floor_without_squads() {
     let squads_vault = vault_pda(&squads, &multisig, 0);
 
     let collateral_mint = Pubkey::new_unique();
-    let coin_mint = Pubkey::new_unique();
     let slab = Pubkey::new_unique();
     let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
     svm.set_account(
@@ -3531,6 +3543,7 @@ fn e2e_attacker_cannot_lower_surplus_floor_without_squads() {
         unix_timestamp: 100,
         ..Clock::default()
     });
+    let coin_mint = Pubkey::new_unique();
     let twap_init = init_config_ix(
         &payer.pubkey(),
         &coin_mint,
@@ -3662,7 +3675,6 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let squads_vault = vault_pda(&squads, &multisig, 0);
 
     let collateral_mint = Pubkey::new_unique();
-    let coin_mint = Pubkey::new_unique();
     let slab = Pubkey::new_unique();
     let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
     svm.set_account(
@@ -3684,7 +3696,9 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
     dpool.push(0);
@@ -3698,7 +3712,8 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: dpool,
     };
@@ -3973,7 +3988,8 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
     dpool.push(0);
@@ -3987,7 +4003,8 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: dpool,
     };
@@ -4253,7 +4270,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
@@ -4271,6 +4288,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(gv_config, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: dp,
     };
@@ -5207,7 +5225,7 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
     let mut dp = vec![3u8];
@@ -5224,6 +5242,7 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(gv_config, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: dp,
     };
@@ -6984,6 +7003,7 @@ fn e2e_vote_rejects_a_position_from_a_foreign_subledger_pool() {
         1,
         &Pubkey::default(),
         &Pubkey::default(),
+        &Pubkey::default(),
     );
     let vault_b = Pubkey::new_unique();
     set_token(&mut svm, &vault_b, &env.collateral_mint, &pool_b, 0);
@@ -7209,6 +7229,7 @@ fn e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum() 
     let pool_f = sub_pool_pda(
         &env.collateral_mint,
         7,
+        &Pubkey::default(),
         &Pubkey::default(),
         &Pubkey::default(),
     );
@@ -11627,7 +11648,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
 
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
@@ -11646,6 +11667,7 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(gv_config, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: d,
     };
@@ -18658,12 +18680,19 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &topup, &tur)
         .expect("market earns surplus (real topup)");
 
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id());
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint);
     let no_market = Pubkey::default();
-    let backing_pool = sub_pool_pda(&collateral_mint, 0, &no_market, &no_market);
+    let backing_pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &no_market,
+        &no_market,
+        &Pubkey::default(),
+    );
 
     // subledger insurance pool, POLICY_WITH_SURPLUS (the soft-veto / tenure-fair cohort).
-    let vote_auth = Pubkey::new_unique();
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(1); // POLICY_WITH_SURPLUS
@@ -18678,6 +18707,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
         ],
         data: d,
     };
