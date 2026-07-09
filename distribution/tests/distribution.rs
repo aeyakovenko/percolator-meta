@@ -891,6 +891,36 @@ fn append_entry_count_capacity_cap_and_an_overflowing_batch_reverts_atomically()
     assert_eq!(env.token_amount(&dave_ata), 40, "dave got the second slot cleanly");
 }
 
+// MAX-SHAPE PROGRESS PROBE: the public API advertises 10,000-entry distributions. The
+// maximum-sized proposal must be allocatable, fillable through transaction-sized append chunks,
+// sealable, and able to serve its final index under the normal compute budget.
+#[test]
+fn max_capacity_proposal_can_fill_seal_and_claim_the_last_entry() {
+    const ENTRIES: u32 = 10_000;
+    const CHUNK: usize = 24;
+    let mut env = Env::new(ENTRIES as u64, 1_000_000);
+    let proposal = env.create_proposal(99, ENTRIES);
+    assert_eq!(env.svm.get_account(&proposal).unwrap().data.len(), 104,
+        "creation allocates only the header");
+
+    let (recipient, recipient_ata) = env.new_recipient();
+    let entry = (recipient.pubkey(), 1u64);
+    let mut appended = 0u32;
+    while appended < ENTRIES {
+        let count = core::cmp::min(CHUNK, (ENTRIES - appended) as usize);
+        env.append(&proposal, &vec![entry; count]).expect("append max-capacity chunk");
+        appended += count as u32;
+    }
+    assert_eq!(env.svm.get_account(&proposal).unwrap().data.len(), 104 + ENTRIES as usize * 40,
+        "appends grow to the declared final capacity");
+
+    let authority = clone_kp(&env.authority);
+    env.seal(&proposal, &authority).expect("seal max proposal");
+    env.claim(&proposal, &recipient, &recipient_ata, ENTRIES - 1)
+        .expect("claim final max-capacity index");
+    assert_eq!(env.token_amount(&recipient_ata), 1);
+}
+
 // MALFORMED ENTRIES (zero amount / zero-address recipient): append rejects amount == 0 || pk ==
 // Pubkey::default() (lib.rs:append_entries). A zero-amount entry is permanently unclaimable and just
 // soaks a slot; a default-pubkey (zero address) entry allocates a chunk of the fixed supply to a key NOBODY

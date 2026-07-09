@@ -1,6 +1,6 @@
 //! Genesis COIN distribution by on-chain proposal list + permissionless claim.
 //!
-//! A proposal is a single on-chain account holding up to ~10k
+//! A proposal is a single on-chain account grown in append-sized increments to hold up to ~10k
 //! `(recipient pubkey, amount)` entries (40 bytes each → ~400KB). After a winner
 //! is sealed by the configured `authority`, recipients **claim** their own entry
 //! permissionlessly (pull model, indexed by offset); anything unclaimed when the
@@ -411,10 +411,33 @@ fn create_proposal(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
-    let size = PROPOSAL_HEADER + (capacity as usize) * ENTRY_SIZE;
+    let entries_size = (capacity as usize)
+        .checked_mul(ENTRY_SIZE)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let final_size = PROPOSAL_HEADER
+        .checked_add(entries_size)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Inner instructions may increase account data by at most 10,240 bytes. Fund the PDA for
+    // its declared final capacity now, allocate only its header, and let append_entries grow the
+    // program-owned account in transaction-sized increments.
+    let final_rent = solana_program::rent::Rent::get()?.minimum_balance(final_size);
+    let current = proposal_account.lamports();
+    if current < final_rent {
+        invoke(
+            &system_instruction::transfer(creator.key, proposal_account.key, final_rent - current),
+            &[creator.clone(), proposal_account.clone(), system_program.clone()],
+        )?;
+    }
     let bump_arr = [bump];
     let seeds: [&[u8]; 4] = [b"dist_proposal", config_account.key.as_ref(), &id_bytes, &bump_arr];
-    create_pda_robust(creator, proposal_account, system_program, program_id, &seeds, size)?;
+    create_pda_robust(
+        creator,
+        proposal_account,
+        system_program,
+        program_id,
+        &seeds,
+        PROPOSAL_HEADER,
+    )?;
 
     let header = ProposalHeader {
         config: *config_account.key,
@@ -448,8 +471,7 @@ fn append_entries(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]
         return Err(ProgramError::IllegalOwner);
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    let mut pd = proposal_account.try_borrow_mut_data()?;
-    let mut header = ProposalHeader::deserialize(&pd)?;
+    let mut header = ProposalHeader::deserialize(&proposal_account.try_borrow_data()?)?;
     if header.config != *config_account.key || header.creator != *creator.key {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -457,6 +479,14 @@ fn append_entries(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    let first_entry = header.entry_count;
+    let new_entry_count = first_entry
+        .checked_add(count)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if new_entry_count > header.capacity {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut new_total_amount = header.total_amount;
     for i in 0..count {
         let off = (i as usize) * ENTRY_SIZE;
         let pk = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
@@ -464,21 +494,29 @@ fn append_entries(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]
         if amount == 0 || pk == Pubkey::default() {
             return Err(ProgramError::InvalidInstructionData);
         }
-        if header.entry_count >= header.capacity {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let eo = entry_offset(header.entry_count);
-        pd[eo..eo + 32].copy_from_slice(pk.as_ref());
-        pd[eo + 32..eo + 40].copy_from_slice(&amount.to_le_bytes());
-        header.entry_count += 1;
-        header.total_amount = header
-            .total_amount
+        new_total_amount = new_total_amount
             .checked_add(amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        if header.total_amount > config.total_supply {
+        if new_total_amount > config.total_supply {
             return Err(ProgramError::InvalidInstructionData);
         }
     }
+
+    let required_len = entry_offset(new_entry_count);
+    if proposal_account.data_len() < required_len {
+        proposal_account.realloc(required_len, false)?;
+    }
+    let mut pd = proposal_account.try_borrow_mut_data()?;
+    for i in 0..count {
+        let off = (i as usize) * ENTRY_SIZE;
+        let pk = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let amount = u64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap());
+        let eo = entry_offset(first_entry + i);
+        pd[eo..eo + 32].copy_from_slice(pk.as_ref());
+        pd[eo + 32..eo + 40].copy_from_slice(&amount.to_le_bytes());
+    }
+    header.entry_count = new_entry_count;
+    header.total_amount = new_total_amount;
     header.serialize(&mut pd);
     Ok(())
 }
