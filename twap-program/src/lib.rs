@@ -47,10 +47,8 @@ const SQUADS_MULTISIG_DISC: [u8; 8] = [224, 116, 121, 186, 68, 161, 79, 236];
 // security model's premise is enforced on-chain instead of trusted to the (off-chain) orchestration.
 const MIN_TIMELOCK_SECS: u32 = 7 * 24 * 60 * 60; // 604_800
 
-// Associated Token Account program — used to derive a bidder's CANONICAL COIN ATA as the auction
-// refund target. Pinning refunds to the canonical ATA (not an arbitrary caller account) means a
-// bidder cannot brick the book by closing the refund destination: anyone can recreate an ATA, so
-// a stuck claim is always recoverable (it is not a permanent DOS).
+// Associated Token Account program — used to derive canonical payout hints. Refund safety is enforced
+// by requiring nonzero public-method payout destinations to be owned by the recorded bidder.
 const ATA_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
@@ -273,6 +271,21 @@ fn read_asset0_insurance(slab_data: &[u8]) -> Result<u128, ProgramError> {
         .get(INSURANCE_OFFSET..INSURANCE_OFFSET + 16)
         .ok_or(ProgramError::InvalidAccountData)?;
     Ok(u128::from_le_bytes(b.try_into().unwrap()))
+}
+
+fn require_bidder_coin_account(
+    account: &AccountInfo,
+    coin_mint: &Pubkey,
+    bidder: &Pubkey,
+) -> ProgramResult {
+    if account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let state = spl_token::state::Account::unpack(&account.try_borrow_data()?)?;
+    if state.mint != *coin_mint || state.owner != *bidder {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,19 +1433,19 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
                 }
                 evicted = Some((
                     book_rd_u128(&d, ow + SL_COIN),
-                    book_rd_key(&d, ow + SL_COIN_ATA),
+                    book_rd_key(&d, ow + SL_BIDDER),
                 ));
                 weakest
             }
         }
     };
 
-    // Refund the evicted bidder's full escrow to its recorded COIN account (passed last).
-    if let Some((evicted_coin, evicted_ata)) = evicted {
+    // Refund the evicted bidder's full escrow to any initialized COIN account they own. This keeps
+    // eviction recoverable even if the canonical refund account is closed, while still preventing
+    // the incoming bidder from redirecting the refund to themselves.
+    if let Some((evicted_coin, evicted_bidder)) = evicted {
         let evict_acct = next_account_info(iter)?;
-        if *evict_acct.key != evicted_ata {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        require_bidder_coin_account(evict_acct, &book.coin_mint, &evicted_bidder)?;
         spl_transfer(
             token_program,
             coin_escrow,
@@ -1944,7 +1957,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let (usd_owed, coin_refund, dest_key, coin_key) = {
+    let (usd_owed, coin_refund, bidder_key) = {
         let d = book_account.try_borrow_data()?;
         let o = slot_off(slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 1 {
@@ -1953,14 +1966,17 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         (
             book_rd_u128(&d, o + SL_USD_OWED),
             book_rd_u128(&d, o + SL_COIN_REFUND),
-            book_rd_key(&d, o + SL_USD_DEST),
-            book_rd_key(&d, o + SL_COIN_ATA),
+            book_rd_key(&d, o + SL_BIDDER),
         )
     };
-    if *usd_dest.key != dest_key || *coin_ata.key != coin_key {
-        return Err(ProgramError::InvalidAccountData);
-    }
     if usd_owed > 0 {
+        if usd_dest.owner != &spl_token::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let ud = spl_token::state::Account::unpack(&usd_dest.try_borrow_data()?)?;
+        if ud.owner != bidder_key || ud.mint != book.collateral_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
         spl_transfer(
             token_program,
             settlement_usd,
@@ -1971,6 +1987,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         )?;
     }
     if coin_refund > 0 {
+        require_bidder_coin_account(coin_ata, &book.coin_mint, &bidder_key)?;
         spl_transfer(
             token_program,
             coin_escrow,
@@ -2059,7 +2076,7 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let (coin_atoms, coin_key) = {
+    let coin_atoms = {
         let d = book_account.try_borrow_data()?;
         let o = slot_off(slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 0 {
@@ -2083,13 +2100,10 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
         if !aged {
             return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
         }
-        (
-            book_rd_u128(&d, o + SL_COIN),
-            book_rd_key(&d, o + SL_COIN_ATA),
-        )
+        book_rd_u128(&d, o + SL_COIN)
     };
-    if *coin_ata.key != coin_key {
-        return Err(ProgramError::InvalidAccountData);
+    if coin_atoms > 0 {
+        require_bidder_coin_account(coin_ata, &book.coin_mint, bidder.key)?;
     }
 
     if coin_atoms > 0 {

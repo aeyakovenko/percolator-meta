@@ -9607,7 +9607,7 @@ fn new_bidder(
 ) -> (Keypair, Pubkey, Pubkey) {
     let bidder = Keypair::new();
     svm.airdrop(&bidder.pubkey(), 1_000_000_000).unwrap();
-    // Fund + bid from the bidder's CANONICAL ATA, which is also the pinned COIN refund target.
+    // Fund + bid from the bidder's canonical ATA, which is the default COIN refund target.
     let coin_src = coin_ata_of(&bidder.pubkey(), &env.coin_mint);
     set_token(svm, &coin_src, &env.coin_mint, &bidder.pubkey(), 0);
     mint_coin(
@@ -10375,11 +10375,8 @@ fn e2e_claim_cannot_be_replayed_to_drain_other_winners() {
 // LOF PROBE (claim payout redirect, sweep tick A): claim is PERMISSIONLESS — any cranker may settle a bidder's
 // slot (the replay test above cranks alice's claim for her). The bidder's payout destinations (usd_dest /
 // coin_ata) come from the caller, so the ONLY thing stopping a cranker from redirecting a winner's parked USD
-// (and escrowed COIN refund) into the cranker's OWN account is the recorded-key bind at lib.rs:1793
-// (usd_dest.key == SL_USD_DEST && coin_ata.key == SL_COIN_ATA). The existing claim tests only ever pass the
-// CORRECT accounts, so that bind was unexercised. This pins it: a redirect to an attacker account is rejected,
-// and it is rejected unconditionally (the guard runs before the >0 transfer branches, so it holds even when the
-// COIN refund is 0). Parity with the distribution claim-theft guard.
+// into the cranker's OWN account is the recorded-bidder owner+mint bind. This pins the USD side here;
+// nonzero COIN-refund theft is pinned by e2e_claim_cannot_redirect_a_losers_coin_refund.
 #[test]
 fn e2e_claim_payout_cannot_be_redirected_to_a_cranker_account() {
     let mut svm =
@@ -10462,27 +10459,6 @@ fn e2e_claim_payout_cannot_be_redirected_to_a_cranker_account() {
         .is_err(),
         "a claim that redirects the USD to a non-recorded dest must be rejected"
     );
-    // ATTACK 2: correct usd_dest but route the COIN refund to mallory's account -> rejected (coin_ata bind),
-    // unconditionally (alice fully filled so the refund is 0, yet the key bind still fails the claim).
-    assert!(
-        send(
-            &mut svm,
-            &[&cranker],
-            claim_ix(
-                &cranker.pubkey(),
-                &env.twap_cfg,
-                &bk.book,
-                &bk.book_escrow,
-                &bk.settlement_usd,
-                &bk.coin_escrow,
-                &a_usd,
-                &m_src,
-                0
-            )
-        )
-        .is_err(),
-        "a claim with a non-recorded coin_ata must be rejected even when the refund is 0"
-    );
     assert_eq!(
         token_amount(&svm, &m_usd),
         m_usd_before,
@@ -10493,6 +10469,7 @@ fn e2e_claim_payout_cannot_be_redirected_to_a_cranker_account() {
         parked,
         "alice's parked USD is byte-for-byte intact"
     );
+    let _ = m_src;
 
     // Alice's legitimate claim (recorded accounts) still pays her in full and drains the slot.
     send(
@@ -12369,6 +12346,23 @@ fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
         10_000,
         "still committed"
     );
+    let close = spl_token::instruction::close_account(
+        &spl_token::ID,
+        &a_src,
+        &alice.pubkey(),
+        &alice.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &[&alice], close).expect("alice closes original refund account");
+    let alternate_refund = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &alternate_refund,
+        &env.coin_mint,
+        &alice.pubkey(),
+        0,
+    );
 
     // After 2*round_length slots (no execute cleared the book), the owner may cancel.
     warp_to(&mut svm, 100 + 2 * round_length + 1);
@@ -12385,7 +12379,7 @@ fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
                 &bk.book,
                 &bk.book_escrow,
                 &bk.coin_escrow,
-                &a_src,
+                &alternate_refund,
                 0
             )
         )
@@ -12401,13 +12395,17 @@ fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
             &bk.book,
             &bk.book_escrow,
             &bk.coin_escrow,
-            &a_src,
+            &alternate_refund,
             0,
         ),
     )
     .expect("alice cancels after cooldown");
 
-    assert_eq!(token_amount(&svm, &a_src), 10_000, "escrowed COIN returned");
+    assert_eq!(
+        token_amount(&svm, &alternate_refund),
+        10_000,
+        "escrowed COIN returned to a fresh bidder-owned account"
+    );
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "escrow drained");
     assert_eq!(
         mint_supply(&svm, &env.coin_mint),
@@ -13039,9 +13037,9 @@ fn e2e_closing_refund_ata_cannot_permanently_brick_the_book() {
         "book is settled — placing is blocked until it drains"
     );
 
-    // RECOVERY (permissionless): anyone recreates the canonical ATA, then claim succeeds and the
-    // book reopens. This is what the canonical-ATA pin buys — no permanent brick.
-    set_token(&mut svm, &a_src, &env.coin_mint, &attacker.pubkey(), 0);
+    // RECOVERY: claim through any fresh COIN account owned by the recorded bidder.
+    let alternate_refund = Pubkey::new_unique();
+    set_token(&mut svm, &alternate_refund, &env.coin_mint, &attacker.pubkey(), 0);
     send(
         &mut svm,
         &[&cranker],
@@ -13053,15 +13051,15 @@ fn e2e_closing_refund_ata_cannot_permanently_brick_the_book() {
             &bk.settlement_usd,
             &bk.coin_escrow,
             &a_usd,
-            &a_src,
+            &alternate_refund,
             1,
         ),
     )
-    .expect("claim recovers once the ATA exists again");
+    .expect("claim recovers through a fresh bidder-owned COIN account");
     assert_eq!(
-        token_amount(&svm, &a_src),
+        token_amount(&svm, &alternate_refund),
         10,
-        "attacker's COIN refund delivered after recreating the ATA"
+        "attacker's COIN refund delivered to the alternate account"
     );
     // Book reopened: a new bid now works.
     send(
@@ -14715,8 +14713,9 @@ fn e2e_closing_usd_dest_cannot_permanently_brick_the_book() {
         "book is settled — placing is blocked until it drains"
     );
 
-    // RECOVERY (permissionless): recreate the canonical collateral ATA, then claim + reopen.
-    set_token(&mut svm, &w_usd, &env.collateral_mint, &winner.pubkey(), 0);
+    // RECOVERY: claim through any fresh collateral account owned by the recorded bidder.
+    let alternate_usd = Pubkey::new_unique();
+    set_token(&mut svm, &alternate_usd, &env.collateral_mint, &winner.pubkey(), 0);
     send(
         &mut svm,
         &[&cranker],
@@ -14727,16 +14726,16 @@ fn e2e_closing_usd_dest_cannot_permanently_brick_the_book() {
             &bk.book_escrow,
             &bk.settlement_usd,
             &bk.coin_escrow,
-            &w_usd,
+            &alternate_usd,
             &w_src,
             0,
         ),
     )
-    .expect("claim recovers once the ATA exists again");
+    .expect("claim recovers through a fresh bidder-owned collateral account");
     assert_eq!(
-        token_amount(&svm, &w_usd),
+        token_amount(&svm, &alternate_usd),
         400_000,
-        "winner's USD delivered after recreating the ATA"
+        "winner's USD delivered to the alternate account"
     );
     send(
         &mut svm,
@@ -15105,9 +15104,8 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
     let (better, bt_s, bt_u) = new_bidder(&mut svm, &payer, &env, 50);
 
     // ATTACK (eviction-refund theft): the incoming bidder tries to redirect the evicted bidder's
-    // escrowed COIN to an account THEY control instead of the evictee's RECORDED canonical ATA. The
-    // refund target is pinned to the weakest bid's stored SL_COIN_ATA (set at the evictee's own
-    // place_bid), so a mismatched evict account is rejected and the evictee's COIN is never stolen.
+    // escrowed COIN to an account THEY control. The refund account must be owned by the evictee,
+    // so a better bidder cannot steal the evictee's COIN.
     let thief = Pubkey::new_unique();
     set_token(&mut svm, &thief, &env.coin_mint, &better.pubkey(), 0);
     assert!(
@@ -15130,7 +15128,7 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
             )
         )
         .is_err(),
-        "eviction must refund the evictee's recorded canonical ATA, not an attacker-chosen account"
+        "eviction must refund an evictee-owned COIN account, not an attacker-owned account"
     );
     assert_eq!(
         token_amount(&svm, &thief),
@@ -16833,14 +16831,10 @@ fn e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation() {
     );
 }
 
-// UNCENSORABILITY survives a closed-ATA poison bid on the EVICTION path (distinct from finding V's
-// CLAIM-path e2e_closing_refund_ata_...). In a FULL 32-slot book, a strictly-better bid evicts the
-// weakest and refunds it to the weakest's CANONICAL coin ATA. If that bidder closed their ATA, the
-// eviction refund (spl transfer) fails and the better bid is temporarily blocked — but anyone can
-// permissionlessly recreate the canonical ATA, after which the eviction succeeds + refunds. Pins that
-// the core uncensorable-bid guarantee is RECOVERABLE (not a permanent brick) on the eviction path
-// too; a regression pointing the eviction refund away from the canonical ATA would not be caught by
-// finding V's claim-path test.
+// UNCENSORABILITY survives a closed-ATA poison bid on the EVICTION path. In a FULL 32-slot book, a
+// strictly-better bid evicts the weakest and refunds it to a COIN account owned by the evictee. If
+// the evictee closed their canonical source/refund account, passing that closed account still fails,
+// but the eviction is recoverable through a fresh evictee-owned account.
 #[test]
 fn e2e_closed_weakest_ata_cannot_permanently_block_eviction() {
     let mut svm =
@@ -16926,10 +16920,11 @@ fn e2e_closed_weakest_ata_cannot_permanently_block_eviction() {
         "the better bid's COIN was NOT escrowed (place reverted)"
     );
 
-    // RECOVERY (permissionless): recreate the canonical ATA, then eviction succeeds + refunds.
+    // RECOVERY: use a fresh COIN account owned by the evicted bidder, not the closed canonical ATA.
+    let alternate_refund = Pubkey::new_unique();
     set_token(
         &mut svm,
-        &weakest_ata,
+        &alternate_refund,
         &env.coin_mint,
         &bidders[0].0.pubkey(),
         0,
@@ -16949,14 +16944,14 @@ fn e2e_closed_weakest_ata_cannot_permanently_block_eviction() {
             &env.collateral_mint,
             50,
             1000,
-            Some(weakest_ata),
+            Some(alternate_refund),
         ),
     )
-    .expect("eviction works once the ATA exists again");
+    .expect("eviction works with a fresh bidder-owned refund account");
     assert_eq!(
-        token_amount(&svm, &weakest_ata),
+        token_amount(&svm, &alternate_refund),
         1,
-        "evicted bidder refunded to the recreated canonical ATA"
+        "evicted bidder refunded to the alternate bidder-owned account"
     );
     assert_eq!(
         token_amount(&svm, &bt_s),
@@ -17948,9 +17943,8 @@ fn e2e_execute_full_four_way_split_composes_in_one_round() {
 // CLAIM COIN-REFUND REDIRECT BY A PERMISSIONLESS CRANKER (external LOF): claim is permissionless and
 // pays a bid's coin_refund (coin_escrow -> coin_ata). For a LOSER (unfilled) bid the refund is the
 // FULL escrowed COIN. If coin_ata weren't pinned, a cranker could claim the loser's slot with THEIR
-// OWN COIN account and steal the refund. claim pins coin_ata == the bid's recorded canonical COIN ATA
-// (findings V/AB). The existing redirect test only covers the USD side (its winner sold all its COIN,
-// so coin_refund was 0) — this exercises a non-zero refund.
+// OWN COIN account and steal the refund. claim requires the refund account to be owned by the
+// recorded bidder and match the COIN mint.
 #[test]
 fn e2e_claim_cannot_redirect_a_losers_coin_refund() {
     let mut svm =
@@ -18049,7 +18043,7 @@ fn e2e_claim_cannot_redirect_a_losers_coin_refund() {
             )
         )
         .is_err(),
-        "claim must reject a coin_ata != the bid's recorded refund target"
+        "claim must reject a coin refund account not owned by the recorded bidder"
     );
     assert_eq!(
         token_amount(&svm, &thief),
@@ -18110,7 +18104,7 @@ fn e2e_claim_cannot_redirect_a_losers_coin_refund() {
     assert_eq!(
         token_amount(&svm, &b_src),
         100_000,
-        "bob's full COIN refund delivered to his canonical ATA"
+        "bob's full COIN refund delivered to his bidder-owned account"
     );
     let _ = (alice, a_src, a_usd);
 }
