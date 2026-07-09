@@ -1204,17 +1204,18 @@ fn process_insurance_withdraw(
     // only their pro-rata share `owed`. (POLICY_WITH_SURPLUS pools always pro-rata, returning
     // any yield too.)
     let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
-    // Burn the share fraction matching the withdrawn principal fraction for BOTH policies. The payout
-    // policy remains separate: WITH_SURPLUS redeems those shares at the live balance, while PRINCIPAL keeps
-    // the principal-only/pro-rata-haircut payout. This keeps RD's live share-value cap aligned with capital
-    // still at risk even for a principal-policy partial exit.
+    // Burn the share fraction matching the withdrawn principal fraction for BOTH policies. Round UP:
+    // if a high share price makes `shares * amount / principal` floor to zero, a depositor could
+    // retire nonzero principal while preserving every live-cap share used by residual-distributor.
+    // The payout policy remains separate: WITH_SURPLUS redeems those shares at the live balance,
+    // while PRINCIPAL keeps the principal-only/pro-rata-haircut payout.
     let shares_to_burn = if position.principal == 0 {
         0u128
     } else {
         position
             .shares
             .checked_mul(amount as u128)
-            .and_then(|v| v.checked_div(position.principal as u128))
+            .map(|v| v.div_ceil(position.principal as u128))
             .ok_or(ProgramError::ArithmeticOverflow)?
     };
     let owed = if pool.policy == POLICY_WITH_SURPLUS {

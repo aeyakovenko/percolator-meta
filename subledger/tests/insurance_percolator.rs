@@ -1146,6 +1146,80 @@ fn principal_policy_partial_insurance_withdraw_burns_proportional_shares_issue_4
     assert_eq!(env.token_amount(&alice_ata), withdraw_amount, "principal-policy payout remains principal-only");
 }
 
+// ISSUE #40 ROUNDING EDGE: the proportional-share burn must round UP. Otherwise a late principal-policy
+// depositor with few shares can withdraw a small nonzero amount, retire principal, and burn 0 shares, leaving
+// stale live-cap shares for residual-distributor while less capital remains at risk.
+#[test]
+fn principal_policy_partial_withdraw_rounds_share_burn_up_no_stale_live_cap_dust() {
+    let mut env = Env::new();
+    env.init_insurance_pool(); // POLICY_PRINCIPAL
+
+    let pool = env.pool;
+    let (early, early_ata) = new_depositor(&mut env, 1);
+    let early_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&early, &early_ata, &early_holding, 1)
+        .expect("early seed deposit");
+    let early_shares = env.position_shares(&early.pubkey());
+    assert_eq!(
+        early_shares, 1_000_000,
+        "first atom mints the virtual-share scale"
+    );
+
+    // Inflate the live share price before a late principal-policy depositor joins. The late depositor
+    // receives 10 * (1_000_000 + VIRTUAL_SHARES) / (3_000_001 + 1) = 6 shares, so a 1-atom
+    // partial exit has a floor burn of 0 but a ceil burn of 1.
+    impair_market(&mut env, 3_000_001);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, 3_000_001),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (late, late_ata) = new_depositor(&mut env, 10);
+    let late_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&late, &late_ata, &late_holding, 10)
+        .expect("late deposit at inflated share price");
+    let shares_before = env.position_shares(&late.pubkey());
+    assert_eq!(
+        shares_before, 6,
+        "late depositor has few shares, making the rounding edge reachable"
+    );
+    assert_eq!(
+        shares_before * 1 / 10,
+        0,
+        "flooring the share burn for a one-atom partial exit would burn zero shares"
+    );
+
+    env.insurance_withdraw(&late, &late_ata, &late_holding, &late, 1)
+        .expect("one-atom partial withdraw");
+
+    let (principal_after, _start_slot, withdrawn) = env.read_position(&late.pubkey());
+    assert_eq!(principal_after, 9, "one atom of principal retired");
+    assert!(!withdrawn, "late position remains live after partial exit");
+    assert_eq!(
+        env.position_shares(&late.pubkey()),
+        shares_before - 1,
+        "ceil burn removes one share; floor burn would have left stale live-cap dust"
+    );
+    assert_eq!(
+        env.pool_total_shares(),
+        early_shares + shares_before - 1,
+        "pool total shares falls with the rounded-up position burn"
+    );
+    assert_eq!(
+        env.token_amount(&late_ata),
+        1,
+        "principal-policy payout remains principal-only"
+    );
+}
+
 // POLICY_WITH_SURPLUS pays out PRO-RATA SURPLUS (sweep tick B — the configurable policy distinction, INTENDED):
 // the two insurance-withdraw policies are a DEPLOYMENT CHOICE with an explicit tradeoff:
 //   * POLICY_PRINCIPAL  — a depositor recovers PRINCIPAL ONLY (haircut under loss, NO upside). Surplus stays in
