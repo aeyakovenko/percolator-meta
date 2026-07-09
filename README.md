@@ -80,7 +80,8 @@ The deterministic `residual-distributor` genesis path is tested with a 10% insur
    and splits bought COIN between burn and a DAO-configured sink. Winners then `claim` their USD.
 8. **Reward epoch (self-service)** — a DAO-authorized config immutably binds `(authority, COIN mint,
    epoch id)`, schedule, cohort bps, canonical COIN vault, and market/pool set. At the deadline,
-   `freeze` snapshots the vault balance and cohort denominators; users claim their own pro-rata COIN.
+   point crystallization closes; after the finalize delay, `freeze` snapshots the vault balance and
+   cohort denominators, and users claim their own pro-rata COIN.
 
 ## Reward-fund boundary
 

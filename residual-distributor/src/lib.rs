@@ -312,10 +312,9 @@ struct Config {
     // coin_mint has no mint authority (GX/EZ) — so the supply can't be inflated under the claimers.
     // Pubkey::default() until frozen.
     vault: Pubkey,
-    // Slots AFTER emission_end during which backers do their final crystallize before the denominators
-    // lock. freeze is rejected until `emission_end + finalize_window`. Since freeze is PERMISSIONLESS,
-    // a zero window would let anyone freeze the instant emission ends and forfeit slower backers' still
-    // un-crystallized points; the orchestrator sets ~1 week here (the "finalize your points" window).
+    // Slots AFTER emission_end before the denominators lock. Legacy configs may crystallize during
+    // this window. Reward epochs close crystallization at emission_end so cumulative counters cannot
+    // add post-period points; their window is an operational delay before permissionless freeze.
     finalize_window: u64,
     // ---- Residual tail. `total_points`/`insurance_total_points` above are BACKING and INSURANCE;
     // these add LP/TRADER residual cohorts and the backing pool scope. trader_bps is implicit from the
@@ -1281,12 +1280,8 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData); // sealed or frozen -> denominators are final
     }
     if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
-        let cutoff = config
-            .emission_end_slot
-            .checked_add(config.finalize_window)
-            .ok_or(ProgramError::InvalidInstructionData)?;
         let now = Clock::get()?.slot;
-        if now < config.emission_start_slot || now > cutoff {
+        if now < config.emission_start_slot || now > config.emission_end_slot {
             return Err(ProgramError::InvalidInstructionData);
         }
     }

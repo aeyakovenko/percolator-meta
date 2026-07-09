@@ -1114,6 +1114,132 @@ fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
     assert_eq!(token_amount(&svm, &funding_ata), 2_400_000);
 }
 
+#[test]
+fn reward_epoch_rejects_funding_points_created_after_emission_end() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let epoch_id = 73u64;
+    let rd_config = reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let start_slot = 100u64;
+    let emission_end = 200u64;
+    let finalize_window = 10u64;
+    set_slot(&mut svm, 50);
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                start_slot,
+                emission_end,
+                0,
+                0,
+                0,
+                0,
+                10_000,
+                finalize_window,
+                0,
+                &[RewardEpochMarket {
+                    market,
+                    insurance_pool: Pubkey::default(),
+                    backing_pool: Pubkey::default(),
+                }],
+            ),
+        }],
+        &[&dao],
+    )
+    .expect("initialize funding-only reward epoch");
+    let supply = 1_000_000u64;
+    mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+    let env = Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth: Keypair::new(),
+        stub_sub,
+        stub_perc,
+        ins_pool: Pubkey::default(),
+        back_pool: Pubkey::default(),
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    };
+
+    let farmer = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &portfolio,
+        &stub_perc,
+        &market,
+        &farmer.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_slot(&mut svm, start_slot);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &farmer,
+        &farmer.pubkey(),
+        &portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register during the reward period");
+
+    // The immutable reward period is over. Growing a cumulative counter now
+    // must not let a registered portfolio mint points during the grace window.
+    set_slot(&mut svm, emission_end + 1);
+    set_portfolio_funding(
+        &mut svm,
+        &portfolio,
+        &stub_perc,
+        &market,
+        &farmer.pubkey(),
+        1_000_000,
+        0,
+        0,
+        0,
+    );
+    assert!(
+        crystallize(&mut svm, &payer, &env, &farmer, &portfolio).is_err(),
+        "counters created after emission_end cannot enter the frozen denominator"
+    );
+
+    set_slot(&mut svm, emission_end + finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze after the grace window");
+    let recipient = create_token_account(&mut svm, &payer, &coin_mint, &farmer.pubkey());
+    claim(&mut svm, &payer, &env, &farmer, &recipient, None)
+        .expect("zero-point stake remains consumable");
+    assert_eq!(token_amount(&svm, &recipient), 0);
+    assert_eq!(token_amount(&svm, &vault), supply);
+}
+
 // DoS PROBE (lamport-prefund front-run brick, sweep tick D): the rd creates its rd_config (and every stake) PDA
 // via create_pda. If that used a naive system create_account, a front-runner could transfer 1 lamport to the
 // canonical rd_config PDA (system-owned, empty) BEFORE the genesis inits — create_account fails on a funded
