@@ -2122,7 +2122,10 @@ fn stake_pda(env: &Env, owner: &Pubkey) -> Pubkey {
 }
 
 fn stake_pda_for_cohort(env: &Env, owner: &Pubkey, cohort: u8) -> Pubkey {
-    if matches!(cohort, COHORT_INSURANCE | COHORT_BACKING) {
+    if matches!(
+        cohort,
+        COHORT_INSURANCE | COHORT_BACKING | COHORT_FUNDING_PAYER
+    ) {
         let cohort_seed = [cohort];
         Pubkey::find_program_address(
             &[
@@ -2151,7 +2154,45 @@ fn stake_pda_for_linked(svm: &LiteSVM, env: &Env, owner: &Pubkey, linked: &Pubke
             }
         }
     }
-    stake_pda(env, owner)
+    let unscoped = stake_pda(env, owner);
+    if let Some(acc) = svm.get_account(&unscoped) {
+        if acc.owner == rd_id() && acc.data.len() >= 104 {
+            let bound = Pubkey::new_from_array(acc.data[72..104].try_into().unwrap());
+            if bound == *linked {
+                return unscoped;
+            }
+        }
+    }
+    let funding = stake_pda_for_cohort(env, owner, COHORT_FUNDING_PAYER);
+    if let Some(acc) = svm.get_account(&funding) {
+        if acc.owner == rd_id() && acc.data.len() >= 104 {
+            let bound = Pubkey::new_from_array(acc.data[72..104].try_into().unwrap());
+            if bound == *linked {
+                return funding;
+            }
+        }
+    }
+    unscoped
+}
+
+fn stake_pda_for_unlinked_claim(svm: &LiteSVM, env: &Env, owner: &Pubkey) -> Pubkey {
+    let unscoped = stake_pda(env, owner);
+    if svm
+        .get_account(&unscoped)
+        .map(|acc| acc.owner == rd_id())
+        .unwrap_or(false)
+    {
+        return unscoped;
+    }
+    let funding = stake_pda_for_cohort(env, owner, COHORT_FUNDING_PAYER);
+    if svm
+        .get_account(&funding)
+        .map(|acc| acc.owner == rd_id())
+        .unwrap_or(false)
+    {
+        return funding;
+    }
+    unscoped
 }
 
 fn register(
@@ -2220,6 +2261,32 @@ fn crystallize(
 ) -> Result<(), String> {
     crystallize_as(svm, payer, env, owner, &owner.pubkey(), linked)
 }
+fn crystallize_cohort(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    cranker: &Keypair,
+    owner: &Pubkey,
+    linked: &Pubkey,
+    cohort: u8,
+) -> Result<(), String> {
+    let stake = stake_pda_for_cohort(env, owner, cohort);
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(cranker.pubkey(), true),
+                AccountMeta::new(env.rd_config, false),
+                AccountMeta::new(stake, false),
+                AccountMeta::new_readonly(*linked, false),
+            ],
+            data: vec![2u8],
+        }],
+        &[cranker],
+    )
+}
 fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
     send(
         svm,
@@ -2254,7 +2321,7 @@ fn claim_as(
 ) -> Result<(), String> {
     let stake = position
         .map(|linked| stake_pda_for_linked(svm, env, owner, linked))
-        .unwrap_or_else(|| stake_pda(env, owner));
+        .unwrap_or_else(|| stake_pda_for_unlinked_claim(svm, env, owner));
     // The bound linked account is now REQUIRED at claim for EVERY cohort (share-value: the subledger position;
     // LP/trader: the percolator portfolio — both == stake.backing_ledger). Use the explicit (possibly decoy)
     // account if a test gives one; otherwise derive it from the stake's recorded backing_ledger (offset 72..104).
@@ -2310,7 +2377,7 @@ fn claim_without_linked(
     owner: &Keypair,
     recipient_ata: &Pubkey,
 ) -> Result<(), String> {
-    let stake = stake_pda(env, &owner.pubkey());
+    let stake = stake_pda_for_unlinked_claim(svm, env, &owner.pubkey());
     let accounts = vec![
         AccountMeta::new(owner.pubkey(), true),
         AccountMeta::new_readonly(env.rd_config, false),
@@ -2319,6 +2386,38 @@ fn claim_without_linked(
         AccountMeta::new(*recipient_ata, false),
         AccountMeta::new_readonly(spl_token::ID, false),
     ];
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts,
+            data: vec![5u8],
+        }],
+        &[owner],
+    )
+}
+fn claim_cohort(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &Env,
+    owner: &Keypair,
+    recipient_ata: &Pubkey,
+    cohort: u8,
+    linked: Option<&Pubkey>,
+) -> Result<(), String> {
+    let stake = stake_pda_for_cohort(env, &owner.pubkey(), cohort);
+    let mut accounts = vec![
+        AccountMeta::new(owner.pubkey(), true),
+        AccountMeta::new_readonly(env.rd_config, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new(*recipient_ata, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    if let Some(linked) = linked {
+        accounts.push(AccountMeta::new_readonly(*linked, false));
+    }
     send(
         svm,
         payer,
@@ -7256,6 +7355,152 @@ fn register_same_owner_cannot_double_dip_lp_and_trader_cohorts_for_one_portfolio
         )
         .is_err(),
         "and LP-first cannot be topped up with a trader stake on the same single PDA either"
+    );
+}
+
+// REWARD-LOSS / LIVENESS PROBE (funding-payer plus residual slice): the funding-payer cohort is a
+// separately configured paid-funding accumulator slice, not the LP/trader residual double-dip. A normal
+// owner who both pays funding and has trader residual points must be able to register one trader stake
+// and one funding-payer stake, while the LP/trader mutual exclusion above remains intact. If the funding
+// stake shares the legacy [config, owner] PDA, the second public register is rejected and the owner loses
+// an otherwise configured supply slice.
+#[test]
+fn same_owner_can_claim_trader_and_funding_payer_slices() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup_custom_split_with_fee_and_extras(
+        &mut svm,
+        &payer,
+        supply,
+        0,
+        0,
+        0,
+        8_000,
+        0,
+        &[],
+    ); // trader remainder = 20%, funding-payer = 80%
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let trader_pf = Pubkey::new_unique();
+    let funding_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &trader_pf,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &funding_pf,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &trader_pf,
+        COHORT_TRADER,
+    )
+    .expect("owner registers trader residual stake");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &funding_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("same owner registers distinct funding-payer stake");
+
+    set_slot(&mut svm, 1_500);
+    set_portfolio_full(
+        &mut svm,
+        &trader_pf,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        10_000,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &funding_pf,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        40_000,
+        0,
+        0,
+        0,
+    );
+    crystallize_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &trader_pf,
+        COHORT_TRADER,
+    )
+    .expect("trader residual crystallizes");
+    crystallize_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &funding_pf,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("funding-payer points crystallize");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    claim_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &ata,
+        COHORT_TRADER,
+        Some(&trader_pf),
+    )
+    .expect("claim trader slice");
+    claim_cohort(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &ata,
+        COHORT_FUNDING_PAYER,
+        None,
+    )
+    .expect("claim funding-payer slice");
+
+    assert_eq!(
+        token_amount(&svm, &ata),
+        supply,
+        "same owner receives the configured 20% trader slice plus 80% funding-payer slice"
     );
 }
 

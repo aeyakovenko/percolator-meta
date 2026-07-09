@@ -902,9 +902,15 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
     };
     let start_slot = now;
-    let share_value_stake = matches!(cohort, COHORT_INSURANCE | COHORT_BACKING);
+    // Insurance/backing are distinct capital-at-risk pools, and funding-payer is a distinct
+    // paid-funding accumulator slice. LP/trader keep the legacy owner-only PDA so one portfolio
+    // cannot double-dip both residual-flow cohorts for the same economics.
+    let cohort_scoped_stake = matches!(
+        cohort,
+        COHORT_INSURANCE | COHORT_BACKING | COHORT_FUNDING_PAYER
+    );
     let cohort_seed = [cohort];
-    let (expected, bump) = if share_value_stake {
+    let (expected, bump) = if cohort_scoped_stake {
         Pubkey::find_program_address(
             &[
                 b"rd_stake",
@@ -924,7 +930,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(ProgramError::InvalidSeeds);
     }
     let bump_arr = [bump];
-    if share_value_stake {
+    if cohort_scoped_stake {
         let seeds: [&[u8]; 5] = [
             b"rd_stake",
             config_account.key.as_ref(),
