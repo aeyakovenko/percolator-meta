@@ -9272,6 +9272,45 @@ fn build_init_book_message(
     bid_fee: u64,
     coin_sink: Option<&Pubkey>, // included only in SEND mode (init_book reads it last)
 ) -> Vec<u8> {
+    build_init_book_message_with_sink_cutoff(
+        squads_vault,
+        book,
+        config,
+        book_escrow,
+        coin_escrow,
+        settlement_usd,
+        holding,
+        coin_mint,
+        collateral_mint,
+        reserve_num,
+        reserve_den,
+        round_length,
+        sink_mode,
+        bid_fee,
+        coin_sink,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_init_book_message_with_sink_cutoff(
+    squads_vault: &Pubkey,
+    book: &Pubkey,
+    config: &Pubkey,
+    book_escrow: &Pubkey,
+    coin_escrow: &Pubkey,
+    settlement_usd: &Pubkey,
+    holding: &Pubkey,
+    coin_mint: &Pubkey,
+    collateral_mint: &Pubkey,
+    reserve_num: u128,
+    reserve_den: u128,
+    round_length: u64,
+    sink_mode: u8,
+    bid_fee: u64,
+    coin_sink: Option<&Pubkey>,
+    sink_cutoff_slot: Option<u64>,
+) -> Vec<u8> {
     let mut m = Vec::new();
     let n_keys: u8 = if coin_sink.is_some() { 12 } else { 11 };
     let twap_idx: u8 = n_keys - 1; // twap program is the last key
@@ -9311,6 +9350,9 @@ fn build_init_book_message(
     data.extend_from_slice(&round_length.to_le_bytes());
     data.push(sink_mode);
     data.extend_from_slice(&bid_fee.to_le_bytes());
+    if let Some(cutoff) = sink_cutoff_slot {
+        data.extend_from_slice(&cutoff.to_le_bytes());
+    }
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -19746,7 +19788,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     assert_eq!(read_buyback_bps(&svm, &twap_cfg), 5_000);
 
     warp_to(&mut svm, reward_start);
-    let ib = build_init_book_message(
+    let ib = build_init_book_message_with_sink_cutoff(
         &squads_vault,
         &book,
         &twap_cfg,
@@ -19762,6 +19804,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         1,
         0,
         Some(&reward_vault),
+        Some(reward_end),
     );
     let ibr = vec![
         AccountMeta::new(squads_vault, false),
@@ -20457,6 +20500,79 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         svm.get_account(&backing_position).unwrap().data,
         backing_position_after_twap,
         "backing attribution is read-only to the reward program"
+    );
+
+    // Once the reward epoch is frozen, this book must not keep routing later
+    // buybacks into the now-immutable snapshot. A permissionless fourth round
+    // should burn the stale sink share rather than strand it outside every claim.
+    let stale_bid_coin = 10_000u128;
+    send(
+        &mut svm,
+        &[&long_payer],
+        place_bid_ix(
+            &long_payer.pubkey(),
+            &env.twap_cfg,
+            &book,
+            &book_escrow,
+            &coin_escrow,
+            &long_payer_coin,
+            &bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            stale_bid_coin,
+            stale_bid_coin,
+            None,
+        ),
+    )
+    .expect("place post-epoch stale-sink probe bid");
+    let post_epoch_round_end = reward_end + 15 * SLOTS_PER_DAY;
+    warp_to(&mut svm, post_epoch_round_end);
+    let handoff_market_mark = read_asset0_effective_price(&svm, &env.slab);
+    let oracle_crank = build_push_ewma_mark_message(
+        &env.squads_vault,
+        &env.slab,
+        &perc_id(),
+        post_epoch_round_end,
+        handoff_market_mark,
+    );
+    let oracle_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        17,
+        &oracle_crank,
+        &oracle_remaining,
+    )
+    .expect("external oracle crank for post-epoch round");
+    let stale_vault_before = token_amount(&svm, &reward_vault);
+    let stale_supply_before = mint_supply(&svm, &env.coin_mint);
+    let exec = execute_ix(
+        &payer.pubkey(),
+        &env,
+        &book,
+        &twap_holding,
+        &settlement_usd,
+        &book_escrow,
+        &coin_escrow,
+        Some(reward_vault),
+    );
+    send(&mut svm, &[&payer], exec).expect("execute post-epoch stale-sink probe");
+    assert_eq!(
+        token_amount(&svm, &reward_vault),
+        stale_vault_before,
+        "a frozen reward vault cannot receive COIN that no claim can reach"
+    );
+    assert_eq!(
+        stale_supply_before - mint_supply(&svm, &env.coin_mint),
+        stale_bid_coin as u64,
+        "after the reward cutoff, all bought COIN is burned"
     );
 }
 

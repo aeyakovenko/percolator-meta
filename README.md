@@ -93,8 +93,9 @@ The full LiteSVM chain test runs fixed-supply genesis, then three consecutive 15
 one dynamic reward epoch. Every round sends 50% of bought COIN to the epoch vault, burns 50%, pays the
 seller, and reopens the book. At day 45 the cumulative vault pays 10% insurance, 10% backing, and 80%
 cumulative funding-payer points across a DAO-selected market set. Insurance/backing balances and
-attribution remain unchanged by reward finalization and claims; Percolator oracle/crank maintenance is
-external.
+attribution remain unchanged by reward finalization and claims. The book binds the epoch's final sink
+slot: later permissionless rounds burn the stale sink share instead of depositing COIN outside the
+frozen reward snapshot. Percolator oracle/crank maintenance is external.
 
 ## Authority chain & the 1-week timelock
 
