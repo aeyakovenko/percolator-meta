@@ -26,6 +26,20 @@ fn so(name: &str) -> String {
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
+fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[
+            b"dist_config",
+            coin_mint.as_ref(),
+            authority.as_ref(),
+            &claim_window,
+        ],
+        &dist_id(),
+    )
+    .0
+}
 
 const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
 const TEST_BOOTSTRAP_START_SLOT: u64 = 0;
@@ -98,7 +112,7 @@ impl Env {
             TEST_BOOTSTRAP_DELAY_SLOTS,
             TEST_BOOTSTRAP_START_SLOT,
         );
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
+        let dist_config = dist_config_pda(&coin_mint, &gv_config);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, total_supply);
 
@@ -138,7 +152,7 @@ impl Env {
             TEST_BOOTSTRAP_DELAY_SLOTS,
             TEST_BOOTSTRAP_START_SLOT,
         );
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
+        let dist_config = dist_config_pda(&coin_mint, &gv_config);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
         let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool, total_supply: 100 };
@@ -158,7 +172,7 @@ impl Env {
         let sub_pid = Pubkey::new_from_array([7u8; 32]);
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
         let gv_config = gv_config_for_schedule(&coin_mint, &sub_pool, delay_slots, start_slot);
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
+        let dist_config = dist_config_pda(&coin_mint, &gv_config);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
         let mut env = Env {
@@ -233,7 +247,7 @@ impl Env {
         self.send(&[revoke], &[&auth]).expect("revoke coin mint authority");
 
         let mut data = vec![0u8];
-        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+        data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes()); // claim window
         data.extend_from_slice(&self.total_supply.to_le_bytes()); // total supply
         let ix = Instruction {
             program_id: dist_id(),
@@ -1142,9 +1156,10 @@ fn init_config_rejects_pool_not_bound_to_this_config() {
 // attacker front-running the permissionless init_config could bind the genesis to a
 // distribution it does NOT control the seal of — making the trigger's seal CPI fail
 // (authority mismatch) and bricking finalize (DOS), or pointing the genesis at the wrong
-// COIN. The honest distribution's own seed binds its authority (finding P/AA: dist_config =
-// f(coin, authority)), so the ONLY distribution that satisfies `authority == gv PDA` is the
-// real one whose funded vault holds the COIN — which an attacker cannot forge.
+// COIN. The honest distribution's own seed binds its authority and claim window (finding P/AA:
+// dist_config = f(coin, authority, claim_window)), so the ONLY distribution that satisfies
+// `authority == gv PDA` under the configured deadline is the real one whose funded vault holds the
+// COIN — which an attacker cannot forge.
 #[test]
 fn init_config_rejects_a_distribution_not_authority_bound_to_this_config() {
     // (a) right coin, but seal authority is an attacker key (not this gv config PDA).
@@ -1194,15 +1209,15 @@ fn init_rejects_a_fake_distribution_program() {
         "gv init must reject a non-canonical distribution program (anti front-run squat)"
     );
     // Boundary check: the SAME bytes under the REAL distribution program are accepted — the reject is
-    // the program-pin, not some unrelated failure. (The real dist_config is authority+coin bound.)
+    // the program-pin, not some unrelated failure. (The real dist_config is authority+coin+window bound.)
     let real = env.dist_config;
     env.init_gv_with_dist(real).expect("the canonical distribution program + bound config is accepted");
 }
 
 // Finding R regression: the gv config PDA now commits to its subledger_pool. init_config
-// is permissionless, and the distribution config it binds is a UNIQUE PDA f(COIN) whose
-// seal authority is pinned to one gv PDA. So a genesis can be wired to exactly ONE pool —
-// the one the real distribution's authority commits to. An attacker cannot front-run
+// is permissionless, and the distribution config it binds is a UNIQUE PDA f(COIN, gv PDA,
+// claim_window) whose seal authority is pinned to one gv PDA. So a genesis can be wired to exactly
+// ONE pool — the one the real distribution's authority commits to. An attacker cannot front-run
 // init_config to bind the genesis to a DIFFERENT (their own) valid pool: doing so makes
 // `expected` = f(COIN, attacker_pool), which no longer matches the distribution's pinned
 // authority, so the binding is refused. (Pre-fix the gv PDA was f(COIN) regardless of the

@@ -26,6 +26,15 @@ fn rd_id() -> Pubkey {
 fn dist_id() -> Pubkey {
     Pubkey::try_from("D1str1but1on11111111111111111111111111111111").unwrap()
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
+fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), authority.as_ref(), &claim_window],
+        &dist_id(),
+    )
+    .0
+}
 fn rd_so() -> String {
     format!(
         "{}/../target/deploy/residual_distributor.so",
@@ -499,11 +508,7 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config); // rd-owned claim vault
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
 
@@ -573,11 +578,7 @@ fn setup_funding_payer_only_with_fee_and_extras(
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
 
@@ -662,11 +663,7 @@ fn setup_share_value_and_funding_split(
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
 
@@ -742,11 +739,7 @@ fn setup_custom_split_with_fee_and_extras(
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
 
@@ -812,11 +805,7 @@ fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16)
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
     let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
@@ -897,6 +886,11 @@ fn maximum_real_subledger_position_claims_its_full_reward_without_mul_overflow_l
     let collateral_mint = create_mint(&mut svm, &payer, &collateral_authority.pubkey());
     let asset_id = 77u64;
     let no_market = Pubkey::default();
+    let policy = [0u8];
+    let domain = [0u8];
+    let deposit_window = u64::MAX.to_le_bytes();
+    let deposit_start = 0u64.to_le_bytes();
+    let bootstrap_delay = 0u64.to_le_bytes();
     let pool = Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -904,6 +898,12 @@ fn maximum_real_subledger_position_claims_its_full_reward_without_mul_overflow_l
             &asset_id.to_le_bytes(),
             no_market.as_ref(),
             no_market.as_ref(),
+            no_market.as_ref(),
+            &policy,
+            &domain,
+            &deposit_window,
+            &deposit_start,
+            &bootstrap_delay,
         ],
         &subledger_program::id(),
     )
@@ -1911,11 +1911,7 @@ fn init_is_not_bricked_by_a_lamport_prefund_of_the_rd_config_pda() {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
 
@@ -1992,11 +1988,7 @@ fn init_requires_current_coin_mint_authority_no_config_squat() {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
     let ins_pool = Pubkey::new_unique();
@@ -2128,11 +2120,7 @@ fn init_omitted_fee_uses_default_but_explicit_zero_remains_allowed() {
         let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
         let rd_config =
             Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-        let dist_config = Pubkey::find_program_address(
-            &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-            &dist_id(),
-        )
-        .0;
+        let dist_config = dist_config_pda(&coin_mint, &rd_config);
         let stub_perc = Pubkey::new_unique();
         let stub_sub = Pubkey::new_unique();
         let d = rd_init_data(
@@ -2256,11 +2244,7 @@ fn setup_with_extra_markets(
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
     mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
     let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
@@ -3187,11 +3171,7 @@ fn init_rejects_an_anti_wash_fee_above_100pct_no_claim_underflow_dos() {
         let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
         let rd_config =
             Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-        let dist_config = Pubkey::find_program_address(
-            &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-            &dist_id(),
-        )
-        .0;
+        let dist_config = dist_config_pda(&coin_mint, &rd_config);
         let stub_perc = Pubkey::new_unique();
         let stub_sub = Pubkey::new_unique();
         let d = rd_init_data(
@@ -5259,11 +5239,7 @@ fn legacy_long_short_funding_tail_maps_to_cumulative_funding_payer_bps() {
             let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
             let rd_config =
                 Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-            let dist_config = Pubkey::find_program_address(
-                &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-                &dist_id(),
-            )
-            .0;
+            let dist_config = dist_config_pda(&coin_mint, &rd_config);
             let vault = create_token_account(svm, &payer, &coin_mint, &rd_config);
             mint_to(svm, &payer, &coin_mint, &mint_auth, &vault, supply);
             let stub_sub = Pubkey::new_unique();
@@ -7931,11 +7907,7 @@ fn try_init_with_timing(
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
     let d = rd_init_data(
@@ -8107,11 +8079,7 @@ fn init_extra_market_vetting_rejects_overflow_default_duplicate_and_malformed_ta
         let coin_mint = create_mint(svm, &payer, &mint_auth.pubkey());
         let rd_config =
             Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-        let dist_config = Pubkey::find_program_address(
-            &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-            &dist_id(),
-        )
-        .0;
+        let dist_config = dist_config_pda(&coin_mint, &rd_config);
         let mut d = vec![0u8];
         d.extend_from_slice(&1_000_000u64.to_le_bytes()); // supply
         d.extend_from_slice(&2_000u64.to_le_bytes()); // emission_end
@@ -8212,15 +8180,7 @@ fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
     );
 
     // ATTACK: re-init the SAME (now frozen) rd config — would reset freeze_slot -> 0 and wipe the denominators.
-    let dist_config = Pubkey::find_program_address(
-        &[
-            b"dist_config",
-            env.coin_mint.as_ref(),
-            env.rd_config.as_ref(),
-        ],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&env.coin_mint, &env.rd_config);
     let mut d = vec![0u8];
     d.extend_from_slice(&supply.to_le_bytes());
     d.extend_from_slice(&env.emission_end.to_le_bytes());
@@ -9053,11 +9013,7 @@ fn init_rejects_cohort_bps_summing_above_one_hundred_percent_no_overallocation()
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
     let (stub_sub, stub_perc, ins_pool, back_pool, market) = (
@@ -9985,11 +9941,7 @@ fn rd_init(
     mint_authority: &Keypair,
 ) -> Pubkey {
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
     let d = rd_init_data(
@@ -10293,11 +10245,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
     let mint_auth = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
     let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
-    let dist_config = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), rd_config.as_ref()],
-        &dist_id(),
-    )
-    .0;
+    let dist_config = dist_config_pda(&coin_mint, &rd_config);
     let stub_perc = Pubkey::new_unique();
     let stub_sub = Pubkey::new_unique();
     let (m0, m1, m2, foreign) = (

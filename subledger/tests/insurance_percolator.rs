@@ -882,10 +882,17 @@ fn gv_config_pda_for_schedule(
     )
     .0
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
 fn dist_config_pda(mint: &Pubkey, authority: &Pubkey) -> Pubkey {
     // finding AA: the distribution config PDA binds its seal AUTHORITY (the gv config) into the
-    // seed, so an attacker can't squat a funded config under a different authority.
-    Pubkey::find_program_address(&[b"dist_config", mint.as_ref(), authority.as_ref()], &dist_id()).0
+    // seed, and its claim window, so an attacker can't squat a funded config under a different
+    // authority or deadline.
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[b"dist_config", mint.as_ref(), authority.as_ref(), &claim_window],
+        &dist_id(),
+    )
+    .0
 }
 
 fn revoke_mint_authority(env: &mut Env, mint: &Pubkey) {
@@ -916,7 +923,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
     mint_to(&mut env.svm, &clone_kp(&env.payer), &coin_mint, &clone_kp(&env.mint_auth), &dist_vault, 100);
     revoke_mint_authority(env, &coin_mint);
     let mut data = vec![0u8];
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+    data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes()); // claim window
     data.extend_from_slice(&100u64.to_le_bytes()); // total supply
     let ix = Instruction {
         program_id: dist_id(),
@@ -2977,7 +2984,7 @@ fn register_rejects_foreign_distribution_proposal() {
     mint_to(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &clone_kp(&env.mint_auth), &foreign_vault, 100);
     revoke_mint_authority(&mut env, &foreign_mint); // fixed-supply COIN (Safety §4)
     let mut data = vec![0u8]; // IX_INIT_CONFIG
-    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes());
     data.extend_from_slice(&100u64.to_le_bytes());
     let init = Instruction {
         program_id: dist_id(),

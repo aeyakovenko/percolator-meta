@@ -83,12 +83,38 @@ fn perc_vault_authority(slab: &Pubkey) -> Pubkey { Pubkey::find_program_address(
 fn canonical_insurance_vault(va: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[va.as_ref(), spl_token::ID.as_ref(), mint.as_ref()], &ATA_PROGRAM_ID).0
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
 fn read_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
     let data = svm.get_account(market).unwrap().data;
     percolator_prog::state::read_market(&data).unwrap().1.insurance
 }
 fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &dist_id()).0
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), authority.as_ref(), &claim_window],
+        &dist_id(),
+    )
+    .0
+}
+
+fn modeled_subledger_position(
+    pool: &Pubkey,
+    owner: &Pubkey,
+    principal: u64,
+    start_slot: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8; subledger_program::POS_SHARES_OFF + 16];
+    data[subledger_program::POS_POOL_OFF..subledger_program::POS_POOL_OFF + 32]
+        .copy_from_slice(pool.as_ref());
+    data[subledger_program::POS_OWNER_OFF..subledger_program::POS_OWNER_OFF + 32]
+        .copy_from_slice(owner.as_ref());
+    data[subledger_program::POS_PRINCIPAL_OFF..subledger_program::POS_PRINCIPAL_OFF + 8]
+        .copy_from_slice(&principal.to_le_bytes());
+    data[subledger_program::POS_START_SLOT_OFF..subledger_program::POS_START_SLOT_OFF + 8]
+        .copy_from_slice(&start_slot.to_le_bytes());
+    data[subledger_program::POS_SHARES_OFF..subledger_program::POS_SHARES_OFF + 16]
+        .copy_from_slice(&(principal as u128).to_le_bytes());
+    data
 }
 
 #[test]
@@ -513,9 +539,10 @@ fn genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_
 //    half WIN and earn nothing from the loss-rewarding trader cohort.
 //  - The farmer opens a long AND a short on ONE market (2 Sybil accounts, 1M each) -> whichever way it moves,
 //    one leg loses risk-free; it captures that loss as trader points for ~0 net market risk.
-//  - insurance/backing cohorts read ONLY the subledger Position share value (rd does no CPI), so they are
-//    modeled at exactly that quantity: 10 depositors x 1M shares in each pool (= "1M insurance + 1M backing
-//    per asset"). Equal shares -> equal pro-rata COIN. The TRADER/LP economy is full real-percolator.
+//  - insurance/backing cohorts read the subledger Position's live base-unit principal (rd does no CPI), so
+//    they are modeled at exactly that quantity: 10 depositors x 1M principal in each pool (= "1M insurance
+//    + 1M backing per asset"). Equal principal and tenure -> equal pro-rata COIN. The TRADER/LP economy is
+//    full real-percolator.
 const SIM_N_RATIONAL: usize = 99;
 const SIM_N_INS: usize = 10;   // 1M insurance per asset
 const SIM_N_BACK: usize = 10;  // 1M backing per asset
@@ -601,17 +628,14 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     ], &[&coin_auth]).expect("freeze COIN");
 
 
-    // ---- insurance + backing cohorts: 10 depositors x 1M shares each (modeled subledger positions) ----
+    // ---- insurance + backing cohorts: 10 depositors x 1M principal each (modeled positions) ----
     let mut ins_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();  // (owner, position, coin_ata)
     let mut back_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();
     for (cohort, pool, parts, n) in [(0u8, sub_pool, &mut ins_parts, SIM_N_INS), (1u8, back_pool, &mut back_parts, SIM_N_BACK)] {
         for _ in 0..n {
             let owner = Keypair::new(); svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
             let pos = Pubkey::new_unique();
-            // modeled subledger Position: pool@8, owner@40, withdrawn@88, shares@104 = 1M (= 1M deposit).
-            let mut d = vec![0u8; 160];
-            d[8..40].copy_from_slice(pool.as_ref()); d[40..72].copy_from_slice(owner.pubkey().as_ref());
-            d[104..120].copy_from_slice(&(SIM_DEPOSIT as u128).to_le_bytes());
+            let d = modeled_subledger_position(&pool, &owner.pubkey(), SIM_DEPOSIT, 100);
             svm.set_account(pos, Account { lamports: 1_000_000_000, data: d, owner: sub_id(), executable: false, rent_epoch: 0 }).unwrap();
             let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pos, cohort);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
@@ -708,13 +732,13 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     };
     for (o, pf, _a, _mi, _l) in &rational { let _ = cryst(&mut svm, &tx_unit, o, pf); }
     for (o, pf, _a) in &farmer { let _ = cryst(&mut svm, &tx_unit, o, pf); }
-    // share-value cohorts (insurance/backing): crystallize sets points = live shares; cranker MUST be the owner.
+    // Capital cohorts: crystallize sets points from live principal and tenure; cranker MUST be the owner.
     for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
         for (o, pos, _a) in parts {
             let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, cohort);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
-            ], data: vec![2u8] }], &[o]).expect("crystallize share-value");
+            ], data: vec![2u8] }], &[o]).expect("crystallize capital");
         }
     }
 
@@ -723,7 +747,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(rd_vault, false),
     ], data: vec![4u8] }], &[]).expect("freeze");
 
-    // claims: share-value (ins/back) sign as owner + append the position; trader permissionless + append the portfolio.
+    // Claims: capital cohorts sign as owner + append the position; trader is permissionless + appends the portfolio.
     let mut ins_coin = 0u64; let mut back_coin = 0u64;
     for (o, pos, ata) in &ins_parts {
         let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, 0);
@@ -808,7 +832,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     // The farmer is NOT disproportionate: its take <= the whole trader cohort, and per-leg it is bounded by the
     // same per-loss share an honest loser gets (the rd treats manufactured and real loss identically).
     assert!(farmer_coin as u128 <= trader_supply, "farmer cannot exceed the trader cohort");
-    assert_eq!(ins_coin as u128, ins_supply, "insurance cohort fully claimed (all depositors live, equal shares)");
+    assert_eq!(ins_coin as u128, ins_supply, "insurance cohort fully claimed (all depositors live, equal principal)");
     assert_eq!(back_coin as u128, back_supply, "backing cohort fully claimed");
     let _ = total_collateral; let _ = loser_examples; let _ = rational_loser_coin;
 }
@@ -896,16 +920,14 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
         spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
     ], &[&coin_auth]).expect("freeze COIN");
 
-    // ---- insurance + backing cohorts: 10 depositors x 1M shares each ----
+    // ---- insurance + backing cohorts: 10 depositors x 1M principal each ----
     let mut ins_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();
     let mut back_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();
     for (cohort, pool, parts, n) in [(0u8, sub_pool, &mut ins_parts, 10usize), (1u8, back_pool, &mut back_parts, 10usize)] {
         for _ in 0..n {
             let owner = Keypair::new(); svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
             let pos = Pubkey::new_unique();
-            let mut d = vec![0u8; 160];
-            d[8..40].copy_from_slice(pool.as_ref()); d[40..72].copy_from_slice(owner.pubkey().as_ref());
-            d[104..120].copy_from_slice(&(XM_DEPOSIT as u128).to_le_bytes());
+            let d = modeled_subledger_position(&pool, &owner.pubkey(), XM_DEPOSIT, 100);
             svm.set_account(pos, Account { lamports: 1_000_000_000, data: d, owner: sub_id(), executable: false, rent_epoch: 0 }).unwrap();
             let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pos, cohort);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
@@ -1004,7 +1026,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     for (_o, pf, _a, legs) in &rational { for (a, _l) in legs { crank(&mut svm, pf, *a); crank(&mut svm, pf, *a); } }
     for (_o, pf, _a, assets) in &farmer { for a in assets { crank(&mut svm, pf, *a); crank(&mut svm, pf, *a); } }
 
-    // ---- crystallize all trader stakes + share-value stakes, freeze, claim ----
+    // ---- crystallize all trader stakes + capital stakes, freeze, claim ----
     for (o, pf, _a, _l) in &rational {
         let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
@@ -1022,7 +1044,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, cohort);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
-            ], data: vec![2u8] }], &[o]).expect("crystallize share-value");
+            ], data: vec![2u8] }], &[o]).expect("crystallize capital");
         }
     }
     svm.set_sysvar(&Clock { slot: 2_101, unix_timestamp: 2_101, ..Default::default() });

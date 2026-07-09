@@ -3065,9 +3065,11 @@ fn gv_id_e2e() -> Pubkey {
 fn dist_id_e2e() -> Pubkey {
     Pubkey::from_str("D1str1but1on11111111111111111111111111111111").unwrap()
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E: u64 = 1_000_000;
 fn dist_config_pda_e2e(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E.to_le_bytes();
     Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), authority.as_ref()],
+        &[b"dist_config", coin_mint.as_ref(), authority.as_ref(), &claim_window],
         &dist_id_e2e(),
     )
     .0
@@ -4424,7 +4426,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
     ))
     .unwrap();
     let mut di = vec![0u8];
-    di.extend_from_slice(&1_000_000u64.to_le_bytes());
+    di.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E.to_le_bytes());
     di.extend_from_slice(&total.to_le_bytes());
     let dist_init = Instruction {
         program_id: dist_id_e2e(),
@@ -5377,7 +5379,7 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
     ))
     .unwrap();
     let mut di = vec![0u8];
-    di.extend_from_slice(&1_000_000u64.to_le_bytes());
+    di.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E.to_le_bytes());
     di.extend_from_slice(&total.to_le_bytes());
     let dist_init = Instruction {
         program_id: dist_id_e2e(),
@@ -11927,7 +11929,7 @@ fn e2e_full_genesis_to_buy_burn() {
     .expect("revoke mint auth");
     // distribution init_config (authority = gv config)
     let mut data = vec![0u8];
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+    data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E.to_le_bytes()); // claim window
     data.extend_from_slice(&total_supply.to_le_bytes());
     let dist_init = Instruction {
         program_id: dist_id_e2e(),
