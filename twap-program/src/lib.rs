@@ -807,7 +807,8 @@ const BK_BOOK_BUMP: usize = 250;
 const BK_ESCROW_BUMP: usize = 251;
 const BK_HOLDING: usize = 252; // the canonical twap_authority-owned USD budget account
 const BK_BID_FEE: usize = 284; // u64: flat COIN fee burned per place_bid (anti-spam, DAO-set)
-const BOOK_HEADER: usize = 292;
+const BK_SINK_CUTOFF_SLOT: usize = 292; // u64: last slot at which bought COIN may reach coin_sink
+const BOOK_HEADER: usize = 300;
 
 // Per-bid slot field offsets, relative to the slot start.
 const SL_OCCUPIED: usize = 0;
@@ -855,6 +856,7 @@ struct BookHeader {
     round_length: u64,
     round_end: u64,
     bid_fee: u64,
+    sink_cutoff_slot: u64,
     state: u8,
     sink_mode: u8,
     #[allow(dead_code)]
@@ -879,6 +881,7 @@ fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
         round_length: book_rd_u64(d, BK_ROUND_LENGTH),
         round_end: book_rd_u64(d, BK_ROUND_END),
         bid_fee: book_rd_u64(d, BK_BID_FEE),
+        sink_cutoff_slot: book_rd_u64(d, BK_SINK_CUTOFF_SLOT),
         state: d[BK_STATE],
         sink_mode: d[BK_SINK_MODE],
         book_bump: d[BK_BOOK_BUMP],
@@ -1029,6 +1032,7 @@ fn require_squads_vault(squads_vault: &AccountInfo, config: &Config) -> ProgramR
 // init_book accounts: [squads_vault(signer, payer), config, book(w, init), book_escrow(pda),
 //   coin_escrow, settlement_usd, holding, coin_mint, collateral_mint, system_program, coin_sink?]
 // data: reserve_num (u128) || reserve_den (u128) || round_length (u64) || sink_mode (u8)
+//   || bid_fee (u64) || sink_cutoff_slot? (u64; absent = no cutoff)
 //
 // Squads-vault-gated (timelock'd): pins the reserve, round length, COIN sink, binding mints and
 // the canonical USD holding, and records the shared COIN-escrow + settlement-USD token accounts
@@ -1049,7 +1053,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let collateral_mint = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
-    if data.len() != 49 {
+    if data.len() != 49 && data.len() != 57 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let reserve_num = u128::from_le_bytes(data[..16].try_into().unwrap());
@@ -1057,6 +1061,11 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let round_length = u64::from_le_bytes(data[32..40].try_into().unwrap());
     let sink_mode = data[40];
     let bid_fee = u64::from_le_bytes(data[41..49].try_into().unwrap());
+    let requested_sink_cutoff = if data.len() == 57 {
+        u64::from_le_bytes(data[49..57].try_into().unwrap())
+    } else {
+        u64::MAX
+    };
     if reserve_den == 0 || round_length == 0 || sink_mode > SINK_SEND {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -1129,6 +1138,19 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         Pubkey::default()
     };
 
+    let round_end = solana_program::clock::Clock::get()?
+        .slot
+        .checked_add(round_length)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let sink_cutoff_slot = if sink_mode == SINK_SEND {
+        if requested_sink_cutoff < round_end {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        requested_sink_cutoff
+    } else {
+        u64::MAX
+    };
+
     let (expected_book, book_bump) =
         Pubkey::find_program_address(&[BOOK_SEED, config_account.key.as_ref()], program_id);
     if *book_account.key != expected_book {
@@ -1148,11 +1170,6 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         BOOK_SIZE,
     )?;
 
-    let round_end = solana_program::clock::Clock::get()?
-        .slot
-        .checked_add(round_length)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
     let mut d = book_account.try_borrow_mut_data()?;
     d[..8].copy_from_slice(&BOOK_DISC);
     d[BK_CONFIG..BK_CONFIG + 32].copy_from_slice(config_account.key.as_ref());
@@ -1163,6 +1180,8 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(coin_sink_key.as_ref());
     d[BK_HOLDING..BK_HOLDING + 32].copy_from_slice(holding.key.as_ref());
     d[BK_BID_FEE..BK_BID_FEE + 8].copy_from_slice(&bid_fee.to_le_bytes());
+    d[BK_SINK_CUTOFF_SLOT..BK_SINK_CUTOFF_SLOT + 8]
+        .copy_from_slice(&sink_cutoff_slot.to_le_bytes());
     book_wr_u128(&mut d, BK_RESERVE_NUM, reserve_num);
     book_wr_u128(&mut d, BK_RESERVE_DEN, reserve_den);
     d[BK_ROUND_LENGTH..BK_ROUND_LENGTH + 8].copy_from_slice(&round_length.to_le_bytes());
@@ -1210,7 +1229,7 @@ fn process_set_reserve(
 }
 
 // set_coin_sink accounts: [squads_vault(signer), config, book(w), coin_sink?]
-// data: sink_mode (u8)
+// data: sink_mode (u8) || sink_cutoff_slot? (u64; absent = no cutoff)
 //
 // Futarchy-configurable: burn the bought COIN (mode 0) or send it to an account (mode 1, e.g. a
 // DAO treasury). Squads-vault-gated.
@@ -1224,10 +1243,15 @@ fn process_set_coin_sink(
     let config_account = next_account_info(iter)?;
     let book_account = next_account_info(iter)?;
 
-    if data.len() != 1 || data[0] > SINK_SEND {
+    if (data.len() != 1 && data.len() != 9) || data[0] > SINK_SEND {
         return Err(ProgramError::InvalidInstructionData);
     }
     let sink_mode = data[0];
+    let requested_sink_cutoff = if data.len() == 9 {
+        u64::from_le_bytes(data[1..9].try_into().unwrap())
+    } else {
+        u64::MAX
+    };
     if config_account.owner != program_id || book_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
@@ -1260,6 +1284,13 @@ fn process_set_coin_sink(
     let mut d = book_account.try_borrow_mut_data()?;
     d[BK_SINK_MODE] = sink_mode;
     d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(sink_key.as_ref());
+    let sink_cutoff_slot = if sink_mode == SINK_SEND {
+        requested_sink_cutoff
+    } else {
+        u64::MAX
+    };
+    d[BK_SINK_CUTOFF_SLOT..BK_SINK_CUTOFF_SLOT + 8]
+        .copy_from_slice(&sink_cutoff_slot.to_le_bytes());
     Ok(())
 }
 
@@ -1840,7 +1871,8 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     //    set_economics) is the fraction. With no sink (BURN mode) OR buyback_bps == 0, the whole bought
     //    amount is burned, exactly as before. Then move the spent USD to the settlement account.
     if settled {
-        let to_sink = if book.sink_mode == SINK_SEND {
+        let sink_active = book.sink_mode == SINK_SEND && clock_slot <= book.sink_cutoff_slot;
+        let to_sink = if sink_active {
             mul_div_floor(
                 total_coin,
                 config.buyback_bps as u128,
@@ -2192,7 +2224,8 @@ mod tests {
         assert_eq!(SL_PLACE_ROUND_END + 8, SLOT_SIZE);
         assert_eq!(BK_ESCROW_BUMP + 1, BK_HOLDING);
         assert_eq!(BK_HOLDING + 32, BK_BID_FEE);
-        assert_eq!(BK_BID_FEE + 8, BOOK_HEADER);
+        assert_eq!(BK_BID_FEE + 8, BK_SINK_CUTOFF_SLOT);
+        assert_eq!(BK_SINK_CUTOFF_SLOT + 8, BOOK_HEADER);
         assert_eq!(BOOK_SIZE, BOOK_HEADER + MAX_BIDS * SLOT_SIZE);
     }
 

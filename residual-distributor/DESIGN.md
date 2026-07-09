@@ -20,6 +20,9 @@ The regular `register -> crystallize -> freeze -> claim` instructions are shared
   mint supply and be present in the vault. This is deterministic genesis.
 - **Vault-balance mode:** `expected_reward_supply == 0`; freeze snapshots the canonical vault's
   actual balance. TWAP can send its retained share of bought COIN into that vault during the epoch.
+- TWAP books that target an epoch vault bind an inclusive sink cutoff to the epoch end. A later
+  permissionless round burns the would-be reward share, so no COIN can arrive outside the frozen
+  snapshot and become permanently unclaimable.
 - A scope may omit insurance/backing pools and contribute only portfolio-flow points. This lets a
   handed-off genesis market provide capital cohorts while other DAO-vetted live markets provide OI.
 
