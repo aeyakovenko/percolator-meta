@@ -1293,10 +1293,10 @@ fn process_insurance_withdraw(
         pool.total_shares = pool.total_shares.saturating_sub(position.shares);
         position.shares = 0;
     }
-    position.withdrawn_amount = position
-        .withdrawn_amount
-        .checked_add(owed)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Historical telemetry must not become a custody gate. A position can cycle
+    // the finite token supply enough times for cumulative withdrawals to exceed
+    // u64 even though every individual balance and principal remains valid.
+    position.withdrawn_amount = position.withdrawn_amount.saturating_add(owed);
     if position.principal == 0 {
         position.withdrawn = true;
     }

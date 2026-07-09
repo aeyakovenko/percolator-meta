@@ -3659,3 +3659,60 @@ fn top_up_resets_the_position_start_slot() {
     assert_eq!(start1, 1_000, "top-up RESET start_slot to now — the huge late capital earns no early-join age");
     assert!(start1 > start0, "start_slot moved forward (no inherited early-join hold time)");
 }
+
+// LIVENESS BOUNDARY: withdrawn_amount is historical telemetry, not a custody
+// limit. Repeated valid partial exits can saturate it while principal remains.
+// Its representational ceiling must not permanently block that principal exit.
+#[test]
+fn withdrawn_amount_counter_saturation_cannot_trap_remaining_insurance_principal() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let live_limit = u64::try_from(percolator::MAX_VAULT_TVL).unwrap();
+    let chunk = live_limit - 1;
+    let full_cycles = u64::MAX / chunk;
+    let remainder = u64::MAX % chunk;
+    assert!(full_cycles < 2_000, "probe remains bounded");
+    let (alice, alice_ata) = new_depositor(&mut env, live_limit);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    env.insurance_deposit(&alice, &alice_ata, &holding, live_limit)
+        .expect("maximum live-shape insurance deposit");
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, chunk)
+        .expect("first valid partial exit");
+
+    for _ in 1..full_cycles {
+        env.insurance_deposit(&alice, &alice_ata, &holding, chunk)
+            .expect("bounded recycled top-up");
+        env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, chunk)
+            .expect("bounded recycled partial exit");
+    }
+    if remainder > 0 {
+        env.insurance_deposit(&alice, &alice_ata, &holding, remainder)
+            .expect("remainder top-up");
+        env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, remainder)
+            .expect("counter reaches u64::MAX");
+    }
+
+    let position = env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap();
+    assert_eq!(u64::from_le_bytes(position.data[80..88].try_into().unwrap()), u64::MAX);
+    assert_eq!(env.read_position(&alice.pubkey()).0, 1);
+    assert_eq!(env.pool_outstanding(), 1);
+    assert_eq!(env.token_amount(&env.perc_vault), 1);
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 1)
+        .expect("counter saturation must not block the final principal exit");
+
+    let (principal, _, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(principal, 0);
+    assert!(withdrawn);
+    let position = env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(position.data[80..88].try_into().unwrap()),
+        u64::MAX,
+        "historical telemetry remains saturated instead of wrapping"
+    );
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.token_amount(&alice_ata), live_limit);
+}
