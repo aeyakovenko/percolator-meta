@@ -18786,16 +18786,25 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     svm.airdrop(&long_receiver.pubkey(), 1_000_000_000).unwrap();
     let short_payer = Keypair::new();
     svm.airdrop(&short_payer.pubkey(), 1_000_000_000).unwrap();
+    let dual_payer = Keypair::new();
+    svm.airdrop(&dual_payer.pubkey(), 1_000_000_000).unwrap();
+    let dual_receiver = Keypair::new();
+    svm.airdrop(&dual_receiver.pubkey(), 1_000_000_000)
+        .unwrap();
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
     let long_payer_pf = Pubkey::new_unique();
     let short_receiver_pf = Pubkey::new_unique();
     let long_receiver_pf = Pubkey::new_unique();
     let short_payer_pf = Pubkey::new_unique();
+    let dual_payer_pf = Pubkey::new_unique();
+    let dual_receiver_pf = Pubkey::new_unique();
     for (owner, pf) in [
         (&long_payer, &long_payer_pf),
         (&short_receiver, &short_receiver_pf),
         (&long_receiver, &long_receiver_pf),
         (&short_payer, &short_payer_pf),
+        (&dual_payer, &dual_payer_pf),
+        (&dual_receiver, &dual_receiver_pf),
     ] {
         svm.set_account(
             *pf,
@@ -18870,6 +18879,29 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         bh,
     ))
     .expect("open long-payer vs short-payer");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(dual_payer.pubkey(), true),
+                AccountMeta::new(dual_receiver.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(dual_payer_pf, false),
+                AccountMeta::new(dual_receiver_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: pos_q,
+                exec_price: initial_price,
+                fee_bps: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &dual_payer, &dual_receiver],
+        bh,
+    ))
+    .expect("open dual payer long vs receiver short");
 
     // ---- (3) DECIDER: residual-distributor distributes COIN via share-value cohorts + cumulative funding-payer cohort ----
     // 10% insurance + 10% backing + 80% funding paid by either side.
@@ -19038,6 +19070,35 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
+    let dual_payer_stake = rd_stake_pda(&rd_config, &dual_payer.pubkey(), &dual_payer_pf, 4);
+    let reg_dual_payer = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new_readonly(dual_payer.pubkey(), true),
+            AccountMeta::new_readonly(dual_payer.pubkey(), false),
+            AccountMeta::new_readonly(dual_payer_pf, false),
+            AccountMeta::new(dual_payer_stake, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![1u8, 4u8],
+    };
+    let dual_receiver_stake =
+        rd_stake_pda(&rd_config, &dual_receiver.pubkey(), &dual_receiver_pf, 4);
+    let reg_dual_receiver = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new_readonly(dual_receiver.pubkey(), true),
+            AccountMeta::new_readonly(dual_receiver.pubkey(), false),
+            AccountMeta::new_readonly(dual_receiver_pf, false),
+            AccountMeta::new(dual_receiver_stake, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![1u8, 4u8],
+    };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -19092,6 +19153,24 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         bh,
     ))
     .expect("register long receiver canary");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[reg_dual_payer],
+        Some(&payer.pubkey()),
+        &[&payer, &dual_payer],
+        bh,
+    ))
+    .expect("register dual-side payer");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[reg_dual_receiver],
+        Some(&payer.pubkey()),
+        &[&payer, &dual_receiver],
+        bh,
+    ))
+    .expect("register dual-side receiver canary");
     let funding_vault_before = token_amount(&svm, &perc_vault);
 
     // The latest Percolator wrapper computes funding from mark/index premium. The DAO pushes an EWMA
@@ -19148,6 +19227,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         crank_refresh(&mut svm, &long_payer_pf, premium_slot).expect("premium refresh long payer");
         crank_refresh(&mut svm, &short_payer_pf, premium_slot)
             .expect("premium refresh short payer");
+        crank_refresh(&mut svm, &dual_payer_pf, premium_slot)
+            .expect("premium refresh dual payer");
+        crank_refresh(&mut svm, &dual_receiver_pf, premium_slot)
+            .expect("premium refresh dual receiver");
     }
 
     let funding_slot = 102u64;
@@ -19161,6 +19244,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         crank_refresh(&mut svm, &long_payer_pf, funding_slot).expect("funding refresh long payer");
         crank_refresh(&mut svm, &short_payer_pf, funding_slot)
             .expect("funding refresh short payer");
+        crank_refresh(&mut svm, &dual_payer_pf, funding_slot)
+            .expect("funding refresh dual payer");
+        crank_refresh(&mut svm, &dual_receiver_pf, funding_slot)
+            .expect("funding refresh dual receiver");
     }
 
     // Refresh records funding that was already accrued into the market. The funding-slot long crank
@@ -19177,6 +19264,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         crank_refresh(&mut svm, &long_payer_pf, record_slot).expect("record long paid funding");
         crank_refresh(&mut svm, &short_payer_pf, record_slot)
             .expect("record short received funding");
+        crank_refresh(&mut svm, &dual_payer_pf, record_slot)
+            .expect("record dual long-paid funding");
+        crank_refresh(&mut svm, &dual_receiver_pf, record_slot)
+            .expect("record dual short-received funding");
     }
     let long_paid = read_portfolio_funding_long_paid(&svm, &long_payer_pf);
     let short_received = read_portfolio_funding_short_received(&svm, &short_payer_pf);
@@ -19197,6 +19288,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             .expect("same-slot long fixed-point probe");
         crank_refresh(&mut svm, &short_payer_pf, record_slot)
             .expect("same-slot short fixed-point probe");
+        crank_refresh(&mut svm, &dual_payer_pf, record_slot)
+            .expect("same-slot dual payer fixed-point probe");
+        crank_refresh(&mut svm, &dual_receiver_pf, record_slot)
+            .expect("same-slot dual receiver fixed-point probe");
     }
     assert_eq!(
         read_portfolio_funding_long_paid(&svm, &long_payer_pf),
@@ -19213,6 +19308,45 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         0,
         "during the premium epoch the short only received funding and has no short-paid points yet"
     );
+    let dual_long_paid = read_portfolio_funding_long_paid(&svm, &dual_payer_pf);
+    let dual_short_received = read_portfolio_funding_short_received(&svm, &dual_receiver_pf);
+    assert!(dual_long_paid > 0, "dual payer first pays from its long side");
+    assert!(
+        dual_short_received > 0 && dual_short_received <= dual_long_paid,
+        "dual receiver receives, but never more than the first long-side debit"
+    );
+    assert_eq!(
+        read_portfolio_funding_short_paid(&svm, &dual_payer_pf),
+        0,
+        "dual payer has not paid from its short side before the flip"
+    );
+
+    // Flip the same portfolio from long to short. The next funding direction must add to this
+    // stake's short-paid accumulator while preserving its already-recorded long-paid accumulator.
+    let flip_price = read_asset0_effective_price(&svm, &slab);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(dual_payer.pubkey(), true),
+                AccountMeta::new(dual_receiver.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(dual_payer_pf, false),
+                AccountMeta::new(dual_receiver_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -2 * pos_q,
+                exec_price: flip_price,
+                fee_bps: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &dual_payer, &dual_receiver],
+        bh,
+    ))
+    .expect("flip one portfolio from long payer to short payer");
 
     // Reverse the mark while the same balanced pair remains open. Now shorts pay longs.
     let discount_slot = 104u64;
@@ -19244,6 +19378,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             .expect("discount refresh short payer");
         crank_refresh(&mut svm, &long_payer_pf, discount_slot)
             .expect("discount refresh long receiver");
+        crank_refresh(&mut svm, &dual_payer_pf, discount_slot)
+            .expect("discount refresh dual short payer");
+        crank_refresh(&mut svm, &dual_receiver_pf, discount_slot)
+            .expect("discount refresh dual long receiver");
     }
 
     let short_funding_slot = 105u64;
@@ -19258,6 +19396,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             .expect("funding refresh short payer");
         crank_refresh(&mut svm, &long_payer_pf, short_funding_slot)
             .expect("funding refresh long receiver");
+        crank_refresh(&mut svm, &dual_payer_pf, short_funding_slot)
+            .expect("funding refresh dual short payer");
+        crank_refresh(&mut svm, &dual_receiver_pf, short_funding_slot)
+            .expect("funding refresh dual long receiver");
     }
 
     let short_record_slot = 106u64;
@@ -19272,6 +19414,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             .expect("record short paid funding");
         crank_refresh(&mut svm, &long_payer_pf, short_record_slot)
             .expect("record long received funding");
+        crank_refresh(&mut svm, &dual_payer_pf, short_record_slot)
+            .expect("record dual short-paid funding");
+        crank_refresh(&mut svm, &dual_receiver_pf, short_record_slot)
+            .expect("record dual long-received funding");
     }
     let short_paid = read_portfolio_funding_short_paid(&svm, &short_payer_pf);
     let long_received = read_portfolio_funding_long_received(&svm, &long_payer_pf);
@@ -19292,6 +19438,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             .expect("same-slot short fixed-point probe");
         crank_refresh(&mut svm, &long_payer_pf, short_record_slot)
             .expect("same-slot long fixed-point probe");
+        crank_refresh(&mut svm, &dual_payer_pf, short_record_slot)
+            .expect("same-slot dual short fixed-point probe");
+        crank_refresh(&mut svm, &dual_receiver_pf, short_record_slot)
+            .expect("same-slot dual long fixed-point probe");
     }
     assert_eq!(
         read_portfolio_funding_short_paid(&svm, &short_payer_pf),
@@ -19302,6 +19452,23 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         read_portfolio_funding_long_received(&svm, &long_payer_pf),
         long_received,
         "same-slot auto-cranks cannot inflate long-received funding"
+    );
+    let dual_short_paid = read_portfolio_funding_short_paid(&svm, &dual_payer_pf);
+    let dual_long_received = read_portfolio_funding_long_received(&svm, &dual_receiver_pf);
+    assert!(dual_short_paid > 0, "the flipped portfolio pays from its short side");
+    assert!(
+        dual_long_received > 0 && dual_long_received <= dual_short_paid,
+        "dual receiver receives, but never more than the second short-side debit"
+    );
+    assert!(
+        read_portfolio_funding_long_paid(&svm, &dual_payer_pf) >= dual_long_paid,
+        "flipping sides preserves the same portfolio's earlier long-paid accumulator"
+    );
+    assert_eq!(
+        read_portfolio_funding_long_paid(&svm, &dual_receiver_pf)
+            + read_portfolio_funding_short_paid(&svm, &dual_receiver_pf),
+        0,
+        "the counterparty received in both directions and never earned payer points"
     );
     let market_data = svm.get_account(&slab).unwrap().data;
     let (_, funding_group) = percolator_prog::state::read_market(&market_data).unwrap();
@@ -19344,7 +19511,30 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &[&payer, &long_payer, &short_payer],
         bh,
     ))
-    .expect("close funding probe positions");
+    .expect("close separate-side funding probe positions");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(dual_payer.pubkey(), true),
+                AccountMeta::new(dual_receiver.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(dual_payer_pf, false),
+                AccountMeta::new(dual_receiver_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: pos_q,
+                exec_price: close_price,
+                fee_bps: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &dual_payer, &dual_receiver],
+        bh,
+    ))
+    .expect("close dual-side funding probe positions");
     assert_eq!(
         read_asset0_oi(&svm, &slab),
         (0, 0),
@@ -19352,6 +19542,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     );
     let final_long_paid = read_portfolio_funding_long_paid(&svm, &long_payer_pf);
     let final_short_paid = read_portfolio_funding_short_paid(&svm, &short_payer_pf);
+    let final_dual_long_paid = read_portfolio_funding_long_paid(&svm, &dual_payer_pf);
+    let final_dual_short_paid = read_portfolio_funding_short_paid(&svm, &dual_payer_pf);
     assert!(
         final_long_paid >= long_paid,
         "closing does not erase the long-paid funding counter"
@@ -19359,6 +19551,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     assert!(
         final_short_paid >= short_paid,
         "closing does not erase the short-paid funding counter"
+    );
+    assert!(
+        final_dual_long_paid >= dual_long_paid && final_dual_short_paid >= dual_short_paid,
+        "closing preserves both paid-side accumulators on one portfolio"
     );
 
     let cry_a = Instruction {
@@ -19421,6 +19617,26 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         ],
         data: vec![2u8],
     };
+    let cry_dual_payer = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(rd_config, false),
+            AccountMeta::new(dual_payer_stake, false),
+            AccountMeta::new_readonly(dual_payer_pf, false),
+        ],
+        data: vec![2u8],
+    };
+    let cry_dual_receiver = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(rd_config, false),
+            AccountMeta::new(dual_receiver_stake, false),
+            AccountMeta::new_readonly(dual_receiver_pf, false),
+        ],
+        data: vec![2u8],
+    };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -19437,6 +19653,15 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         bh,
     ))
     .expect("crystallize");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[cry_dual_payer, cry_dual_receiver],
+        Some(&payer.pubkey()),
+        &[&payer],
+        bh,
+    ))
+    .expect("crystallize dual-side payer and receiver");
 
     // Freeze after emission_end + finalize_window, then each live cohort's sole payer claims its slice.
     {
@@ -19498,6 +19723,22 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &long_receiver_coin,
         &coin_mint,
         &long_receiver.pubkey(),
+        0,
+    );
+    let dual_payer_coin = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &dual_payer_coin,
+        &coin_mint,
+        &dual_payer.pubkey(),
+        0,
+    );
+    let dual_receiver_coin = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &dual_receiver_coin,
+        &coin_mint,
+        &dual_receiver.pubkey(),
         0,
     );
     let claim_a = Instruction {
@@ -19578,6 +19819,30 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         ],
         data: vec![5u8],
     };
+    let claim_dual_payer = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new(dual_payer_stake, false),
+            AccountMeta::new(rd_vault, false),
+            AccountMeta::new(dual_payer_coin, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![5u8],
+    };
+    let claim_dual_receiver = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new(dual_receiver_stake, false),
+            AccountMeta::new(rd_vault, false),
+            AccountMeta::new(dual_receiver_coin, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![5u8],
+    };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -19594,10 +19859,21 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         bh,
     ))
     .expect("claims");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[claim_dual_payer, claim_dual_receiver],
+        Some(&payer.pubkey()),
+        &[&payer],
+        bh,
+    ))
+    .expect("dual-side payer and receiver claims");
     let funding_supply = supply * 8_000 / 10_000;
-    let funding_points = final_long_paid + final_short_paid;
+    let dual_paid = final_dual_long_paid + final_dual_short_paid;
+    let funding_points = final_long_paid + final_short_paid + dual_paid;
     let expected_long_payer = (funding_supply as u128 * final_long_paid / funding_points) as u64;
     let expected_short_payer = (funding_supply as u128 * final_short_paid / funding_points) as u64;
+    let expected_dual_payer = (funding_supply as u128 * dual_paid / funding_points) as u64;
     assert_eq!(
         token_amount(&svm, &alice_coin),
         supply * 1_000 / 10_000,
@@ -19628,9 +19904,20 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         0,
         "long only received short-paid funding, so it earns no funding-payer points"
     );
-    let funding_paid_sum =
-        token_amount(&svm, &long_payer_coin) + token_amount(&svm, &short_payer_coin);
-    assert!(funding_paid_sum <= funding_supply && funding_supply - funding_paid_sum <= 1,
+    assert_eq!(
+        token_amount(&svm, &dual_payer_coin),
+        expected_dual_payer,
+        "one portfolio claims its cumulative long-paid plus short-paid points"
+    );
+    assert_eq!(
+        token_amount(&svm, &dual_receiver_coin),
+        0,
+        "the same counterparty received in both directions and earns no payer points"
+    );
+    let funding_paid_sum = token_amount(&svm, &long_payer_coin)
+        + token_amount(&svm, &short_payer_coin)
+        + token_amount(&svm, &dual_payer_coin);
+    assert!(funding_paid_sum <= funding_supply && funding_supply - funding_paid_sum <= 2,
         "the single funding-payer cohort distributes its 80% slice pro-rata over long_paid + short_paid, modulo floor dust");
 
     // Prepare the next immutable reward epoch under the DAO. It starts after handoff, runs for an
