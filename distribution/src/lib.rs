@@ -14,10 +14,10 @@
 //!
 //! This program is intentionally **agnostic to *how* the winner is chosen**. The
 //! sole trust hook is `config.authority` — the "decider" — which is bound into the
-//! config-PDA seed (`["dist_config", coin_mint, authority]`, finding P/AA) so each
-//! decider gets its own isolated config + vault. Any signer or program PDA can be a
-//! decider; this program never references `genesis-vote`. Two interchangeable
-//! deciders today:
+//! config-PDA seed (`["dist_config", coin_mint, authority, claim_window]`) so each
+//! decider gets its own isolated config + vault under the exact claim window it
+//! is authorizing. Any signer or program PDA can be a decider; this program never
+//! references `genesis-vote`. Two interchangeable deciders today:
 //!   - **`genesis-vote`** (the default): log-time-weighted insurance quorum vote;
 //!     its config PDA is the `authority` and its `trigger` CPIs `IX_SEAL_WINNER`.
 //!   - **a deterministic points distributor** (e.g. residual-backing points): a
@@ -74,15 +74,22 @@ const IX_BURN_UNCLAIMED: u8 = 5;
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
-// The config PDA binds the AUTHORITY into its seed (finding P/AA), not just the coin_mint.
-// Otherwise init_config was front-run squattable: an attacker could init the per-mint config FIRST
-// with authority=themselves AND the deployer's already-funded vault (owned by the deterministic
-// PDA) — then seal a self-dealing proposal and CLAIM the entire COIN supply (theft). By folding the
-// authority into the seed, an attacker's authority lands at a DIFFERENT PDA whose vault they must
-// own + fund themselves (impossible without the COIN), so the legit (authority = gv config PDA)
-// config + funded vault are untouchable.
-fn config_seeds<'a>(coin_mint: &'a Pubkey, authority: &'a Pubkey) -> [&'a [u8]; 3] {
-    [b"dist_config", coin_mint.as_ref(), authority.as_ref()]
+// The config PDA binds the AUTHORITY and claim window into its seed (finding P/AA + first-writer
+// policy bind), not just the coin_mint. The authority seed prevents an attacker from initializing
+// the per-mint config over the deployer's already-funded vault with authority=themselves. The
+// claim-window seed prevents the same authority/mint from being first-written with a hostile
+// burn/claim deadline before the intended setup lands.
+fn config_seeds<'a>(
+    coin_mint: &'a Pubkey,
+    authority: &'a Pubkey,
+    claim_window_slots: &'a [u8; 8],
+) -> [&'a [u8]; 4] {
+    [
+        b"dist_config",
+        coin_mint.as_ref(),
+        authority.as_ref(),
+        claim_window_slots,
+    ]
 }
 
 fn proposal_seeds<'a>(config: &'a Pubkey, id: &'a [u8; 8]) -> [&'a [u8]; 3] {
@@ -302,8 +309,11 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let (expected_config, bump) =
-        Pubkey::find_program_address(&config_seeds(coin_mint.key, authority.key), program_id);
+    let claim_window_bytes = claim_window_slots.to_le_bytes();
+    let (expected_config, bump) = Pubkey::find_program_address(
+        &config_seeds(coin_mint.key, authority.key, &claim_window_bytes),
+        program_id,
+    );
     if *config_account.key != expected_config {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -356,7 +366,13 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 4] = [b"dist_config", coin_mint.key.as_ref(), authority.key.as_ref(), &bump_arr];
+    let seeds: [&[u8]; 5] = [
+        b"dist_config",
+        coin_mint.key.as_ref(),
+        authority.key.as_ref(),
+        claim_window_bytes.as_ref(),
+        &bump_arr,
+    ];
     create_pda_robust(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
 
     let config = Config {
@@ -621,7 +637,14 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Prog
     }
 
     let bump_arr = [config.bump];
-    let seeds: [&[u8]; 4] = [b"dist_config", config.coin_mint.as_ref(), config.authority.as_ref(), &bump_arr];
+    let claim_window_bytes = config.claim_window_slots.to_le_bytes();
+    let seeds: [&[u8]; 5] = [
+        b"dist_config",
+        config.coin_mint.as_ref(),
+        config.authority.as_ref(),
+        claim_window_bytes.as_ref(),
+        &bump_arr,
+    ];
     invoke_signed(
         &spl_token::instruction::transfer(
             token_program.key,
@@ -680,7 +703,14 @@ fn burn_unclaimed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let remaining = token_balance(vault, &config.coin_mint)?;
     if remaining > 0 {
         let bump_arr = [config.bump];
-        let seeds: [&[u8]; 4] = [b"dist_config", config.coin_mint.as_ref(), config.authority.as_ref(), &bump_arr];
+        let claim_window_bytes = config.claim_window_slots.to_le_bytes();
+        let seeds: [&[u8]; 5] = [
+            b"dist_config",
+            config.coin_mint.as_ref(),
+            config.authority.as_ref(),
+            claim_window_bytes.as_ref(),
+            &bump_arr,
+        ];
         invoke_signed(
             &spl_token::instruction::burn(
                 token_program.key,

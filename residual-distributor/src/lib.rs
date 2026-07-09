@@ -69,6 +69,7 @@ pub const DEFAULT_FEE_SUPPORT_BPS: u16 = 80;
 // sealed -> DOS. Synced to distribution_program::id() by tests/offsets.rs.
 pub const DISTRIBUTION_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("D1str1but1on11111111111111111111111111111111");
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
 
 const CONFIG_DISC: [u8; 8] = *b"RDCONFG1";
 const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
@@ -926,14 +927,22 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     if *distribution_program.key != DISTRIBUTION_PROGRAM_ID {
         return Err(ProgramError::IncorrectProgramId);
     }
-    // Bind distribution_config to the canonical PDA(["dist_config", coin_mint, rd_config]) under the
-    // distribution program (finding HC; parity with genesis-vote finding R). rd_config (= `expected`)
-    // is the distribution authority, so the ONLY config rd can ever seal is the one at this PDA.
+    // Bind distribution_config to the canonical PDA(["dist_config", coin_mint, rd_config,
+    // claim_window]) under the distribution program (finding HC; parity with genesis-vote finding R).
+    // rd_config (= `expected`) is the distribution authority, so the ONLY config rd can ever seal is
+    // the one at this PDA. The seal path is retired, so keep this vestigial dependency pinned to the
+    // historical default claim window instead of widening residual init policy.
     // Without this, a front-runner could squat this canonical (per-coin_mint) rd_config with a foreign
     // distribution_config; since rd_config can't be re-initialized, seal would forever target the
     // foreign config and the real COIN-holding distribution could never be sealed -> DOS.
+    let distribution_claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
     let (expected_dist, _) = Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.key.as_ref(), expected.as_ref()],
+        &[
+            b"dist_config",
+            coin_mint.key.as_ref(),
+            expected.as_ref(),
+            &distribution_claim_window,
+        ],
         distribution_program.key,
     );
     if *distribution_config.key != expected_dist {
