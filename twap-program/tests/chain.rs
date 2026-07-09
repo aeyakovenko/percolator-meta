@@ -2550,6 +2550,9 @@ const POLICY_WITH_SURPLUS: u8 = 1;
 const DOMAIN_INSURANCE: u8 = 0;
 const DOMAIN_BACKING: u8 = 1;
 const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
+const DEFAULT_GENESIS_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
+const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
 
 fn sub_pool_pda(
     collateral_mint: &Pubkey,
@@ -2562,15 +2565,21 @@ fn sub_pool_pda(
 ) -> Pubkey {
     let policy = [policy];
     let domain = [domain];
-    let deposit_window = if *slab == Pubkey::default()
-        && *perc == Pubkey::default()
-        && *coin_mint == Pubkey::default()
+    let no_market = Pubkey::default();
+    let deposit_window_slots =
+        if *slab == no_market && *perc == no_market && *coin_mint == no_market {
+            OWN_VAULT_DEPOSIT_WINDOW_SLOTS
+        } else {
+            DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS
+        };
+    let deposit_start_slot = if *slab == no_market && *perc == no_market && *coin_mint == no_market
     {
-        u64::MAX
+        OWN_VAULT_DEPOSIT_START_SLOT
     } else {
-        DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS
-    }
-    .to_le_bytes();
+        DEFAULT_GENESIS_DEPOSIT_START_SLOT
+    };
+    let deposit_window_seed = deposit_window_slots.to_le_bytes();
+    let deposit_start_seed = deposit_start_slot.to_le_bytes();
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -2581,7 +2590,8 @@ fn sub_pool_pda(
             coin_mint.as_ref(),
             &policy,
             &domain,
-            &deposit_window,
+            &deposit_window_seed,
+            &deposit_start_seed,
         ],
         &sub_id(),
     )

@@ -73,6 +73,37 @@ const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
 const DOMAIN_INSURANCE: u8 = 0;
 const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
+const DEFAULT_GENESIS_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
+const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
+
+fn insurance_pool_pda_with_schedule(
+    mint: &Pubkey,
+    coin_mint: &Pubkey,
+    slab: &Pubkey,
+    policy: u8,
+    deposit_window_slots: u64,
+    deposit_start_slot: u64,
+) -> Pubkey {
+    let policy_seed = [policy];
+    let domain_seed = [DOMAIN_INSURANCE];
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            slab.as_ref(),
+            perc_id().as_ref(),
+            coin_mint.as_ref(),
+            &policy_seed,
+            &domain_seed,
+            &deposit_window_slots.to_le_bytes(),
+            &deposit_start_slot.to_le_bytes(),
+        ],
+        &sub_id(),
+    )
+    .0
+}
 
 struct Env {
     svm: LiteSVM,
@@ -96,10 +127,22 @@ impl Env {
     }
 
     fn new_for_policy(pool_policy: u8) -> Self {
-        Self::new_for_policy_and_window(pool_policy, DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS)
+        Self::new_for_policy_with_schedule(
+            pool_policy,
+            DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS,
+            DEFAULT_GENESIS_DEPOSIT_START_SLOT,
+        )
     }
 
-    fn new_for_policy_and_window(pool_policy: u8, deposit_window_slots: u64) -> Self {
+    fn new_for_policy_with_window(pool_policy: u8, deposit_window_slots: u64) -> Self {
+        Self::new_for_policy_with_schedule(pool_policy, deposit_window_slots, 100)
+    }
+
+    fn new_for_policy_with_schedule(
+        pool_policy: u8,
+        deposit_window_slots: u64,
+        deposit_start_slot: u64,
+    ) -> Self {
         let mut svm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
             heap_size: 256 * 1024,
@@ -122,25 +165,16 @@ impl Env {
         let slab = Pubkey::new_unique();
 
         // The subledger insurance pool PDA: asset-0 insurance authority + operator,
-        // bound to (mint, asset_id, market_slab, percolator_program, coin_mint, policy, domain).
-        let policy_seed = [pool_policy];
-        let domain_seed = [DOMAIN_INSURANCE];
-        let deposit_window_seed = deposit_window_slots.to_le_bytes();
-        let pool = Pubkey::find_program_address(
-            &[
-                b"subledger_pool",
-                mint.as_ref(),
-                &ASSET_ID.to_le_bytes(),
-                slab.as_ref(),
-                perc_id().as_ref(),
-                coin_mint.as_ref(),
-                &policy_seed,
-                &domain_seed,
-                &deposit_window_seed,
-            ],
-            &sub_id(),
-        )
-        .0;
+        // bound to (mint, asset_id, market_slab, percolator_program, coin_mint,
+        // policy, domain, deposit_window_slots, deposit_start_slot).
+        let pool = insurance_pool_pda_with_schedule(
+            &mint,
+            &coin_mint,
+            &slab,
+            pool_policy,
+            deposit_window_slots,
+            deposit_start_slot,
+        );
 
         // Build the real Live market-0 slab with marketauth = pool PDA and the
         // deposits-only principal-recovery insurance policy.
@@ -242,11 +276,26 @@ impl Env {
     }
 
     fn init_insurance_pool_policy_with_window(&mut self, policy: u8, window_slots: Option<u64>) {
+        let start_slot = window_slots.map(|_| 100);
+        self.init_insurance_pool_policy_with_schedule(policy, window_slots, start_slot);
+    }
+
+    fn init_insurance_pool_policy_with_schedule(
+        &mut self,
+        policy: u8,
+        window_slots: Option<u64>,
+        start_slot: Option<u64>,
+    ) {
         let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
         data.extend_from_slice(&ASSET_ID.to_le_bytes());
         data.push(policy);
         if let Some(window_slots) = window_slots {
             data.extend_from_slice(&window_slots.to_le_bytes());
+            data.extend_from_slice(
+                &start_slot
+                    .expect("custom deposit window requires an explicit start slot")
+                    .to_le_bytes(),
+            );
         }
         let ix = Instruction {
             program_id: sub_id(),
@@ -3530,6 +3579,7 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     let attacker_policy = [POLICY_PRINCIPAL];
     let attacker_domain = [DOMAIN_INSURANCE];
     let attacker_window = DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let attacker_start = DEFAULT_GENESIS_DEPOSIT_START_SLOT.to_le_bytes();
     let attacker_pool = Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -3541,6 +3591,7 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
             &attacker_policy,
             &attacker_domain,
             &attacker_window,
+            &attacker_start,
         ],
         &sub_id(),
     ).0;
@@ -3641,6 +3692,7 @@ fn init_insurance_pool_rejects_nonzero_asset_id() {
             &[POLICY_PRINCIPAL],
             &[DOMAIN_INSURANCE],
             &DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes(),
+            &DEFAULT_GENESIS_DEPOSIT_START_SLOT.to_le_bytes(),
         ],
         &sub_id(),
     )
@@ -3729,7 +3781,7 @@ fn wrong_in_range_policy_cannot_squat_the_share_based_genesis_pool() {
 // carrying comparable voting tenure, turning the bootstrap into a late-deposit DOS.
 #[test]
 fn genesis_insurance_deposit_window_rejects_late_capital_but_not_exits() {
-    let mut env = Env::new_for_policy_and_window(POLICY_PRINCIPAL, 3);
+    let mut env = Env::new_for_policy_with_window(POLICY_PRINCIPAL, 3);
     env.init_insurance_pool_policy_with_window(POLICY_PRINCIPAL, Some(3));
     let pool = env.pool;
     let (alice, alice_ata) = new_depositor(&mut env, 10);
@@ -3763,6 +3815,101 @@ fn genesis_insurance_deposit_window_rejects_late_capital_but_not_exits() {
     assert_eq!(env.token_amount(&alice_ata), 10);
 }
 
+// FIRST-WRITER SCHEDULE SQUAT: a custom window length alone is not enough. If
+// the absolute start is implicit, a permissionless first writer can initialize
+// the otherwise correct pool before launch, starting the deposit clock early and
+// closing it before normal participants arrive. The configured start is now
+// explicit, PDA-bound, and enforced by insurance_deposit.
+#[test]
+fn configured_deposit_start_cannot_be_opened_early_by_permissionless_init() {
+    let start_slot = 110u64;
+    let window = 3u64;
+    let mut env = Env::new_for_policy_with_schedule(POLICY_PRINCIPAL, window, start_slot);
+
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(window), Some(start_slot));
+    let pool = env.pool;
+
+    let (early, early_ata) = new_depositor(&mut env, 10);
+    let early_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start_slot - 1);
+    assert!(
+        env.insurance_deposit(&early, &early_ata, &early_hold, 10)
+            .is_err(),
+        "deposits before the configured start must not open early"
+    );
+    assert_eq!(
+        env.token_amount(&early_ata),
+        10,
+        "rejected pre-start deposit moved no funds"
+    );
+
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let alice_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start_slot);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 10)
+        .expect("deposit succeeds once the configured window opens");
+
+    let (late, late_ata) = new_depositor(&mut env, 10);
+    let late_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start_slot + window);
+    assert!(
+        env.insurance_deposit(&late, &late_ata, &late_hold, 10)
+            .is_err(),
+        "deposits at/after the configured deadline must close"
+    );
+    assert_eq!(env.token_amount(&late_ata), 10);
+}
+
+// FIRST-WRITER DEPOSIT-WINDOW SQUAT: the window is part of the depositor contract.
+// A hostile short window can make normal depositors miss genesis; a hostile long
+// window re-opens the late-capital quorum grief the on-chain window is supposed
+// to close. Permissionless init must therefore not let a wrong-window call
+// consume the intended genesis pool PDA.
+#[test]
+fn wrong_deposit_window_cannot_squat_the_genesis_pool() {
+    let intended_window = 3u64;
+    let hostile_window = 1u64;
+    let mut env = Env::new_for_policy_with_window(POLICY_PRINCIPAL, intended_window);
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&hostile_window.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let squat = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+    assert!(
+        env.send(&[squat], &[]).is_err(),
+        "wrong-window init must not consume the intended genesis pool PDA"
+    );
+    assert!(
+        env.svm
+            .get_account(&env.pool)
+            .map_or(true, |a| a.data.is_empty()),
+        "genesis pool remains free for the intended window"
+    );
+
+    env.init_insurance_pool_policy_with_window(POLICY_PRINCIPAL, Some(intended_window));
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let alice_hold = create_holding(&mut env, &pool);
+    env.warp_slot(101);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 10)
+        .expect("intended-window pool accepts an in-window deposit");
+}
 // CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)
 // and init_insurance_pool (tag 3) derive their pool PDA from pool_seeds(mint, asset_id, market_slab,
 // percolator_program, coin_mint, policy, domain). The genesis insurance pool lives at
@@ -3783,7 +3930,8 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
     // insurance pool — the market/program seed parts differ (default vs the real market).
     let own_policy = [POLICY_PRINCIPAL];
     let own_domain = [1u8]; // DOMAIN_BACKING
-    let own_window = u64::MAX.to_le_bytes();
+    let own_window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let own_start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
     let own_vault_pda = Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -3795,6 +3943,7 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
             &own_policy,
             &own_domain,
             &own_window,
+            &own_start,
         ],
         &sub_id(),
     ).0;
