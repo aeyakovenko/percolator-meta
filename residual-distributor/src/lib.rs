@@ -1075,10 +1075,16 @@ fn init_reward_epoch(
         let market = take_pubkey(&mut data)?;
         let insurance_pool = take_pubkey(&mut data)?;
         let backing_pool = take_pubkey(&mut data)?;
+        // Pool domains are globally disjoint across the epoch, not just within one market tuple.
+        // Otherwise one position can derive separate insurance/backing stakes and claim both slices.
         if market == Pubkey::default()
             || markets.contains(&market)
-            || (insurance_pool != Pubkey::default() && insurance_pools.contains(&insurance_pool))
-            || (backing_pool != Pubkey::default() && backing_pools.contains(&backing_pool))
+            || (insurance_pool != Pubkey::default()
+                && (insurance_pools.contains(&insurance_pool)
+                    || backing_pools.contains(&insurance_pool)))
+            || (backing_pool != Pubkey::default()
+                && (backing_pools.contains(&backing_pool)
+                    || insurance_pools.contains(&backing_pool)))
             || (insurance_pool != Pubkey::default() && insurance_pool == backing_pool)
         {
             return Err(ProgramError::InvalidInstructionData);

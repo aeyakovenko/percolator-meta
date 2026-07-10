@@ -1568,6 +1568,64 @@ fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
     assert_eq!(token_amount(&svm, &funding_ata), 2_400_000);
 }
 
+// ATTACK PROBE: reward-epoch pool scopes must be globally segregated by cohort. If one
+// pool appears as insurance in one market tuple and backing in another, the same owner-bound
+// position gets two distinct stake PDAs and can consume both cohort allocations.
+#[test]
+fn reward_epoch_rejects_cross_domain_pool_alias_no_double_claim() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let epoch_id = 43u64;
+    let rd_config = reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    let aliased_pool = Pubkey::new_unique();
+    let scopes = [
+        RewardEpochMarket {
+            market: Pubkey::new_unique(),
+            insurance_pool: aliased_pool,
+            backing_pool: Pubkey::new_unique(),
+        },
+        RewardEpochMarket {
+            market: Pubkey::new_unique(),
+            insurance_pool: Pubkey::new_unique(),
+            backing_pool: aliased_pool,
+        },
+    ];
+    set_slot(&mut svm, 50);
+    let result = send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                Pubkey::new_unique(),
+                Pubkey::new_unique(),
+                rd_config,
+                vault,
+            ),
+            data: reward_epoch_init_data(epoch_id, 100, 104, 0, 5_000, 5_000, 0, 0, 1, 0, &scopes),
+        }],
+        &[&dao],
+    );
+    assert!(
+        result.is_err(),
+        "one pool cannot source both insurance and backing reward families"
+    );
+    assert!(
+        svm.get_account(&rd_config).is_none(),
+        "a rejected alias must leave the canonical epoch PDA available"
+    );
+}
+
 #[test]
 fn reward_epoch_rejects_funding_points_created_after_emission_end() {
     let mut svm = LiteSVM::new();
