@@ -1528,11 +1528,13 @@ fn process_grant_genesis_pool<'a>(
 // [governance, current_authority(signer), controller_pda, market(w), percolator_program]
 // A permissionless creator can hand a market to the governance-bound controller;
 // governance does not need to participate in or approve the donation. Percolator's
-// market-authority update also rotates asset-0 roles that equal the outgoing key. If
-// that key owns funded insurance or is the recorded backing provider, restore only
-// those same roles after the handoff so donating lifecycle control cannot donate
-// segregated capital too. A later genesis-pool grant requires the external insurance
-// balance to exit first.
+// market-authority update also rotates asset-0 roles that equal the outgoing key, but
+// it does not migrate secondary asset_admin roles. Accept only an asset-0-only market
+// or one whose secondary slots are all fully retired; controller-governed secondary
+// assets can then be activated after the handoff. If the outgoing key owns funded
+// asset-0 insurance or is the recorded backing provider, restore only those same roles
+// so donating lifecycle control cannot donate segregated capital too. A later
+// genesis-pool grant requires the external insurance balance to exit first.
 fn process_accept_market_authority<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1559,6 +1561,11 @@ fn process_accept_market_authority<'a>(
     )?;
     let (restore_insurance_authority, restore_insurance_operator, restore_outgoing_backing) = {
         let market_data = market.try_borrow_data()?;
+        if !percolator_accounting::all_secondary_assets_retired(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let current_bytes = current.key.to_bytes();
         let has_insurance = percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?

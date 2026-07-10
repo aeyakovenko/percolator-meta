@@ -12123,3 +12123,25 @@ and atomically forward and close the transit account to the outgoing provider's 
 both domains and earnings before principal. No governance signer, caller-selected amount, DAO recipient, generic
 authority mutation, or reusable withdrawal key was added; a failed CPI rolls the role change and all transfers
 back.
+
+## Tick — donating a live secondary asset orphaned its asset admin (surface A/C)
+
+Percolator's `UpdateAuthority` migrates marketauth and matching asset-0 roles only. A creator could activate and
+fund asset 1, then publicly donate marketauth to the controller while asset 1 kept the creator as its
+`asset_admin`. The controller could still shut the asset down through marketauth, but a signerless public stale
+resolution ends that live shutdown override. If the creator then disappeared, the controller could not rotate
+the secondary insurance or backing role for resolved provider cleanup, leaving provider capital able to block
+terminal market closure.
+
+A fresh pinned-Percolator + controller LiteSVM test configured public stale resolution, activated asset 1 with a
+creator admin and external provider, deposited `11,000` insurance units through the real public API, and attempted
+the ordinary permissionless market donation. The old controller SBF accepted the unsafe handoff, making the
+retained rejection assertion fail. The fixed test requires byte-atomic rejection, proves the external provider's
+normal withdrawal remains live, retires the now-empty secondary slot through Percolator, and then proves the
+identical donation succeeds.
+
+FIX: the pinned read-only accounting view compares Percolator's configured-slot count with its canonical
+`free_market_slot_count`. Controller market donation now proceeds only when asset 0 is the sole non-retired slot;
+the check is O(1) even though Percolator market slots are dynamically sized. Multi-asset markets remain
+permissionlessly deployable by initializing them under the controller before activation. No new signer, admin
+instruction, authority mutation, value destination, or custody path was added.
