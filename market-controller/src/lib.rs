@@ -1,10 +1,10 @@
 //! Stateless, deny-by-default Percolator market controller.
 //!
 //! A controller PDA permanently holds `marketauth`. Governance can make it sign
-//! only a fixed set of lifecycle and policy instructions. Live-state value movement
-//! and all authority mutation tags are absent by construction. Terminal cleanup is
-//! a fixed close-and-forward path that runs only after Percolator proves every
-//! attributed balance is zero.
+//! only a fixed set of lifecycle and policy instructions. Generic value movement
+//! and all authority mutation tags are absent by construction. A fixed shutdown
+//! path can return backing only to its recorded provider, and terminal cleanup runs
+//! only after Percolator proves every attributed balance is zero.
 #![no_std]
 extern crate alloc;
 
@@ -37,11 +37,14 @@ const IX_GRANT_GENESIS_POOL: u8 = 2;
 const IX_ACCEPT_MARKET_AUTHORITY: u8 = 3;
 const IX_DONATE_INSURANCE: u8 = 4;
 const IX_CLOSE_MARKET_AND_RECLAIM: u8 = 5;
+const IX_RETURN_SHUTDOWN_BACKING: u8 = 6;
 
 const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
+const PERC_IX_WITHDRAW_BACKING: u8 = 50;
+const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const ASSET_AUTH_ORACLE: u8 = 4;
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
@@ -142,6 +145,7 @@ pub fn process_instruction<'a>(
         IX_ACCEPT_MARKET_AUTHORITY => process_accept_market_authority(program_id, accounts, data),
         IX_DONATE_INSURANCE => process_donate_insurance(program_id, accounts, data),
         IX_CLOSE_MARKET_AND_RECLAIM => process_close_market_and_reclaim(program_id, accounts, data),
+        IX_RETURN_SHUTDOWN_BACKING => process_return_shutdown_backing(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -257,7 +261,7 @@ fn validate_reclaim_token_accounts(
 
 fn forward_and_close_token_account<'a>(
     controller: &AccountInfo<'a>,
-    governance: &AccountInfo<'a>,
+    lamport_destination: &AccountInfo<'a>,
     transit: &AccountInfo<'a>,
     destination: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
@@ -287,17 +291,218 @@ fn forward_and_close_token_account<'a>(
         &spl_token::instruction::close_account(
             token_program.key,
             transit.key,
-            governance.key,
+            lamport_destination.key,
             controller.key,
             &[],
         )?,
         &[
             transit.clone(),
-            governance.clone(),
+            lamport_destination.clone(),
             controller.clone(),
             token_program.clone(),
         ],
         &[signer_seeds],
+    )
+}
+
+fn validate_provider_return_token_accounts(
+    controller: &AccountInfo,
+    provider: &Pubkey,
+    transit: &AccountInfo,
+    destination: &AccountInfo,
+) -> ProgramResult {
+    if transit.owner != &spl_token::ID
+        || destination.owner != &spl_token::ID
+        || transit.key == destination.key
+        || provider == controller.key
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
+    let destination_state = spl_token::state::Account::unpack(&destination.try_borrow_data()?)?;
+    let canonical_transit = Pubkey::find_program_address(
+        &[
+            controller.key.as_ref(),
+            spl_token::ID.as_ref(),
+            transit_state.mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0;
+    let canonical_destination = Pubkey::find_program_address(
+        &[
+            provider.as_ref(),
+            spl_token::ID.as_ref(),
+            transit_state.mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0;
+    if transit_state.state != spl_token::state::AccountState::Initialized
+        || destination_state.state != spl_token::state::AccountState::Initialized
+        || *transit.key != canonical_transit
+        || *destination.key != canonical_destination
+        || transit_state.owner != *controller.key
+        || destination_state.owner != *provider
+        || transit_state.mint != destination_state.mint
+        || transit_state.delegate.is_some()
+        || transit_state.delegated_amount != 0
+        || transit_state.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+// return_shutdown_backing accounts:
+// [governance, controller_pda, market(w), provider_canonical_ata(w),
+//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  controller_backing_ledger(w), percolator_program, token_program]
+// data: domain(u16) | principal(u128) | earnings(u128)
+//
+// Permissionless after Percolator's own asset-shutdown delay and empty-state checks.
+// The controller can exercise marketauth's shutdown override, but neither governance
+// nor the caller chooses the recipient: all value and transit rent go to the canonical
+// ATA of the backing authority recorded in the asset profile. Earnings are returned
+// first because Percolator refuses a final-principal exit while earnings remain.
+fn process_return_shutdown_backing<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 34 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let domain = u16::from_le_bytes(data[0..2].try_into().unwrap());
+    let principal = u128::from_le_bytes(data[2..18].try_into().unwrap());
+    let earnings = u128::from_le_bytes(data[18..34].try_into().unwrap());
+    if principal == 0 && earnings == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let iter = &mut accounts.iter();
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let provider_destination = next_account_info(iter)?;
+    let controller_transit = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let backing_ledger = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !market.is_writable
+        || !provider_destination.is_writable
+        || !controller_transit.is_writable
+        || !percolator_vault.is_writable
+        || !backing_ledger.is_writable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *token_program.key != spl_token::ID || backing_ledger.owner != percolator_program.key {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let bump = controller_bump(
+        program_id,
+        governance,
+        controller,
+        market,
+        percolator_program,
+    )?;
+    let provider = {
+        let market_data = market.try_borrow_data()?;
+        let authority = percolator_accounting::read_asset_backing_authority(
+            &market_data,
+            usize::from(domain / 2),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        if authority == [0u8; 32] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Pubkey::new_from_array(authority)
+    };
+    validate_provider_return_token_accounts(
+        controller,
+        &provider,
+        controller_transit,
+        provider_destination,
+    )?;
+
+    let bump_seed = [bump];
+    let seeds = signer_seeds(
+        governance.key,
+        market.key,
+        percolator_program.key,
+        &bump_seed,
+    );
+    if earnings != 0 {
+        let mut ix_data = vec![PERC_IX_WITHDRAW_BACKING_EARNINGS];
+        ix_data.extend_from_slice(&domain.to_le_bytes());
+        ix_data.extend_from_slice(&earnings.to_le_bytes());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*controller.key, true),
+                    AccountMeta::new(*market.key, false),
+                    AccountMeta::new(*backing_ledger.key, false),
+                    AccountMeta::new(*controller_transit.key, false),
+                    AccountMeta::new(*percolator_vault.key, false),
+                    AccountMeta::new_readonly(*vault_authority.key, false),
+                    AccountMeta::new_readonly(*token_program.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                controller.clone(),
+                market.clone(),
+                backing_ledger.clone(),
+                controller_transit.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                token_program.clone(),
+                percolator_program.clone(),
+            ],
+            &[&seeds],
+        )?;
+    }
+    if principal != 0 {
+        let mut ix_data = vec![PERC_IX_WITHDRAW_BACKING];
+        ix_data.extend_from_slice(&domain.to_le_bytes());
+        ix_data.extend_from_slice(&principal.to_le_bytes());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*controller.key, true),
+                    AccountMeta::new(*market.key, false),
+                    AccountMeta::new(*controller_transit.key, false),
+                    AccountMeta::new(*percolator_vault.key, false),
+                    AccountMeta::new_readonly(*vault_authority.key, false),
+                    AccountMeta::new_readonly(*token_program.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                controller.clone(),
+                market.clone(),
+                controller_transit.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                token_program.clone(),
+                percolator_program.clone(),
+            ],
+            &[&seeds],
+        )?;
+    }
+    forward_and_close_token_account(
+        controller,
+        provider_destination,
+        controller_transit,
+        provider_destination,
+        token_program,
+        &seeds,
     )
 }
 

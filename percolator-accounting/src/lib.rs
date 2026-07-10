@@ -11,6 +11,9 @@ pub const ASSET_WRAPPER_LEN: usize = 512;
 pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
+// Pinned `AssetOracleProfileV16`: four u8s, one u32, five u16s, six bytes
+// of padding, then two 32-byte authorities precede the backing authority.
+pub const BACKING_AUTHORITY_PROFILE_OFFSET: usize = 88;
 
 const MAGIC: u64 = 0x5045_5243_5631_3600;
 const VERSION: u16 = 16;
@@ -57,28 +60,7 @@ fn validate_market(data: &[u8]) -> Result<(), ReadError> {
     Ok(())
 }
 
-fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
-    let slot_stride = size_of::<Market<[u8; ASSET_WRAPPER_LEN]>>();
-    MARKET_GROUP_OFFSET
-        .checked_add(size_of::<MarketGroupV16HeaderAccount>())
-        .and_then(|v| {
-            asset_index
-                .checked_mul(slot_stride)
-                .and_then(|n| v.checked_add(n))
-        })
-        .and_then(|v| v.checked_add(ASSET_WRAPPER_LEN))
-        .ok_or(ReadError::Truncated)
-}
-
-/// Returns the insurance attributed to one asset's long and short domains.
-///
-/// This mirrors Percolator's `market_insurance_remaining_view`: each domain contributes
-/// `budget - spent`, and the sum is capped by the market-wide insurance balance. It does
-/// not subtract temporary source-credit reservations; Percolator's withdrawal CPI still
-/// enforces those, so an active reservation delays an exit instead of crystallizing it as
-/// a depositor loss.
-pub fn read_asset_insurance_remaining(data: &[u8], asset_index: usize) -> Result<u128, ReadError> {
-    validate_market(data)?;
+fn validate_asset(data: &[u8], asset_index: usize) -> Result<(), ReadError> {
     let header_config = MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, config);
     let configured = read_u32(
         data,
@@ -91,6 +73,50 @@ pub fn read_asset_insurance_remaining(data: &[u8], asset_index: usize) -> Result
     if asset_index >= configured || asset_index >= capacity {
         return Err(ReadError::InvalidAsset);
     }
+    Ok(())
+}
+
+fn asset_wrapper_offset(asset_index: usize) -> Result<usize, ReadError> {
+    let slot_stride = size_of::<Market<[u8; ASSET_WRAPPER_LEN]>>();
+    MARKET_GROUP_OFFSET
+        .checked_add(size_of::<MarketGroupV16HeaderAccount>())
+        .and_then(|v| {
+            asset_index
+                .checked_mul(slot_stride)
+                .and_then(|n| v.checked_add(n))
+        })
+        .ok_or(ReadError::Truncated)
+}
+
+fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
+    asset_wrapper_offset(asset_index)?
+        .checked_add(ASSET_WRAPPER_LEN)
+        .ok_or(ReadError::Truncated)
+}
+
+/// Returns the backing authority recorded in one pinned-v16 asset profile.
+pub fn read_asset_backing_authority(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[u8; 32], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    bytes(
+        data,
+        asset_wrapper_offset(asset_index)? + BACKING_AUTHORITY_PROFILE_OFFSET,
+    )
+}
+
+/// Returns the insurance attributed to one asset's long and short domains.
+///
+/// This mirrors Percolator's `market_insurance_remaining_view`: each domain contributes
+/// `budget - spent`, and the sum is capped by the market-wide insurance balance. It does
+/// not subtract temporary source-credit reservations; Percolator's withdrawal CPI still
+/// enforces those, so an active reservation delays an exit instead of crystallizing it as
+/// a depositor loss.
+pub fn read_asset_insurance_remaining(data: &[u8], asset_index: usize) -> Result<u128, ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
 
     let engine = asset_engine_offset(asset_index)?;
     let long_budget = read_u128(

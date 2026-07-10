@@ -11928,3 +11928,31 @@ Percolator's own insurance-ledger observation. TWAP surplus and subledger haircu
 Temporary source-credit reservations remain enforced by the Percolator CPI and delay rather than
 crystallize an exit. No counter, signer, setter, token destination, withdrawal instruction, or admin
 authority was added.
+
+## Tick — abandoned external backing could permanently block market cleanup (surface A/C)
+
+A permissionless asset provider can deposit backing and disappear. Percolator correctly refuses to retire
+or close a slab while principal or provider earnings remain. It gives `marketauth` a narrowly timed override
+after the asset shutdown delay and empty-state checks pass, but only before market resolution. The stateless
+controller denied backing tags 50/52 through its generic proxy and exposed no fixed use of that override. A
+one-atom public deposit could therefore make a controller-owned market impossible for futarchy to retire or
+close unless the provider returned.
+
+The red real Percolator + Squads + controller LiteSVM lifecycle deposited external long-domain backing,
+shut the asset down through the one-week-timelocked governance path, and then required a permissionless
+return of the provider's abandoned remainder. The old controller rejected the new operation with
+`InvalidInstructionData`. The retained probe also funds the short domain, covers provider self-service
+withdrawal before and after resolution, and reaches final `CloseSlab` cleanup.
+
+FIX: controller tag 6 reads the backing authority from the pinned asset profile, requires canonical token
+accounts for that provider and the controller, invokes Percolator's earnings withdrawal before principal,
+forwards the complete transient balance and rent to the provider, and closes the transient account. It is
+permissionless and adds no DAO-selected recipient. The generic proxy still rejects tags 50/52. Percolator
+itself remains the shutdown-delay, empty-asset, available-balance, and pre-resolution authority gate.
+
+Safety probes prove the fixed path is byte-atomic and unusable before shutdown, rejects a canonical
+DAO-owned recipient after shutdown, rolls back the earnings CPI and ledger initialization when a subsequent
+oversized principal CPI fails, and stops working after resolution while the recorded provider remains able
+to exit. The earnings fixture mirrors the aggregate and domain state produced by the pinned public backing-
+fee path; all withdrawal, authorization, token movement, and cleanup run through the real SBF binaries. The
+shared read-only profile offset is asserted against the exact Cargo-pinned wrapper struct in the chain test.
