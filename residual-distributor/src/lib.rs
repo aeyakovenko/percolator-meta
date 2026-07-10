@@ -169,6 +169,24 @@ fn replace_cohort_points(total: &mut u128, old: u128, new: u128) -> ProgramResul
     Ok(())
 }
 
+/// `points` is constructed as `tenure_multiplier * frozen_net`; cancel the common factor before
+/// applying the live cap so the intermediate cannot overflow u128.
+fn cap_residual_points(
+    points: u128,
+    frozen_net: u128,
+    cap_net: u128,
+) -> Result<u128, ProgramError> {
+    if frozen_net == 0 || cap_net >= frozen_net {
+        return Ok(points);
+    }
+    if points % frozen_net != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    (points / frozen_net)
+        .checked_mul(cap_net)
+        .ok_or(ProgramError::ArithmeticOverflow)
+}
+
 // percolator account header length (KIND/version/etc.) — all percolator account reads below are at
 // PERC_HEADER_LEN + within-struct offset, PINNED against the real structs by tests/offsets.rs
 // (offset_of! + HEADER_LEN), finding-T discipline.
@@ -1395,7 +1413,9 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let counter = residual_counter(stake.cohort, received, crystallized, spent);
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let tenure = Clock::get()?.slot.saturating_sub(stake.start_slot);
-            let new_pts = floor_log2(tenure).saturating_mul(net_delta);
+            let new_pts = floor_log2(tenure)
+                .checked_mul(net_delta)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
             replace_cohort_points(
                 config.cohort_points_mut(stake.cohort),
                 stake.points,
@@ -1666,11 +1686,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             } else {
                 live_net
             };
-            let pts = if frozen_net == 0 || cap_net >= frozen_net {
-                stake.points
-            } else {
-                stake.points.saturating_mul(cap_net) / frozen_net
-            };
+            let pts = cap_residual_points(stake.points, frozen_net, cap_net)?;
             points_to_amount(cohort_supply, pts, frozen_denom)
         }
         _ => {

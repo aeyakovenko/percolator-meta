@@ -1199,6 +1199,112 @@ fn crystallize_rejects_point_sum_overflow_instead_of_saturating_the_denominator(
     );
 }
 
+// LoF PROBE: the trader live cap scales frozen points down after spent principal rises. Its
+// `points * cap_net / frozen_net` intermediate can exceed u128 even though the exact result fits.
+// Saturating that intermediate underpays the irreversible claim and locks the remaining COIN.
+#[test]
+fn trader_live_cap_is_exact_when_its_intermediate_exceeds_u128() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup_custom_split_with_fee_and_extras(
+        &mut svm,
+        &payer,
+        supply,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &[],
+    ); // trader receives the 100% remainder
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+        0,
+    );
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+
+    set_slot(&mut svm, 100);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_TRADER,
+    )
+    .expect("register trader");
+
+    let frozen_net = 1u128 << 125;
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        frozen_net,
+        0,
+    );
+    set_slot(&mut svm, 104); // age 4 => multiplier 2
+    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+        .expect("crystallize large but representable trader points");
+    let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_TRADER);
+    assert_eq!(
+        u128::from_le_bytes(
+            svm.get_account(&stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap()
+        ),
+        1u128 << 126,
+        "frozen points are exactly multiplier * frozen net"
+    );
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze trader denominator");
+    let live_net = frozen_net / 2;
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        frozen_net,
+        frozen_net - live_net,
+    );
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &recipient,
+        Some(&portfolio),
+    )
+    .expect("claim exactly live-capped trader points");
+    assert_eq!(
+        token_amount(&svm, &recipient),
+        supply / 2,
+        "halving eligible loss pays exactly half the cohort despite a wide intermediate"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        supply / 2,
+        "only the intentionally forfeited half remains"
+    );
+}
+
 #[test]
 fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
     let mut svm = LiteSVM::new();
