@@ -87,7 +87,7 @@ const CUSTODY_MODE_POOLLESS_EMPTY: u8 = 2;
 const DEFAULT_SURPLUS_BUY_BURN_BPS: u16 = 8_000;
 const BPS_DENOMINATOR: u16 = 10_000;
 
-// Percolator CPI tags (verified against the real v16 program, percolator-prog 5349b2f).
+// Percolator CPI tags (verified against the pinned real v16 program).
 // tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
 // insurance-operator-gated, during-Live (mode==0) insurance withdraw that REPLACED the removed asset-0
 // tag-23 WithdrawInsuranceLimited (reconcile, finding JX). Accounts: [operator(s), market(w), dest(w),
@@ -97,6 +97,7 @@ const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_AUTH_ADMIN: u8 = 0;
 const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance / deposits)
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
@@ -174,6 +175,8 @@ const IX_RETURN_RESOLVED_PROTOCOL_INSURANCE: u8 = 19;
 // Permissionless, amountless wrapper for the controller's provider-bound asset-0
 // backing return while a pool-less config's TWAP PDA remains asset_admin.
 const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 20;
+// Timelocked, value-neutral restart for asset 0 while this program holds asset_admin.
+const IX_RESTART_ASSET0: u8 = 21;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -534,6 +537,7 @@ pub fn process_instruction(
         IX_RETURN_RESOLVED_ASSET0_BACKING => {
             process_return_resolved_asset0_backing(program_id, accounts, data)
         }
+        IX_RESTART_ASSET0 => process_restart_asset0(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1681,6 +1685,75 @@ fn process_set_market_fees(
         )?;
     }
     Ok(())
+}
+
+// restart_asset0 accounts:
+// [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program]
+// data: now_slot(u64) || initial_price(u64)
+//
+// Once custody is handed off, Percolator recognizes only the TWAP PDA as asset_admin.
+// This fixed wrapper keeps restart reachable without exposing a generic admin proxy or any
+// value-bearing account. Percolator enforces Recovery, empty positions/backing, the real Clock,
+// and preservation of the existing insurance and authority fields.
+fn process_restart_asset0(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let now_slot = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let initial_price = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    require_squads_vault(squads_vault, &config)?;
+    if *market_slab.key != config.market_slab
+        || market_slab.owner != percolator_program.key
+        || *percolator_program.key != config.percolator_program
+        || !percolator_program.executable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let mut ix_data = vec![PERC_IX_RESTART_ASSET_ORACLE];
+    ix_data.extend_from_slice(&0u16.to_le_bytes());
+    ix_data.extend_from_slice(&now_slot.to_le_bytes());
+    ix_data.extend_from_slice(&initial_price.to_le_bytes());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*twap_authority.key, true),
+                AccountMeta::new(*market_slab.key, false),
+            ],
+            data: ix_data,
+        },
+        &[
+            twap_authority.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+        ],
+        &[&auth_seeds],
+    )
 }
 
 // ---------------------------------------------------------------------------
