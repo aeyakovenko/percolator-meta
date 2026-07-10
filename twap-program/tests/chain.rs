@@ -5934,6 +5934,186 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
 // drained before CloseSlab can make progress. The fixed path must derive every amount and recipient,
 // reject while live, and atomically return all remaining principal and earnings after resolution.
 #[test]
+fn e2e_provider_cannot_brick_resolved_cleanup_by_reassigning_its_canonical_ata() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let provider = Keypair::new();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(
+        &mut svm,
+        &payer,
+        &provider,
+        &collateral_mint,
+        &slab,
+    );
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let backing_amount = 1u64;
+    let provider_destination =
+        canonical_insurance_vault(&provider.pubkey(), &collateral_mint);
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral_mint,
+        &provider.pubkey(),
+        backing_amount,
+    );
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(provider_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+                domain: 0,
+                amount: backing_amount as u128,
+                expiry_slot: 10_000,
+            }
+            .encode(),
+        },
+    )
+    .expect("provider deposits one atom through Percolator");
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("provider donates lifecycle control without donating backing");
+
+    let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves the empty market");
+
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    let long_backing_ledger = Pubkey::new_unique();
+    let short_backing_ledger = Pubkey::new_unique();
+    for ledger in [long_backing_ledger, short_backing_ledger] {
+        svm.set_account(
+            ledger,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; backing_ledger_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    // The provider can publicly reassign its token account owner, but the exact
+    // canonical address remains the only destination the controller will accept.
+    // Leaving the account initialized makes recreation impossible.
+    let dead_owner = Pubkey::new_unique();
+    let reassign = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &provider_destination,
+        Some(&dead_owner),
+        spl_token::instruction::AuthorityType::AccountOwner,
+        &provider.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &[&payer, &provider], reassign)
+        .expect("provider reassigns its canonical ATA");
+    let reassigned = spl_token::state::Account::unpack(
+        &svm.get_account(&provider_destination).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(reassigned.owner, dead_owner);
+
+    send(
+        &mut svm,
+        &[&payer],
+        controller_return_resolved_asset0_backing_ix(
+            &governance.pubkey(),
+            &controller,
+            &controller,
+            &slab,
+            &provider_destination,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker returns backing to the immutable canonical address");
+    assert_eq!(token_amount(&svm, &provider_destination), backing_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+    assert!(
+        svm.get_account(&controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "controller transit closes after the terminal return"
+    );
+}
+
+#[test]
 fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {

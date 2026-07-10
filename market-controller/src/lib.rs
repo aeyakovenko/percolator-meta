@@ -385,12 +385,14 @@ fn validate_provider_return_token_accounts(
         &ASSOCIATED_TOKEN_PROGRAM_ID,
     )
     .0;
+    // The address, mint, and initialized state are the immutable routing boundary.
+    // Requiring the mutable token owner to remain `provider` lets that provider
+    // reassign the account to a dead key and permanently block terminal cleanup.
     if transit_state.state != spl_token::state::AccountState::Initialized
         || destination_state.state != spl_token::state::AccountState::Initialized
         || *transit.key != canonical_transit
         || *destination.key != canonical_destination
         || transit_state.owner != *controller.key
-        || destination_state.owner != *provider
         || transit_state.mint != destination_state.mint
         || transit_state.delegate.is_some()
         || transit_state.delegated_amount != 0
