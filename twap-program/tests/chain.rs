@@ -4224,6 +4224,232 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     assert_eq!(token_amount(&svm, &perc_vault), 0);
 }
 
+fn init_creator_owned_market(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    creator: &Keypair,
+    collateral_mint: &Pubkey,
+    slab: &Pubkey,
+) {
+    svm.set_account(
+        *slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let init_market = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(*slab, false),
+            AccountMeta::new_readonly(*collateral_mint, false),
+        ],
+        data: controller_init_market_data(1),
+    };
+    send(svm, &[payer, creator], init_market)
+        .expect("permissionless creator initializes a real market");
+}
+
+// PUBLIC LOF: Percolator's market-authority handoff also rewrites every asset-0 role that still
+// equals the outgoing market authority. A permissionless creator is initially the backing provider,
+// so donating a backed market to the stateless controller used to rewrite the provider to the
+// controller and make the creator's ordinary withdrawal permanently unauthorized.
+#[test]
+fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let backing_amount = 500_000u64;
+    let provider_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_token,
+        &collateral_mint,
+        &creator.pubkey(),
+        backing_amount,
+    );
+    let top_up = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(provider_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+            domain: 0,
+            amount: backing_amount as u128,
+            expiry_slot: 10_000,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], top_up)
+        .expect("creator backs asset 0 through the real public path");
+    assert_eq!(token_amount(&svm, &provider_token), 0);
+    assert_eq!(token_amount(&svm, &percolator_vault), backing_amount);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        creator.pubkey().to_bytes(),
+        "the permissionless creator begins as the asset-0 backing provider"
+    );
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+    };
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("creator donates the backed market to the governance controller");
+
+    let slab_after_handoff = svm.get_account(&slab).unwrap();
+    let (config, _, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+        &slab_after_handoff.data,
+    )
+    .unwrap();
+    assert_eq!(config.marketauth, controller.to_bytes());
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(&slab_after_handoff.data, 0).unwrap(),
+        creator.pubkey().to_bytes(),
+        "market donation must not collapse external backing into the stateless controller"
+    );
+
+    let withdraw = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(provider_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawBackingBucket {
+            domain: 0,
+            amount: backing_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], withdraw)
+        .expect("the original provider withdraws after donating market lifecycle control");
+    assert_eq!(token_amount(&svm, &provider_token), backing_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+}
+
+#[test]
+fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let provider = Keypair::new();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let rotate_backing = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: percolator_prog::ix::Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: 3,
+            new_pubkey: provider.pubkey().to_bytes(),
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator, &provider], rotate_backing)
+        .expect("creator delegates backing to a distinct external provider");
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8],
+    };
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("creator donates lifecycle control without changing the provider");
+
+    let slab_after_handoff = svm.get_account(&slab).unwrap();
+    let (config, _, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+        &slab_after_handoff.data,
+    )
+    .unwrap();
+    assert_eq!(config.marketauth, controller.to_bytes());
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(&slab_after_handoff.data, 0).unwrap(),
+        provider.pubkey().to_bytes(),
+        "the fixed handoff cannot select or overwrite an unrelated provider"
+    );
+}
+
 // Canonical authority chain: permissionless controller-owned market init, then
 // Squads-authorized controller -> owner-bound subledger custody. Governance keeps
 // lifecycle/policy control but never receives a Percolator value-moving authority.

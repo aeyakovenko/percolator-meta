@@ -29,7 +29,9 @@ recover their owner-bound share of the insurance pool, subject to market losses.
   authority mutation. After an asset's shutdown matures, a separate permissionless path can return
   principal and earnings only to that asset's recorded backing provider. Raw `CloseSlab` is
   excluded; a fixed atomic cleanup runs only after Percolator proves all attributed balances and
-  portfolios are zero, then forwards terminal vault dust and account rent to Squads.
+  portfolios are zero, then forwards terminal vault dust and account rent to Squads. Donating a
+  creator-owned market preserves that creator when it is already the recorded asset-0 backing
+  provider; the handoff cannot collapse its backing into the controller or select another provider.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
