@@ -61,9 +61,11 @@ capital's own tenure.
   first recovered to the canonical controller account, anyone may return the now value-less roles to
   the same pool so its fixed wrapper can release an absent asset-0 backing provider. The pool-less
   compatibility handoff accepts only an empty asset-0 insurance balance; later value must enter
-  through the inbound-only donation path.
-  After resolution, TWAP can move a retained terminal floor to the canonical controller account
-  only after the bound pool itself attests that no owner principal or shares remain.
+  through the inbound-only donation path. Current-layout pool-less handoffs persist that empty-state
+  attestation, allowing any cranker to move later donated terminal insurance only to the canonical
+  controller account after resolution. Historical unmarked configs cannot infer protocol ownership.
+  For pool-bound custody, TWAP can move a retained terminal floor to that controller account only
+  after the bound pool itself attests that no owner principal or shares remain.
 - **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
   approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
   Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
@@ -78,9 +80,9 @@ capital's own tenure.
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, deregisters only empty resolved portfolios, and retains controller-owned protocol insurance for terminal reclaim. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. Its terminal read-only attestation proves when that principal pool has no owner claims. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
-| `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
+| `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Each recipient authorizes its own claim; unclaimed COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. It reads principal-bearing accounts but cannot debit them. |
-| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, and apply the exact trade/backing fee setters. Its recovery path is bound to the original genesis pool. After resolution and a zero-claim pool attestation, it can route the terminal protocol floor only to the canonical market-controller account. |
+| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, and apply the exact trade/backing fee setters. Pool-bound recovery stays bound to the original genesis pool. After resolution, either that pool proves zero claims or a current-layout pool-less config proves it began empty; TWAP can then route the terminal protocol floor only to the canonical market-controller account. |
 | `twap/` | Host-side auction simulation and Percolator wire helpers. It does not expose the obsolete raw Squads/operator rotation conveniences; deployed custody transitions live in `subledger` and `twap-program`. |
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 

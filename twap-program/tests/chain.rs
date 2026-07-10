@@ -3132,7 +3132,7 @@ fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
 
 // TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:
 // signer first, then writable non-signers, then readonly non-signers):
-// [squads_vault(ro-signer), market_slab(w), config, twap_authority, percolator_program, twap_program].
+// [squads_vault(ro-signer), market_slab(w), config(w), twap_authority, percolator_program, twap_program].
 fn build_accept_operator_message(
     squads_vault: &Pubkey,
     market_slab: &Pubkey,
@@ -3144,11 +3144,11 @@ fn build_accept_operator_message(
     let mut m = Vec::new();
     m.push(1); // num_signers
     m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (market_slab)
+    m.push(2); // num_writable_non_signers (market_slab + config attestation)
     m.push(6); // account_keys count
     m.extend_from_slice(squads_vault.as_ref()); // 0
     m.extend_from_slice(market_slab.as_ref()); // 1 (writable)
-    m.extend_from_slice(config.as_ref()); // 2
+    m.extend_from_slice(config.as_ref()); // 2 (writable)
     m.extend_from_slice(twap_authority.as_ref()); // 3
     m.extend_from_slice(percolator_program.as_ref()); // 4
     m.extend_from_slice(twap_program.as_ref()); // 5 (program id)
@@ -3328,7 +3328,7 @@ fn handoff_rotates_operator_to_twap_only_after_timelock() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(cfg, false),
+        AccountMeta::new(cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -3485,7 +3485,7 @@ fn legacy_handoff_rejects_funded_insurance_before_rotating_custody() {
     let handoff_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(config, false),
+        AccountMeta::new(config, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -3510,6 +3510,148 @@ fn legacy_handoff_rejects_funded_insurance_before_rotating_custody() {
         "all custody-role mutations roll back"
     );
     assert_eq!(token_amount(&svm, &percolator_vault), amount);
+}
+
+// PUBLIC DOS: the pool-less compatibility handoff starts from zero insurance, and every later atom
+// enters through TWAP's explicit donation instruction with no owner claim. Once lifecycle authority
+// moves to the controller, an unaffiliated stale resolver can still resolve the market. Terminal
+// protocol recovery must not require a subledger pool that this compatibility config never had.
+#[test]
+fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    assert_eq!(
+        svm.get_account(&env.twap_cfg).unwrap().data[265],
+        2,
+        "the public empty handoff records pool-less custody provenance"
+    );
+    let amount = env.principal + env.surplus;
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), amount as u128);
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("Squads donates pool-less market lifecycle to the constrained controller");
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 5_000;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(env.slab, false)],
+            data: percolator_prog::ix::Instruction::ResolveStalePermissionless {
+                now_slot: clock.slot,
+            }
+            .encode(),
+        },
+    )
+    .expect("unaffiliated stale resolver ends the pool-less market");
+
+    let twap_transit = canonical_insurance_vault(&env.twap_authority, &env.collateral_mint);
+    let controller_transit = canonical_insurance_vault(&controller, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &twap_transit,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    let attacker = Keypair::new();
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    let market_before_redirect = svm.get_account(&env.slab).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_resolved_protocol_insurance_ix(
+                &env.twap_cfg,
+                &env.twap_authority,
+                &system_program::ID,
+                &env.slab,
+                &twap_transit,
+                &attacker_destination,
+                &env.perc_vault,
+                &env.vault_authority,
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "pool-less recovery cannot redirect protocol insurance"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_redirect);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_resolved_protocol_insurance_ix(
+            &env.twap_cfg,
+            &env.twap_authority,
+            &system_program::ID,
+            &env.slab,
+            &twap_transit,
+            &controller_transit,
+            &env.perc_vault,
+            &env.vault_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker recovers pool-less protocol insurance to the canonical controller");
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), amount);
 }
 
 // accept_operator BINDING (the keystone authority transfer): even a fully-approved, timelock'd Squads
@@ -3689,7 +3831,7 @@ fn handoff_rejects_a_substituted_market_or_percolator_program() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(cfg, false),
+        AccountMeta::new(cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(foreign_perc, false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -3712,7 +3854,7 @@ fn handoff_rejects_a_substituted_market_or_percolator_program() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(foreign_market, false),
-        AccountMeta::new_readonly(cfg, false),
+        AccountMeta::new(cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -3734,7 +3876,7 @@ fn handoff_rejects_a_substituted_market_or_percolator_program() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(cfg, false),
+        AccountMeta::new(cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -4048,6 +4190,38 @@ fn build_controller_accept_and_top_up_asset0_backing_message(
     .encode();
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_controller_accept_market_authority_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance is also the current market authority signer
+    m.push(0);
+    m.push(1); // market writable
+    m.push(5);
+    for key in [
+        governance,
+        market,
+        controller,
+        percolator_program,
+        &controller_id(),
+    ] {
+        m.extend_from_slice(key.as_ref());
+    }
+    m.push(1);
+    m.push(4); // market-controller program
+    m.push(5);
+    for index in [0u8, 0, 2, 1, 3] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(3); // IX_ACCEPT_MARKET_AUTHORITY
     m.push(0);
     m
 }
@@ -11504,7 +11678,7 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
     let or = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -12005,7 +12179,7 @@ fn parasite_config_cannot_grant_itself_the_victims_insurance_operator() {
     let or_b = vec![
         AccountMeta::new_readonly(squads_vault_b, false),
         AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(twap_cfg_b, false),
+        AccountMeta::new(twap_cfg_b, false),
         AccountMeta::new_readonly(twap_authority_b, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),

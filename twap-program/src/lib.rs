@@ -79,6 +79,9 @@ const INITIAL_CONFIG_SIZE: usize = 200;
 const LEGACY_CONFIG_SIZE: usize = 232;
 const CUSTODY_CONFIG_SIZE: usize = 264;
 const CONFIG_SIZE: usize = 272;
+const CUSTODY_MODE_UNATTESTED: u8 = 0;
+const CUSTODY_MODE_POOL_BOUND: u8 = 1;
+const CUSTODY_MODE_POOLLESS_EMPTY: u8 = 2;
 
 // Default surplus share routed to buy/burn (the rest is retained as insurance).
 const DEFAULT_SURPLUS_BUY_BURN_BPS: u16 = 8_000;
@@ -390,6 +393,9 @@ struct Config {
     /// A later recovery/re-handoff may replace only this component with the pool's new
     /// live outstanding principal; retained insurance and DAO-raised buffers stay locked.
     custody_principal: u64,
+    /// Current-layout custody provenance. Historical zero means no safe inference.
+    /// Pool-less terminal recovery requires the explicit empty-at-handoff marker.
+    custody_mode: u8,
 }
 
 impl Config {
@@ -399,6 +405,14 @@ impl Config {
             && data.len() < CONFIG_SIZE)
             || data[..8] != CONFIG_DISC
         {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let custody_mode = if data.len() >= CONFIG_SIZE {
+            data[265]
+        } else {
+            0
+        };
+        if custody_mode > CUSTODY_MODE_POOLLESS_EMPTY {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -425,6 +439,7 @@ impl Config {
             } else {
                 0
             },
+            custody_mode,
         })
     }
 
@@ -453,7 +468,8 @@ impl Config {
             data[225..257].copy_from_slice(self.custody_pool.as_ref());
             if data.len() >= CONFIG_SIZE {
                 data[257..265].copy_from_slice(&self.custody_principal.to_le_bytes());
-                data[265..CONFIG_SIZE].fill(0);
+                data[265] = self.custody_mode;
+                data[266..CONFIG_SIZE].fill(0);
             } else {
                 data[257..CUSTODY_CONFIG_SIZE].fill(0);
             }
@@ -635,6 +651,7 @@ fn process_init_config(
         base_unit_savings_account: Pubkey::default(),
         custody_pool: Pubkey::default(),
         custody_principal: 0,
+        custody_mode: CUSTODY_MODE_UNATTESTED,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -821,7 +838,7 @@ fn process_set_reserved_floor(
     Ok(())
 }
 
-// accept_operator accounts: [squads_vault/current_admin(signer), config,
+// accept_operator accounts: [squads_vault/current_admin(signer), config(w for current layout),
 //   twap_authority(pda), market_slab(w), percolator_program]
 //
 // Legacy migration path for an unfunded market whose Squads vault is still the raw
@@ -918,6 +935,7 @@ fn process_accept_custody<'a>(
         return Err(ProgramError::IllegalOwner);
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let mut persist_config = false;
     if let Some((pool, protected_floor)) = source_pool {
         if !config_account.is_writable || config_account.data_len() < CUSTODY_CONFIG_SIZE {
             return Err(ProgramError::InvalidAccountData);
@@ -951,7 +969,9 @@ fn process_accept_custody<'a>(
         }
         if config_account.data_len() >= CONFIG_SIZE {
             config.custody_principal = new_pool_principal;
+            config.custody_mode = CUSTODY_MODE_POOL_BOUND;
         }
+        persist_config = true;
     }
     if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
         return Err(ProgramError::IllegalOwner);
@@ -965,13 +985,25 @@ fn process_accept_custody<'a>(
     // before insurance is funded; otherwise this rotation would place existing capital under the
     // TWAP PDA with no public path that can return custody to its provider. Funded handoffs must
     // come through the subledger, which binds `custody_pool` and imports its live principal floor.
-    if source_pool.is_none()
-        && read_asset_insurance(
-            &market_slab.try_borrow_data()?,
-            config.market_0_domain as usize,
-        )? != 0
-    {
-        return Err(ProgramError::InvalidAccountData);
+    if source_pool.is_none() {
+        if config.custody_pool != Pubkey::default()
+            || read_asset_insurance(
+                &market_slab.try_borrow_data()?,
+                config.market_0_domain as usize,
+            )? != 0
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // Only current-layout configs can persist proof that a pool-less handoff
+        // started empty. Historical unmarked configs keep their existing live
+        // behavior but cannot later infer that terminal insurance is protocol-owned.
+        if config_account.data_len() >= CONFIG_SIZE {
+            if !config_account.is_writable {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            config.custody_mode = CUSTODY_MODE_POOLLESS_EMPTY;
+            persist_config = true;
+        }
     }
     let auth_bump = [config.authority_bump];
     let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
@@ -1014,7 +1046,7 @@ fn process_accept_custody<'a>(
             &[&auth_seeds],
         )?;
     }
-    if source_pool.is_some() {
+    if persist_config {
         config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     }
     Ok(())
@@ -1122,7 +1154,7 @@ fn process_return_to_subledger(
 }
 
 // return_resolved_protocol_insurance accounts:
-// [config, twap_authority, custody_pool, market(w), twap_canonical_ata(w),
+// [config, twap_authority, custody_pool_or_system, market(w), twap_canonical_ata(w),
 //  controller_canonical_ata(w), percolator_vault(w), vault_authority,
 //  percolator_program, subledger_program, token_program]
 //
@@ -1158,7 +1190,7 @@ fn process_return_resolved_protocol_insurance(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    if config_account.owner != program_id || pool.owner != &SUBLEDGER_PROGRAM_ID {
+    if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
     if *subledger_program.key != SUBLEDGER_PROGRAM_ID
@@ -1170,11 +1202,20 @@ fn process_return_resolved_protocol_insurance(
         return Err(ProgramError::IncorrectProgramId);
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let pool_bound = config.custody_pool != Pubkey::default();
     if config.market_0_domain != 0
-        || config.custody_pool == Pubkey::default()
-        || *pool.key != config.custody_pool
         || *market_slab.key != config.market_slab
         || *percolator_program.key != config.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if pool_bound {
+        if pool.owner != &SUBLEDGER_PROGRAM_ID || *pool.key != config.custody_pool {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    } else if config.custody_mode != CUSTODY_MODE_POOLLESS_EMPTY
+        || config.custody_principal != 0
+        || *pool.key != solana_program::system_program::ID
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -1187,16 +1228,18 @@ fn process_return_resolved_protocol_insurance(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    // The subledger owns the claim accounting and its historical layouts. A
-    // successful read-only CPI is the proof that no owner principal or shares remain.
-    invoke(
-        &Instruction {
-            program_id: *subledger_program.key,
-            accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
-            data: vec![SUBLEDGER_IX_ASSERT_NO_PRINCIPAL],
-        },
-        &[pool.clone(), subledger_program.clone()],
-    )?;
+    if pool_bound {
+        // The subledger owns the claim accounting and its historical layouts. A
+        // successful read-only CPI is the proof that no owner principal or shares remain.
+        invoke(
+            &Instruction {
+                program_id: *subledger_program.key,
+                accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
+                data: vec![SUBLEDGER_IX_ASSERT_NO_PRINCIPAL],
+            },
+            &[pool.clone(), subledger_program.clone()],
+        )?;
+    }
 
     let governance = squads_default_vault(&config.squads_multisig);
     let controller = Pubkey::find_program_address(
@@ -3215,6 +3258,7 @@ mod tests {
             base_unit_savings_account: Pubkey::new_unique(),
             custody_pool: Pubkey::new_unique(),
             custody_principal: 987_654_321,
+            custody_mode: CUSTODY_MODE_POOL_BOUND,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf).unwrap();
@@ -3232,11 +3276,19 @@ mod tests {
         assert_eq!(d.base_unit_savings_account, c.base_unit_savings_account);
         assert_eq!(d.custody_pool, c.custody_pool);
         assert_eq!(d.custody_principal, c.custody_principal);
+        assert_eq!(d.custody_mode, c.custody_mode);
 
         let mut predecessor = [0u8; CUSTODY_CONFIG_SIZE];
         c.serialize(&mut predecessor).unwrap();
         let old = Config::deserialize(&predecessor).unwrap();
         assert_eq!(old.custody_pool, c.custody_pool);
         assert_eq!(old.custody_principal, 0);
+        assert_eq!(old.custody_mode, CUSTODY_MODE_UNATTESTED);
+
+        buf[265] = CUSTODY_MODE_POOLLESS_EMPTY + 1;
+        assert!(matches!(
+            Config::deserialize(&buf),
+            Err(ProgramError::InvalidAccountData)
+        ));
     }
 }
