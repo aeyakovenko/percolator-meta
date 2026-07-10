@@ -3335,6 +3335,41 @@ fn vote_weight_first_becomes_nonzero_at_exactly_age_2() {
     assert_eq!(p, amount, "principal credited once the position is old enough to vote");
 }
 
+// SLOT-ZERO LIVENESS: slot 0 is a valid configured bootstrap start and a valid deposit slot.
+// The position's `start_slot` therefore legitimately serializes as zero; it must acquire ordinary
+// vote weight once it ages instead of being mistaken for an unfunded sentinel forever.
+#[test]
+fn a_slot_zero_deposit_can_vote_after_aging() {
+    let mut env = Env::new();
+    env.warp_slot(0);
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let amount = 1u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount)
+        .expect("slot-zero deposit through real Percolator");
+    assert_eq!(
+        env.read_position(&alice.pubkey()),
+        (amount, 0, false),
+        "the public deposit path records the valid slot-zero timestamp"
+    );
+
+    let dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &dest);
+    env.warp_slot(2);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("a slot-zero position has weight after age two");
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        (amount, amount),
+        "floor(log2(2)) gives one vote-weight unit per deposited base unit"
+    );
+}
+
 // Cross-config binding (finalize-DOS): a vote may only be registered against a
 // distribution proposal that belongs to THIS genesis's distribution config. A
 // proposal owned by the distribution program but under a DIFFERENT config, if it
