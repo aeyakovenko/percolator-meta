@@ -16599,9 +16599,31 @@ fn e2e_full_genesis_to_buy_burn() {
         "winner received the surplus USD at the clearing price"
     );
 
+    // Resolve while TWAP holds every asset role. Recovery must remain live in resolved mode: the
+    // fixed return rotates all roles back to the same pool, whose tag-57 exit then authenticates as
+    // insurance_authority rather than the live-mode operator. Otherwise a normal lifecycle action
+    // could permanently strand every genesis depositor behind the TWAP floor.
+    let resolve_message = build_direct_resolve_message(&squads_vault, &slab, &perc_id());
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &resolve_message,
+        &resolve_remaining,
+    )
+    .expect("futarchy resolves while TWAP holds custody");
+
     // Complete the advertised lifecycle: return custody to the canonical pool, retract the sealed
     // ballot, and recover the genesis deposit. Insurance is still healthy (1.1M >= 1M outstanding),
-    // so TWAP's protocol-surplus auction must not turn into a depositor-principal haircut.
+    // so resolution and the protocol-surplus auction must not turn into a principal haircut.
     let return_message = build_return_to_subledger_message(
         &squads_vault,
         &pool,
@@ -16626,11 +16648,11 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        7,
+        8,
         &return_message,
         &return_remaining,
     )
-    .expect("return custody for genesis deposit recovery");
+    .expect("return resolved-market custody for genesis deposit recovery");
 
     let retract = Instruction {
         program_id: gv_id_e2e(),

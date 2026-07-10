@@ -81,7 +81,8 @@ The workspace pins `percolator-prog` to commit
    principal-pool-to-TWAP transition. The transition records the exact pool identity and live
    principal in the TWAP floor. After a recovery, re-handoff replaces only that principal component;
    retained insurance stays protected and exited principal no longer strands fee surplus. Deposits
-   and exits are closed while TWAP holds custody; the fixed recovery transition restores owner exits.
+   and exits are closed while TWAP holds custody; the fixed recovery transition restores owner exits,
+   including after the Percolator market has entered resolved mode.
 
 ## Continuous Rewards
 

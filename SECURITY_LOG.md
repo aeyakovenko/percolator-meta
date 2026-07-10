@@ -11996,3 +11996,16 @@ FIX: distribution now requires the payout to be an initialized SPL Token account
 whose token authority is the signing recipient. Arbitrary recipient-owned accounts and historical claims stay
 supported; attacker accounts and the config-owned vault cannot pass. No signer, mint, admin, custody, amount,
 or claim authority was added.
+
+## Tick — resolved-mode TWAP recovery preserves genesis principal exits (surface A/C)
+
+A fresh six-program LiteSVM lifecycle extends the complete genesis-to-buy-burn path through the authorization
+branch used only after Percolator resolution. Futarchy resolves the real pinned market while TWAP still holds
+all asset-0 roles, invokes the fixed `return_to_subledger` transition through real Squads, retracts the sealed
+genesis ballot, and withdraws the depositor's full real Percolator insurance principal.
+
+This pins a semantic distinction in Percolator tag 57: live exits authenticate the insurance operator, while
+resolved exits authenticate the insurance authority after all portfolios and collateral are gone. The fixed
+return restores both roles plus `asset_admin` to the same canonical owner-bound pool, so resolution cannot
+strand genesis capital behind TWAP custody. No production code, signer, setter, withdrawal destination, or
+admin surface was added.
