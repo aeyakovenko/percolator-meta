@@ -13,6 +13,8 @@ pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
+// Pinned `WrapperConfigV16::permissionless_market_init_fee` relative to the account.
+pub const PERMISSIONLESS_MARKET_INIT_FEE_OFFSET: usize = HEADER_LEN + 112;
 // Pinned `WrapperConfigV16::free_market_slot_count` relative to the account.
 // The wrapper config starts after the 16-byte account header; this field follows
 // its authority/mint, fee, resolve, insurance-withdraw, and oracle-policy prefix.
@@ -120,6 +122,12 @@ fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
 pub fn read_market_authority(data: &[u8]) -> Result<[u8; 32], ReadError> {
     validate_market(data)?;
     bytes(data, MARKET_AUTHORITY_OFFSET)
+}
+
+/// Returns the fee that enables direct, non-marketauth secondary-slot activation.
+pub fn read_permissionless_market_init_fee(data: &[u8]) -> Result<u128, ReadError> {
+    validate_market(data)?;
+    read_u128(data, PERMISSIONLESS_MARKET_INIT_FEE_OFFSET)
 }
 
 /// Returns true when asset 0 is the only non-retired configured slot.

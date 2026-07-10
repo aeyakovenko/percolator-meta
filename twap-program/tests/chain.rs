@@ -4824,7 +4824,7 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
     svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
     let provider = Keypair::new();
     svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
-    let governance = Pubkey::new_unique();
+    let governance = Keypair::new();
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
     let slab = Pubkey::new_unique();
@@ -4913,11 +4913,11 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
         .expect("external provider funds the creator-administered secondary asset");
     assert_eq!(token_amount(&svm, &provider_token), 0);
 
-    let controller = controller_pda(&governance, &slab, &perc_id());
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
     let donate_market = Instruction {
         program_id: controller_id(),
         accounts: vec![
-            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(governance.pubkey(), false),
             AccountMeta::new_readonly(creator.pubkey(), true),
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
@@ -4989,6 +4989,41 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
     )
     .unwrap());
 
+    let set_permissionless_fee = |min_init_fee: u128| Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: percolator_prog::ix::Instruction::UpdateMarketInitFeePolicy { min_init_fee }
+            .encode(),
+    };
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        set_permissionless_fee(1),
+    )
+    .expect("creator enables direct permissionless asset append");
+    assert_eq!(
+        percolator_accounting::read_permissionless_market_init_fee(
+            &svm.get_account(&slab).unwrap().data,
+        )
+        .unwrap(),
+        1
+    );
+    let market_before_fee_rejection = svm.get_account(&slab).unwrap();
+    assert!(
+        send(&mut svm, &[&payer, &creator], donate_market.clone()).is_err(),
+        "market donation must not preserve an external-asset-admin append backdoor"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_fee_rejection);
+
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        set_permissionless_fee(0),
+    )
+    .expect("creator disables direct permissionless asset append");
     send(&mut svm, &[&payer, &creator], donate_market)
         .expect("fully retired secondary slots do not block safe market donation");
     let donated_market = svm.get_account(&slab).unwrap();
@@ -5000,6 +5035,40 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
             .unwrap()
             .asset_admin,
         [0u8; 32]
+    );
+
+    let mut proxy_fee_data = vec![0u8]; // IX_PROXY_ADMIN
+    proxy_fee_data.extend_from_slice(
+        &percolator_prog::ix::Instruction::UpdateMarketInitFeePolicy { min_init_fee: 1 }
+            .encode(),
+    );
+    let reopen_direct_append = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: proxy_fee_data,
+    };
+    let market_before_reopen = svm.get_account(&slab).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            reopen_direct_append,
+        )
+        .is_err(),
+        "governance proxy cannot recreate external asset admins after handoff"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_reopen);
+    assert_eq!(
+        percolator_accounting::read_permissionless_market_init_fee(
+            &svm.get_account(&slab).unwrap().data,
+        )
+        .unwrap(),
+        0
     );
 }
 

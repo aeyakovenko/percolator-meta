@@ -12145,3 +12145,12 @@ FIX: the pinned read-only accounting view compares Percolator's configured-slot 
 the check is O(1) even though Percolator market slots are dynamically sized. Multi-asset markets remain
 permissionlessly deployable by initializing them under the controller before activation. No new signer, admin
 instruction, authority mutation, value destination, or custody path was added.
+
+A follow-up bypass probe set Percolator's `permissionless_market_init_fee` on the now-retired creator market. The
+first guard then accepted donation even though any caller could append a new asset afterward and become its
+external `asset_admin`; the retained fee-gate assertion failed against that SBF. Donation now also requires the
+pinned fee field to be zero, and tag 59 is removed from the controller governance allow-list so it cannot be
+reopened after handoff. The real-binary test proves nonzero-fee rejection, creator disable-and-retry, and a failed
+governance-signed proxy attempt with market bytes unchanged. Whole-market initialization remains permissionless;
+secondary activation is governance-approved and can still name external insurance, backing, and oracle roles
+while setting the constrained controller as activator/admin.
