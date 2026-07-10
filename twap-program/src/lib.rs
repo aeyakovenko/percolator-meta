@@ -1181,6 +1181,11 @@ const SL_PLACE_ROUND_END: usize = 170; // u64: book.round_end at placement. Reco
                                        // unlocked cancel early — cancel now gates on the aged window alone).
 const SLOT_SIZE: usize = 178;
 const BOOK_SIZE: usize = BOOK_HEADER + MAX_BIDS * SLOT_SIZE;
+// Exact layout immediately before the sink-cutoff field was appended. Existing canonical books
+// cannot be re-created at a new address, so claims and owner cancellations must keep recognizing
+// this generation long enough to release already-escrowed bidder funds.
+const LEGACY_PRE_CUTOFF_BOOK_HEADER: usize = BK_SINK_CUTOFF_SLOT;
+const LEGACY_PRE_CUTOFF_BOOK_SIZE: usize = LEGACY_PRE_CUTOFF_BOOK_HEADER + MAX_BIDS * SLOT_SIZE;
 
 fn book_rd_u128(d: &[u8], o: usize) -> u128 {
     u128::from_le_bytes(d[o..o + 16].try_into().unwrap())
@@ -1196,6 +1201,10 @@ fn book_rd_key(d: &[u8], o: usize) -> Pubkey {
 }
 fn slot_off(i: usize) -> usize {
     BOOK_HEADER + i * SLOT_SIZE
+}
+
+fn slot_off_with_header(header: usize, i: usize) -> usize {
+    header + i * SLOT_SIZE
 }
 
 struct BookHeader {
@@ -1219,8 +1228,13 @@ struct BookHeader {
     escrow_bump: u8,
 }
 
-fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
-    if d.len() < BOOK_SIZE || d[..8] != BOOK_DISC {
+fn decode_book_header(d: &[u8], legacy_pre_cutoff: bool) -> Result<BookHeader, ProgramError> {
+    let valid_size = if legacy_pre_cutoff {
+        d.len() == LEGACY_PRE_CUTOFF_BOOK_SIZE
+    } else {
+        d.len() >= BOOK_SIZE
+    };
+    if !valid_size || d[..8] != BOOK_DISC {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(BookHeader {
@@ -1236,12 +1250,30 @@ fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
         round_length: book_rd_u64(d, BK_ROUND_LENGTH),
         round_end: book_rd_u64(d, BK_ROUND_END),
         bid_fee: book_rd_u64(d, BK_BID_FEE),
-        sink_cutoff_slot: book_rd_u64(d, BK_SINK_CUTOFF_SLOT),
+        sink_cutoff_slot: if legacy_pre_cutoff {
+            u64::MAX
+        } else {
+            book_rd_u64(d, BK_SINK_CUTOFF_SLOT)
+        },
         state: d[BK_STATE],
         sink_mode: d[BK_SINK_MODE],
         book_bump: d[BK_BOOK_BUMP],
         escrow_bump: d[BK_ESCROW_BUMP],
     })
+}
+
+fn load_book_header(d: &[u8]) -> Result<BookHeader, ProgramError> {
+    decode_book_header(d, false)
+}
+
+// Legacy books are exit-only. Keeping this decoder private to claim/cancel prevents the retired
+// perpetual reward-sink semantics from accepting new bids, executing, or receiving DAO updates.
+fn load_exit_book_header(d: &[u8]) -> Result<(BookHeader, usize), ProgramError> {
+    if d.len() == LEGACY_PRE_CUTOFF_BOOK_SIZE {
+        Ok((decode_book_header(d, true)?, LEGACY_PRE_CUTOFF_BOOK_HEADER))
+    } else {
+        Ok((load_book_header(d)?, BOOK_HEADER))
+    }
 }
 
 // CONSTANT-TIME comparison of two bid rates coin_a/usdc_a vs coin_b/usdc_b. Both legs are token
@@ -2320,7 +2352,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         return Err(ProgramError::IllegalOwner);
     }
     let _config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    let (book, book_header) = load_exit_book_header(&book_account.try_borrow_data()?)?;
     if book.config != *config_account.key
         || *settlement_usd.key != book.settlement_usd
         || *coin_escrow.key != book.coin_escrow
@@ -2337,7 +2369,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
 
     let (usd_owed, coin_refund, dest_key, coin_key) = {
         let d = book_account.try_borrow_data()?;
-        let o = slot_off(slot_index);
+        let o = slot_off_with_header(book_header, slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 1 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -2373,13 +2405,13 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
     }
 
     let mut d = book_account.try_borrow_mut_data()?;
-    let o = slot_off(slot_index);
+    let o = slot_off_with_header(book_header, slot_index);
     for b in d[o..o + SLOT_SIZE].iter_mut() {
         *b = 0;
     }
     let mut any = false;
     for i in 0..MAX_BIDS {
-        if d[slot_off(i) + SL_OCCUPIED] == 1 {
+        if d[slot_off_with_header(book_header, i) + SL_OCCUPIED] == 1 {
             any = true;
             break;
         }
@@ -2438,7 +2470,7 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
     if config_account.owner != program_id || book_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    let (book, book_header) = load_exit_book_header(&book_account.try_borrow_data()?)?;
     if book.config != *config_account.key || *coin_escrow.key != book.coin_escrow {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -2452,7 +2484,7 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
 
     let (coin_atoms, coin_key) = {
         let d = book_account.try_borrow_data()?;
-        let o = slot_off(slot_index);
+        let o = slot_off_with_header(book_header, slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 0 {
             return Err(ProgramError::InvalidAccountData); // empty, or settled (use claim)
         }
@@ -2501,7 +2533,7 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
         )?;
     }
     let mut d = book_account.try_borrow_mut_data()?;
-    let o = slot_off(slot_index);
+    let o = slot_off_with_header(book_header, slot_index);
     for b in d[o..o + SLOT_SIZE].iter_mut() {
         *b = 0;
     }
@@ -2593,6 +2625,8 @@ mod tests {
         assert_eq!(BK_BID_FEE + 8, BK_SINK_CUTOFF_SLOT);
         assert_eq!(BK_SINK_CUTOFF_SLOT + 8, BOOK_HEADER);
         assert_eq!(BOOK_SIZE, BOOK_HEADER + MAX_BIDS * SLOT_SIZE);
+        assert_eq!(LEGACY_PRE_CUTOFF_BOOK_HEADER, BK_SINK_CUTOFF_SLOT);
+        assert_eq!(LEGACY_PRE_CUTOFF_BOOK_SIZE + 8, BOOK_SIZE);
     }
 
     #[test]
