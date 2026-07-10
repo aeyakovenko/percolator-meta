@@ -28656,6 +28656,10 @@ fn read_portfolio_crystallized(svm: &LiteSVM, pf: &Pubkey) -> u128 {
     let d = svm.get_account(pf).unwrap().data;
     u128::from_le_bytes(d[196..212].try_into().unwrap()) // HEADER_LEN(16) + offset_of(crystallized) 180
 }
+fn read_portfolio_residual_spent(svm: &LiteSVM, pf: &Pubkey) -> u128 {
+    let d = svm.get_account(pf).unwrap().data;
+    u128::from_le_bytes(d[212..228].try_into().unwrap()) // HEADER_LEN(16) + offset_of(spent) 196
+}
 fn read_asset0_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
     let data = svm.get_account(market).unwrap().data;
     let (_, group) = percolator_prog::state::read_market(&data).unwrap();
@@ -28703,7 +28707,7 @@ fn read_portfolio_funding_short_received(svm: &LiteSVM, pf: &Pubkey) -> u128 {
     u128::from_le_bytes(d[292..308].try_into().unwrap()) // HEADER_LEN(16) + offset_of(funding_short_received) 276
 }
 #[test]
-fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
+fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
     use percolator_prog::ix::Instruction as PIx;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -28895,11 +28899,11 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
     .expect("fund coin vault");
     let mut ri = vec![0u8];
     ri.extend_from_slice(&supply.to_le_bytes());
-    ri.extend_from_slice(&500u64.to_le_bytes());
+    ri.extend_from_slice(&111u64.to_le_bytes());
     ri.extend_from_slice(&0u16.to_le_bytes());
     ri.extend_from_slice(&0u16.to_le_bytes());
     ri.extend_from_slice(&0u16.to_le_bytes()); // ins/back/lp = 0 -> trader 100%
-    ri.extend_from_slice(&100u64.to_le_bytes());
+    ri.extend_from_slice(&1u64.to_le_bytes());
     ri.extend_from_slice(Pubkey::default().as_ref());
     ri.extend_from_slice(Pubkey::default().as_ref());
     ri.extend_from_slice(market.as_ref());
@@ -29086,11 +29090,39 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         bh,
     ))
     .expect("crystallize");
-    svm.set_sysvar(&Clock {
-        slot: 700,
-        unix_timestamp: 700,
-        ..Clock::default()
-    });
+    // Keep the live market and both portfolios current through the short finalize window.
+    // These public oracle/crank calls do not spend the trader loss budget; they only make the
+    // post-freeze follow-on trade admissible under the market's one-slot accrual bound.
+    for slot in [111u64, 112u64] {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: slot,
+                    mark_e6: initial_price / 2,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &admin],
+            bh,
+        ))
+        .expect("advance authenticated mark through the finalize window");
+        for pf in [&winner_pf, &loser_pf] {
+            crank(&mut svm, pf, slot).expect("advance portfolio through the finalize window");
+            crank(&mut svm, pf, slot).expect("refresh portfolio after shared settlement");
+        }
+    }
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -29109,33 +29141,110 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         bh,
     ))
     .expect("freeze");
+
+    assert_eq!(
+        read_portfolio_residual_spent(&svm, &loser_pf),
+        0,
+        "the frozen trader entitlement starts with its full organic loss budget"
+    );
+
+    // A later, ordinary trade can spend part of that loss budget into the counterparty's
+    // residual credit. The trader claim deliberately live-caps against this decrease, so
+    // claim timing is value-relevant and an unrelated cranker must not be able to finalize it.
+    let follow_on_pos = -((percolator::POS_SCALE / 10) as i128);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(winner.pubkey(), true),
+                AccountMeta::new(loser.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(winner_pf, false),
+                AccountMeta::new(loser_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: follow_on_pos,
+                exec_price: initial_price / 2,
+                fee_bps: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &winner, &loser],
+        bh,
+    ))
+    .expect("follow-on trade spends part of the frozen trader loss budget");
+    let spent = read_portfolio_residual_spent(&svm, &loser_pf);
+    assert!(
+        spent > 0 && spent < crystallized,
+        "follow-on trade must lower, but not erase, the live trader cap: spent={spent}, crystallized={crystallized}"
+    );
+
     let loser_coin = Pubkey::new_unique();
     set_token(&mut svm, &loser_coin, &coin_mint, &loser.pubkey(), 0);
+
+    // ATTACK: an unrelated public cranker tries to lock in the now-lower cap. Before the
+    // owner gate this succeeded, marked the stake claimed, and irreversibly destroyed the
+    // owner's remaining allocation even though the COIN could only go to the bound recipient.
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(rd_config, false),
+                    AccountMeta::new(t_stake, false),
+                    AccountMeta::new(rd_vault, false),
+                    AccountMeta::new(loser_coin, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(loser_pf, false), // trader live-cap portfolio (stake.backing_ledger)
+                ],
+                data: vec![5u8],
+            }],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .is_err(),
+        "a third party cannot force a value-relevant trader claim"
+    );
+    assert_eq!(token_amount(&svm, &loser_coin), 0);
+    assert_eq!(
+        svm.get_account(&t_stake).unwrap().data[210],
+        0,
+        "the rejected forced claim leaves the stake unclaimed"
+    );
+
+    // The owner can intentionally accept the current live cap and finalize to the same bound
+    // recipient. This preserves the anti-free-farm cap without granting a third party timing power.
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[Instruction {
             program_id: rd_id(),
             accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(loser.pubkey(), true),
                 AccountMeta::new_readonly(rd_config, false),
                 AccountMeta::new(t_stake, false),
                 AccountMeta::new(rd_vault, false),
                 AccountMeta::new(loser_coin, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(loser_pf, false), // trader live-cap portfolio (stake.backing_ledger)
+                AccountMeta::new_readonly(loser_pf, false),
             ],
             data: vec![5u8],
         }],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &loser],
         bh,
     ))
-    .expect("claim");
-    // sole trader-cohort staker -> the full trader cohort supply (= 100% here), from an ORGANIC real-trade loss.
+    .expect("stake owner claims at the current live trader cap");
+    let expected = ((supply as u128) * (crystallized - spent) / crystallized) as u64;
     assert_eq!(
         token_amount(&svm, &loser_coin),
-        supply,
-        "trader cohort earns the organically-settled residual loss"
+        expected,
+        "the owner receives the exact live-capped organic trader allocation"
     );
 }

@@ -58,11 +58,16 @@ redirect, lock, or confiscate insurance/backing principal.
   position and caps by its current principal; a full withdrawal therefore pays zero. Forfeited COIN
   remains in the immutable reward vault and cannot be redirected or redistributed.
 - Symmetric for backing depositors: partial/full exits lower live principal and therefore points.
+- Insurance, backing, and trader claims require the stake owner. Their live principal or
+  `crystallized - spent` caps can fall after freeze, so an unrelated cranker must not choose the
+  irreversible claim slot. LP received and funding-paid counters are monotonic, so those claims
+  remain permissionless.
 
 ## Trust / determinism
 - `IX_FREEZE` snapshots cohort denominators and the reward supply after the finalize window; `IX_CLAIM` then pays
   `floor(cohort_supply * stake.points / frozen_total_points)` to the stake's bound recipient.
-  Nothing is trusted from a cranker; users self-claim their deterministic share.
+  Nothing is trusted from a cranker; owner-gated cohorts self-claim, while permissionless claims
+  can only finalize a deterministic share from monotonic counters.
 - Stake PDAs are derived as `[b"rd_stake", config, owner, linked_account, reward_family]`. Insurance,
   backing, residual, and funding are distinct families; LP and trader deliberately share the residual
   family. One wallet can register multiple legitimate linked accounts, and one portfolio can earn both

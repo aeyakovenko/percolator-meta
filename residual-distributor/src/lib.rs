@@ -1606,8 +1606,8 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 //   insurance/backing cohorts append one more: the subledger position (for the live HE cap).
 //   LP/trader cohorts append one more: the Percolator portfolio (for the residual live cap).
 //
-// PERMISSIONLESS self-service claim (replaces the cranker-assembled seal for the portfolio
-// cohort). Pays the stake's OWN deterministic share —
+// Self-service claim (replaces the cranker-assembled seal for the portfolio cohort). Pays the
+// stake's OWN deterministic share —
 // `cohort_supply * stake.points / frozen_total_points` — to the stake's BOUND recipient, then marks
 // it claimed. Each backer pulls their own slice; nobody assembles a global list, so there is no
 // one-tx completeness seal (IG dissolved) and no cranker can omit or redirect a backer (the recipient
@@ -1615,8 +1615,8 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 // (floor math), so the vault can never be over-drawn. Funding-payer claims use the crystallized,
 // now-frozen `stake.points` from monotonic paid counters, so there is no live-position dependency and
 // no HE concern and deliberately do not require the Percolator portfolio at claim time; users may
-// close or dematerialize flat portfolios after crystallize/freeze. The capital and residual cohorts
-// (live, HE-capped) are handled separately.
+// close or dematerialize flat portfolios after crystallize/freeze. Capital and trader claims are
+// owner-authorized because their live caps can fall; LP and funding claims remain permissionless.
 fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -1696,15 +1696,16 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.claimed {
         return Err(ProgramError::InvalidAccountData); // double-claim
     }
-    // Capital cohorts (insurance/backing) cap the payout by LIVE principal at claim time, so the claim
-    // SLOT is value-relevant. claim is otherwise permissionless; if a third party could trigger a
-    // capital claim they could force it during a transient low-principal moment after a partial
-    // insurance-withdraw, which leaves the Position withdrawn=false but principal reduced - and the
-    // irreversible claimed-flag would lock in the reduced (or zero) payout, stranding the remainder
-    // (finding KM). So a capital claim must be authorized by the stake's OWN owner (the depositor who
-    // controls the position and bears the soft-veto timing). Portfolio-flow cohorts pay frozen points from
-    // account counters, so their claim slot is irrelevant and stays permissionless.
-    if matches!(stake.cohort, COHORT_INSURANCE | COHORT_BACKING) && cranker.key != &stake.owner {
+    // Capital claims cap against live principal, and trader claims cap against the live
+    // `crystallized - spent` remainder. Both numerators can fall after freeze, so a public cranker
+    // could otherwise wait for a lower value and irreversibly force the victim's reduced claim.
+    // Require the stake owner to choose that value-relevant claim slot. LP received and cumulative
+    // funding-paid counters are monotonic, so those claims remain safely permissionless.
+    if matches!(
+        stake.cohort,
+        COHORT_INSURANCE | COHORT_BACKING | COHORT_TRADER
+    ) && cranker.key != &stake.owner
+    {
         return Err(ProgramError::MissingRequiredSignature);
     }
     // The COIN must land in the bound recipient's own account (finding GY: no cranker redirect).

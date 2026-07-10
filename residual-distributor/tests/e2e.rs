@@ -3426,9 +3426,9 @@ fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
 // claim: insurance/backing append the live subledger position (for the live-share cap); LP/trader append
 // the live portfolio (for the residual live cap). Funding-payer claims are frozen-counter only and do not
 // require the Percolator portfolio at claim time; extra accounts are ignored.
-// `cranker` is the claim trigger (first account, must sign). Share-value cohorts (insurance/backing)
-// require it to be the stake owner (finding KM); portfolio-flow cohorts accept any cranker. The helper takes the
-// cranker keypair explicitly so tests can model both the owner's own claim and a foreign forced claim.
+// `cranker` is the claim trigger (first account, must sign). Share-value cohorts and trader
+// residual claims require the stake owner because their live caps can fall; LP and funding claims
+// accept any cranker. The helper takes the cranker keypair explicitly so tests can model both paths.
 fn claim_as(
     svm: &mut LiteSVM,
     payer: &Keypair,
@@ -6908,8 +6908,8 @@ fn register_rejects_a_default_pubkey_recipient_no_unclaimable_denominator_pollut
     .expect("a real recipient registers cleanly");
 }
 
-// LP/trader points are the Δ of the monotonic residual counter since register; claim is frozen-final
-// (no live cap account), and double-claim is rejected.
+// LP points are the delta of the monotonic received counter since register; claim is frozen-final,
+// needs no live cap account, and rejects a double claim.
 #[test]
 fn lp_residual_delta_and_double_claim_rejected() {
     let mut svm = LiteSVM::new();
@@ -7286,10 +7286,9 @@ fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero
 
 // FREE-FARM PROBE (stale frozen points bypass net-by-spent, sweep weird-state): the net-by-spent defense assumes
 // a stake's frozen points reflect the FINAL net (crystallized - spent). But the trader net is NOT monotonic
-// (spent rises -> net drops), and the LP/trader CLAIM uses the FROZEN stake.points with NO live re-read (unlike
-// the capital cohorts' live-cap). So: crystallize at PEAK net -> raise spent to recover the loss (net -> 0)
-// -> do NOT re-crystallize -> freeze -> claim the STALE-HIGH points. An honest co-trader is diluted by the
-// attacker's recovered-but-still-counted loss. This probes whether that bypass pays out.
+// (spent rises -> net drops). So: crystallize at PEAK net -> raise spent to recover the loss (net -> 0)
+// -> do NOT re-crystallize -> freeze -> try to claim the STALE-HIGH points. The trader claim's live re-read
+// must cap that stale allocation at the current net so an honest co-trader is not diluted.
 #[test]
 fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit() {
     let mut svm = LiteSVM::new();
@@ -8459,7 +8458,7 @@ fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
     );
 }
 
-// claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
+// claim anti-theft (GY at the claim layer): an LP claim is permissionless (any cranker may finalize a
 // backer's claim), so the cranker must NOT be able to (a) redirect the COIN to an account it controls, nor
 // (b) pay from a decoy vault. The bound recipient + the config.vault are the only acceptable endpoints. Real .so.
 #[test]
@@ -9475,9 +9474,9 @@ fn cross_cohort_claims_never_exceed_cohort_or_total_supply() {
 
 // CROSS-COHORT 100-CASE LIFECYCLE SWEEP: mixes tiny supplies, odd bps splits, zero/100% portfolio-flow
 // fees, zero-bps cohorts, stale live caps, idle zero-point stakes, receiver-only funding canaries, foreign
-// capital claim attempts, permissionless portfolio-flow claims, and varied claim order. This is the
+// capital/trader forced-claim attempts, permissionless LP/funding claims, and varied claim order. This is the
 // broad "weird branch" conservation probe: each case must pay only the expected capped/fee-adjusted amount,
-// never let idle/receiver-only stakes farm, never let a foreign cranker force a capital claim, and never
+// never let idle/receiver-only stakes farm, never let a foreign cranker force a live-cap claim, and never
 // overdraw the vault regardless of claim order.
 #[test]
 fn cross_cohort_100_case_lifecycle_sweep_no_overdraw_or_free_farm() {
@@ -9973,16 +9972,21 @@ fn cross_cohort_100_case_lifecycle_sweep_no_overdraw_or_free_farm() {
         )
         .expect("permissionless lp claim to bound recipient");
         claim(&mut svm, &payer, &env, &lp_idle, &lp_idle_ata, None).expect("idle lp claim");
-        claim_as(
-            &mut svm,
-            &payer,
-            &env,
-            &attacker,
-            &trader.pubkey(),
-            &trader_ata,
-            None,
-        )
-        .expect("permissionless trader claim to bound recipient");
+        assert!(
+            claim_as(
+                &mut svm,
+                &payer,
+                &env,
+                &attacker,
+                &trader.pubkey(),
+                &trader_ata,
+                None,
+            )
+            .is_err(),
+            "case {case_idx}: foreign cranker cannot force a trader live-cap claim"
+        );
+        claim(&mut svm, &payer, &env, &trader, &trader_ata, None)
+            .expect("owner-authorized trader claim to bound recipient");
         claim(&mut svm, &payer, &env, &trader_idle, &trader_idle_ata, None)
             .expect("idle trader claim");
         claim_as(

@@ -12257,3 +12257,23 @@ and requires zero before the first role mutation. Funded genesis continues to us
 atomically binds the sole recovery pool and live principal floor. Legacy auction fixtures now hand off while
 empty and fund afterward through TWAP's existing inbound-only donation. No recovery signer, destination, role,
 or admin surface was added.
+
+## Tick - a public cranker could force a trader's reduced live-cap claim (reward-only LoF)
+
+Trader rewards freeze points from `residual_crystallized_loss - residual_spent_principal`, then cap the final
+claim against that same live remainder to prevent recovered losses from farming stale points. A normal signed
+trade after freeze can increase spent principal and lower the live cap. Because claims were permissionless, an
+unrelated cranker could wait for that lower value, force the one-shot claim, and permanently destroy the
+trader's remaining COIN allocation. The bound recipient prevented theft, and no collateral or depositor
+principal was exposed, but the targeted reward loss was irreversible.
+
+A retained real-Percolator + residual-distributor LiteSVM regression creates the loss through public trades and
+oracle/crank settlement, crystallizes and freezes it, then makes a normal follow-on signed trade that spends only
+part of the frozen loss budget. The old SBF accepted a foreign claim at the reduced cap and marked the stake
+claimed. The fixed test requires that attempt to leave both the stake and recipient unchanged, then proves the
+owner can claim the exact live-capped amount. The 100-case cross-cohort lifecycle matrix also checks the owner
+gate while preserving permissionless LP and funding claims.
+
+FIX: trader claims now require the stake owner, matching insurance and backing claims whose live caps can also
+fall. LP received and cumulative funding-paid counters are monotonic, so those claims remain permissionless. No
+recipient, transfer, collateral, custody, governance, or admin surface changed.
