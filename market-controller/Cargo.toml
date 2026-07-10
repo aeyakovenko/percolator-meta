@@ -14,6 +14,7 @@ path = "src/lib.rs"
 no-entrypoint = []
 
 [dependencies]
+percolator-accounting = { path = "../percolator-accounting" }
 solana-program = { workspace = true }
 spl-token = { workspace = true }
 

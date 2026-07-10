@@ -3689,6 +3689,43 @@ fn build_controller_close_and_reclaim_message(
     m
 }
 
+#[allow(clippy::too_many_arguments)]
+fn controller_return_shutdown_backing_ix(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    provider_destination: &Pubkey,
+    controller_transit: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    backing_ledger: &Pubkey,
+    percolator_program: &Pubkey,
+    domain: u16,
+    principal: u128,
+    earnings: u128,
+) -> Instruction {
+    let mut data = vec![6u8]; // IX_RETURN_SHUTDOWN_BACKING
+    data.extend_from_slice(&domain.to_le_bytes());
+    data.extend_from_slice(&principal.to_le_bytes());
+    data.extend_from_slice(&earnings.to_le_bytes());
+    Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new_readonly(*controller, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*provider_destination, false),
+            AccountMeta::new(*controller_transit, false),
+            AccountMeta::new(*vault, false),
+            AccountMeta::new_readonly(*vault_authority, false),
+            AccountMeta::new(*backing_ledger, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
 fn build_controller_grant_pool_message(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -4192,6 +4229,14 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
 // lifecycle/policy control but never receives a Percolator value-moving authority.
 #[test]
 fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
+    assert_eq!(
+        percolator_accounting::BACKING_AUTHORITY_PROFILE_OFFSET,
+        core::mem::offset_of!(
+            percolator_prog::state::AssetOracleProfileV16,
+            backing_bucket_authority
+        ),
+        "shared backing-authority reader must match the pinned wrapper layout"
+    );
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -4506,6 +4551,124 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     };
     send(&mut svm, &[&backing_provider], backing_topup).expect("external backing deposit");
     assert_eq!(token_amount(&svm, &backing_account), 0);
+    let resolved_only_backing_amount = 10_000u64;
+    let resolved_only_backing_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &resolved_only_backing_source,
+        &collateral_mint,
+        &backing_provider.pubkey(),
+        resolved_only_backing_amount,
+    );
+    let short_backing_topup = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(backing_provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(resolved_only_backing_source, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+            domain: 3,
+            amount: resolved_only_backing_amount as u128,
+            expiry_slot: 10_000,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&backing_provider], short_backing_topup)
+        .expect("external short-domain backing deposit");
+    assert_eq!(token_amount(&svm, &resolved_only_backing_source), 0);
+
+    let provider_destination = canonical_insurance_vault(
+        &backing_provider.pubkey(),
+        &collateral_mint,
+    );
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    let backing_ledger = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral_mint,
+        &backing_provider.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    svm.set_account(
+        backing_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::backing_domain_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    // Seed the exact state produced by Percolator's independently covered public
+    // backing-fee trade path, then exercise withdrawal through the real pinned
+    // binary below. The extra vault tokens preserve the engine's conservation
+    // equation; only fee generation itself is outside this lifecycle probe.
+    let provider_earnings = 10_000u64;
+    let mint_earnings = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        &collateral_mint,
+        &perc_vault,
+        &mint_authority.pubkey(),
+        &[],
+        provider_earnings,
+    )
+    .unwrap();
+    send(&mut svm, &[&payer, &mint_authority], mint_earnings)
+        .expect("fund reachable backing-fee earnings state");
+    let mut slab_with_earnings = svm.get_account(&slab).unwrap();
+    {
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut slab_with_earnings.data).unwrap();
+        group.header.vault =
+            percolator::V16PodU128::new(group.header.vault.get() + provider_earnings as u128);
+        group.header.backing_provider_earnings_total =
+            percolator::V16PodU128::new(provider_earnings as u128);
+        group.markets[1]
+            .engine
+            .backing_long
+            .utilization_fee_earnings = percolator::V16PodU128::new(provider_earnings as u128);
+    }
+    svm.set_account(slab, slab_with_earnings).unwrap();
+
+    // Even with a canonical provider route, marketauth cannot use this fixed
+    // instruction to accelerate a live provider's exit before shutdown matures.
+    let slab_before_live_return = svm.get_account(&slab).unwrap();
+    let vault_before_live_return = svm.get_account(&perc_vault).unwrap();
+    let live_return = controller_return_shutdown_backing_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &provider_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &backing_ledger,
+        &perc_id(),
+        2,
+        1,
+        0,
+    );
+    assert!(
+        send(&mut svm, &[&payer], live_return).is_err(),
+        "fixed return must remain unreachable before Percolator accepts shutdown"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), slab_before_live_return);
+    assert_eq!(svm.get_account(&perc_vault).unwrap(), vault_before_live_return);
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
 
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot = 110;
@@ -4616,6 +4779,41 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     );
     assert_eq!(token_amount(&svm, &dao_backing_destination), 0);
 
+    // A public shutdown-return crank cannot redirect provider funds to the DAO,
+    // even though the controller is Percolator's marketauth.
+    let dao_canonical_destination = canonical_insurance_vault(&squads_vault, &collateral_mint);
+    set_token(
+        &mut svm,
+        &dao_canonical_destination,
+        &collateral_mint,
+        &squads_vault,
+        0,
+    );
+    let slab_before_wrong_return = svm.get_account(&slab).unwrap();
+    let vault_before_wrong_return = svm.get_account(&perc_vault).unwrap();
+    let wrong_return = controller_return_shutdown_backing_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &dao_canonical_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &backing_ledger,
+        &perc_id(),
+        2,
+        1,
+        0,
+    );
+    assert!(
+        send(&mut svm, &[&payer], wrong_return).is_err(),
+        "shutdown return cannot substitute a DAO-owned recipient"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), slab_before_wrong_return);
+    assert_eq!(svm.get_account(&perc_vault).unwrap(), vault_before_wrong_return);
+    assert_eq!(token_amount(&svm, &dao_canonical_destination), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+
     // The segregated provider remains live and withdraws part of its own principal.
     let live_withdraw_amount = 40_000u64;
     let backing_withdraw = Instruction {
@@ -4637,6 +4835,86 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     send(&mut svm, &[&backing_provider], backing_withdraw)
         .expect("external provider partially withdraws its own backing after shutdown");
     assert_eq!(token_amount(&svm, &backing_account), live_withdraw_amount);
+
+    // ATTACK PROBE: earnings withdrawal is the first CPI. If a malicious crank
+    // overstates the following principal withdrawal, Solana must roll the entire
+    // instruction back instead of consuming earnings or initializing a poisoned
+    // controller ledger that blocks a later honest cleanup.
+    let abandoned_amount = backing_amount - live_withdraw_amount;
+    let market_before_oversized = svm.get_account(&slab).unwrap();
+    let vault_before_oversized = svm.get_account(&perc_vault).unwrap();
+    let ledger_before_oversized = svm.get_account(&backing_ledger).unwrap();
+    let destination_before_oversized = svm.get_account(&provider_destination).unwrap();
+    let transit_before_oversized = svm.get_account(&controller_transit).unwrap();
+    let oversized = controller_return_shutdown_backing_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &provider_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &backing_ledger,
+        &perc_id(),
+        2,
+        abandoned_amount as u128 + 1,
+        provider_earnings as u128,
+    );
+    assert!(
+        send(&mut svm, &[&payer], oversized).is_err(),
+        "oversized principal after an earnings CPI must reject atomically"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_oversized);
+    assert_eq!(svm.get_account(&perc_vault).unwrap(), vault_before_oversized);
+    assert_eq!(svm.get_account(&backing_ledger).unwrap(), ledger_before_oversized);
+    assert_eq!(
+        svm.get_account(&provider_destination).unwrap(),
+        destination_before_oversized
+    );
+    assert_eq!(
+        svm.get_account(&controller_transit).unwrap(),
+        transit_before_oversized
+    );
+
+    // If the provider disappears now, any cranker can complete shutdown without
+    // acquiring custody: the controller must return all remaining backing only to
+    // the provider recorded in Percolator's asset profile.
+    let return_abandoned = controller_return_shutdown_backing_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &provider_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &backing_ledger,
+        &perc_id(),
+        2,
+        abandoned_amount as u128,
+        provider_earnings as u128,
+    );
+    send(&mut svm, &[&payer], return_abandoned)
+        .expect("permissionless crank returns abandoned backing to the recorded provider");
+    assert_eq!(
+        token_amount(&svm, &provider_destination),
+        abandoned_amount + provider_earnings,
+        "recorded provider receives both earnings and remaining principal"
+    );
+    let controller_ledger = percolator_prog::state::read_backing_domain_ledger(
+        &svm.get_account(&backing_ledger).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(controller_ledger.authority, controller.to_bytes());
+    assert_eq!(controller_ledger.domain, 2);
+    assert_eq!(
+        controller_ledger.total_earnings_withdrawn_atoms,
+        provider_earnings as u128
+    );
+    assert!(
+        svm.get_account(&controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "controller transit closes after forwarding its complete balance"
+    );
 
     // Lifecycle remains governed: resolve is allowlisted. Squads itself still
     // cannot use the terminal insurance withdrawal key after resolution.
@@ -4693,8 +4971,41 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         "governance cannot bypass the controller after resolve"
     );
 
-    let resolved_withdraw_amount = backing_amount - live_withdraw_amount;
-    let resolved_backing_withdraw = Instruction {
+    // The fixed shutdown return intentionally stops at resolution. Recreate its
+    // canonical empty transit and prove marketauth cannot take the provider's
+    // short-domain principal in resolved mode; the provider's original key can.
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let resolved_market_before = svm.get_account(&slab).unwrap();
+    let resolved_vault_before = svm.get_account(&perc_vault).unwrap();
+    let late_return = controller_return_shutdown_backing_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &provider_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &backing_ledger,
+        &perc_id(),
+        3,
+        resolved_only_backing_amount as u128,
+        0,
+    );
+    assert!(
+        send(&mut svm, &[&payer], late_return).is_err(),
+        "controller shutdown override must end when the market resolves"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), resolved_market_before);
+    assert_eq!(svm.get_account(&perc_vault).unwrap(), resolved_vault_before);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+
+    let resolved_provider_withdraw = Instruction {
         program_id: perc_id(),
         accounts: vec![
             AccountMeta::new_readonly(backing_provider.pubkey(), true),
@@ -4705,18 +5016,23 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
         data: percolator_prog::ix::Instruction::WithdrawBackingBucket {
-            domain: 2,
-            amount: resolved_withdraw_amount as u128,
+            domain: 3,
+            amount: resolved_only_backing_amount as u128,
         }
         .encode(),
     };
     send(
         &mut svm,
         &[&backing_provider],
-        resolved_backing_withdraw,
+        resolved_provider_withdraw,
     )
-    .expect("external provider withdraws its remaining backing after resolve");
-    assert_eq!(token_amount(&svm, &backing_account), backing_amount);
+    .expect("recorded provider retains its resolved-mode short-domain exit");
+
+    assert_eq!(
+        token_amount(&svm, &backing_account) + token_amount(&svm, &provider_destination),
+        backing_amount + resolved_only_backing_amount + provider_earnings,
+        "provider receives complete principal and earnings across both exit paths"
+    );
 
     let mut withdraw_data = vec![5u8];
     withdraw_data.extend_from_slice(&amount.to_le_bytes());
