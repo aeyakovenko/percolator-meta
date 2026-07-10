@@ -2,6 +2,28 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - pool-less TWAP protocol insurance had no terminal recovery (surface A/C)
+
+The compatibility TWAP handoff intentionally accepted only an empty asset-0 insurance balance, and
+every later atom entered through TWAP's inbound-only donation instruction without an owner claim.
+After market lifecycle moved to the controller, an unaffiliated stale resolver could end the market,
+but terminal insurance recovery unconditionally required a Subledger pool. Pool-less protocol
+insurance therefore remained under the TWAP PDA forever and prevented whole-market close.
+
+A fresh real-binary LiteSVM regression performs the empty handoff through a timelocked Squads vault,
+donates insurance through TWAP, donates market authority to the constrained controller, and resolves
+through Percolator's public stale path. The old TWAP binary rejects the canonical terminal recovery
+with `IllegalOwner`. An attacker-selected token destination also fails and rolls back the market
+byte-exact.
+
+FIX: current-layout pool-less handoff now records explicit proof that insurance was zero when TWAP
+accepted custody. After resolution, any cranker may pass the System program as the no-pool sentinel;
+TWAP derives the controller and canonical token accounts and moves the exact slab insurance there.
+There is no caller-supplied amount, owner, or admin. Historical layouts and current-layout configs
+without the marker remain untrusted, so an upgrade cannot relabel legacy external insurance as
+protocol-owned. Pool-bound recovery still requires the exact Subledger pool and its zero-principal
+attestation.
+
 ## Tick - zero-principal TWAP custody could strand absent asset-0 backing (surface A/C)
 
 A principal pool may legitimately re-hand custody to TWAP after every owner exits so retained
