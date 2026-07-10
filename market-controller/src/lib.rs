@@ -134,7 +134,6 @@ fn admin_tag_allowed(tag: u8) -> bool {
             | 51 // UpdateBackingFeePolicy
             | 55 // UpdateTradeFeePolicy
             | 58 // UpdateFeeRedirectPolicy
-            | 59 // UpdateMarketInitFeePolicy
             | 62 // ConfigureAuthMark
     )
 }
@@ -1530,8 +1529,9 @@ fn process_grant_genesis_pool<'a>(
 // governance does not need to participate in or approve the donation. Percolator's
 // market-authority update also rotates asset-0 roles that equal the outgoing key, but
 // it does not migrate secondary asset_admin roles. Accept only an asset-0-only market
-// or one whose secondary slots are all fully retired; controller-governed secondary
-// assets can then be activated after the handoff. If the outgoing key owns funded
+// or one whose secondary slots are all fully retired, with direct permissionless asset
+// append disabled; controller-governed secondary assets can then be activated after
+// the handoff. If the outgoing key owns funded
 // asset-0 insurance or is the recorded backing provider, restore only those same roles
 // so donating lifecycle control cannot donate segregated capital too. A later
 // genesis-pool grant requires the external insurance balance to exit first.
@@ -1563,6 +1563,9 @@ fn process_accept_market_authority<'a>(
         let market_data = market.try_borrow_data()?;
         if !percolator_accounting::all_secondary_assets_retired(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
+            || percolator_accounting::read_permissionless_market_init_fee(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != 0
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -1755,11 +1758,11 @@ mod tests {
 
     #[test]
     fn allowlist_denies_live_value_and_every_key_mutation_path() {
-        let allowed = [19u8, 34, 35, 37, 38, 40, 49, 51, 55, 58, 59, 62];
+        let allowed = [19u8, 34, 35, 37, 38, 40, 49, 51, 55, 58, 62];
         for tag in 0u8..=69 {
             assert_eq!(admin_tag_allowed(tag), allowed.contains(&tag), "tag {tag}");
         }
-        for forbidden in [3u8, 4, 9, 13, 24, 32, 41, 50, 52, 56, 57, 60, 61, 65] {
+        for forbidden in [3u8, 4, 9, 13, 24, 32, 41, 50, 52, 56, 57, 59, 60, 61, 65] {
             assert!(!admin_tag_allowed(forbidden));
         }
     }

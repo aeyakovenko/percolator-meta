@@ -36,9 +36,10 @@ recover their owner-bound share of the insurance pool, subject to market losses.
   recorded backing provider; the handoff cannot collapse that capital into the controller or select
   another provider. Donation is accepted only when every secondary slot is fully retired because
   Percolator does not migrate secondary `asset_admin` roles with `marketauth`; multi-asset markets are
-  instead initialized under the controller before activation. A genesis-pool grant cannot rotate
-  nonzero external insurance into pool custody: its recorded owner exits first, after which the same
-  grant can proceed.
+  instead initialized under the controller before governance-approved activation. The handoff also
+  requires direct permissionless asset append to be disabled, and the controller cannot enable it.
+  A genesis-pool grant cannot rotate nonzero external insurance into pool custody: its recorded owner
+  exits first, after which the same grant can proceed.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
@@ -168,8 +169,10 @@ installs the canonical owner-bound pool; governance cannot convert the external 
 or pool-controlled insurance. Percolator's market-authority update does not migrate secondary
 `asset_admin` roles, so the controller rejects donation while any secondary slot is active,
 drain-only, or recovering. Once those slots are empty and retired, the same permissionless handoff
-succeeds. New multi-asset markets should use permissionless controller initialization before assets
-are activated.
+succeeds only if direct permissionless asset append is disabled. The controller proxy cannot enable
+that mode because a direct activator becomes an external `asset_admin`. New multi-asset deployments
+use permissionless controller initialization followed by governance-approved asset activation, which
+still assigns external insurance, backing, and oracle roles while keeping lifecycle admin constrained.
 
 At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved
