@@ -11956,3 +11956,25 @@ oversized principal CPI fails, and stops working after resolution while the reco
 to exit. The earnings fixture mirrors the aggregate and domain state produced by the pinned public backing-
 fee path; all withdrawal, authorization, token movement, and cleanup run through the real SBF binaries. The
 shared read-only profile offset is asserted against the exact Cargo-pinned wrapper struct in the chain test.
+
+## Tick — owner-signed subledger exits could redirect principal (surface C)
+
+Both subledger withdrawal handlers bound the signer to the position but passed the caller-supplied
+`owner_ata` directly into a pool-PDA-signed SPL transfer without checking that the token account belonged
+to that owner. A malicious transaction builder could preserve the victim's required signature, replace
+only the destination with an attacker-owned same-mint account, and receive the victim's own-vault backing
+or real Percolator insurance payout while the program retired the victim's principal. The insurance path
+also accepted its pool holding as both transfer source and destination; SPL Token treats an authorized
+self-transfer as a successful no-op, so the position was retired while its payout remained stranded.
+
+Two fresh LiteSVM probes went red against the old SBF: a real own-vault withdrawal and a real Percolator
+insurance withdrawal each succeeded with the victim signing and the attacker token account substituted.
+The retained insurance probe also attempts the holding-to-itself payout. Every rejected attempt snapshots
+the pool, position, market slab, vault, and holding as applicable, proves byte-exact rollback, and then
+completes the honest owner's exit.
+
+FIX: one shared validator now requires each withdrawal destination to be an initialized SPL Token account
+of the pool mint whose token authority is the signing position owner. It permits any owner-controlled token
+account, preserving historical exits and PDA owners, while structurally excluding attacker destinations,
+pool vaults, and insurance holding accounts. No signer, admin, policy, amount, share, or custody authority
+was added.

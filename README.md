@@ -16,7 +16,8 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 - **Capital stays segregated.** Insurance and backing principal stays in Percolator or an
   owner-bound subledger vault. Insurance haircuts and TWAP surplus are computed from the selected
   asset's own long/short domain budgets, so another asset's backing cannot mask a loss or authorize
-  a withdrawal. Governance and reward programs custody COIN points/rewards only.
+  a withdrawal. Every subledger exit also requires an initialized token destination owned by the
+  signing position owner. Governance and reward programs custody COIN points/rewards only.
 - **No governance withdrawal key.** Squads authorizes constrained program calls but does not hold
   a funded market's insurance operator, insurance authority, backing authority, or `asset_admin`.
   TWAP accepts only a real 1-of-1 Squads multisig whose sole all-permissions member and config
