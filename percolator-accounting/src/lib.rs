@@ -13,8 +13,10 @@ pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
-// Pinned `AssetOracleProfileV16`: four u8s, one u32, five u16s, six bytes
-// of padding, then two 32-byte authorities precede the backing authority.
+// Pinned `AssetOracleProfileV16`: four u8s, one u32, five u16s, and six bytes
+// of padding precede the three custody authorities.
+pub const INSURANCE_AUTHORITY_PROFILE_OFFSET: usize = 24;
+pub const INSURANCE_OPERATOR_PROFILE_OFFSET: usize = 56;
 pub const BACKING_AUTHORITY_PROFILE_OFFSET: usize = 88;
 
 const MAGIC: u64 = 0x5045_5243_5631_3600;
@@ -174,6 +176,32 @@ pub fn read_asset_backing_authority(
     bytes(
         data,
         asset_wrapper_offset(asset_index)? + BACKING_AUTHORITY_PROFILE_OFFSET,
+    )
+}
+
+/// Returns the insurance withdrawal authority recorded in one pinned-v16 asset profile.
+pub fn read_asset_insurance_authority(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[u8; 32], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    bytes(
+        data,
+        asset_wrapper_offset(asset_index)? + INSURANCE_AUTHORITY_PROFILE_OFFSET,
+    )
+}
+
+/// Returns the live insurance operator recorded in one pinned-v16 asset profile.
+pub fn read_asset_insurance_operator(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[u8; 32], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    bytes(
+        data,
+        asset_wrapper_offset(asset_index)? + INSURANCE_OPERATOR_PROFILE_OFFSET,
     )
 }
 

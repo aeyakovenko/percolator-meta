@@ -12053,3 +12053,27 @@ nonzero metadata `asset_id` still routed every insurance CPI to asset 0. Rejecti
 same resolved cleanup after an upgrade. The wrapper therefore accepts every supported historical insurance-pool
 seed schema, while still requiring its immutable market/program/domain binding, PDA signature, and Percolator's
 live current-admin check; the stale metadata cannot select an asset, controller, recipient, or amount.
+
+## Tick — secondary-asset insurance could block retirement (surface A/C)
+
+Percolator lets a secondary asset's market authority withdraw asset-local insurance only after the configured
+shutdown delay and empty-state checks pass. That override ends at resolution, and retirement requires both
+insurance-domain budgets to be zero. The stateless controller denied insurance withdrawal tag 57 through its
+generic proxy but exposed no fixed use of the shutdown override. If an external insurance authority disappeared
+after funding either domain, the asset could therefore remain permanently unretirable.
+
+A fresh real Percolator + Squads + controller LiteSVM reproduction activated asset 1 with an external insurance
+authority/operator, deposited `50,000` and `30,000` units through the public long/short insurance top-up API,
+and shut the asset down through the timelocked governance lifecycle. The old controller rejected the required
+post-delay return with `InvalidInstructionData`. The retained regression also proves the operation is byte-atomic
+while live, rejects a canonical DAO-owned destination after shutdown, records the exact controller-ledger
+withdrawal, closes its transient account, and continues through backing cleanup, resolution, user exits, and
+real `CloseSlab` terminal cleanup.
+
+FIX: controller tag 8 accepts only an asset index. A shared pinned-layout parser derives the market authority,
+recorded insurance authority/operator, and complete remaining asset-local insurance. The controller requires a
+secondary asset, remains bound as marketauth, rejects itself as the live insurance operator, routes only through
+Percolator's delayed shutdown override, and forwards tokens and transit rent only to the recorded authority's
+canonical ATA. The caller, DAO, and governance message select neither amount nor recipient. Generic tag 57 and
+all insurance-role mutations remain denied, and every failed CPI rolls back atomically. No reusable withdrawal
+key, new signer, DAO destination, or custody authority was added.
