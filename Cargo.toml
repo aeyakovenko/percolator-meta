@@ -1,5 +1,5 @@
 [workspace]
-members = ["subledger", "distribution", "twap", "twap-program", "market-controller", "genesis-vote", "setup", "residual-distributor", "sim"]
+members = ["percolator-accounting", "subledger", "distribution", "twap", "twap-program", "market-controller", "genesis-vote", "setup", "residual-distributor", "sim"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -7,6 +7,7 @@ solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 solana-sdk = "1.18"
 litesvm = "0.1"
+percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "c8aab33814dd30878cf9b054eca89bcd6cf9f5e7" }
 percolator-prog = { git = "file:///home/anatoly/percolator-prog", rev = "624b13da8ed96f49b6049a4874052e05ae7a7cb6", features = ["no-entrypoint"] }
 
 [profile.release]

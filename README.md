@@ -14,7 +14,9 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 - **Fixed supply.** Genesis allocates an existing COIN vault. It never mints. Unclaimed genesis
   allocations are burned.
 - **Capital stays segregated.** Insurance and backing principal stays in Percolator or an
-  owner-bound subledger vault. Governance and reward programs custody COIN points/rewards only.
+  owner-bound subledger vault. Insurance haircuts and TWAP surplus are computed from the selected
+  asset's own long/short domain budgets, so another asset's backing cannot mask a loss or authorize
+  a withdrawal. Governance and reward programs custody COIN points/rewards only.
 - **No governance withdrawal key.** Squads authorizes constrained program calls but does not hold
   a funded market's insurance operator, insurance authority, backing authority, or `asset_admin`.
   TWAP accepts only a real 1-of-1 Squads multisig whose sole all-permissions member and config
@@ -37,6 +39,7 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 
 | Crate | Responsibility |
 |---|---|
+| `percolator-accounting/` | Shared read-only parser for asset-local insurance remaining in the pinned Percolator slab. It derives engine offsets from the pinned engine structs and exposes no instruction or authority. |
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. The controller cannot withdraw insurance/backing, trade, rotate keys, or move portfolio collateral. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; shares track tenure and live capital for rewards. Only a principal-policy pool can hand custody to TWAP; with-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
@@ -47,7 +50,8 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`624b13da8ed96f49b6049a4874052e05ae7a7cb6`.
+`624b13da8ed96f49b6049a4874052e05ae7a7cb6` and its engine layout dependency to
+`c8aab33814dd30878cf9b054eca89bcd6cf9f5e7`.
 
 ## Genesis
 
@@ -78,9 +82,10 @@ The workspace pins `percolator-prog` to commit
 
 ## Continuous Rewards
 
-TWAP rounds are externally cranked. Each round pulls only live insurance surplus, retains the
-configured insurance share by ratcheting the floor upward, and buys COIN at one marginal clearing
-price. Bought COIN can be split between burn and a canonical dynamic reward vault.
+TWAP rounds are externally cranked. Each round pulls only asset-0's live insurance surplus, retains
+the configured insurance share by ratcheting the floor upward, and buys COIN at one marginal
+clearing price. Insurance deposited for other assets is never counted toward that surplus. Bought
+COIN can be split between burn and a canonical dynamic reward vault.
 
 The full chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
 vault and burns 50%. At day 45 the accumulated reward vault distributes:

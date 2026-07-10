@@ -807,6 +807,100 @@ fn impair_market(env: &mut Env, new_insurance: u128) {
     env.svm.set_account(env.slab, acct).unwrap();
 }
 
+fn activate_external_asset(env: &mut Env, authority: &Pubkey) {
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    acct.data.resize(
+        percolator_prog::state::market_account_len_for_capacity(2).unwrap(),
+        0,
+    );
+    let mut profile = percolator_prog::state::activate_dynamic_asset_slot(
+        &mut acct.data,
+        1,
+        101,
+        1_000_000,
+        authority.to_bytes(),
+        authority.to_bytes(),
+        authority.to_bytes(),
+        authority.to_bytes(),
+    )
+    .expect("append asset 1 through the pinned engine transition");
+    profile.asset_admin = authority.to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(&mut acct.data, 1, &profile)
+        .expect("write asset-1 authority profile");
+    env.svm.set_account(env.slab, acct).unwrap();
+}
+
+fn asset_insurance_remaining(env: &Env, asset_index: usize) -> u128 {
+    let data = env.svm.get_account(&env.slab).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&data).unwrap();
+    let long = asset_index * 2;
+    let short = long + 1;
+    group.insurance_domain_budget[long]
+        .checked_sub(group.insurance_domain_spent[long])
+        .unwrap()
+        .checked_add(
+            group.insurance_domain_budget[short]
+                .checked_sub(group.insurance_domain_spent[short])
+                .unwrap(),
+        )
+        .unwrap()
+        .min(group.insurance)
+}
+
+// Model a valid 1M loss isolated to asset 0 while asset 1's 2M insurance remains intact.
+// This mirrors the exact engine counters after both asset-0 domains spend 500k and the paid
+// loss leaves the shared vault; all aggregate invariants continue to reconcile.
+fn impair_asset0_with_external_insurance(env: &mut Env) {
+    use percolator::{EngineAssetSlotV16Account as E, MarketGroupV16HeaderAccount as H};
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    let header = MARKET_GROUP_OFF;
+    let engine0 = header
+        + core::mem::size_of::<H>()
+        + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN;
+    let write_u128 = |data: &mut [u8], offset: usize, value: u128| {
+        data[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    };
+
+    write_u128(
+        &mut acct.data,
+        header + core::mem::offset_of!(H, vault),
+        3_000_000,
+    );
+    write_u128(
+        &mut acct.data,
+        header + core::mem::offset_of!(H, insurance),
+        3_000_000,
+    );
+    write_u128(
+        &mut acct.data,
+        header + core::mem::offset_of!(H, insurance_domain_budget_remaining_total),
+        3_000_000,
+    );
+    write_u128(
+        &mut acct.data,
+        engine0 + core::mem::offset_of!(E, insurance_domain_spent_long),
+        500_000,
+    );
+    write_u128(
+        &mut acct.data,
+        engine0 + core::mem::offset_of!(E, insurance_domain_spent_short),
+        500_000,
+    );
+    env.svm.set_account(env.slab, acct).unwrap();
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, 3_000_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+}
+
 fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot: u64) -> Vec<u8> {
     let initial_price = 1_000_000u64;
     let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
@@ -1383,6 +1477,69 @@ fn impaired_insurance_exit_is_pro_rata() {
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits with the same haircut");
     assert_eq!(env.token_amount(&bob_ata), 500_000, "late depositor takes the SAME 50% haircut — order-independent");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
+}
+
+// CROSS-ASSET EXIT DOS: the market header's `insurance` is global, while tag-57 debits
+// only asset 0. If asset 0 is impaired and an external asset keeps the global total above
+// outstanding principal, a global quote asks Percolator for more than asset 0 owns and the
+// owner's entire exit reverts. The subledger must price the haircut from asset 0's domains.
+#[test]
+fn external_asset_insurance_cannot_hide_asset0_impairment_or_block_owner_exit() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let principal = 2_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, principal);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, principal)
+        .expect("asset-0 principal deposit");
+
+    let external_amount = 2_000_000u64;
+    let (provider, provider_source) = new_depositor(&mut env, external_amount);
+    activate_external_asset(&mut env, &provider.pubkey());
+    let topup = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(provider_source, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+            domain: 2,
+            amount: external_amount as u128,
+        }
+        .encode(),
+    };
+    env.send(&[topup], &[&provider])
+        .expect("external provider funds asset 1");
+    assert_eq!(asset_insurance_remaining(&env, 0), principal as u128);
+    assert_eq!(asset_insurance_remaining(&env, 1), external_amount as u128);
+
+    impair_asset0_with_external_insurance(&mut env);
+    assert_eq!(asset_insurance_remaining(&env, 0), 1_000_000);
+    assert_eq!(asset_insurance_remaining(&env, 1), external_amount as u128);
+    let (_, group) = percolator_prog::state::read_market(
+        &env.svm.get_account(&env.slab).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(group.insurance, 3_000_000, "global insurance still exceeds Alice's principal");
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, principal)
+        .expect("asset-local pro-rata exit must not be blocked by foreign insurance");
+    assert_eq!(
+        env.token_amount(&alice_ata),
+        1_000_000,
+        "Alice receives all remaining asset-0 insurance, a 50% pro-rata haircut"
+    );
+    assert_eq!(env.pool_outstanding(), 0, "the impaired position retires");
+    assert_eq!(
+        asset_insurance_remaining(&env, 1),
+        external_amount as u128,
+        "the external provider's segregated asset-1 insurance is untouched"
+    );
 }
 
 // POLICY DISTINCTION (surplus exclusion under POLICY_PRINCIPAL, sweep tick B): the impaired test above pins the
