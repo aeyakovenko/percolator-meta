@@ -3727,6 +3727,39 @@ fn controller_return_shutdown_backing_ix(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn controller_return_shutdown_insurance_ix(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    provider_destination: &Pubkey,
+    controller_transit: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    insurance_ledger: &Pubkey,
+    percolator_program: &Pubkey,
+    asset_index: u16,
+) -> Instruction {
+    let mut data = vec![8u8]; // IX_RETURN_SHUTDOWN_INSURANCE
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new_readonly(*controller, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*provider_destination, false),
+            AccountMeta::new(*controller_transit, false),
+            AccountMeta::new(*vault, false),
+            AccountMeta::new_readonly(*vault_authority, false),
+            AccountMeta::new(*insurance_ledger, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn controller_return_resolved_asset0_backing_ix(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -5237,8 +5270,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
     assert_eq!(cfg.fee_redirect_to_market_0_bps, 777);
 
-    // Configure shutdown, activate asset 1 with an EXTERNAL backing authority,
-    // and fund its long-side bucket through the real Percolator program.
+    // Configure shutdown, activate asset 1 with EXTERNAL insurance/backing roles,
+    // and fund it through the real Percolator program.
     let configure_shutdown = build_controller_proxy_message(
         &squads_vault,
         &controller,
@@ -5292,6 +5325,15 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &controller_remaining,
     )
     .expect("controller activates externally backed asset");
+    let activated_slab = svm.get_account(&slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&activated_slab.data, 1).unwrap(),
+        backing_provider.pubkey().to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&activated_slab.data, 1).unwrap(),
+        backing_provider.pubkey().to_bytes()
+    );
     let backing_amount = 100_000u64;
     let backing_account = Pubkey::new_unique();
     set_token(
@@ -5348,12 +5390,56 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         .expect("external short-domain backing deposit");
     assert_eq!(token_amount(&svm, &resolved_only_backing_source), 0);
 
+    let long_insurance_amount = 50_000u64;
+    let short_insurance_amount = 30_000u64;
+    let asset_insurance_amount = long_insurance_amount + short_insurance_amount;
+    let insurance_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &insurance_source,
+        &collateral_mint,
+        &backing_provider.pubkey(),
+        asset_insurance_amount,
+    );
+    for (domain, insurance_amount) in [
+        (2u16, long_insurance_amount),
+        (3u16, short_insurance_amount),
+    ] {
+        let insurance_topup = Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(backing_provider.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(insurance_source, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+                domain,
+                amount: insurance_amount as u128,
+            }
+            .encode(),
+        };
+        send(&mut svm, &[&backing_provider], insurance_topup)
+            .expect("external provider funds both asset-local insurance domains");
+    }
+    assert_eq!(token_amount(&svm, &insurance_source), 0);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        asset_insurance_amount as u128
+    );
+
     let provider_destination = canonical_insurance_vault(
         &backing_provider.pubkey(),
         &collateral_mint,
     );
     let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
     let backing_ledger = Pubkey::new_unique();
+    let insurance_ledger = Pubkey::new_unique();
     set_token(
         &mut svm,
         &provider_destination,
@@ -5373,6 +5459,17 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         Account {
             lamports: 1_000_000_000,
             data: vec![0u8; percolator_prog::state::backing_domain_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        insurance_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::insurance_ledger_account_len()],
             owner: perc_id(),
             executable: false,
             rent_epoch: 0,
@@ -5435,6 +5532,32 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     );
     assert_eq!(svm.get_account(&slab).unwrap(), slab_before_live_return);
     assert_eq!(svm.get_account(&perc_vault).unwrap(), vault_before_live_return);
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+
+    let insurance_ledger_before_live_return = svm.get_account(&insurance_ledger).unwrap();
+    let live_insurance_return = controller_return_shutdown_insurance_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &provider_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &insurance_ledger,
+        &perc_id(),
+        1,
+    );
+    assert!(
+        send(&mut svm, &[&payer], live_insurance_return).is_err(),
+        "market authority must not return asset insurance before shutdown matures"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), slab_before_live_return);
+    assert_eq!(svm.get_account(&perc_vault).unwrap(), vault_before_live_return);
+    assert_eq!(
+        svm.get_account(&insurance_ledger).unwrap(),
+        insurance_ledger_before_live_return
+    );
     assert_eq!(token_amount(&svm, &provider_destination), 0);
     assert_eq!(token_amount(&svm, &controller_transit), 0);
 
@@ -5582,6 +5705,91 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     assert_eq!(token_amount(&svm, &dao_canonical_destination), 0);
     assert_eq!(token_amount(&svm, &controller_transit), 0);
 
+    let slab_before_wrong_insurance_return = svm.get_account(&slab).unwrap();
+    let vault_before_wrong_insurance_return = svm.get_account(&perc_vault).unwrap();
+    let ledger_before_wrong_insurance_return = svm.get_account(&insurance_ledger).unwrap();
+    let wrong_insurance_return = controller_return_shutdown_insurance_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &dao_canonical_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &insurance_ledger,
+        &perc_id(),
+        1,
+    );
+    assert!(
+        send(&mut svm, &[&payer], wrong_insurance_return).is_err(),
+        "shutdown insurance return cannot substitute a DAO-owned recipient"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap(),
+        slab_before_wrong_insurance_return
+    );
+    assert_eq!(
+        svm.get_account(&perc_vault).unwrap(),
+        vault_before_wrong_insurance_return
+    );
+    assert_eq!(
+        svm.get_account(&insurance_ledger).unwrap(),
+        ledger_before_wrong_insurance_return
+    );
+    assert_eq!(token_amount(&svm, &dao_canonical_destination), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+
+    // The external insurance authority can disappear after funding. Once the
+    // configured shutdown delay matures, any cranker returns the exact remaining
+    // asset-local insurance to that authority's canonical token account.
+    let return_insurance = controller_return_shutdown_insurance_ix(
+        &squads_vault,
+        &controller,
+        &slab,
+        &provider_destination,
+        &controller_transit,
+        &perc_vault,
+        &vault_authority,
+        &insurance_ledger,
+        &perc_id(),
+        1,
+    );
+    send(&mut svm, &[&payer], return_insurance)
+        .expect("permissionless crank returns abandoned insurance to its recorded authority");
+    assert_eq!(
+        token_amount(&svm, &provider_destination),
+        asset_insurance_amount
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        0
+    );
+    let controller_insurance_ledger = percolator_prog::state::read_insurance_ledger(
+        &svm.get_account(&insurance_ledger).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(controller_insurance_ledger.authority, controller.to_bytes());
+    assert_eq!(
+        controller_insurance_ledger.total_withdrawn_atoms,
+        asset_insurance_amount as u128
+    );
+    assert!(
+        svm.get_account(&controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "controller transit closes after forwarding returned insurance"
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+
     // The segregated provider remains live and withdraws part of its own principal.
     let live_withdraw_amount = 40_000u64;
     let backing_withdraw = Instruction {
@@ -5665,7 +5873,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         .expect("permissionless crank returns abandoned backing to the recorded provider");
     assert_eq!(
         token_amount(&svm, &provider_destination),
-        abandoned_amount + provider_earnings,
+        asset_insurance_amount + abandoned_amount + provider_earnings,
         "recorded provider receives both earnings and remaining principal"
     );
     let controller_ledger = percolator_prog::state::read_backing_domain_ledger(
@@ -5798,7 +6006,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
 
     assert_eq!(
         token_amount(&svm, &backing_account) + token_amount(&svm, &provider_destination),
-        backing_amount + resolved_only_backing_amount + provider_earnings,
+        backing_amount + resolved_only_backing_amount + provider_earnings + asset_insurance_amount,
         "provider receives complete principal and earnings across both exit paths"
     );
 
