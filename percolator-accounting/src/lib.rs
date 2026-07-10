@@ -13,6 +13,10 @@ pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
+// Pinned `WrapperConfigV16::free_market_slot_count` relative to the account.
+// The wrapper config starts after the 16-byte account header; this field follows
+// its authority/mint, fee, resolve, insurance-withdraw, and oracle-policy prefix.
+pub const FREE_MARKET_SLOT_COUNT_OFFSET: usize = HEADER_LEN + 198;
 // Pinned `AssetOracleProfileV16`: four u8s, one u32, five u16s, and six bytes
 // of padding precede the three custody authorities.
 pub const INSURANCE_AUTHORITY_PROFILE_OFFSET: usize = 24;
@@ -71,6 +75,14 @@ fn validate_market(data: &[u8]) -> Result<(), ReadError> {
 }
 
 fn validate_asset(data: &[u8], asset_index: usize) -> Result<(), ReadError> {
+    let (configured, capacity) = market_slot_counts(data)?;
+    if asset_index >= configured || asset_index >= capacity {
+        return Err(ReadError::InvalidAsset);
+    }
+    Ok(())
+}
+
+fn market_slot_counts(data: &[u8]) -> Result<(usize, usize), ReadError> {
     let header_config = MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, config);
     let configured = read_u32(
         data,
@@ -80,10 +92,10 @@ fn validate_asset(data: &[u8], asset_index: usize) -> Result<(), ReadError> {
         data,
         MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, asset_slot_capacity),
     )? as usize;
-    if asset_index >= configured || asset_index >= capacity {
-        return Err(ReadError::InvalidAsset);
+    if configured == 0 || configured > capacity {
+        return Err(ReadError::InvalidAccounting);
     }
-    Ok(())
+    Ok((configured, capacity))
 }
 
 fn asset_wrapper_offset(asset_index: usize) -> Result<usize, ReadError> {
@@ -108,6 +120,22 @@ fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
 pub fn read_market_authority(data: &[u8]) -> Result<[u8; 32], ReadError> {
     validate_market(data)?;
     bytes(data, MARKET_AUTHORITY_OFFSET)
+}
+
+/// Returns true when asset 0 is the only non-retired configured slot.
+///
+/// Percolator increments `free_market_slot_count` only after a secondary slot is
+/// fully retired and canonicalized. This O(1) view lets a lifecycle handoff reject
+/// active secondary admins without scanning a dynamically sized market account.
+pub fn all_secondary_assets_retired(data: &[u8]) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    let (configured, _) = market_slot_counts(data)?;
+    let free = usize::from(read_u16(data, FREE_MARKET_SLOT_COUNT_OFFSET)?);
+    let secondary_slots = configured - 1;
+    if free > secondary_slots {
+        return Err(ReadError::InvalidAccounting);
+    }
+    Ok(free == secondary_slots)
 }
 
 /// Returns true only after Percolator has resolved the market and every materialized

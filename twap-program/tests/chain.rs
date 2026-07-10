@@ -4802,6 +4802,207 @@ fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
     );
 }
 
+// PUBLIC LOF/DOS: Percolator's market-authority handoff updates only asset-0 roles.
+// If a creator first activates a funded secondary asset, donating marketauth while
+// that asset remains live leaves its asset_admin on the creator. A later public
+// stale resolution then removes marketauth's shutdown withdrawal override, and the
+// controller cannot rotate the secondary value roles for terminal provider returns.
+#[test]
+fn e2e_market_donation_rejects_a_live_secondary_asset() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let provider = Keypair::new();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let configure_resolve = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 1_000,
+            force_close_delay_slots: 10,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], configure_resolve)
+        .expect("creator enables the public stale resolver");
+
+    let activate = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 0,
+            asset_index: 1,
+            now_slot: 100,
+            initial_price: 1_000_000,
+            insurance_authority: provider.pubkey().to_bytes(),
+            insurance_operator: provider.pubkey().to_bytes(),
+            backing_bucket_authority: provider.pubkey().to_bytes(),
+            oracle_authority: provider.pubkey().to_bytes(),
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], activate)
+        .expect("creator activates a secondary market through the public API");
+    let active_profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&slab).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(active_profile.asset_admin, creator.pubkey().to_bytes());
+    assert!(!percolator_accounting::all_secondary_assets_retired(
+        &svm.get_account(&slab).unwrap().data,
+    )
+    .unwrap());
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let insurance_amount = 11_000u64;
+    let provider_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_token,
+        &collateral_mint,
+        &provider.pubkey(),
+        insurance_amount,
+    );
+    let top_up = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(provider_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+            domain: 2,
+            amount: insurance_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &provider], top_up)
+        .expect("external provider funds the creator-administered secondary asset");
+    assert_eq!(token_amount(&svm, &provider_token), 0);
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+    };
+    let market_before = svm.get_account(&slab).unwrap();
+    let vault_before = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(&mut svm, &[&payer, &creator], donate_market.clone()).is_err(),
+        "market donation must not orphan a live secondary asset_admin"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), vault_before);
+
+    let unchanged_profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&slab).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(unchanged_profile.asset_admin, creator.pubkey().to_bytes());
+    assert_eq!(unchanged_profile.insurance_authority, provider.pubkey().to_bytes());
+    assert_eq!(unchanged_profile.insurance_operator, provider.pubkey().to_bytes());
+
+    let withdraw = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(provider_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+            asset_index: 1,
+            amount: insurance_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &provider], withdraw)
+        .expect("rejected donation leaves the provider's ordinary exit live");
+    assert_eq!(token_amount(&svm, &provider_token), insurance_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+
+    let retire = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 2,
+            asset_index: 1,
+            now_slot: 100,
+            initial_price: 0,
+            insurance_authority: [0u8; 32],
+            insurance_operator: [0u8; 32],
+            backing_bucket_authority: [0u8; 32],
+            oracle_authority: [0u8; 32],
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], retire)
+        .expect("creator retires the now-empty secondary asset");
+    assert!(percolator_accounting::all_secondary_assets_retired(
+        &svm.get_account(&slab).unwrap().data,
+    )
+    .unwrap());
+
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("fully retired secondary slots do not block safe market donation");
+    let donated_market = svm.get_account(&slab).unwrap();
+    let (config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&donated_market.data).unwrap();
+    assert_eq!(config.marketauth, controller.to_bytes());
+    assert_eq!(
+        percolator_prog::state::read_asset_oracle_profile(&donated_market.data, 1)
+            .unwrap()
+            .asset_admin,
+        [0u8; 32]
+    );
+}
+
 // PUBLIC LOF: the shutdown override used by IX_RETURN_SHUTDOWN_BACKING intentionally excludes
 // asset 0, while a resolved market still requires its absent provider's two backing domains to be
 // drained before CloseSlab can make progress. The fixed path must derive every amount and recipient,

@@ -34,8 +34,11 @@ recover their owner-bound share of the insurance pool, subject to market losses.
   `CloseSlab` is excluded; a fixed terminal cleanup forwards only vault dust and account rent to
   Squads. Donating a creator-owned market preserves funded outgoing asset-0 insurance roles and the
   recorded backing provider; the handoff cannot collapse that capital into the controller or select
-  another provider. A genesis-pool grant cannot rotate nonzero external insurance into pool custody:
-  its recorded owner exits first, after which the same grant can proceed.
+  another provider. Donation is accepted only when every secondary slot is fully retired because
+  Percolator does not migrate secondary `asset_admin` roles with `marketauth`; multi-asset markets are
+  instead initialized under the controller before activation. A genesis-pool grant cannot rotate
+  nonzero external insurance into pool custody: its recorded owner exits first, after which the same
+  grant can proceed.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
@@ -162,7 +165,11 @@ that exact insurance authority/operator after accepting `marketauth`, just as it
 recorded backing provider. Genesis custody cannot move to a pool until those external insurance
 roles hold no balance. The creator can withdraw through Percolator, then the unchanged grant path
 installs the canonical owner-bound pool; governance cannot convert the external balance into its own
-or pool-controlled insurance.
+or pool-controlled insurance. Percolator's market-authority update does not migrate secondary
+`asset_admin` roles, so the controller rejects donation while any secondary slot is active,
+drain-only, or recovering. Once those slots are empty and retired, the same permissionless handoff
+succeeds. New multi-asset markets should use permissionless controller initialization before assets
+are activated.
 
 At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved
