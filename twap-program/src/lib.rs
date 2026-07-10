@@ -1527,6 +1527,28 @@ fn require_squads_vault(squads_vault: &AccountInfo, config: &Config) -> ProgramR
     Ok(())
 }
 
+fn load_coin_sink(
+    account: &AccountInfo,
+    coin_mint: &Pubkey,
+) -> Result<spl_token::state::Account, ProgramError> {
+    if account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let state = spl_token::state::Account::unpack(&account.try_borrow_data()?)?;
+    if state.state != spl_token::state::AccountState::Initialized || state.mint != *coin_mint {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(state)
+}
+
+fn validate_coin_sink_configuration(account: &AccountInfo, coin_mint: &Pubkey) -> ProgramResult {
+    let state = load_coin_sink(account, coin_mint)?;
+    if state.delegate.is_some() || state.delegated_amount != 0 || state.close_authority.is_some() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 // init_book accounts: [squads_vault(signer, payer), config, book(w, init), book_escrow(pda),
 //   coin_escrow, settlement_usd, holding, coin_mint, collateral_mint, system_program, coin_sink?]
 // data: reserve_num (u128) || reserve_den (u128) || round_length (u64) || sink_mode (u8)
@@ -1642,13 +1664,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         if *coin_sink.key == *coin_escrow.key {
             return Err(ProgramError::InvalidAccountData);
         }
-        if coin_sink.owner != &spl_token::ID {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
-        if s.state != spl_token::state::AccountState::Initialized || s.mint != *coin_mint.key {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        validate_coin_sink_configuration(coin_sink, coin_mint.key)?;
         *coin_sink.key
     } else {
         Pubkey::default()
@@ -1786,13 +1802,7 @@ fn process_set_coin_sink(
         if *coin_sink.key == book.coin_escrow {
             return Err(ProgramError::InvalidAccountData);
         }
-        if coin_sink.owner != &spl_token::ID {
-            return Err(ProgramError::IllegalOwner);
-        }
-        let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
-        if s.mint != book.coin_mint {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        validate_coin_sink_configuration(coin_sink, &book.coin_mint)?;
         *coin_sink.key
     } else {
         Pubkey::default()
@@ -2388,7 +2398,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     //    amount is burned, exactly as before. Then move the spent USD to the settlement account.
     if settled {
         let sink_active = book.sink_mode == SINK_SEND && clock_slot <= book.sink_cutoff_slot;
-        let to_sink = if sink_active {
+        let requested_to_sink = if sink_active {
             mul_div_floor(
                 total_coin,
                 config.buyback_bps as u128,
@@ -2397,26 +2407,34 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         } else {
             0
         };
-        let to_burn = total_coin
-            .checked_sub(to_sink)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let mut sink_for_transfer = None;
+        let mut to_sink = 0;
         if book.sink_mode == SINK_SEND {
             // The coin_sink trailing account is always supplied in SINK_SEND mode (account ordering is
-            // independent of the runtime buyback fraction); validate it even when to_sink == 0.
+            // independent of the runtime buyback fraction). The key remains exact, so a cranker cannot
+            // select the fallback. If the configured external account was closed or otherwise became
+            // invalid, burn its share instead of letting that public mutation stall every round.
             let coin_sink = next_account_info(iter)?;
             if *coin_sink.key != book.coin_sink {
                 return Err(ProgramError::InvalidAccountData);
             }
-            if to_sink > 0 {
-                spl_transfer(
-                    token_program,
-                    coin_escrow,
-                    coin_sink,
-                    book_escrow,
-                    as_u64(to_sink)?,
-                    Some(&escrow_seeds),
-                )?;
+            if requested_to_sink > 0 && load_coin_sink(coin_sink, &book.coin_mint).is_ok() {
+                to_sink = requested_to_sink;
+                sink_for_transfer = Some(coin_sink);
             }
+        }
+        let to_burn = total_coin
+            .checked_sub(to_sink)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        if let Some(coin_sink) = sink_for_transfer {
+            spl_transfer(
+                token_program,
+                coin_escrow,
+                coin_sink,
+                book_escrow,
+                as_u64(to_sink)?,
+                Some(&escrow_seeds),
+            )?;
         }
         if to_burn > 0 {
             spl_burn_signed(

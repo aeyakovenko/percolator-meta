@@ -11868,3 +11868,20 @@ attack state through the real SPL program, proves the vulnerable setter accepted
 fixed setter rejects it without changing bps or sink identity, and independently exercises the attacker's live
 close path. Valid savings-only and full four-way rounds remain green. No signer, withdrawal, or admin surface was
 added; the check only removes an external liveness key.
+
+## Tick — externally mutable bought-COIN sink could stall settlement (surface A)
+
+The book's SEND-mode COIN sink is intentionally allowed to be an external DAO/reward destination. Both
+`init_book` and `set_coin_sink` previously accepted a valid COIN account that retained an attacker close authority,
+and even an account with no separate close key remains closable by its external token owner while empty. Three
+fresh real Squads + SPL Token + TWAP LiteSVM probes reproduced the complete class: the old init and setter each
+accepted a Squads-owned account whose attacker close key survived owner rotation, and a normally configured
+external owner closed its sink before a filled round, causing the old permissionless `execute` to revert at the
+sink transfer.
+
+FIX: both configuration doors now require initialized, correct-mint sinks with no delegate or close authority.
+Execution still requires the exact configured account key, but if that authoritative account later becomes closed,
+frozen, malformed, or non-SPL, its requested share deterministically joins the burn amount. A cranker cannot select
+or redirect this fallback. The impact regression closes the sink through real SPL, fills a real auction, and proves
+the whole bought-COIN amount burns while winner settlement remains fully funded. This changes only COIN routing;
+insurance pulls, the principal floor, bids, and user collateral are unchanged, and no admin surface was added.
