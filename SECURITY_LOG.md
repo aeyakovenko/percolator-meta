@@ -12214,3 +12214,26 @@ FIX: before moving donor tokens, `donate_insurance` now reads the pinned market 
 the controller PDA to be the current `marketauth`, insurance authority, insurance operator, and `asset_admin`.
 The canonical controller-owned donation and full genesis-to-reward chain remain live. No repair signer,
 withdrawal destination, role mutation, governance key, or reusable admin surface was added.
+
+## Tick - a frozen canonical bidder account could permanently settle-lock the auction (surface C)
+
+`place_bid` accepted any healthy bidder-owned COIN source and collateral destination, but persisted the
+bidder's canonical ATAs for later refund and settlement. A bidder whose canonical account was already frozen
+could therefore validate a healthy decoy, escrow a bid, and leave a settled or evicted slot whose mandatory
+transfer could never succeed. Unlike a closed ATA, a permanently frozen ATA cannot be permissionlessly
+recreated or thawed, so one poisoned slot could keep the singleton book from reopening.
+
+Two retained real-SBF LiteSVM regressions cover the independent USD-payout and COIN-refund paths. Each creates
+a legitimate externally controlled freeze state, presents a healthy decoy, and proves rejection leaves the
+bidder source and shared escrow unchanged. The COIN case revokes the freeze key after freezing to prove the
+recorded destination would be permanently unusable.
+
+FIX: placement now requires the passed source and destination to be the exact canonical bidder ATAs, owned by
+SPL Token and in `Initialized` state, before burning the fee, refunding an eviction, or moving escrow. The same
+validated keys are persisted into the slot. No cleanup authority, alternate recipient, admin path, or custody
+surface was added.
+
+The same chain now initializes a maximal six-market reward epoch through the real timelocked Squads path and
+checks the serialized legacy transaction against Solana's packet limit. Reusing the sole DAO member as fee
+payer keeps the maximal transaction at 1,188 bytes; a separate fee-payer signature would make it 1,284 bytes
+and non-broadcastable. This is governance-lifecycle coverage, not an additional authority.

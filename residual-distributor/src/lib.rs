@@ -82,7 +82,7 @@ const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
 // Ten total allow-listed markets: market_group plus nine extras.
 const MAX_EXTRA_MARKETS: usize = 9;
 // Reward-epoch init carries a full (market, insurance pool, backing pool) tuple atomically. Six
-// tuples leave room for two signatures and all account keys under Solana's transaction-size limit.
+// tuples fit one DAO-member-signed Squads transaction under Solana's packet-size limit.
 const MAX_REWARD_EPOCH_MARKETS: usize = 6;
 const CONFIG_FUNDING_TAIL_OFF: usize = 466 + 1 + MAX_EXTRA_MARKETS * 32;
 const CONFIG_EPOCH_TAIL_OFF: usize = CONFIG_FUNDING_TAIL_OFF + 68;

@@ -1962,12 +1962,27 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let need = coin_atoms_u64
         .checked_add(book.bid_fee)
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    let canonical_coin_refund = bidder_coin_ata(bidder.key, coin_mint.key);
+    if *bidder_coin_src.key != canonical_coin_refund || bidder_coin_src.owner != &spl_token::ID {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let src = spl_token::state::Account::unpack(&bidder_coin_src.try_borrow_data()?)?;
-    if src.owner != *bidder.key || src.mint != *coin_mint.key || src.amount < need {
+    if src.state != spl_token::state::AccountState::Initialized
+        || src.owner != *bidder.key
+        || src.mint != *coin_mint.key
+        || src.amount < need
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let canonical_usd_dest = bidder_coin_ata(bidder.key, collateral_mint.key);
+    if *usd_dest.key != canonical_usd_dest || usd_dest.owner != &spl_token::ID {
         return Err(ProgramError::InvalidAccountData);
     }
     let dest = spl_token::state::Account::unpack(&usd_dest.try_borrow_data()?)?;
-    if dest.owner != *bidder.key || dest.mint != *collateral_mint.key {
+    if dest.state != spl_token::state::AccountState::Initialized
+        || dest.owner != *bidder.key
+        || dest.mint != *collateral_mint.key
+    {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -2086,9 +2101,9 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     // book by closing a payout account after bidding: a closed ATA is permissionlessly recreatable,
     // making any stuck claim recoverable (finding V + AB).
     d[o + SL_USD_DEST..o + SL_USD_DEST + 32]
-        .copy_from_slice(bidder_coin_ata(bidder.key, collateral_mint.key).as_ref());
+        .copy_from_slice(canonical_usd_dest.as_ref());
     d[o + SL_COIN_ATA..o + SL_COIN_ATA + 32]
-        .copy_from_slice(bidder_coin_ata(bidder.key, coin_mint.key).as_ref());
+        .copy_from_slice(canonical_coin_refund.as_ref());
     book_wr_u128(&mut d, o + SL_COIN, coin_atoms);
     book_wr_u128(&mut d, o + SL_USDC, usdc_atoms);
     book_wr_u128(&mut d, o + SL_USD_OWED, 0);

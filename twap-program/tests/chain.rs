@@ -743,6 +743,238 @@ fn init_book_rejects_a_permanently_frozen_settlement_account() {
     );
 }
 
+// PUBLIC DOS PROBE: place_bid records the bidder's canonical collateral ATA for settlement.
+// Validating a different healthy token account lets a bidder whose canonical ATA is frozen enter
+// the book, after which its settled slot can never be claimed and the singleton book never reopens.
+#[test]
+fn place_bid_rejects_a_frozen_canonical_usd_destination() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let book = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (bidder, coin_source, canonical_usd) =
+        new_bidder(&mut svm, &payer, &env, 1_000_000);
+
+    let freeze_authority = Keypair::new();
+    let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::Some(freeze_authority.pubkey()),
+        },
+        &mut mint_data,
+    )
+    .unwrap();
+    svm.set_account(
+        env.collateral_mint,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN),
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let alternate_usd = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &alternate_usd,
+        &env.collateral_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &canonical_usd,
+        &env.collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[freeze],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).expect("freeze canonical USD ATA");
+
+    let coin_before = token_amount(&svm, &coin_source);
+    assert!(
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &coin_source,
+                &alternate_usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1_000_000,
+                1_000_000,
+                None,
+            ),
+        )
+        .is_err(),
+        "a healthy decoy account must not mask the frozen canonical payout ATA"
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &coin_source,
+                &canonical_usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1_000_000,
+                1_000_000,
+                None,
+            ),
+        )
+        .is_err(),
+        "the frozen canonical payout ATA itself must be rejected"
+    );
+    assert_eq!(token_amount(&svm, &coin_source), coin_before);
+    assert_eq!(token_amount(&svm, &book.coin_escrow), 0);
+}
+
+// PUBLIC DOS PROBE: refunds are pinned to the canonical COIN ATA. A healthy noncanonical source
+// must not mask a canonical refund ATA that was frozen before the mint's freeze key was revoked.
+#[test]
+fn place_bid_rejects_a_frozen_canonical_coin_refund_account() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let book = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let bidder = Keypair::new();
+    svm.airdrop(&bidder.pubkey(), 1_000_000_000).unwrap();
+    let canonical_coin = coin_ata_of(&bidder.pubkey(), &env.coin_mint);
+    let alternate_coin = Pubkey::new_unique();
+    let canonical_usd = coin_ata_of(&bidder.pubkey(), &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &canonical_coin,
+        &env.coin_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &alternate_coin,
+        &env.coin_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &canonical_usd,
+        &env.collateral_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    mint_coin(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.coin_mint_authority,
+        &alternate_coin,
+        1_000_000,
+    );
+
+    let freeze_authority = Keypair::new();
+    let mut mint_account = svm.get_account(&env.coin_mint).unwrap();
+    let mut mint_state = spl_token::state::Mint::unpack(&mint_account.data).unwrap();
+    mint_state.freeze_authority = COption::Some(freeze_authority.pubkey());
+    spl_token::state::Mint::pack(mint_state, &mut mint_account.data).unwrap();
+    svm.set_account(env.coin_mint, mint_account).unwrap();
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &canonical_coin,
+        &env.coin_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &env.coin_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[freeze, revoke],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .expect("freeze canonical refund ATA and revoke the thaw key");
+
+    let source_before = token_amount(&svm, &alternate_coin);
+    assert!(
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &alternate_coin,
+                &canonical_usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1_000_000,
+                1_000_000,
+                None,
+            ),
+        )
+        .is_err(),
+        "a healthy source must not mask the permanently frozen refund ATA"
+    );
+    assert_eq!(token_amount(&svm, &alternate_coin), source_before);
+    assert_eq!(token_amount(&svm, &book.coin_escrow), 0);
+}
+
 // EXTERNAL CLOSE-AUTHORITY DOS: SPL owner rotation clears delegates but preserves an explicit
 // close authority on non-native accounts. Without this guard, the attacker can close the empty
 // canonical escrow after `init_book` commits it and permanently brick the singleton auction.
@@ -4030,13 +4262,25 @@ fn build_return_to_subledger_message(
 // Run a full Squads vault-transaction lifecycle (create, propose, approve, warp past the
 // 1-week timelock, execute) for `message`. Advances only the unix clock (keeps the slot
 // stable so the percolator oracle does not go stale).
+fn legacy_transaction_wire_size(transaction: &Transaction) -> usize {
+    let signature_count = transaction.signatures.len();
+    let short_vec_len = if signature_count < 1 << 7 {
+        1
+    } else if signature_count < 1 << 14 {
+        2
+    } else {
+        3
+    };
+    short_vec_len + signature_count * 64 + transaction.message.serialize().len()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn squads_execute(
     svm: &mut LiteSVM,
     squads: &Pubkey,
     multisig: &Pubkey,
     dao: &Keypair,
-    payer: &Keypair,
+    _payer: &Keypair,
     idx: u64,
     message: &[u8],
     remaining: &[AccountMeta],
@@ -4046,12 +4290,20 @@ fn squads_execute(
     let mut send = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(
+        let transaction = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&payer.pubkey()),
-            &[payer, dao],
+            Some(&dao.pubkey()),
+            &[dao],
             bh,
-        ))
+        );
+        let wire_size = legacy_transaction_wire_size(&transaction);
+        if wire_size > solana_sdk::packet::PACKET_DATA_SIZE {
+            return Err(format!(
+                "serialized transaction is {wire_size} bytes (limit {})",
+                solana_sdk::packet::PACKET_DATA_SIZE
+            ));
+        }
+        svm.send_transaction(transaction)
         .map(|_| ())
         .map_err(|e| format!("{:?}", e))
     };
@@ -4072,7 +4324,7 @@ fn squads_execute(
     svm.set_sysvar::<Clock>(&clock);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(
+    let transaction = Transaction::new_signed_with_payer(
         &[vault_transaction_execute_ix(
             squads,
             multisig,
@@ -4081,10 +4333,18 @@ fn squads_execute(
             &dao.pubkey(),
             remaining,
         )],
-        Some(&payer.pubkey()),
-        &[payer, dao],
+        Some(&dao.pubkey()),
+        &[dao],
         bh,
-    ))
+    );
+    let wire_size = legacy_transaction_wire_size(&transaction);
+    if wire_size > solana_sdk::packet::PACKET_DATA_SIZE {
+        return Err(format!(
+            "serialized transaction is {wire_size} bytes (limit {})",
+            solana_sdk::packet::PACKET_DATA_SIZE
+        ));
+    }
+    svm.send_transaction(transaction)
     .map(|_| ())
     .map_err(|e| format!("{:?}", e))
 }
@@ -25227,6 +25487,78 @@ fn rd_epoch_init_ix(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_rd_epoch_init_message(
+    squads_vault: &Pubkey,
+    coin_mint: &Pubkey,
+    percolator_program: &Pubkey,
+    subledger_program: &Pubkey,
+    config: &Pubkey,
+    vault: &Pubkey,
+    epoch_id: u64,
+    start_slot: u64,
+    end_slot: u64,
+    expected_reward_supply: u64,
+    insurance_bps: u16,
+    backing_bps: u16,
+    lp_bps: u16,
+    funding_payer_bps: u16,
+    finalize_window: u64,
+    fee_bps: u16,
+    markets: &[(Pubkey, Pubkey, Pubkey)],
+) -> Vec<u8> {
+    let ix = rd_epoch_init_ix(
+        squads_vault,
+        squads_vault,
+        coin_mint,
+        percolator_program,
+        subledger_program,
+        config,
+        vault,
+        epoch_id,
+        start_slot,
+        end_slot,
+        expected_reward_supply,
+        insurance_bps,
+        backing_bps,
+        lp_bps,
+        funding_payer_bps,
+        finalize_window,
+        fee_bps,
+        markets,
+    );
+
+    // One writable Squads signer acts as both epoch authority and rent payer. The
+    // remaining keys follow Squads' writable-then-readonly transaction ordering.
+    let mut message = Vec::new();
+    message.push(1); // signers
+    message.push(1); // writable signers
+    message.push(1); // writable non-signers (config)
+    message.push(8); // unique account keys
+    for key in [
+        squads_vault,
+        config,
+        coin_mint,
+        percolator_program,
+        subledger_program,
+        vault,
+        &system_program::ID,
+        &rd_id(),
+    ] {
+        message.extend_from_slice(key.as_ref());
+    }
+    message.push(1); // instructions
+    message.push(7); // residual-distributor program
+    message.push(8); // instruction account indexes
+    for index in [0u8, 0, 2, 3, 4, 1, 5, 6] {
+        message.push(index);
+    }
+    message.extend_from_slice(&(ix.data.len() as u16).to_le_bytes());
+    message.extend_from_slice(&ix.data);
+    message.push(0); // address table lookups
+    message
+}
+
 fn rd_register_ix(
     payer: &Pubkey,
     config: &Pubkey,
@@ -26842,12 +27174,13 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &epoch_vault_authority,
         0,
     );
-    let reward_config = rd_epoch_config_pda(&dao.pubkey(), &coin_mint, reward_epoch_id);
+    let reward_config = rd_epoch_config_pda(&squads_vault, &coin_mint, reward_epoch_id);
     let reward_vault = Pubkey::new_unique();
     set_token(&mut svm, &reward_vault, &coin_mint, &reward_config, 0);
-    let reward_init = rd_epoch_init_ix(
-        &payer.pubkey(),
-        &dao.pubkey(),
+    let inactive_epoch_markets: [Pubkey; 4] =
+        std::array::from_fn(|_| Pubkey::new_unique());
+    let reward_init = build_rd_epoch_init_message(
+        &squads_vault,
         &coin_mint,
         &perc_id(),
         &sub_id(),
@@ -26866,9 +27199,49 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &[
             (slab, pool, backing_pool),
             (epoch_market, Pubkey::default(), Pubkey::default()),
+            (
+                inactive_epoch_markets[0],
+                Pubkey::default(),
+                Pubkey::default(),
+            ),
+            (
+                inactive_epoch_markets[1],
+                Pubkey::default(),
+                Pubkey::default(),
+            ),
+            (
+                inactive_epoch_markets[2],
+                Pubkey::default(),
+                Pubkey::default(),
+            ),
+            (
+                inactive_epoch_markets[3],
+                Pubkey::default(),
+                Pubkey::default(),
+            ),
         ],
     );
-    send(&mut svm, &[&payer, &dao], reward_init).expect("DAO initializes 45-day reward epoch");
+    let reward_init_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(reward_config, false),
+        AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(reward_vault, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(rd_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        6,
+        &reward_init,
+        &reward_init_remaining,
+    )
+    .expect("DAO initializes a six-market reward epoch through its timelocked Squads vault");
 
     // ---- (4) HANDOFF the live market to the twap, then (5) PULL the surplus ----
     // twap config bound to the SAME market + multisig + coin.
@@ -26900,7 +27273,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 6, &pol, &pr)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 7, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
     let op = build_subledger_handoff_to_twap_message(
         &squads_vault,
@@ -26920,7 +27293,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 7, &op, &or)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 8, &op, &or)
         .expect("operator -> twap (handoff)");
     let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, amount as u128);
     let fr = vec![
@@ -26928,7 +27301,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 8, &fm, &fr).expect("floor");
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 9, &fm, &fr).expect("floor");
 
     // init_book (Squads), then PERMISSIONLESS execute pulls the burn-share (80%) of the surplus.
     let book = book_pda(&twap_cfg);
@@ -26958,7 +27331,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &multisig,
         &dao,
         &payer,
-        9,
+        10,
         &economics,
         &economics_remaining,
     )
@@ -26998,7 +27371,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         AccountMeta::new_readonly(reward_vault, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 10, &ib, &ibr)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 11, &ib, &ibr)
         .expect("init_book with 15-day rounds and reward epoch sink");
 
     let epoch_oracle_config = build_configure_ewma_mark_message(
@@ -27021,7 +27394,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &multisig,
         &dao,
         &payer,
-        11,
+        12,
         &epoch_oracle_config,
         &epoch_oracle_config_remaining,
     )
@@ -27226,7 +27599,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &env.multisig,
         &env.dao,
         &payer,
-        12,
+        13,
         &epoch_premium,
         &epoch_oracle_remaining,
     )
@@ -27263,7 +27636,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &env.multisig,
         &env.dao,
         &payer,
-        13,
+        14,
         &epoch_discount,
         &epoch_oracle_remaining,
     )
@@ -27401,7 +27774,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &env.multisig,
             &env.dao,
             &payer,
-            14 + round_index as u64,
+            15 + round_index as u64,
             &oracle_crank,
             &oracle_remaining,
         )
@@ -27724,7 +28097,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &env.multisig,
         &env.dao,
         &payer,
-        17,
+        18,
         &oracle_crank,
         &oracle_remaining,
     )
@@ -27780,7 +28153,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &env.multisig,
         &env.dao,
         &payer,
-        18,
+        19,
         &return_message,
         &return_remaining,
     )
