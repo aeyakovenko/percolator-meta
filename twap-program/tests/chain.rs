@@ -4969,6 +4969,211 @@ fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
+// PUBLIC LOF: market donation migrates only asset-0 roles still equal to the outgoing market
+// authority. A delegated asset admin must not survive the handoff and retain a post-donation path
+// to rotate the insurance operator after an honest caller uses the controller's inbound-only top-up.
+fn assert_controller_donation_rejects_delegated_role(delegated_kind: u8) {
+    assert_eq!(
+        percolator_accounting::ASSET_ADMIN_PROFILE_OFFSET,
+        core::mem::offset_of!(percolator_prog::state::AssetOracleProfileV16, asset_admin),
+        "shared asset-admin reader must match the pinned wrapper layout"
+    );
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let delegated_authority = Keypair::new();
+    svm.airdrop(&delegated_authority.pubkey(), 1_000_000_000)
+        .unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let delegate_role = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(delegated_authority.pubkey(), true),
+            AccountMeta::new(slab, false),
+        ],
+        data: percolator_prog::ix::Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: delegated_kind,
+            new_pubkey: delegated_authority.pubkey().to_bytes(),
+        }
+        .encode(),
+    };
+    send(
+        &mut svm,
+        &[&payer, &creator, &delegated_authority],
+        delegate_role,
+    )
+    .expect("creator delegates one empty-market custody role");
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+    };
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("creator donates market lifecycle control");
+    let profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(profile.insurance_authority, controller.to_bytes());
+    if delegated_kind == 0 {
+        assert_eq!(profile.insurance_operator, controller.to_bytes());
+        assert_eq!(
+            profile.asset_admin,
+            delegated_authority.pubkey().to_bytes(),
+            "Percolator intentionally leaves a separately delegated asset admin unchanged"
+        );
+    } else {
+        assert_eq!(delegated_kind, 2);
+        assert_eq!(profile.asset_admin, controller.to_bytes());
+        assert_eq!(
+            profile.insurance_operator,
+            delegated_authority.pubkey().to_bytes(),
+            "Percolator intentionally leaves a separately delegated operator unchanged"
+        );
+    }
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let controller_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let amount = 600_000u64;
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        amount,
+    );
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &delegated_authority.pubkey(),
+        0,
+    );
+
+    let market_before_donation = svm.get_account(&slab).unwrap();
+    let vault_before_donation = svm.get_account(&percolator_vault).unwrap();
+    let holding_before_donation = svm.get_account(&controller_holding).unwrap();
+    let donor_before_donation = svm.get_account(&donor_source).unwrap();
+    let donation = controller_donate_insurance_ix(
+        &donor.pubkey(),
+        &governance,
+        &controller,
+        &slab,
+        &donor_source,
+        &controller_holding,
+        &percolator_vault,
+        amount,
+    );
+    if send(&mut svm, &[&payer, &donor], donation).is_ok() {
+        if delegated_kind == 0 {
+            let seize_operator = Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(delegated_authority.pubkey(), true),
+                    AccountMeta::new_readonly(delegated_authority.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                ],
+                data: percolator_prog::ix::Instruction::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind: 2,
+                    new_pubkey: delegated_authority.pubkey().to_bytes(),
+                }
+                .encode(),
+            };
+            send(&mut svm, &[&payer, &delegated_authority], seize_operator)
+                .expect("surviving asset admin rotates the funded withdrawal role");
+        }
+        let steal = Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(delegated_authority.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: amount as u128,
+            }
+            .encode(),
+        };
+        send(&mut svm, &[&payer, &delegated_authority], steal)
+            .expect("delegated authority drains the controller donation");
+        assert_eq!(token_amount(&svm, &attacker_destination), amount);
+        panic!("controller accepted a donation while delegated role {delegated_kind} retained a drain path");
+    }
+
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_donation);
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_donation
+    );
+    assert_eq!(
+        svm.get_account(&controller_holding).unwrap(),
+        holding_before_donation
+    );
+    assert_eq!(
+        svm.get_account(&donor_source).unwrap(),
+        donor_before_donation,
+        "unsafe donation rejects before moving the donor's tokens"
+    );
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+}
+
+#[test]
+fn e2e_controller_donation_rejects_external_roles_with_a_drain_path() {
+    assert_controller_donation_rejects_delegated_role(0); // asset admin can seize operator later
+    assert_controller_donation_rejects_delegated_role(2); // operator can withdraw immediately
+}
+
 #[test]
 fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
     let mut svm =

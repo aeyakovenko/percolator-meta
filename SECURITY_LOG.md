@@ -12194,3 +12194,23 @@ FIX: the controller validates the exact pinned tag-40 activation wire before CPI
 `insurance_authority == insurance_operator`. Backing and oracle providers remain independently selectable, and
 non-activation lifecycle actions remain unchanged. This adds no signer, authority, destination, withdrawal path,
 or admin surface; it removes governance's ability to construct split custody in the first place.
+
+## Tick - delegated asset-0 roles could drain inbound controller donations (surface A/C)
+
+Percolator's market-authority handoff rewrites only asset-0 roles still equal to the outgoing market key.
+A permissionless creator could delegate the empty asset's cold admin or insurance operator, donate
+`marketauth` to the controller, and leave that external key intact. The controller's public
+`donate_insurance` path checked only that its PDA could top up; it did not prove that no surviving key could
+withdraw or rotate the operator after the donation. Its advertised inbound-only property was therefore false.
+
+A fresh controller + pinned-Percolator LiteSVM regression exercises both public variants. In the stronger
+variant, the creator delegates `asset_admin`, donates the market, an honest caller deposits `600,000`, the
+surviving admin rotates the operator to itself, and it withdraws all `600,000`. The sibling variant leaves an
+external operator through the handoff and can withdraw immediately. Both drains succeeded against the old SBF.
+The retained test requires each unsafe donation to reject before changing the slab, Percolator vault,
+controller holding account, or donor source, and pins the new admin offset to the exact Cargo-pinned profile.
+
+FIX: before moving donor tokens, `donate_insurance` now reads the pinned market and asset-0 profile and requires
+the controller PDA to be the current `marketauth`, insurance authority, insurance operator, and `asset_admin`.
+The canonical controller-owned donation and full genesis-to-reward chain remain live. No repair signer,
+withdrawal destination, role mutation, governance key, or reusable admin surface was added.

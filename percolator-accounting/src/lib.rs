@@ -24,6 +24,8 @@ pub const FREE_MARKET_SLOT_COUNT_OFFSET: usize = HEADER_LEN + 198;
 pub const INSURANCE_AUTHORITY_PROFILE_OFFSET: usize = 24;
 pub const INSURANCE_OPERATOR_PROFILE_OFFSET: usize = 56;
 pub const BACKING_AUTHORITY_PROFILE_OFFSET: usize = 88;
+// The cold admin is the final field after the oracle feed/price/timestamp arrays.
+pub const ASSET_ADMIN_PROFILE_OFFSET: usize = 368;
 
 const MAGIC: u64 = 0x5045_5243_5631_3600;
 const VERSION: u16 = 16;
@@ -238,6 +240,16 @@ pub fn read_asset_insurance_operator(
     bytes(
         data,
         asset_wrapper_offset(asset_index)? + INSURANCE_OPERATOR_PROFILE_OFFSET,
+    )
+}
+
+/// Returns the cold-storage admin recorded in one pinned-v16 asset profile.
+pub fn read_asset_admin(data: &[u8], asset_index: usize) -> Result<[u8; 32], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    bytes(
+        data,
+        asset_wrapper_offset(asset_index)? + ASSET_ADMIN_PROFILE_OFFSET,
     )
 }
 
