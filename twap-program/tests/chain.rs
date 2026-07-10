@@ -3999,34 +3999,55 @@ fn build_controller_proxy_message(
     m
 }
 
-fn build_controller_accept_market_authority_message(
+fn build_controller_accept_and_top_up_asset0_backing_message(
     governance: &Pubkey,
     controller: &Pubkey,
     market: &Pubkey,
+    provider_source: &Pubkey,
+    percolator_vault: &Pubkey,
     percolator_program: &Pubkey,
+    amount: u128,
 ) -> Vec<u8> {
     let mut m = Vec::new();
-    m.push(1); // governance is also the current market authority signer
+    m.push(1); // governance is the signer for both instructions
     m.push(0);
-    m.push(1); // market writable
-    m.push(5);
+    m.push(3); // market, provider source, and vault are writable
+    m.push(8);
     for key in [
         governance,
         market,
+        provider_source,
+        percolator_vault,
         controller,
+        &spl_token::ID,
         percolator_program,
         &controller_id(),
     ] {
         m.extend_from_slice(key.as_ref());
     }
-    m.push(1);
-    m.push(4); // market-controller program
+    m.push(2);
+
+    m.push(7); // market-controller program
     m.push(5);
-    for index in [0u8, 0, 2, 1, 3] {
+    for index in [0u8, 0, 4, 1, 6] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
     m.push(3); // IX_ACCEPT_MARKET_AUTHORITY
+
+    m.push(6); // Percolator program
+    m.push(5);
+    for index in [0u8, 1, 2, 3, 5] {
+        m.push(index);
+    }
+    let data = percolator_prog::ix::Instruction::TopUpBackingBucket {
+        domain: 0,
+        amount,
+        expiry_slot: 10_000,
+    }
+    .encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
     m.push(0);
     m
 }
@@ -30447,16 +30468,32 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         .unwrap();
     let env = setup_genesis(&mut svm, &payer);
     let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
-    let donate_market = build_controller_accept_market_authority_message(
+    let asset0_backing_amount = 7u64;
+    let asset0_provider_destination =
+        canonical_insurance_vault(&env.squads_vault, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &asset0_provider_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        asset0_backing_amount,
+    );
+    let donate_market = build_controller_accept_and_top_up_asset0_backing_message(
         &env.squads_vault,
         &controller,
         &env.slab,
+        &asset0_provider_destination,
+        &env.perc_vault,
         &perc_id(),
+        asset0_backing_amount as u128,
     );
-    let donate_remaining = vec![
+    let accept_and_back_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.slab, false),
+        AccountMeta::new(asset0_provider_destination, false),
+        AccountMeta::new(env.perc_vault, false),
         AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
@@ -30468,9 +30505,18 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &payer,
         2,
         &donate_market,
-        &donate_remaining,
+        &accept_and_back_remaining,
     )
-    .expect("Squads donates lifecycle authority to the constrained controller");
+    .expect("Squads donates lifecycle authority while preserving and funding asset-0 backing");
+    assert_eq!(token_amount(&svm, &asset0_provider_destination), 0);
+
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
 
     let backing_provider = Keypair::new();
     svm.airdrop(&backing_provider.pubkey(), 1_000_000_000)
@@ -31098,6 +31144,20 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
     assert_eq!(token_amount(&svm, &controller_transit), retained_protocol_insurance);
 
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker returns zero-value asset-admin custody after protocol insurance exits");
+
     let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
     let long_backing_ledger = Pubkey::new_unique();
     let short_backing_ledger = Pubkey::new_unique();
@@ -31114,6 +31174,34 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         )
         .unwrap();
     }
+    send(
+        &mut svm,
+        &[&payer],
+        subledger_return_resolved_asset0_backing_ix(
+            &env.pool,
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &asset0_provider_destination,
+            &controller_transit,
+            &env.perc_vault,
+            &perc_vault_authority(&env.slab, &perc_id()),
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+        ),
+    )
+    .expect("permissionless resolved cleanup returns the absent asset-0 provider's backing");
+    assert_eq!(
+        token_amount(&svm, &asset0_provider_destination),
+        asset0_backing_amount,
+        "asset-0 backing reaches only its recorded provider"
+    );
+    assert_eq!(
+        token_amount(&svm, &controller_transit),
+        retained_protocol_insurance,
+        "asset-0 backing cleanup cannot sweep retained protocol insurance"
+    );
     send(
         &mut svm,
         &[&payer],
