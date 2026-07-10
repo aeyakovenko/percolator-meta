@@ -254,6 +254,70 @@ fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
     env.send(&[init_pool_ix(&env, &pool, &real_vault, asset_id, 1)], &[]).expect("real SPL vault accepted");
 }
 
+// DoS PROBE: SPL Token preserves a non-native account's close authority when its owner changes.
+// A front-runner can therefore prepare an empty vault owned by the future pool PDA while retaining
+// a close authority, initialize the deterministic pool against it, and then close the vault. The
+// pool account remains initialized and every later deposit is permanently bound to a missing vault.
+#[test]
+fn init_pool_rejects_a_vault_with_an_external_close_authority() {
+    let mut env = Env::new();
+    let asset_id = 18;
+    let pool = pool_pda(&env.mint, asset_id);
+    let attacker = Keypair::new();
+    let prepared_vault = create_token_account(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &attacker.pubkey(),
+    );
+
+    let set_close = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &prepared_vault,
+        Some(&attacker.pubkey()),
+        spl_token::instruction::AuthorityType::CloseAccount,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    env.send(&[set_close], &[&attacker]).expect("set close authority");
+
+    let set_owner = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &prepared_vault,
+        Some(&pool),
+        spl_token::instruction::AuthorityType::AccountOwner,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    env.send(&[set_owner], &[&attacker]).expect("transfer token ownership to pool PDA");
+
+    let prepared = spl_token::state::Account::unpack(
+        &env.svm.get_account(&prepared_vault).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(prepared.owner, pool);
+    assert_eq!(prepared.close_authority, COption::Some(attacker.pubkey()));
+
+    assert!(
+        env.send(
+            &[init_pool_ix(&env, &pool, &prepared_vault, asset_id, 1)],
+            &[],
+        )
+        .is_err(),
+        "init_pool must reject a vault an external authority can close"
+    );
+
+    let honest_vault =
+        create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(
+        &[init_pool_ix(&env, &pool, &honest_vault, asset_id, 1)],
+        &[],
+    )
+    .expect("rejected attack must leave the canonical pool available");
+}
+
 // SOURCE-OF-TRUTH OFFSET CANARY (sweep): genesis-vote + residual-distributor read the subledger Position
 // (principal=vote weight, start_slot=tenure, shares=rd share-value points) and Pool (outstanding=quorum
 // denominator) by HARDCODED byte offsets, cross-pinned in their offsets.rs to the subledger's EXPORTED consts
