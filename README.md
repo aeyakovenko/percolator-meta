@@ -95,7 +95,8 @@ underlying principal, shares, or Percolator balances.
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. The DAO may configure future epochs but cannot mutate a live epoch,
 redirect a user's claim, or sweep principal. After a sink epoch freezes, later rounds burn that stale
-sink share rather than writing outside the snapshot.
+sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
+also falls back to burn instead of stalling settlement.
 
 ## Authority Model
 

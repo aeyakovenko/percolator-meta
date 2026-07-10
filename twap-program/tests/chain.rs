@@ -1042,6 +1042,330 @@ fn set_economics_rejects_a_savings_sink_with_external_close_authority() {
     assert!(svm.get_account(&savings_sink).map_or(true, |a| a.lamports == 0));
 }
 
+// EXTERNAL CLOSE-AUTHORITY DOS (book creation): SEND mode persists one bought-COIN destination. A sink
+// owned by the Squads vault can still retain a separate attacker close key across SPL owner rotation. If
+// init accepts it, the attacker closes the empty account after the timelock and every settle reverts.
+#[test]
+fn init_book_rejects_a_coin_sink_with_external_close_authority() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let coin_sink = create_token_with_external_close_authority(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.squads_vault,
+        &attacker,
+    );
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &coin_escrow,
+        &env.coin_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &settlement_usd,
+        &env.collateral_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+    let message = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        0,
+        1,
+        10,
+        1,
+        0,
+        Some(&coin_sink),
+    );
+    let remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(coin_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &message,
+            &remaining,
+        )
+        .is_err(),
+        "init_book must reject a bought-COIN sink an external signer can close"
+    );
+    assert!(
+        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
+        "rejected sink cannot consume the singleton book PDA"
+    );
+
+    let close_sink = spl_token::instruction::close_account(
+        &spl_token::ID,
+        &coin_sink,
+        &attacker.pubkey(),
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &[&attacker], close_sink).expect("the retained external close path is live");
+}
+
+// EXTERNAL CLOSE-AUTHORITY DOS (sink rotation): the post-init setter is a separate persisted-account
+// entry point and must enforce the same invariant as SEND-mode book creation.
+#[test]
+fn set_coin_sink_rejects_an_external_close_authority() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let book = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0).book;
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let coin_sink = create_token_with_external_close_authority(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.squads_vault,
+        &attacker,
+    );
+    let message = build_set_coin_sink_send_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book,
+        &coin_sink,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(coin_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            6,
+            &message,
+            &remaining,
+        )
+        .is_err(),
+        "set_coin_sink must reject a bought-COIN sink an external signer can close"
+    );
+
+    let close_sink = spl_token::instruction::close_account(
+        &spl_token::ID,
+        &coin_sink,
+        &attacker.pubkey(),
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &[&attacker], close_sink).expect("the retained external close path is live");
+
+    let safe_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &safe_sink,
+        &env.coin_mint,
+        &env.squads_vault,
+        0,
+    );
+    let message = build_set_coin_sink_send_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book,
+        &safe_sink,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(safe_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &message,
+        &remaining,
+    )
+    .expect("a sink without an external authority remains configurable");
+}
+
+// PUBLIC SINK-CLOSURE DOS: an intentionally external recipient controls its own token account and can close
+// it even when no separate close authority was configured. The exact configured key must still be supplied,
+// but an invalid/closed account cannot be allowed to revert every settle forever. Its share deterministically
+// falls back to burn, matching the existing post-cutoff behavior and preserving all bidder/insurance accounting.
+#[test]
+fn e2e_closed_coin_sink_falls_back_to_burn_without_stalling_the_round() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let sink_owner = Keypair::new();
+    svm.airdrop(&sink_owner.pubkey(), 1_000_000_000).unwrap();
+    let coin_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &coin_sink,
+        &env.coin_mint,
+        &sink_owner.pubkey(),
+        0,
+    );
+    let book = setup_auction(&mut svm, &payer, &env, 10, 1, Some(coin_sink), 0);
+
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &coin_sink, 0, 10_000);
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(coin_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &economics,
+        &remaining,
+    )
+    .expect("DAO configures retain-all buyback to the live external sink");
+
+    let close_sink = spl_token::instruction::close_account(
+        &spl_token::ID,
+        &coin_sink,
+        &sink_owner.pubkey(),
+        &sink_owner.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &[&sink_owner], close_sink).expect("external sink owner closes its empty account");
+
+    let (bidder, bidder_coin, bidder_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &bidder_coin,
+            &bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            400_000,
+            400_000,
+            None,
+        ),
+    )
+    .expect("bid remains permissionless after the configured sink closes");
+    warp_to(&mut svm, 111);
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            Some(coin_sink),
+        ),
+    )
+    .expect("closed exact-key sink falls back to burn instead of stalling execute");
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        400_000,
+        "the entire bought-COIN amount is burned when its configured sink is unavailable"
+    );
+    assert_eq!(
+        token_amount(&svm, &book.settlement_usd),
+        400_000,
+        "winner settlement remains fully funded"
+    );
+}
+
 // ISSUE #42 REGRESSION: the Squads-gated setters must reject token-shaped accounts that are not actually
 // owned by SPL Token. Account::unpack only validates bytes; without an owner check a valid DAO transaction
 // can bind a system-owned fake sink and later brick execution when SPL Token receives it as a destination.
@@ -3076,6 +3400,66 @@ fn set_token(svm: &mut LiteSVM, key: &Pubkey, mint: &Pubkey, owner: &Pubkey, amo
     )
     .unwrap();
 }
+
+fn create_token_with_external_close_authority(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    final_owner: &Pubkey,
+    attacker: &Keypair,
+) -> Pubkey {
+    let account = Keypair::new();
+    let key = account.pubkey();
+    let instructions = [
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &key,
+            svm.minimum_balance_for_rent_exemption(spl_token::state::Account::LEN),
+            spl_token::state::Account::LEN as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_account(
+            &spl_token::ID,
+            &key,
+            mint,
+            &attacker.pubkey(),
+        )
+        .unwrap(),
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &key,
+            Some(&attacker.pubkey()),
+            spl_token::instruction::AuthorityType::CloseAccount,
+            &attacker.pubkey(),
+            &[],
+        )
+        .unwrap(),
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &key,
+            Some(final_owner),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            &attacker.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    ];
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&payer.pubkey()),
+        &[payer, &account, attacker],
+        bh,
+    ))
+    .expect("create token account retaining an external close authority");
+    let state = spl_token::state::Account::unpack(&svm.get_account(&key).unwrap().data).unwrap();
+    assert_eq!(state.owner, *final_owner);
+    assert_eq!(state.mint, *mint);
+    assert_eq!(state.amount, 0);
+    assert_eq!(state.close_authority, COption::Some(attacker.pubkey()));
+    key
+}
+
 fn token_amount(svm: &LiteSVM, key: &Pubkey) -> u64 {
     let a = svm.get_account(key).unwrap();
     u64::from_le_bytes(a.data[64..72].try_into().unwrap())
