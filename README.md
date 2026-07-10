@@ -26,12 +26,13 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 - **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
   `marketauth` and can sign only a fixed allow-list of lifecycle, oracle, and fee-policy calls. Its
   generic proxy rejects live deposits, withdrawals, swaps, portfolio operations, and every
-  authority mutation. After an asset's shutdown matures, a separate permissionless path can return
-  principal and earnings only to that asset's recorded backing provider. Raw `CloseSlab` is
-  excluded; a fixed atomic cleanup runs only after Percolator proves all attributed balances and
-  portfolios are zero, then forwards terminal vault dust and account rent to Squads. Donating a
-  creator-owned market preserves that creator when it is already the recorded asset-0 backing
-  provider; the handoff cannot collapse its backing into the controller or select another provider.
+  authority mutation. After a secondary asset's shutdown matures, a permissionless path can return
+  principal and earnings only to that asset's recorded backing provider. Asset 0 instead has a
+  fixed whole-market resolution path that derives and atomically returns both backing domains after
+  Percolator proves the market empty. Raw `CloseSlab` is excluded; a fixed terminal cleanup forwards
+  only vault dust and account rent to Squads. Donating a creator-owned market preserves that creator
+  when it is already the recorded asset-0 backing provider; the handoff cannot collapse its backing
+  into the controller or select another provider.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
@@ -44,9 +45,9 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 
 | Crate | Responsibility |
 |---|---|
-| `percolator-accounting/` | Shared read-only parser for asset-local insurance and the recorded backing authority in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
-| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; a fixed permissionless shutdown path can return backing only to the recorded provider. |
-| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; shares track tenure and live capital for rewards. Only a principal-policy pool can hand custody to TWAP; with-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
+| `percolator-accounting/` | Shared read-only parser for asset-local insurance, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
+| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns backing only to the recorded provider. |
+| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; shares track tenure and live capital for rewards. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. It reads principal-bearing accounts but cannot debit them. |
@@ -135,6 +136,13 @@ and principal through the controller. The destination is the recorded provider's
 account, not a DAO-selected account; earnings are paid first and the temporary controller account
 is forwarded and closed atomically. This must run before market resolution, because Percolator's
 shutdown override deliberately ends in resolved mode.
+
+Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
+reads both domains' complete principal and earnings from the pinned slab, atomically transfers the
+backing role to the controller, and returns the full value to the outgoing provider's canonical
+account. Before genesis custody moves, the controller is the constrained asset admin; after TWAP,
+custody first returns to the canonical pool, whose only backing action is invoking this same fixed
+cleanup. A failed domain CPI rolls back every earlier transfer and the authority change.
 
 At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved
