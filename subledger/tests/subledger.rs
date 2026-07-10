@@ -947,6 +947,72 @@ fn non_owner_cannot_withdraw_another_position() {
     assert_eq!(env.token_amount(&attacker_ata), 0);
 }
 
+// OWNER-SIGNED PAYOUT REDIRECT: checking the position signer is not enough when
+// the pool PDA signs the SPL transfer. A malicious transaction builder can retain
+// the real owner's signature but substitute an attacker-owned destination unless
+// the program binds the payout token account back to that owner.
+#[test]
+fn owner_signed_withdraw_cannot_redirect_to_a_foreign_token_account() {
+    let mut env = Env::new();
+    let asset_id = 4_004;
+    let amount = 60u64;
+    let pool = pool_pda(&env.mint, asset_id, 0);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[])
+        .unwrap();
+
+    let (victim, victim_ata) = new_depositor(&mut env, amount);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            amount,
+        )],
+        &[&victim],
+    )
+    .unwrap();
+    let (_attacker, attacker_ata) = new_depositor(&mut env, 0);
+    let position = position_pda(&pool, &victim.pubkey());
+    let pool_before = env.svm.get_account(&pool).unwrap();
+    let position_before = env.svm.get_account(&position).unwrap();
+    let vault_before = env.svm.get_account(&vault).unwrap();
+
+    assert!(
+        env.send(
+            &[withdraw_ix(
+                &pool,
+                &victim.pubkey(),
+                &attacker_ata,
+                &vault,
+            )],
+            &[&victim],
+        )
+        .is_err(),
+        "a valid owner signature must not authorize payout to an attacker-owned account"
+    );
+    assert_eq!(env.svm.get_account(&pool).unwrap(), pool_before);
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_before);
+    assert_eq!(env.svm.get_account(&vault).unwrap(), vault_before);
+    assert_eq!(env.token_amount(&victim_ata), 0);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+
+    env.send(
+        &[withdraw_ix(
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+        )],
+        &[&victim],
+    )
+    .expect("owner still exits to their own token account after the rejected redirect");
+    assert_eq!(env.token_amount(&victim_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+}
+
 // Anti-theft boundary: init_pool must reject a vault that is NOT owned by the pool
 // PDA. If it accepted an attacker-owned vault, the attacker could stand up a pool,
 // lure a victim's deposit (tag 1 transfers owner -> pool.vault), and then drain the

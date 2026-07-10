@@ -3963,6 +3963,61 @@ fn a_non_owner_cannot_withdraw_a_victims_insurance_principal() {
     assert_eq!(env.token_amount(&victim_ata), amount, "owner recovers their full principal");
 }
 
+// OWNER-SIGNED PAYOUT REDIRECT: insurance_withdraw correctly binds the signer to
+// the position, but the pool PDA signs both downstream transfers. The destination
+// must also belong to that owner or a malicious transaction builder can preserve
+// the victim's signature while replacing only the payout account.
+#[test]
+fn owner_signed_insurance_withdraw_cannot_redirect_or_self_alias_the_payout() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let amount = 1_000_000u64;
+    let (victim, victim_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &holding, amount)
+        .expect("victim deposit");
+    let (_attacker, attacker_ata) = new_depositor(&mut env, 0);
+    let position = env.position_pda(&victim.pubkey());
+
+    let pool_before = env.svm.get_account(&env.pool).unwrap();
+    let position_before = env.svm.get_account(&position).unwrap();
+    let slab_before = env.svm.get_account(&env.slab).unwrap();
+    let vault_before = env.svm.get_account(&env.perc_vault).unwrap();
+    let holding_before = env.svm.get_account(&holding).unwrap();
+    assert!(
+        env.insurance_withdraw(&victim, &attacker_ata, &holding, &victim, amount)
+            .is_err(),
+        "a valid owner signature must not authorize insurance payout to an attacker"
+    );
+    assert_eq!(env.svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_before);
+    assert_eq!(env.svm.get_account(&env.slab).unwrap(), slab_before);
+    assert_eq!(env.svm.get_account(&env.perc_vault).unwrap(), vault_before);
+    assert_eq!(env.svm.get_account(&holding).unwrap(), holding_before);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+
+    // SPL Token accepts a fully-authorized self-transfer as a no-op. Naming the
+    // pool holding as both source and payout must not consume the position while
+    // leaving its withdrawn principal stranded in that shared account.
+    assert!(
+        env.insurance_withdraw(&victim, &holding, &holding, &victim, amount)
+            .is_err(),
+        "holding-to-itself payout must reject before principal accounting changes"
+    );
+    assert_eq!(env.svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_before);
+    assert_eq!(env.svm.get_account(&env.slab).unwrap(), slab_before);
+    assert_eq!(env.svm.get_account(&env.perc_vault).unwrap(), vault_before);
+    assert_eq!(env.svm.get_account(&holding).unwrap(), holding_before);
+
+    env.insurance_withdraw(&victim, &victim_ata, &holding, &victim, amount)
+        .expect("victim still exits to their own token account");
+    assert_eq!(env.token_amount(&victim_ata), amount);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+    assert_eq!(env.token_amount(&holding), 0);
+}
+
 // Type-confusion boundary: the own-vault deposit path (tag 1) must REJECT an
 // insurance pool. An insurance pool's `vault` is the percolator insurance vault,
 // owned by the percolator vault_authority — not this pool PDA. Without the guard,

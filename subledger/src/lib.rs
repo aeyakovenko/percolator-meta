@@ -795,6 +795,24 @@ fn token_balance(account: &AccountInfo) -> Result<u64, ProgramError> {
     Ok(spl_token::state::Account::unpack(&account.try_borrow_data()?)?.amount)
 }
 
+fn validate_owner_token_destination(
+    account: &AccountInfo,
+    expected_owner: &Pubkey,
+    expected_mint: &Pubkey,
+) -> ProgramResult {
+    if account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let token = spl_token::state::Account::unpack(&account.try_borrow_data()?)?;
+    if token.state != spl_token::state::AccountState::Initialized
+        || token.owner != *expected_owner
+        || token.mint != *expected_mint
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 // init_pool accounts: [payer(s,w), mint, pool(w,pda), vault(token acct, authority=pool pda),
 //                      system_program]
 // data: asset_id (u64), policy (u8)
@@ -1130,6 +1148,7 @@ fn process_withdraw(
     if pool.outstanding_principal == 0 || position.principal > pool.outstanding_principal {
         return Err(ProgramError::InvalidAccountData);
     }
+    validate_owner_token_destination(owner_ata, owner.key, &pool.mint)?;
 
     let balance = token_balance(vault)?;
     // POLICY_WITH_SURPLUS redeems the position's SHARES at the live balance (tenure-fair, finding HT):
@@ -1702,6 +1721,7 @@ fn process_insurance_withdraw(
     if position.owner != *owner.key || position.pool != *pool_account.key {
         return Err(ProgramError::IllegalOwner);
     }
+    validate_owner_token_destination(owner_ata, owner.key, &pool.mint)?;
     if position.withdrawn {
         return Err(ProgramError::InvalidAccountData);
     }
