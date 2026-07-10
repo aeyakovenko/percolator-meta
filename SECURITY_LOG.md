@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - public terminal cleanup could erase frozen reward claims (surface C/D)
+
+Percolator intentionally excludes monotonic reward telemetry from its empty-portfolio predicate.
+That permits terminal dematerialization after every collateral, PnL, position, and receipt exits,
+but the residual distributor still needs the same portfolio account to live-cap LP and trader
+claims. The controller's new permissionless empty-portfolio wrapper therefore let any caller close
+an otherwise empty reward-bearing portfolio after crystallization/freeze and before claim. Closing
+returned rent to the slab and erased the only authenticated claim witness, permanently locking that
+backer's COIN allocation in the reward vault.
+
+A fresh LiteSVM regression initializes the real pinned Percolator and residual-distributor binaries,
+opens a real trade, moves the oracle, permissionlessly settles a real loss, and crystallizes/freezes
+the resulting trader points. It then hands the market to the real controller, resolves it, and pays
+the trader through public `CloseResolved`, leaving an economically empty portfolio with its organic
+loss counter intact. Against the old controller binary, an unaffiliated tag-11 cleanup succeeds and
+the regression fails because the portfolio disappears before claim.
+
+FIX: the shared pinned-layout reader identifies LP received value, unspent crystallized trader loss,
+or paid-funding history before the controller CPI. Counter-free empty portfolios remain publicly
+cleanable. A reward-bearing portfolio additionally requires the controller's existing governance
+account to sign; Percolator still independently proves resolved mode and complete economic emptiness,
+and rent still has only the slab as destination. The regression proves the public attempt is
+byte-atomic, the trader claims the full organic allocation, and governance can then retire the
+consumed witness. The original abandoned counter-free portfolio lifecycle remains green.
+
 ## Tick - resolved owner principal depended on a surviving DAO (surface A/C)
 
 After the genesis pool handed asset-0 custody to TWAP, subledger exits correctly remained closed

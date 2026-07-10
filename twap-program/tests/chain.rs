@@ -29661,10 +29661,15 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         });
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let admin = Keypair::new();
     svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
     svm.set_sysvar(&Clock {
         slot: 100,
         unix_timestamp: 100,
@@ -30057,6 +30062,100 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         bh,
     ))
     .expect("freeze");
+
+    // A portfolio's historical loss counters are the trader claim's live-cap
+    // witness. Hand the market to the real controller, resolve it, and fully pay
+    // the trader so its Percolator account is otherwise safe to dematerialize.
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&admin],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates the live market to the fixed controller");
+    let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves through the controller");
+
+    let loser_collateral = canonical_insurance_vault(&loser.pubkey(), &collateral);
+    set_token(
+        &mut svm,
+        &loser_collateral,
+        &collateral,
+        &loser.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(loser.pubkey(), false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(loser_pf, false),
+                AccountMeta::new(loser_collateral, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+        ),
+    )
+    .expect("public resolved close pays and empties the reward-bearing trader");
+    assert!(
+        read_portfolio_crystallized(&svm, &loser_pf) > 0,
+        "terminal payout preserves the monotonic reward witness"
+    );
+
+    let public_cleanup = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(loser_pf, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![11u8], // IX_CLOSE_RESOLVED_PORTFOLIO
+    };
+    let market_before_public_cleanup = svm.get_account(&market).unwrap();
+    let portfolio_before_public_cleanup = svm.get_account(&loser_pf).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], public_cleanup).is_err(),
+        "an unaffiliated cleanup cannot erase a frozen reward claim witness"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_public_cleanup);
+    assert_eq!(
+        svm.get_account(&loser_pf).unwrap(),
+        portfolio_before_public_cleanup
+    );
+
     let loser_coin = Pubkey::new_unique();
     set_token(&mut svm, &loser_coin, &coin_mint, &loser.pubkey(), 0);
     svm.expire_blockhash();
@@ -30085,6 +30184,30 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         token_amount(&svm, &loser_coin),
         supply,
         "trader cohort earns the organically-settled residual loss"
+    );
+
+    // Terminal governance can remove the now-consumed witness. Percolator still
+    // enforces that no collateral, PnL, position, or receipt remains.
+    send(
+        &mut svm,
+        &[&governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(loser_pf, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![11u8],
+        },
+    )
+    .expect("governance retires the consumed reward witness");
+    assert!(
+        svm.get_account(&loser_pf)
+            .map_or(true, |account| account.lamports == 0),
+        "claimed portfolio is dematerialized"
     );
 }
 

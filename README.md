@@ -36,9 +36,11 @@ capital's own tenure.
   Percolator proves the market empty. Controller-owned protocol insurance is recovered only to the
   canonical controller account after resolution and stays there until terminal close. Raw
   `CloseSlab` is excluded; a fixed terminal cleanup forwards that protocol insurance, vault dust,
-  and account rent to Squads. Before that close, anyone can ask the controller to deregister an
-  abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
-  portfolio and returns its rent only to the slab. Donating a creator-owned market preserves funded
+  and account rent to Squads. Before that close, anyone can ask the controller to deregister a
+  counter-free abandoned portfolio, but pinned Percolator accepts only a resolved market and an
+  actually empty portfolio and returns its rent only to the slab. A portfolio with monotonic
+  LP/trader/funding reward counters remains available as a claim witness until the existing
+  governance signer coordinates its retirement. Donating a creator-owned market preserves funded
   outgoing asset-0 insurance roles and the recorded backing provider; the handoff cannot collapse
   that capital into the controller or select another provider. Donation is accepted only when every
   secondary slot is fully retired because Percolator does not migrate secondary `asset_admin` roles with `marketauth`;
@@ -168,9 +170,12 @@ insurance authority and operator must be one key so deposit and withdrawal custo
 
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
 cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
-fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Percolator rejects live or
-nonempty portfolios and sends the closed account's lamports only into the bound market slab. The
-wrapper accepts no amount, token account, or destination and exposes no generic portfolio authority.
+fixed portfolio cleanup when its reward counters are empty. It signs only pinned Percolator
+`ClosePortfolio`; Percolator rejects live or nonempty portfolios and sends the closed account's
+lamports only into the bound market slab. Monotonic LP/trader/funding counters are the residual
+distributor's pre-claim witness, so erasing a portfolio carrying them also requires the existing
+governance signer. The wrapper accepts no amount, token account, or destination and exposes no
+generic portfolio authority.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one
 remaining atom. After Squads shuts the asset down and Percolator's delay and empty-state checks pass,

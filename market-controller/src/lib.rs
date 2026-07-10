@@ -1384,9 +1384,12 @@ fn process_return_resolved_asset0_backing<'a>(
 // [governance, controller_pda, market(w), portfolio(w), percolator_program]
 //
 // Anyone can ask the controller to exercise Percolator's terminal marketauth
-// override. Percolator itself requires a resolved market and a genuinely empty
-// portfolio, deregisters the materialized account, and returns only its rent to
-// the market slab. There is no caller-selected amount or destination.
+// override for a counter-free portfolio. Percolator itself requires a resolved
+// market and a genuinely empty portfolio, deregisters the materialized account,
+// and returns only its rent to the market slab. A portfolio carrying monotonic
+// reward counters remains the live-cap witness for LP/trader claims, so deleting
+// it additionally requires the existing governance signer. There is no
+// caller-selected amount or destination.
 fn process_close_resolved_portfolio<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1403,6 +1406,13 @@ fn process_close_resolved_portfolio<'a>(
     let percolator_program = next_account_info(iter)?;
     if iter.next().is_some() || !market.is_writable || !portfolio.is_writable {
         return Err(ProgramError::InvalidInstructionData);
+    }
+    let has_reward_witness = percolator_accounting::portfolio_has_reward_claim_witness(
+        &portfolio.try_borrow_data()?,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?;
+    if has_reward_witness && !governance.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
     }
     let bump = controller_bump(
         program_id,

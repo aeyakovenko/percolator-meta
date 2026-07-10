@@ -3,7 +3,7 @@
 use core::mem::{offset_of, size_of};
 use percolator::{
     BackingBucketV16Account, EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount,
-    V16ConfigAccount, BOUND_SCALE,
+    PortfolioAccountV16Account, V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -30,6 +30,7 @@ pub const ASSET_ADMIN_PROFILE_OFFSET: usize = 368;
 const MAGIC: u64 = 0x5045_5243_5631_3600;
 const VERSION: u16 = 16;
 const KIND_MARKET: u8 = 1;
+const KIND_PORTFOLIO: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadError {
@@ -72,6 +73,16 @@ fn validate_market(data: &[u8]) -> Result<(), ReadError> {
     if read_u64(data, 0)? != MAGIC
         || read_u16(data, 8)? != VERSION
         || data.get(10).copied() != Some(KIND_MARKET)
+    {
+        return Err(ReadError::InvalidHeader);
+    }
+    Ok(())
+}
+
+fn validate_portfolio(data: &[u8]) -> Result<(), ReadError> {
+    if read_u64(data, 0)? != MAGIC
+        || read_u16(data, 8)? != VERSION
+        || data.get(10).copied() != Some(KIND_PORTFOLIO)
     {
         return Err(ReadError::InvalidHeader);
     }
@@ -167,6 +178,49 @@ pub fn market_is_resolved_and_empty(data: &[u8]) -> Result<bool, ReadError> {
         header + offset_of!(MarketGroupV16HeaderAccount, materialized_portfolio_count),
     )?;
     Ok(mode == 1 && c_tot == 0 && portfolios == 0)
+}
+
+/// Returns true when closing this portfolio would erase a live witness used by a
+/// residual-distributor claim. These counters are historical telemetry rather than
+/// solvency state, so Percolator intentionally permits dematerialization with them
+/// nonzero. A permissionless wrapper must preserve the account until governance has
+/// coordinated reward settlement.
+pub fn portfolio_has_reward_claim_witness(data: &[u8]) -> Result<bool, ReadError> {
+    validate_portfolio(data)?;
+    let base = HEADER_LEN;
+    let crystallized = read_u128(
+        data,
+        base + offset_of!(
+            PortfolioAccountV16Account,
+            residual_crystallized_loss_atoms_total
+        ),
+    )?;
+    let spent = read_u128(
+        data,
+        base + offset_of!(
+            PortfolioAccountV16Account,
+            residual_spent_principal_atoms_total
+        ),
+    )?;
+    let received = read_u128(
+        data,
+        base + offset_of!(
+            PortfolioAccountV16Account,
+            residual_received_atoms_total
+        ),
+    )?;
+    let funding_long_paid = read_u128(
+        data,
+        base + offset_of!(PortfolioAccountV16Account, funding_long_paid_atoms_total),
+    )?;
+    let funding_short_paid = read_u128(
+        data,
+        base + offset_of!(PortfolioAccountV16Account, funding_short_paid_atoms_total),
+    )?;
+    Ok(received != 0
+        || crystallized.saturating_sub(spent) != 0
+        || funding_long_paid != 0
+        || funding_short_paid != 0)
 }
 
 /// Returns the withdrawable principal and provider earnings for both domains of one
