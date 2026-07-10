@@ -1275,11 +1275,12 @@ fn process_insurance_withdraw(
     let shares_to_burn = if position.principal == 0 {
         0u128
     } else {
-        position
-            .shares
-            .checked_mul(amount as u128)
-            .and_then(|v| v.checked_div(position.principal as u128))
-            .ok_or(ProgramError::ArithmeticOverflow)?
+        wide_mul_div_floor(
+            position.shares,
+            amount as u128,
+            position.principal as u128,
+        )
+        .ok_or(ProgramError::ArithmeticOverflow)?
     };
     let owed = if pool.policy == POLICY_WITH_SURPLUS {
         redeem_shares(shares_to_burn, insurance, pool.total_shares)?
