@@ -47,6 +47,10 @@ const PROPOSAL_DISC: [u8; 8] = *b"GVPROPV1";
 const CONFIG_SIZE: usize = 264; // total_cast_weight widened u64->u128 (GG fix)
 const BALLOT_SIZE: usize = 120; // voted_weight widened u64->u128 (GG fix)
 const PROPOSAL_SIZE: usize = 112; // support_weight widened u64->u128 (GG fix)
+const LEGACY_CONFIG_SIZE_U64: usize = 232;
+const LEGACY_CONFIG_SIZE_U128: usize = 240;
+const LEGACY_CONFIG_SIZE_BOOTSTRAP_END: usize = 248;
+const LEGACY_BALLOT_SIZE_U64: usize = 112;
 const DEFAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 38_880_000;
 const DEFAULT_BOOTSTRAP_START_SLOT: u64 = 0;
 
@@ -579,6 +583,138 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     Ok(())
 }
 
+// Historical configs remain deliberately inert: they cannot accept new backing or
+// trigger a distribution under the current binary. Retraction is the sole exception
+// because the config PDA is also a subledger vote-lock authority; rejecting its old
+// layout would permanently freeze the owner's principal after an upgrade.
+fn retract_legacy_vote<'a>(
+    program_id: &Pubkey,
+    voter: &AccountInfo<'a>,
+    config_account: &AccountInfo<'a>,
+    ballot_account: &AccountInfo<'a>,
+    proposal_account: &AccountInfo<'a>,
+    sub_position: &AccountInfo<'a>,
+    sub_pool: &AccountInfo<'a>,
+    subledger_program: &AccountInfo<'a>,
+) -> ProgramResult {
+    let (coin_mint, configured_subledger, configured_pool, bump, coin_only, ballot_size, contribution_end) = {
+        let d = config_account.try_borrow_data()?;
+        let (bump_offset, ballot_size, contribution_end) = match d.len() {
+            LEGACY_CONFIG_SIZE_U64 => (224, LEGACY_BALLOT_SIZE_U64, 88),
+            LEGACY_CONFIG_SIZE_U128 | LEGACY_CONFIG_SIZE_BOOTSTRAP_END => {
+                (232, BALLOT_SIZE, 96)
+            }
+            _ => return Err(ProgramError::InvalidAccountData),
+        };
+        if d[..8] != CONFIG_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let coin_mint = Pubkey::new_from_array(d[8..40].try_into().unwrap());
+        let configured_subledger = Pubkey::new_from_array(d[104..136].try_into().unwrap());
+        let configured_pool = Pubkey::new_from_array(d[136..168].try_into().unwrap());
+        let bump = d[bump_offset];
+        let (pool_key, pool_bump) = Pubkey::find_program_address(
+            &[b"gv_config", coin_mint.as_ref(), configured_pool.as_ref()],
+            program_id,
+        );
+        let pool_match = *config_account.key == pool_key && bump == pool_bump;
+
+        // The 232-byte generation spans the one historical PDA transition: early
+        // configs were keyed by COIN only, then a75b0ab bound the subledger pool.
+        let coin_only = if d.len() == LEGACY_CONFIG_SIZE_U64 {
+            let (coin_key, coin_bump) =
+                Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref()], program_id);
+            match (*config_account.key == coin_key && bump == coin_bump, pool_match) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => return Err(ProgramError::InvalidSeeds),
+            }
+        } else if pool_match {
+            false
+        } else {
+            return Err(ProgramError::InvalidSeeds);
+        };
+        (coin_mint, configured_subledger, configured_pool, bump, coin_only, ballot_size, contribution_end)
+    };
+
+    if ballot_account.owner != program_id
+        || sub_position.owner != &configured_subledger
+        || sub_pool.owner != &configured_subledger
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *sub_pool.key != configured_pool
+        || *subledger_program.key != configured_subledger
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let (expected_sub_position, _) = Pubkey::find_program_address(
+        &sub_position_seeds(sub_pool.key, voter.key),
+        &configured_subledger,
+    );
+    if *sub_position.key != expected_sub_position {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
+
+    let (expected_ballot, _) =
+        Pubkey::find_program_address(&ballot_seeds(config_account.key, voter.key), program_id);
+    if *ballot_account.key != expected_ballot {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let voted_proposal = {
+        let ballot = ballot_account.try_borrow_data()?;
+        if ballot.len() != ballot_size || ballot[..8] != BALLOT_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if Pubkey::new_from_array(ballot[8..40].try_into().unwrap()) != *voter.key {
+            return Err(ProgramError::IllegalOwner);
+        }
+        Pubkey::new_from_array(ballot[40..72].try_into().unwrap())
+    };
+    if voted_proposal == Pubkey::default() || voted_proposal != *proposal_account.key {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let unlock_ix = Instruction {
+        program_id: configured_subledger,
+        accounts: vec![
+            AccountMeta::new_readonly(*config_account.key, true),
+            AccountMeta::new_readonly(*sub_pool.key, false),
+            AccountMeta::new(*sub_position.key, false),
+            AccountMeta::new_readonly(*voter.key, true),
+        ],
+        data: vec![SUB_IX_SET_VOTE_LOCK, 0],
+    };
+    let cpi_accounts = [
+        config_account.clone(),
+        sub_pool.clone(),
+        sub_position.clone(),
+        voter.clone(),
+        subledger_program.clone(),
+    ];
+    let bump_arr = [bump];
+    if coin_only {
+        let seeds: [&[u8]; 3] = [b"gv_config", coin_mint.as_ref(), &bump_arr];
+        invoke_signed(&unlock_ix, &cpi_accounts, &[&seeds])?;
+    } else {
+        let seeds: [&[u8]; 4] = [
+            b"gv_config",
+            coin_mint.as_ref(),
+            configured_pool.as_ref(),
+            &bump_arr,
+        ];
+        invoke_signed(&unlock_ix, &cpi_accounts, &[&seeds])?;
+    }
+
+    // Do not reinterpret or rewrite old global tallies. No current instruction can
+    // use those generations for voting/triggering, while clearing this owner-bound
+    // ballot makes the one recovery action non-replayable.
+    ballot_account.try_borrow_mut_data()?[40..contribution_end].fill(0);
+    Ok(())
+}
+
 // vote accounts: [voter(s,w), config(w), ballot(w,pda), proposal_vote(w),
 //   sub_position(w), sub_pool(ro), system_program, subledger_program]
 // data: action(u8) — 1 back, 2 retract
@@ -614,6 +750,25 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     }
     if config_account.owner != program_id || proposal_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
+    }
+    if action == VOTE_RETRACT
+        && matches!(
+            config_account.data_len(),
+            LEGACY_CONFIG_SIZE_U64
+                | LEGACY_CONFIG_SIZE_U128
+                | LEGACY_CONFIG_SIZE_BOOTSTRAP_END
+        )
+    {
+        return retract_legacy_vote(
+            program_id,
+            voter,
+            config_account,
+            ballot_account,
+            proposal_account,
+            sub_position,
+            sub_pool,
+            subledger_program,
+        );
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     let mut pv = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
