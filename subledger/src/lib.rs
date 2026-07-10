@@ -155,6 +155,9 @@ const IX_HANDOFF_TO_TWAP: u8 = 8;
 const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 9;
 // Read-only CPI attestation for TWAP's terminal protocol-insurance recovery.
 const IX_ASSERT_NO_PRINCIPAL: u8 = 10;
+// Read-only CPI attestation for a permissionless resolved custody return. Keeping
+// this check in the subledger supports every pool layout without duplicating it in TWAP.
+const IX_ASSERT_PRINCIPAL: u8 = 11;
 
 // Percolator CPI tags (verified against the pinned v16 program, percolator-prog 624b13d).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -778,6 +781,7 @@ pub fn process_instruction(
             process_return_resolved_asset0_backing(program_id, accounts, &mut data)
         }
         IX_ASSERT_NO_PRINCIPAL => process_assert_no_principal(program_id, accounts, &mut data),
+        IX_ASSERT_PRINCIPAL => process_assert_principal(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -2211,6 +2215,40 @@ fn process_assert_no_principal(
         || pool.policy != POLICY_PRINCIPAL
         || pool.outstanding_principal != 0
         || pool.total_shares != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+// assert_principal accounts: [pool]
+// data: none
+//
+// This is the positive counterpart to `assert_no_principal`. It proves a resolved
+// TWAP custody return is restoring a real owner claim rather than moving protocol
+// insurance into an empty pool.
+fn process_assert_principal(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let pool_account = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    validate_pool_pda(program_id, pool_account, &pool)?;
+    if !pool.is_insurance()
+        || pool.policy != POLICY_PRINCIPAL
+        || pool.outstanding_principal == 0
+        || pool.total_shares == 0
     {
         return Err(ProgramError::InvalidAccountData);
     }

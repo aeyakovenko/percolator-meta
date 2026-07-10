@@ -4479,6 +4479,29 @@ fn build_return_to_subledger_message(
     m
 }
 
+fn twap_return_to_subledger_ix(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*squads_vault, false),
+            AccountMeta::new_readonly(*twap_config, false),
+            AccountMeta::new_readonly(*twap_authority, false),
+            AccountMeta::new_readonly(*pool, false),
+            AccountMeta::new(*market_slab, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![16u8], // IX_RETURN_TO_SUBLEDGER
+    }
+}
+
 // Run a full Squads vault-transaction lifecycle (create, propose, approve, warp past the
 // 1-week timelock, execute) for `message`. Advances only the unix clock (keeps the slot
 // stable so the percolator oracle does not go stale).
@@ -30071,7 +30094,7 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
 // cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
 // exact residual only through the canonical controller account.
 #[test]
-fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
+fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -30475,6 +30498,23 @@ fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
     )
     .expect("permissionless same-market decoy pool is a reachable public account");
 
+    let public_return_to_pool = twap_return_to_subledger_ix(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let live_market_before_public_return = svm.get_account(&env.slab).unwrap();
+    let pool_before_public_return = svm.get_account(&env.pool).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], public_return_to_pool.clone()).is_err(),
+        "an unaffiliated caller cannot interrupt live TWAP custody"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), live_market_before_public_return);
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_public_return);
+
     let resolve = build_controller_proxy_message(
         &env.squads_vault,
         &controller,
@@ -30558,35 +30598,8 @@ fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
     );
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
 
-    let return_to_pool = build_return_to_subledger_message(
-        &env.squads_vault,
-        &env.pool,
-        &env.slab,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-    );
-    let return_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(env.pool, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(sub_id(), false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        8,
-        &return_to_pool,
-        &return_remaining,
-    )
-    .expect("resolved custody returns to the canonical owner-bound pool");
+    send(&mut svm, &[&payer], public_return_to_pool)
+        .expect("any cranker returns resolved custody to the canonical owner-bound pool");
 
     let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
     withdraw_data.extend_from_slice(&principal.to_le_bytes());
@@ -30620,12 +30633,33 @@ fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
         &env.multisig,
         &env.dao,
         &payer,
-        9,
+        8,
         &handoff,
         &handoff_remaining,
     )
     .expect("zero-principal pool returns protocol custody to TWAP");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_protocol_insurance as u128);
+
+    let market_before_empty_pool_return = svm.get_account(&env.slab).unwrap();
+    let pool_before_empty_pool_return = svm.get_account(&env.pool).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_to_subledger_ix(
+                &env.squads_vault,
+                &env.pool,
+                &env.slab,
+                &twap_cfg,
+                &twap_authority,
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "a public caller cannot rotate terminal protocol insurance into an empty pool"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_empty_pool_return);
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_empty_pool_return);
 
     svm.set_account(
         controller,
@@ -30675,7 +30709,7 @@ fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
             &env.multisig,
             &env.dao,
             &payer,
-            10,
+            9,
             &close,
             &close_remaining,
         )
@@ -30785,7 +30819,7 @@ fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
         &env.multisig,
         &env.dao,
         &payer,
-        11,
+        10,
         &close,
         &close_remaining,
     )
