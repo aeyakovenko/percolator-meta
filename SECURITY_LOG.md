@@ -2,6 +2,26 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - provider-owned canonical ATA mutation could block terminal cleanup (surface A/C)
+
+Every fixed controller return pinned external backing and insurance to the provider's canonical ATA, but also
+required the token account's mutable owner field to remain the provider. After depositing one atom through the
+public Percolator API, the provider could use SPL Token `SetAuthority(AccountOwner)` to assign that initialized
+ATA to a dead key and disappear. The address remained allocated, so no cranker could recreate it, while every
+shutdown and resolved return rejected before moving value. The provider's one atom could therefore block asset
+retirement or whole-market closure indefinitely.
+
+A fresh real Percolator + controller LiteSVM regression initializes and backs asset 0, permissionlessly donates
+the market to its controller, resolves it through the governance proxy, reassigns the exact canonical provider
+ATA through the real SPL Token program, and then exercises the public resolved two-domain cleanup. The old
+controller fails with `InvalidAccountData` at the destination check.
+
+FIX: the exact canonical address, SPL ownership, initialized state, and mint remain mandatory, but cleanup no
+longer treats the destination token owner as immutable. Only the provider can authorize that field change, and
+the controller still cannot select or accept another address, so the change restores liveness without creating
+a redirect or governance withdrawal surface. The regression returns the atom to the same canonical address and
+closes the controller transit account; the existing noncanonical-recipient and atomic-return tests stay green.
+
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 302 standalone tests GREEN (subledger 75, genesis-vote 22, distribution 36, residual-distributor 52,
 twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
