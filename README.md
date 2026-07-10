@@ -22,6 +22,8 @@ capital's own tenure.
   signing position owner. Governance and reward programs custody COIN points/rewards only.
 - **No governance withdrawal key.** Squads authorizes constrained program calls but does not hold
   a funded market's insurance operator, insurance authority, backing authority, or `asset_admin`.
+  Controller-governed secondary activation requires the insurance authority and operator to be the
+  same provider, so governance cannot invite an external deposit while retaining its withdrawal key.
   TWAP accepts only a real 1-of-1 Squads multisig whose sole all-permissions member and config
   authority are the named MetaDAO, with at least a one-week timelock.
 - **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
@@ -138,7 +140,8 @@ cleanup. Raw `CloseSlab` is not proxied: the dedicated cleanup forwards its mand
 destinations atomically. The proxy excludes deposits, withdrawals, swaps, portfolio operations,
 authority rotation, and backing-bucket movement. External backing providers retain their own
 asset-local withdrawal path; governance only sets the fee split that sends the configured share
-into insurance.
+into insurance. Secondary activation may independently select backing and oracle providers, but its
+insurance authority and operator must be one key so deposit and withdrawal custody cannot diverge.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one
 remaining atom. After Squads shuts the asset down and Percolator's delay and empty-state checks pass,

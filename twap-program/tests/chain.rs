@@ -4734,6 +4734,241 @@ fn e2e_market_donation_preserves_creator_insurance_until_owner_exit() {
     );
 }
 
+// PUBLIC LOF: secondary-asset activation names the deposit authority and withdrawal operator
+// independently. The governance controller must not let governance retain the withdrawal key
+// while inviting an external provider to fund the asset's insurance balance.
+#[test]
+fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+    let provider = Keypair::new();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    let init_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: init_data,
+    };
+    send(&mut svm, &[&payer], init_market)
+        .expect("any payer initializes the controller-owned appendable market");
+
+    let proxy_activation = |insurance_authority: Pubkey, insurance_operator: Pubkey| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(
+            &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+                action: 0,
+                asset_index: 1,
+                now_slot: 100,
+                initial_price: 1_000_000,
+                insurance_authority: insurance_authority.to_bytes(),
+                insurance_operator: insurance_operator.to_bytes(),
+                backing_bucket_authority: provider.pubkey().to_bytes(),
+                oracle_authority: provider.pubkey().to_bytes(),
+            }
+            .encode(),
+        );
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let insurance_amount = 700_000u64;
+    let provider_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_token,
+        &collateral_mint,
+        &provider.pubkey(),
+        insurance_amount,
+    );
+    let governance_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_token,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+
+    let market_before_unsafe_activation = svm.get_account(&slab).unwrap();
+    let unsafe_activation = proxy_activation(provider.pubkey(), governance.pubkey());
+    if send(&mut svm, &[&payer, &governance], unsafe_activation).is_ok() {
+        let top_up = Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(provider_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+                domain: 2,
+                amount: insurance_amount as u128,
+            }
+            .encode(),
+        };
+        send(&mut svm, &[&payer, &provider], top_up)
+            .expect("external provider funds the split-role asset");
+        let steal = Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(governance_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+                asset_index: 1,
+                amount: insurance_amount as u128,
+            }
+            .encode(),
+        };
+        send(&mut svm, &[&payer, &governance], steal)
+            .expect("configured operator drains the external provider's insurance");
+        assert_eq!(token_amount(&svm, &governance_token), insurance_amount);
+        panic!("controller accepted split insurance custody and governance withdrew principal");
+    }
+    assert_eq!(
+        svm.get_account(&slab).unwrap(),
+        market_before_unsafe_activation,
+        "rejected activation is atomic"
+    );
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy_activation(provider.pubkey(), provider.pubkey()),
+    )
+    .expect("provider-controlled insurance roles remain available");
+    let activated_market = svm.get_account(&slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&activated_market.data, 1).unwrap(),
+        provider.pubkey().to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&activated_market.data, 1).unwrap(),
+        provider.pubkey().to_bytes()
+    );
+
+    let top_up = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(provider_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+            domain: 2,
+            amount: insurance_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &provider], top_up).expect("provider funds its own insurance role");
+
+    let withdraw = |operator: Pubkey, destination: Pubkey| Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(operator, true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(destination, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+            asset_index: 1,
+            amount: insurance_amount as u128,
+        }
+        .encode(),
+    };
+    let market_before_governance_withdraw = svm.get_account(&slab).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            withdraw(governance.pubkey(), governance_token),
+        )
+        .is_err(),
+        "governance cannot withdraw provider-controlled insurance"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap(),
+        market_before_governance_withdraw
+    );
+    assert_eq!(token_amount(&svm, &governance_token), 0);
+    assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
+
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        withdraw(provider.pubkey(), provider_token),
+    )
+    .expect("provider retains its complete withdrawal path");
+    assert_eq!(token_amount(&svm, &provider_token), insurance_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+}
+
 #[test]
 fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
     let mut svm =

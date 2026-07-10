@@ -48,10 +48,15 @@ const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
+const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_ACTION_ACTIVATE: u8 = 0;
+const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
+const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
+const ACTIVATE_INSURANCE_OPERATOR_OFFSET: usize = 52;
 const ASSET_AUTH_INSURANCE: u8 = 1;
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 const ASSET_AUTH_BACKING_BUCKET: u8 = 3;
@@ -138,6 +143,27 @@ fn admin_tag_allowed(tag: u8) -> bool {
     )
 }
 
+fn validate_admin_instruction_data(data: &[u8]) -> ProgramResult {
+    if data.first().copied() != Some(PERC_IX_UPDATE_ASSET_LIFECYCLE)
+        || data.get(1).copied() != Some(ASSET_ACTION_ACTIVATE)
+    {
+        return Ok(());
+    }
+    if data.len() != UPDATE_ASSET_LIFECYCLE_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let insurance_authority = data
+        .get(ACTIVATE_INSURANCE_AUTHORITY_OFFSET..ACTIVATE_INSURANCE_OPERATOR_OFFSET)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let insurance_operator = data
+        .get(ACTIVATE_INSURANCE_OPERATOR_OFFSET..ACTIVATE_INSURANCE_OPERATOR_OFFSET + 32)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if insurance_authority != insurance_operator {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(())
+}
+
 pub fn process_instruction<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -185,6 +211,7 @@ fn process_proxy_admin<'a>(
     if !admin_tag_allowed(perc_tag) {
         return Err(ProgramError::InvalidInstructionData);
     }
+    validate_admin_instruction_data(data)?;
     let iter = &mut accounts.iter();
     let governance = next_account_info(iter)?;
     let controller = next_account_info(iter)?;
@@ -1765,6 +1792,49 @@ mod tests {
         for forbidden in [3u8, 4, 9, 13, 24, 32, 41, 50, 52, 56, 57, 59, 60, 61, 65] {
             assert!(!admin_tag_allowed(forbidden));
         }
+    }
+
+    fn asset_lifecycle_data(
+        action: u8,
+        authority: Pubkey,
+        operator: Pubkey,
+    ) -> alloc::vec::Vec<u8> {
+        let mut data = vec![PERC_IX_UPDATE_ASSET_LIFECYCLE, action];
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.extend_from_slice(&1_000_000u64.to_le_bytes());
+        data.extend_from_slice(authority.as_ref());
+        data.extend_from_slice(operator.as_ref());
+        data.extend_from_slice(Pubkey::new_unique().as_ref());
+        data.extend_from_slice(Pubkey::new_unique().as_ref());
+        assert_eq!(data.len(), UPDATE_ASSET_LIFECYCLE_LEN);
+        data
+    }
+
+    #[test]
+    fn activation_cannot_split_deposit_and_withdrawal_authorities() {
+        let provider = Pubkey::new_unique();
+        let safe = asset_lifecycle_data(ASSET_ACTION_ACTIVATE, provider, provider);
+        assert_eq!(validate_admin_instruction_data(&safe), Ok(()));
+
+        let split = asset_lifecycle_data(ASSET_ACTION_ACTIVATE, provider, Pubkey::new_unique());
+        assert_eq!(
+            validate_admin_instruction_data(&split),
+            Err(ProgramError::InvalidInstructionData)
+        );
+
+        let mut truncated = safe;
+        truncated.pop();
+        assert_eq!(
+            validate_admin_instruction_data(&truncated),
+            Err(ProgramError::InvalidInstructionData)
+        );
+
+        let lifecycle_transition = asset_lifecycle_data(1, provider, Pubkey::new_unique());
+        assert_eq!(
+            validate_admin_instruction_data(&lifecycle_transition),
+            Ok(())
+        );
     }
 
     #[test]
