@@ -3130,6 +3130,239 @@ fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
     assert_eq!(group.config.initial_margin_bps, 10_000, "genesis market is 100% initial margin — fully collateralized, no trader bankruptcy -> no insurance draw");
 }
 
+#[test]
+fn controller_can_restart_asset0_after_governed_shutdown() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0;
+                percolator_prog::state::market_account_len_for_capacity(1).unwrap()
+            ],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller market initialization");
+
+    let insurance_amount = 17u64;
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault =
+        canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let donor_source = Pubkey::new_unique();
+    let controller_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &payer.pubkey(),
+        insurance_amount,
+    );
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let mut donation_data = vec![4u8]; // IX_DONATE_INSURANCE
+    donation_data.extend_from_slice(&insurance_amount.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(donor_source, false),
+                AccountMeta::new(controller_holding, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: donation_data,
+        },
+    )
+    .expect("fund controller-owned insurance before shutdown");
+    assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
+
+    let proxy = |percolator_instruction: percolator_prog::ix::Instruction| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&percolator_instruction.encode());
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 5,
+            },
+        ),
+    )
+    .expect("controller configures the shutdown delay");
+
+    svm.set_sysvar(&Clock {
+        slot: 110,
+        unix_timestamp: 110,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 3, // ASSET_ACTION_SHUTDOWN
+            asset_index: 0,
+            now_slot: 110,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }),
+    )
+    .expect("controller shuts down asset 0");
+
+    let shutdown_market = svm.get_account(&market).unwrap();
+    let (_, shutdown_group) =
+        percolator_prog::state::read_market(&shutdown_market.data).unwrap();
+    assert_eq!(
+        shutdown_group.assets[0].lifecycle,
+        percolator::AssetLifecycleV16::Recovery
+    );
+    let old_market_id = shutdown_group.assets[0].market_id;
+    let value_before = (
+        shutdown_group.vault,
+        shutdown_group.c_tot,
+        shutdown_group.insurance,
+    );
+
+    svm.set_sysvar(&Clock {
+        slot: 111,
+        unix_timestamp: 111,
+        ..Clock::default()
+    });
+    let restart = percolator_prog::ix::Instruction::RestartAssetOracle {
+        asset_index: 0,
+        now_slot: 111,
+        initial_price: 1_000_000,
+    };
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                data: restart.encode(),
+            },
+        )
+        .is_err(),
+        "governance cannot bypass the controller PDA and restart directly"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), shutdown_market);
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(restart),
+    )
+    .expect("controller exposes the pinned value-neutral restart lifecycle");
+
+    let restarted_market = svm.get_account(&market).unwrap();
+    let (config, restarted_group) =
+        percolator_prog::state::read_market(&restarted_market.data).unwrap();
+    assert_eq!(config.marketauth, controller.to_bytes());
+    assert_eq!(
+        restarted_group.assets[0].lifecycle,
+        percolator::AssetLifecycleV16::Active
+    );
+    assert!(restarted_group.assets[0].market_id > old_market_id);
+    assert_eq!(restarted_group.assets[0].effective_price, 1_000_000);
+    assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
+    assert_eq!(
+        (
+            restarted_group.vault,
+            restarted_group.c_tot,
+            restarted_group.insurance,
+        ),
+        value_before,
+        "restart moves no collateral or insurance"
+    );
+}
+
 // TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:
 // signer first, then writable non-signers, then readonly non-signers):
 // [squads_vault(ro-signer), market_slab(w), config(w), twap_authority, percolator_program, twap_program].

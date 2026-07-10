@@ -235,6 +235,8 @@ succeeds only if direct permissionless asset append is disabled. The controller 
 that mode because a direct activator becomes an external `asset_admin`. New multi-asset deployments
 use permissionless controller initialization followed by governance-approved asset activation, which
 still assigns external insurance, backing, and oracle roles while keeping lifecycle admin constrained.
+The same constrained proxy can restart an empty recovering asset through Percolator's value-neutral
+restart instruction; it cannot choose a recipient or move insurance/backing while doing so.
 
 At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved

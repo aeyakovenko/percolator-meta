@@ -145,6 +145,7 @@ fn admin_tag_allowed(tag: u8) -> bool {
             | 55 // UpdateTradeFeePolicy
             | 58 // UpdateFeeRedirectPolicy
             | 62 // ConfigureAuthMark
+            | 69 // RestartAssetOracle
     )
 }
 
@@ -1998,7 +1999,7 @@ mod tests {
 
     #[test]
     fn allowlist_denies_live_value_and_every_key_mutation_path() {
-        let allowed = [19u8, 34, 35, 37, 38, 40, 49, 51, 55, 58, 62];
+        let allowed = [19u8, 34, 35, 37, 38, 40, 49, 51, 55, 58, 62, 69];
         for tag in 0u8..=69 {
             assert_eq!(admin_tag_allowed(tag), allowed.contains(&tag), "tag {tag}");
         }
