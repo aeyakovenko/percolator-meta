@@ -2,6 +2,33 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - resolved owner principal depended on a surviving DAO (surface A/C)
+
+After the genesis pool handed asset-0 custody to TWAP, subledger exits correctly remained closed
+until custody returned. The only TWAP return instruction, however, always required the Squads vault
+signature. Even after anyone resolved and fully cranked the bound Percolator market empty, a missing
+or hostile DAO could refuse the fixed return forever. Every owner-bound position then retained a
+valid principal claim with no public path able to restore its withdrawal authority: persistent
+liveness failure and effective loss of funds without any market loss.
+
+A fresh full-chain LiteSVM regression uses the real pinned Percolator, subledger, TWAP, controller,
+Squads, genesis-vote, and distribution binaries. It deposits owner principal, hands custody to TWAP,
+and proves an unaffiliated return against the live market rejects with the market and pool
+byte-exact. It then resolves through the real controller lifecycle and uses the same unaffiliated
+caller to return custody, redeem all protected principal to the owner's destination, re-handoff the
+remaining protocol insurance, and complete the existing canonical terminal cleanup. The old TWAP
+binary fails the post-resolution return with `MissingRequiredSignature`.
+
+FIX: TWAP tag 16 still requires the bound Squads vault signature while the market is live. Without
+that signature it now additionally requires the config-bound executable Percolator program, a slab
+owned by that program, Percolator's resolved-and-empty predicate, and a read-only subledger
+attestation that the bound principal-only insurance pool still has both owner principal and shares.
+The instruction still accepts no amount or destination and can rotate custody only through
+subledger's immutable pool derivation. The regression then re-hands off with zero principal and
+proves the same public call rejects byte-exact, preventing a caller from moving terminal protocol
+insurance into an empty pool. User exits are restored without adding a governance or public
+withdrawal surface.
+
 ## Tick - abandoned empty portfolio could block terminal market close (surface C)
 
 Any user could fund and initialize an empty Percolator portfolio, which increments the market's

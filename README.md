@@ -52,10 +52,14 @@ capital's own tenure.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
-  return custody only to that same pool. The pool-less compatibility handoff accepts only an empty
-  asset-0 insurance balance; later value must enter through the inbound-only donation path. After
-  resolution, TWAP can move a retained terminal floor to the canonical controller account only
-  after the bound pool itself attests that no owner principal or shares remain.
+  return custody only to that same pool. Squads must authorize that return while the market is live;
+  after the bound Percolator market is resolved and empty, anyone can crank the same fixed return
+  while the pool attests that owner principal remains, so owner exits do not depend on a surviving
+  DAO. An empty pool cannot pull terminal protocol insurance back from TWAP. The pool-less
+  compatibility handoff accepts only an empty asset-0 insurance balance; later value must enter
+  through the inbound-only donation path.
+  After resolution, TWAP can move a retained terminal floor to the canonical controller account
+  only after the bound pool itself attests that no owner principal or shares remain.
 - **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
   approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
   Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
@@ -95,9 +99,11 @@ The workspace pins `percolator-prog` to commit
    winning allocation is immutable; recipients claim from the fixed vault and expired claims burn.
 5. **Return deposits.** The intended genesis flow keeps custody in the owner-bound pool while
    initial risk takers redeem up to their loss-adjusted principal. If TWAP already holds custody,
-   its fixed recovery path returns it to that same pool first. Sealed votes are no longer governance
-   authority. Standalone with-surplus pools return their live share value pro rata but are never
-   eligible for TWAP custody.
+   its fixed recovery path returns it to that same pool first. This return is permissionless after
+   the bound market is resolved and empty while the pool still has owner principal. Sealed votes
+   are no longer governance authority.
+   Standalone with-surplus pools return their live share value pro rata but are never eligible for
+   TWAP custody.
 6. **Kickstart.** Futarchy can use retained surplus to initialize insurance/backing for approved
    markets and set fee splits. Inbound-only donation instructions fund Percolator without giving
    governance an insurance key and reject unless every asset-0 insurance withdrawal/rotation role is

@@ -101,6 +101,7 @@ const SUBLEDGER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Sub1edger1111111111111111111111111111111111");
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
 const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
+const SUBLEDGER_IX_ASSERT_PRINCIPAL: u8 = 11;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
@@ -156,7 +157,8 @@ const IX_CANCEL_BID: u8 = 13;
 const IX_SET_ECONOMICS: u8 = 14;
 // Fixed pool -> TWAP custody transition, called only by the subledger pool PDA.
 const IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
-// Governance-authorized recovery transition back to the owner-bound subledger pool.
+// Governance-authorized live recovery transition back to the owner-bound subledger pool;
+// permissionless once the market is resolved/empty while owner principal remains.
 const IX_RETURN_TO_SUBLEDGER: u8 = 16;
 // Permissionless inbound-only donation: donor -> TWAP holding -> Percolator insurance.
 const IX_DONATE_INSURANCE: u8 = 17;
@@ -1018,7 +1020,7 @@ fn process_accept_custody<'a>(
     Ok(())
 }
 
-// return_to_subledger accounts: [squads_vault(signer), config,
+// return_to_subledger accounts: [squads_vault(signer unless resolved + empty + principal), config,
 //   twap_authority(current_admin), pool, market_slab(w), percolator_program,
 //   subledger_program]
 //
@@ -1042,9 +1044,6 @@ fn process_return_to_subledger(
     let percolator_program = next_account_info(iter)?;
     let subledger_program = next_account_info(iter)?;
 
-    if !squads_vault.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
     if *subledger_program.key != SUBLEDGER_PROGRAM_ID || !subledger_program.executable {
         return Err(ProgramError::IncorrectProgramId);
     }
@@ -1068,6 +1067,29 @@ fn process_return_to_subledger(
         .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_authority {
         return Err(ProgramError::InvalidSeeds);
+    }
+    if !squads_vault.is_signer {
+        if !percolator_program.executable || market_slab.owner != percolator_program.key {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        let market_data = market_slab.try_borrow_data()?;
+        if !percolator_accounting::market_is_resolved_and_empty(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        drop(market_data);
+        // The subledger owns both current and historical pool layouts. Its
+        // read-only attestation prevents a public caller from rotating terminal
+        // protocol insurance into a pool after every owner claim has exited.
+        invoke(
+            &Instruction {
+                program_id: *subledger_program.key,
+                accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
+                data: vec![SUBLEDGER_IX_ASSERT_PRINCIPAL],
+            },
+            &[pool.clone(), subledger_program.clone()],
+        )?;
     }
 
     invoke_signed(
