@@ -33,12 +33,14 @@ capital's own tenure.
   only to the recorded insurance authority and its backing only to the recorded backing provider,
   both after shutdown matures and after a public stale resolver wins the race. Asset 0 instead has a
   fixed whole-market resolution path that derives and atomically returns both backing domains after
-  Percolator proves the market empty. Raw
-  `CloseSlab` is excluded; a fixed terminal cleanup forwards only vault dust and account rent to
-  Squads. Donating a creator-owned market preserves funded outgoing asset-0 insurance roles and the
-  recorded backing provider; the handoff cannot collapse that capital into the controller or select
-  another provider. Donation is accepted only when every secondary slot is fully retired because
-  Percolator does not migrate secondary `asset_admin` roles with `marketauth`; multi-asset markets are
+  Percolator proves the market empty. Controller-owned protocol insurance is recovered only to the
+  canonical controller account after resolution and stays there until terminal close. Raw
+  `CloseSlab` is excluded; a fixed terminal cleanup forwards that protocol insurance, vault dust,
+  and account rent to Squads. Donating a creator-owned market preserves funded outgoing asset-0
+  insurance roles and the recorded backing provider; the handoff cannot collapse that capital into
+  the controller or select another provider. Donation is accepted only when every secondary slot is
+  fully retired because Percolator does not migrate secondary `asset_admin` roles with `marketauth`;
+  multi-asset markets are
   instead initialized under the controller before governance-approved activation. The handoff also
   requires direct permissionless asset append to be disabled, and the controller cannot enable it.
   Inbound bootstrap donations additionally require the controller to hold `marketauth`, both asset-0
@@ -61,7 +63,7 @@ capital's own tenure.
 | Crate | Responsibility |
 |---|---|
 | `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
-| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns insurance and backing only to their recorded providers. |
+| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers and retains controller-owned protocol insurance for terminal reclaim. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
@@ -168,6 +170,11 @@ relevant insurance or backing role. They then return all value to the outgoing r
 canonical account. The caller and DAO still choose neither an amount nor a recipient, and any failed
 rotation, withdrawal, forwarding, or close rolls the entire operation back.
 
+If the slab instead records the controller itself as insurance authority, including for asset 0,
+the resolved companion withdraws only the exact asset-local amount into the canonical controller
+account and leaves it there. It cannot select another destination. The balance reaches Squads only
+through the existing governance-signed terminal reclaim after Percolator accepts `CloseSlab`.
+
 Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
 reads both domains' complete principal and earnings from the pinned slab, atomically transfers the
 backing role to the controller, and returns the full value to the outgoing provider's canonical
@@ -194,7 +201,8 @@ insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle
 builder, but it cannot use that role to move insurance or backing. Post-genesis, TWAP receives both
 insurance roles and `asset_admin`; its exposed Percolator CPIs are fixed-purpose and accept no
 arbitrary withdrawal destination. Governance therefore has no arbitrary resolved-mode insurance
-withdrawal; only the provider-bound fixed cleanup is available.
+withdrawal; external funds use the provider-bound fixed cleanup, while controller-owned protocol
+insurance can move only to the canonical controller account for terminal reclaim.
 
 ## Build And Test
 
