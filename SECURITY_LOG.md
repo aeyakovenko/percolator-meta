@@ -11830,3 +11830,23 @@ never enter a custody regime that removes protocol surplus from its share-value 
 probe proves the rejected handoff leaves the with-surplus owner able to withdraw directly. The completed genesis
 E2E now returns the full `1,000,000` and leaves exactly `100,000` retained protocol insurance. No new authority,
 admin path, or asset-moving instruction was added.
+
+## Tick — raw controller CloseSlab stranded terminal vault dust and account rent (surface A/C)
+
+The controller's generic proxy allow-listed Percolator CloseSlab even though Percolator requires its current
+`marketauth` to receive all raw vault dust, vault rent, and slab rent. Here `marketauth` is the stateless controller
+PDA, which had no post-close signer path. A fresh real Squads + controller + subledger + pinned-Percolator LiteSVM
+probe completed the full permissionless-create/deposit/shutdown/resolve/owner-exit lifecycle, injected raw terminal
+vault dust, and proved the old generic close succeeded while leaving both tokens and lamports inaccessible under
+the controller PDA.
+
+FIX: raw CloseSlab is no longer accepted by the generic proxy. A single fixed terminal instruction invokes the
+exact pinned CloseSlab, then atomically forwards its controller-owned token destinations and all recovered lamports
+to the governance signer. Percolator still requires resolved mode, zero insurance, zero collateral, and zero
+materialized portfolios before any transfer occurs, so this adds no live-market withdrawal authority. The retained
+LiteSVM lifecycle proves the old route is rejected, live-market close is rejected without moving either vault,
+omitting a configured secondary collateral vault rolls back atomically, both primary and secondary terminal dust
+are forwarded, temporary accounts close, and controller/vault/slab rent is conserved exactly. The temporary
+destination is pinned to the controller's canonical ATA for the Percolator-validated collateral mint; its complete
+balance is forwarded, so a public one-atom transfer during the Squads timelock cannot DoS cleanup while governance
+still cannot select and sweep an arbitrary controller-owned token account.

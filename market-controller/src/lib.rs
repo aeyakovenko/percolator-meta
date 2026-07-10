@@ -2,8 +2,9 @@
 //!
 //! A controller PDA permanently holds `marketauth`. Governance can make it sign
 //! only a fixed set of lifecycle and policy instructions. Live-state value movement
-//! and all authority mutation tags are absent by construction; terminal `CloseSlab`
-//! is allowed only after Percolator proves every attributed balance is zero.
+//! and all authority mutation tags are absent by construction. Terminal cleanup is
+//! a fixed close-and-forward path that runs only after Percolator proves every
+//! attributed balance is zero.
 #![no_std]
 extern crate alloc;
 
@@ -19,11 +20,14 @@ use solana_program::{
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
+    system_instruction,
 };
 
 declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
 const CONTROLLER_SEED: &[u8] = b"market-controller";
+const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const SUBLEDGER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Sub1edger1111111111111111111111111111111111");
 
@@ -32,9 +36,11 @@ const IX_INIT_MARKET: u8 = 1;
 const IX_GRANT_GENESIS_POOL: u8 = 2;
 const IX_ACCEPT_MARKET_AUTHORITY: u8 = 3;
 const IX_DONATE_INSURANCE: u8 = 4;
+const IX_CLOSE_MARKET_AND_RECLAIM: u8 = 5;
 
 const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
+const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const ASSET_AUTH_ORACLE: u8 = 4;
@@ -99,14 +105,14 @@ fn signer_seeds<'a>(
     ]
 }
 
-/// Exact pinned-v16 governance surface. Every value mover, authority mutation,
-/// trader/portfolio operation, oracle push, and recovery accounting operation is
-/// intentionally absent.
+/// Exact pinned-v16 generic governance surface. Every value mover, authority
+/// mutation, trader/portfolio operation, oracle push, recovery accounting
+/// operation, and raw CloseSlab call is intentionally absent. CloseSlab is exposed
+/// only through the fixed terminal cleanup instruction below.
 fn admin_tag_allowed(tag: u8) -> bool {
     matches!(
         tag,
-        13 // CloseSlab (Percolator requires every attributed balance to be zero)
-            | 19 // ResolveMarket
+        19 // ResolveMarket
             | 34 // ConfigureHybridOracle
             | 35 // ConfigureEwmaMark
             | 37 // UpdateLiquidationFeePolicy
@@ -135,6 +141,7 @@ pub fn process_instruction<'a>(
         IX_GRANT_GENESIS_POOL => process_grant_genesis_pool(program_id, accounts, data),
         IX_ACCEPT_MARKET_AUTHORITY => process_accept_market_authority(program_id, accounts, data),
         IX_DONATE_INSURANCE => process_donate_insurance(program_id, accounts, data),
+        IX_CLOSE_MARKET_AND_RECLAIM => process_close_market_and_reclaim(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -208,6 +215,239 @@ fn process_proxy_admin<'a>(
         &cpi_accounts,
         &[&seeds],
     )
+}
+
+fn validate_reclaim_token_accounts(
+    controller: &AccountInfo,
+    governance: &AccountInfo,
+    transit: &AccountInfo,
+    destination: &AccountInfo,
+) -> ProgramResult {
+    if transit.owner != &spl_token::ID || destination.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if transit.key == destination.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
+    let destination_state = spl_token::state::Account::unpack(&destination.try_borrow_data()?)?;
+    let canonical_transit = Pubkey::find_program_address(
+        &[
+            controller.key.as_ref(),
+            spl_token::ID.as_ref(),
+            transit_state.mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0;
+    if transit_state.state != spl_token::state::AccountState::Initialized
+        || destination_state.state != spl_token::state::AccountState::Initialized
+        || *transit.key != canonical_transit
+        || transit_state.owner != *controller.key
+        || destination_state.owner != *governance.key
+        || transit_state.mint != destination_state.mint
+        || transit_state.delegate.is_some()
+        || transit_state.delegated_amount != 0
+        || transit_state.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+fn forward_and_close_token_account<'a>(
+    controller: &AccountInfo<'a>,
+    governance: &AccountInfo<'a>,
+    transit: &AccountInfo<'a>,
+    destination: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let amount = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?.amount;
+    if amount > 0 {
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                transit.key,
+                destination.key,
+                controller.key,
+                &[],
+                amount,
+            )?,
+            &[
+                transit.clone(),
+                destination.clone(),
+                controller.clone(),
+                token_program.clone(),
+            ],
+            &[signer_seeds],
+        )?;
+    }
+    invoke_signed(
+        &spl_token::instruction::close_account(
+            token_program.key,
+            transit.key,
+            governance.key,
+            controller.key,
+            &[],
+        )?,
+        &[
+            transit.clone(),
+            governance.clone(),
+            controller.clone(),
+            token_program.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+// close_market_and_reclaim accounts:
+// [governance(s,w), controller(w), market(w), vault_authority,
+//  primary_vault(w), controller_primary_transit(w), governance_primary_dest(w),
+//  percolator_program, token_program, system_program,
+//  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w)]
+//
+// Percolator's CloseSlab requires its current marketauth to receive the slab rent,
+// vault rent, and any raw vault dust. Here marketauth is the stateless controller
+// PDA, so exposing CloseSlab through the generic proxy would strand that value.
+// This fixed instruction closes only a fully wound-down market (enforced by
+// Percolator), forwards each controller canonical ATA's complete balance to a
+// governance-owned token account, closes the temporary accounts, and forwards
+// every recovered lamport. Forwarding the complete canonical balance makes public
+// pre-execution token dust harmless without exposing an arbitrary token sweep.
+fn process_close_market_and_reclaim<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let primary_vault = next_account_info(iter)?;
+    let primary_transit = next_account_info(iter)?;
+    let primary_destination = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+    let optional: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
+    let secondary = match optional.as_slice() {
+        [] => None,
+        [vault, transit, destination] => Some((vault, transit, destination)),
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+
+    if !governance.is_signer || !governance.is_writable {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !controller.is_writable
+        || !market.is_writable
+        || !primary_vault.is_writable
+        || !primary_transit.is_writable
+        || !primary_destination.is_writable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *token_program.key != spl_token::ID
+        || *system_program.key != solana_program::system_program::ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if controller.owner != system_program.key || controller.data_len() != 0 {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if let Some((vault, transit, destination)) = secondary {
+        if !vault.is_writable || !transit.is_writable || !destination.is_writable {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        validate_reclaim_token_accounts(controller, governance, transit, destination)?;
+    }
+    validate_reclaim_token_accounts(controller, governance, primary_transit, primary_destination)?;
+
+    let bump = controller_bump(
+        program_id,
+        governance,
+        controller,
+        market,
+        percolator_program,
+    )?;
+    let bump_seed = [bump];
+    let seeds = signer_seeds(
+        governance.key,
+        market.key,
+        percolator_program.key,
+        &bump_seed,
+    );
+
+    let mut metas = vec![
+        AccountMeta::new(*controller.key, true),
+        AccountMeta::new(*market.key, false),
+        AccountMeta::new(*primary_vault.key, false),
+        AccountMeta::new_readonly(*vault_authority.key, false),
+        AccountMeta::new(*primary_transit.key, false),
+        AccountMeta::new_readonly(*token_program.key, false),
+    ];
+    let mut cpi_accounts = vec![
+        controller.clone(),
+        market.clone(),
+        primary_vault.clone(),
+        vault_authority.clone(),
+        primary_transit.clone(),
+        token_program.clone(),
+    ];
+    if let Some((vault, transit, _)) = secondary {
+        metas.push(AccountMeta::new(*vault.key, false));
+        metas.push(AccountMeta::new(*transit.key, false));
+        cpi_accounts.push(vault.clone());
+        cpi_accounts.push(transit.clone());
+    }
+    cpi_accounts.push(percolator_program.clone());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: metas,
+            data: vec![PERC_IX_CLOSE_SLAB],
+        },
+        &cpi_accounts,
+        &[&seeds],
+    )?;
+
+    forward_and_close_token_account(
+        controller,
+        governance,
+        primary_transit,
+        primary_destination,
+        token_program,
+        &seeds,
+    )?;
+    if let Some((_, transit, destination)) = secondary {
+        forward_and_close_token_account(
+            controller,
+            governance,
+            transit,
+            destination,
+            token_program,
+            &seeds,
+        )?;
+    }
+
+    let recovered_lamports = controller.lamports();
+    if recovered_lamports > 0 {
+        invoke_signed(
+            &system_instruction::transfer(controller.key, governance.key, recovered_lamports),
+            &[
+                controller.clone(),
+                governance.clone(),
+                system_program.clone(),
+            ],
+            &[&seeds],
+        )?;
+    }
+    Ok(())
 }
 
 // init_market accounts:
@@ -517,11 +757,11 @@ mod tests {
 
     #[test]
     fn allowlist_denies_live_value_and_every_key_mutation_path() {
-        let allowed = [13u8, 19, 34, 35, 37, 38, 40, 49, 51, 55, 58, 59, 62];
+        let allowed = [19u8, 34, 35, 37, 38, 40, 49, 51, 55, 58, 59, 62];
         for tag in 0u8..=69 {
             assert_eq!(admin_tag_allowed(tag), allowed.contains(&tag), "tag {tag}");
         }
-        for forbidden in [3u8, 4, 9, 24, 32, 41, 50, 52, 56, 57, 60, 61, 65] {
+        for forbidden in [3u8, 4, 9, 13, 24, 32, 41, 50, 52, 56, 57, 60, 61, 65] {
             assert!(!admin_tag_allowed(forbidden));
         }
     }

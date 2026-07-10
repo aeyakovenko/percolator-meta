@@ -3058,6 +3058,85 @@ fn build_controller_proxy_message(
     m
 }
 
+fn build_controller_raw_close_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    controller_destination: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(0); // signer is read-only
+    m.push(4); // controller, market, vault, destination are writable
+    m.push(9);
+    for key in [
+        governance,
+        controller,
+        market,
+        vault,
+        controller_destination,
+        vault_authority,
+        &perc_id(),
+        &spl_token::ID,
+        &controller_id(),
+    ] {
+        m.extend_from_slice(key.as_ref());
+    }
+    m.push(1);
+    m.push(8); // market-controller program
+    m.push(8);
+    for index in [0u8, 1, 2, 6, 3, 5, 4, 7] {
+        m.push(index);
+    }
+    m.extend_from_slice(&2u16.to_le_bytes());
+    m.extend_from_slice(&[0, 13]); // proxy_admin -> Percolator CloseSlab
+    m.push(0);
+    m
+}
+
+fn build_controller_close_and_reclaim_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    controller_destination: &Pubkey,
+    governance_destination: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(1); // governance receives the reclaimed lamports
+    m.push(5); // controller, market, vault, and both token destinations
+    m.push(11);
+    for key in [
+        governance,
+        controller,
+        market,
+        vault,
+        controller_destination,
+        governance_destination,
+        vault_authority,
+        &perc_id(),
+        &spl_token::ID,
+        &system_program::ID,
+        &controller_id(),
+    ] {
+        m.extend_from_slice(key.as_ref());
+    }
+    m.push(1);
+    m.push(10); // market-controller program
+    m.push(10);
+    for index in [0u8, 1, 2, 6, 3, 4, 5, 7, 8, 9] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(5); // IX_CLOSE_MARKET_AND_RECLAIM
+    m.push(0);
+    m
+}
+
 fn build_controller_grant_pool_message(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -4090,6 +4169,409 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     .expect("owner recovers principal after governed resolve");
     assert_eq!(token_amount(&svm, &alice_ata), amount);
     assert_eq!(token_amount(&svm, &destination), 0);
+
+    // Terminal cleanup must not strand raw vault dust or account rent in the
+    // stateless controller PDA. Direct token donations are not reflected in
+    // Percolator accounting, so CloseSlab is allowed to recover them after all
+    // user principal has exited.
+    let raw_dust = 123_456u64;
+    let mint_dust = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        &collateral_mint,
+        &perc_vault,
+        &mint_authority.pubkey(),
+        &[],
+        raw_dust,
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[mint_dust],
+        Some(&payer.pubkey()),
+        &[&payer, &mint_authority],
+        bh,
+    ))
+    .expect("donate unaccounted terminal vault dust");
+
+    let controller_destination = canonical_insurance_vault(&controller, &collateral_mint);
+    let governance_destination = Pubkey::new_unique();
+    let transit_dust = 7u64;
+    set_token(
+        &mut svm,
+        &controller_destination,
+        &collateral_mint,
+        &controller,
+        transit_dust,
+    );
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &squads_vault,
+        0,
+    );
+    let controller_before = svm
+        .get_account(&controller)
+        .map_or(0, |account| account.lamports);
+    let market_before = svm.get_account(&slab).unwrap().lamports;
+    let vault_before = svm.get_account(&perc_vault).unwrap().lamports;
+    let transit_before = svm.get_account(&controller_destination).unwrap().lamports;
+    let governance_before = svm
+        .get_account(&squads_vault)
+        .map_or(0, |account| account.lamports);
+
+    // The generic proxy cannot complete cleanup: Percolator is required to send
+    // both the vault dust and all reclaimed lamports to `marketauth` (the
+    // controller PDA), which has no generic signer surface. Keep CloseSlab out of
+    // that proxy and use the atomic close-and-forward instruction below.
+    let raw_close = build_controller_raw_close_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_vault,
+        &vault_authority,
+        &controller_destination,
+    );
+    let raw_close_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(perc_vault, false),
+        AccountMeta::new(controller_destination, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            10,
+            &raw_close,
+            &raw_close_remaining,
+        )
+        .is_err(),
+        "raw CloseSlab must be denied because its mandatory controller destinations strand value"
+    );
+
+    let close = build_controller_close_and_reclaim_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_vault,
+        &vault_authority,
+        &controller_destination,
+        &governance_destination,
+    );
+    let close_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(perc_vault, false),
+        AccountMeta::new(controller_destination, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        11,
+        &close,
+        &close_remaining,
+    )
+    .expect("controller atomically closes the empty market and forwards terminal value");
+
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
+        raw_dust + transit_dust,
+        "pre-close transit dust cannot block cleanup and is not stranded"
+    );
+    assert!(svm.get_account(&slab).map_or(true, |account| account.lamports == 0));
+    assert!(svm
+        .get_account(&perc_vault)
+        .map_or(true, |account| account.lamports == 0));
+    assert!(svm
+        .get_account(&controller_destination)
+        .map_or(true, |account| account.lamports == 0));
+    assert!(svm
+        .get_account(&controller)
+        .map_or(true, |account| account.lamports == 0));
+    let governance_after = svm.get_account(&squads_vault).unwrap().lamports;
+    assert_eq!(
+        governance_after - governance_before,
+        controller_before + market_before + vault_before + transit_before,
+        "controller prefund, slab rent, vault rent, and transit rent are all reclaimed"
+    );
+}
+
+#[test]
+fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+
+    let slab = Pubkey::new_unique();
+    let primary_mint = Pubkey::new_unique();
+    let secondary_mint = Pubkey::new_unique();
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut market_data = make_live_market(
+        &slab,
+        &primary_mint,
+        &controller,
+        100,
+    );
+    let (mut config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&market_data).unwrap();
+    config.secondary_collateral_mint = secondary_mint.to_bytes();
+    percolator_prog::state::write_wrapper_config(&mut market_data, &config).unwrap();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: market_data,
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let primary_vault = canonical_insurance_vault(&vault_authority, &primary_mint);
+    let secondary_vault = canonical_insurance_vault(&vault_authority, &secondary_mint);
+    let primary_dust = 111u64;
+    let secondary_dust = 222u64;
+    set_token(
+        &mut svm,
+        &primary_vault,
+        &primary_mint,
+        &vault_authority,
+        primary_dust,
+    );
+    set_token(
+        &mut svm,
+        &secondary_vault,
+        &secondary_mint,
+        &vault_authority,
+        secondary_dust,
+    );
+
+    let primary_transit = canonical_insurance_vault(&controller, &primary_mint);
+    let secondary_transit = canonical_insurance_vault(&controller, &secondary_mint);
+    let primary_destination = Pubkey::new_unique();
+    let secondary_destination = Pubkey::new_unique();
+    let primary_transit_dust = 3u64;
+    let secondary_transit_dust = 4u64;
+    set_token(
+        &mut svm,
+        &primary_transit,
+        &primary_mint,
+        &controller,
+        primary_transit_dust,
+    );
+    set_token(
+        &mut svm,
+        &secondary_transit,
+        &secondary_mint,
+        &controller,
+        secondary_transit_dust,
+    );
+    set_token(
+        &mut svm,
+        &primary_destination,
+        &primary_mint,
+        &governance.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &secondary_destination,
+        &secondary_mint,
+        &governance.pubkey(),
+        0,
+    );
+    svm.airdrop(&controller, 777).unwrap();
+
+    let close_accounts = |include_secondary: bool| {
+        let mut accounts = vec![
+            AccountMeta::new(governance.pubkey(), true),
+            AccountMeta::new(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(primary_vault, false),
+            AccountMeta::new(primary_transit, false),
+            AccountMeta::new(primary_destination, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ];
+        if include_secondary {
+            accounts.extend_from_slice(&[
+                AccountMeta::new(secondary_vault, false),
+                AccountMeta::new(secondary_transit, false),
+                AccountMeta::new(secondary_destination, false),
+            ]);
+        }
+        accounts
+    };
+    let close = |include_secondary: bool| Instruction {
+        program_id: controller_id(),
+        accounts: close_accounts(include_secondary),
+        data: vec![5],
+    };
+
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[close(true)],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            bh,
+        ))
+        .is_err(),
+        "terminal cleanup cannot close a live market"
+    );
+    assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
+    assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
+
+    let resolve = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![0, 19], // proxy_admin -> ResolveMarket
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[resolve],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        bh,
+    ))
+    .expect("controller resolves the empty two-collateral market");
+
+    let arbitrary_controller_account = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &arbitrary_controller_account,
+        &primary_mint,
+        &controller,
+        9,
+    );
+    let mut substituted_transit = close(true);
+    substituted_transit.accounts[5] = AccountMeta::new(arbitrary_controller_account, false);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[substituted_transit],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            bh,
+        ))
+        .is_err(),
+        "terminal cleanup cannot sweep an arbitrary controller-owned token account"
+    );
+    assert_eq!(token_amount(&svm, &arbitrary_controller_account), 9);
+    assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
+    assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
+
+    let controller_before = svm.get_account(&controller).unwrap().lamports;
+    let market_before = svm.get_account(&slab).unwrap().lamports;
+    let primary_vault_before = svm.get_account(&primary_vault).unwrap().lamports;
+    let secondary_vault_before = svm.get_account(&secondary_vault).unwrap().lamports;
+    let primary_transit_before = svm.get_account(&primary_transit).unwrap().lamports;
+    let secondary_transit_before = svm.get_account(&secondary_transit).unwrap().lamports;
+    let governance_before = svm.get_account(&governance.pubkey()).unwrap().lamports;
+
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[close(false)],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            bh,
+        ))
+        .is_err(),
+        "a configured secondary vault cannot be omitted from terminal cleanup"
+    );
+    assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
+    assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
+
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[close(true)],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        bh,
+    ))
+    .expect("atomic cleanup includes both configured collateral vaults");
+
+    assert_eq!(
+        token_amount(&svm, &primary_destination),
+        primary_dust + primary_transit_dust
+    );
+    assert_eq!(
+        token_amount(&svm, &secondary_destination),
+        secondary_dust + secondary_transit_dust
+    );
+    for closed in [
+        slab,
+        primary_vault,
+        secondary_vault,
+        primary_transit,
+        secondary_transit,
+        controller,
+    ] {
+        assert!(svm
+            .get_account(&closed)
+            .map_or(true, |account| account.lamports == 0));
+    }
+    let governance_after = svm.get_account(&governance.pubkey()).unwrap().lamports;
+    assert_eq!(
+        governance_after - governance_before,
+        controller_before
+            + market_before
+            + primary_vault_before
+            + secondary_vault_before
+            + primary_transit_before
+            + secondary_transit_before,
+        "both vault rents, both transit rents, slab rent, and controller prefund are reclaimed"
+    );
 }
 
 // ATTACK PROBE (subledger genesis-grant binding — the mirror of handoff_rejects_a_substituted_market). The
