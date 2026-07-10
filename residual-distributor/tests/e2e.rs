@@ -32,6 +32,12 @@ fn rd_so() -> String {
         env!("CARGO_MANIFEST_DIR")
     )
 }
+fn subledger_so() -> String {
+    format!(
+        "{}/../target/deploy/subledger_program.so",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
 
 const COHORT_INSURANCE: u8 = 0;
 const COHORT_BACKING: u8 = 1;
@@ -867,6 +873,330 @@ fn setup_with_fee(svm: &mut LiteSVM, payer: &Keypair, supply: u64, fee_bps: u16)
         emission_end,
         finalize_window,
     }
+}
+
+// LoF PROBE: reward multiplication must remain exact when a legal capital position's tenure
+// multiplier makes `cohort_supply * points` exceed u128. Saturating that intermediate underpays
+// the sole staker and locks the rest of the immutable COIN cohort forever.
+#[test]
+fn maximum_real_subledger_position_claims_its_full_reward_without_mul_overflow_loss() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    svm.add_program_from_file(subledger_program::id(), subledger_so())
+        .unwrap();
+
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    let owner = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&owner.pubkey(), 10_000_000_000).unwrap();
+    set_slot(&mut svm, 1);
+
+    // Build the maximum principal through the real subledger public API.
+    let collateral_authority = Keypair::new();
+    let collateral_mint = create_mint(&mut svm, &payer, &collateral_authority.pubkey());
+    let asset_id = 77u64;
+    let no_market = Pubkey::default();
+    let pool = Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            collateral_mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            no_market.as_ref(),
+            no_market.as_ref(),
+        ],
+        &subledger_program::id(),
+    )
+    .0;
+    let pool_vault = create_token_account(&mut svm, &payer, &collateral_mint, &pool);
+    let mut init_pool_data = vec![0u8];
+    init_pool_data.extend_from_slice(&asset_id.to_le_bytes());
+    init_pool_data.push(0); // principal policy
+    init_pool_data.push(0); // insurance domain
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: subledger_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(pool_vault, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: init_pool_data,
+        }],
+        &[],
+    )
+    .expect("initialize real subledger pool");
+
+    let owner_collateral =
+        create_token_account(&mut svm, &payer, &collateral_mint, &owner.pubkey());
+    mint_to(
+        &mut svm,
+        &payer,
+        &collateral_mint,
+        &collateral_authority,
+        &owner_collateral,
+        u64::MAX,
+    );
+    let position = Pubkey::find_program_address(
+        &[b"subledger_position", pool.as_ref(), owner.pubkey().as_ref()],
+        &subledger_program::id(),
+    )
+    .0;
+    let mut deposit_data = vec![1u8];
+    deposit_data.extend_from_slice(&u64::MAX.to_le_bytes());
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: subledger_program::id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(owner_collateral, false),
+                AccountMeta::new(pool_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: deposit_data,
+        }],
+        &[&owner],
+    )
+    .expect("deposit maximum principal through subledger");
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&position).unwrap().data[72..80]
+                .try_into()
+                .unwrap()
+        ),
+        u64::MAX,
+        "the reward source is a real maximum-principal position"
+    );
+
+    // Allocate a fixed maximum COIN supply to one insurance cohort.
+    let coin_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &coin_authority.pubkey());
+    let epoch_id = 9001u64;
+    let rd_config = reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id);
+    let reward_vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    mint_to(
+        &mut svm,
+        &payer,
+        &coin_mint,
+        &coin_authority,
+        &reward_vault,
+        u64::MAX,
+    );
+    revoke_mint(&mut svm, &payer, &coin_mint, &coin_authority);
+    let market = Pubkey::new_unique();
+    let stub_percolator = Pubkey::new_unique();
+    let emission_start = 10u64;
+    let emission_end = 14u64;
+    let finalize_window = 1u64;
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                stub_percolator,
+                subledger_program::id(),
+                rd_config,
+                reward_vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                emission_start,
+                emission_end,
+                u64::MAX,
+                10_000,
+                0,
+                0,
+                0,
+                finalize_window,
+                0,
+                &[RewardEpochMarket {
+                    market,
+                    insurance_pool: pool,
+                    backing_pool: Pubkey::default(),
+                }],
+            ),
+        }],
+        &[&dao],
+    )
+    .expect("initialize maximum fixed reward epoch");
+    let env = Env {
+        rd_config,
+        coin_mint,
+        vault: reward_vault,
+        mint_auth: Keypair::new(),
+        stub_sub: subledger_program::id(),
+        stub_perc: stub_percolator,
+        ins_pool: pool,
+        back_pool: Pubkey::default(),
+        market,
+        supply: u64::MAX,
+        emission_end,
+        finalize_window,
+    };
+    let recipient = create_token_account(&mut svm, &payer, &coin_mint, &owner.pubkey());
+
+    set_slot(&mut svm, emission_start);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &position,
+        COHORT_INSURANCE,
+    )
+    .expect("register real capital");
+    set_slot(&mut svm, emission_end); // age 4 => floor(log2(age)) = 2
+    crystallize(&mut svm, &payer, &env, &owner, &position).expect("crystallize maximum points");
+    let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &position, COHORT_INSURANCE);
+    let expected_points = (u64::MAX as u128) * 2;
+    assert_eq!(
+        u128::from_le_bytes(
+            svm.get_account(&stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap()
+        ),
+        expected_points,
+        "the legal point total crosses the u128 multiplication threshold"
+    );
+
+    set_slot(&mut svm, emission_end + finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze exact denominator");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &recipient,
+        Some(&position),
+    )
+    .expect("claim sole-staker allocation");
+    assert_eq!(
+        token_amount(&svm, &recipient),
+        u64::MAX,
+        "a sole staker receives the entire cohort; overflow must not strand COIN"
+    );
+    assert_eq!(token_amount(&svm, &reward_vault), 0);
+}
+
+// Conservation PROBE: the cohort denominator must remain the exact sum of stake points. If a
+// second maximum counter were allowed to saturate the denominator at u128::MAX, both stakes would
+// have `points == denominator` and could each calculate a full-cohort claim.
+#[test]
+fn crystallize_rejects_point_sum_overflow_instead_of_saturating_the_denominator() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_funding_payer_only_with_fee(&mut svm, &payer, 1_000_000, 0);
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_portfolio = Pubkey::new_unique();
+    let bob_portfolio = Pubkey::new_unique();
+    set_portfolio_funding(
+        &mut svm,
+        &alice_portfolio,
+        &env.stub_perc,
+        &env.market,
+        &alice.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &bob_portfolio,
+        &env.stub_perc,
+        &env.market,
+        &bob.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    set_slot(&mut svm, 100);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &alice,
+        &alice.pubkey(),
+        &alice_portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register first funding payer");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &bob,
+        &bob.pubkey(),
+        &bob_portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register second funding payer");
+
+    set_portfolio_funding(
+        &mut svm,
+        &alice_portfolio,
+        &env.stub_perc,
+        &env.market,
+        &alice.pubkey(),
+        u128::MAX,
+        0,
+        0,
+        0,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &bob_portfolio,
+        &env.stub_perc,
+        &env.market,
+        &bob.pubkey(),
+        u128::MAX,
+        0,
+        0,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &alice, &alice_portfolio)
+        .expect("first maximum counter fills denominator exactly");
+    let config_before = svm.get_account(&env.rd_config).unwrap().data;
+    let bob_stake = stake_pda_for_cohort(
+        &env,
+        &bob.pubkey(),
+        &bob_portfolio,
+        COHORT_FUNDING_PAYER,
+    );
+    let bob_stake_before = svm.get_account(&bob_stake).unwrap().data;
+
+    assert!(
+        crystallize(&mut svm, &payer, &env, &bob, &bob_portfolio).is_err(),
+        "a second maximum stake must not saturate the denominator"
+    );
+    assert_eq!(
+        svm.get_account(&env.rd_config).unwrap().data,
+        config_before,
+        "rejected overflow leaves the exact denominator unchanged"
+    );
+    assert_eq!(
+        svm.get_account(&bob_stake).unwrap().data,
+        bob_stake_before,
+        "rejected overflow cannot persist a numerator outside the denominator"
+    );
 }
 
 #[test]

@@ -118,23 +118,55 @@ const REWARD_SUPPLY_VAULT_BALANCE: u8 = 1;
 // Deterministic, gaming-resistant point math  (pure — unit-tested below)
 // ===========================================================================
 
-/// Deterministic pro-rata split; floor rounding never over-allocates the fixed pool.
+/// Deterministic exact pro-rata split; floor rounding never over-allocates the fixed pool.
 ///
-/// Overflow defense: `total_supply` (u64) * `points_i` (u128) can exceed u128 when `points_i` is large
-/// (`points_i = floor_log2(tenure) * net_delta` for residual cohorts), so we `saturating_mul`
-/// rather than use an unchecked `*`
-/// (which would PANIC = brick every claim in the cohort) or a wrapping `*` (which would DRAIN). Because
-/// `points_i <= total_points` for any real stake, the result is ALWAYS `<= total_supply`, so this never
-/// overpays/over-allocates the fixed pool regardless of saturation. Saturation is itself unreachable for
-/// realistic inputs (`net_delta` is funding paid, bounded by the market's collateral, far below
-/// the u64*u128 product limit); were it ever reached the claimant would UNDERpay and the remainder stays
-/// LOCKED in the vault (conservation holds — never a drain). Do NOT replace the saturating_mul with `*`;
-/// switch to u256 only if exactness past the (unreachable) saturation point is ever required.
+/// `total_supply * points_i` is a 192-bit intermediate. Capital points can exceed the u128
+/// multiplication threshold with entirely legal u64 principal and tenure, so saturating that product
+/// would underpay claims and permanently lock COIN. The overflow path below performs binary long
+/// division as 64 quotient/remainder steps. It never materializes the wide product and has no new
+/// bigint dependency. The caller maintains `points_i <= total_points`; invalid standalone inputs return 0.
 pub fn points_to_amount(total_supply: u64, points_i: u128, total_points: u128) -> u64 {
-    if total_points == 0 {
+    if total_points == 0 || points_i > total_points {
         return 0;
     }
-    ((total_supply as u128).saturating_mul(points_i) / total_points) as u64
+    if let Some(product) = (total_supply as u128).checked_mul(points_i) {
+        return (product / total_points) as u64;
+    }
+
+    let mut quotient = 0u128;
+    let mut remainder = 0u128;
+    for bit in (0..64).rev() {
+        quotient *= 2;
+
+        // Double the remainder modulo total_points without overflowing u128.
+        let complement = total_points - remainder;
+        if remainder >= complement {
+            remainder -= complement; // 2 * remainder - total_points
+            quotient += 1;
+        } else {
+            remainder += remainder;
+        }
+
+        if (total_supply >> bit) & 1 != 0 {
+            // Add points_i modulo total_points, again using the complement to avoid overflow.
+            let complement = total_points - points_i;
+            if remainder >= complement {
+                remainder -= complement;
+                quotient += 1;
+            } else {
+                remainder += points_i;
+            }
+        }
+    }
+    quotient as u64
+}
+
+fn replace_cohort_points(total: &mut u128, old: u128, new: u128) -> ProgramResult {
+    *total = total
+        .checked_sub(old)
+        .and_then(|remaining| remaining.checked_add(new))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok(())
 }
 
 // percolator account header length (KIND/version/etc.) — all percolator account reads below are at
@@ -1342,8 +1374,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
             let multiplier = floor_log2(now.saturating_sub(effective_start));
             let new_pts = multiplier.saturating_mul(live_principal);
-            let slot = config.cohort_points_mut(stake.cohort);
-            *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
+            replace_cohort_points(
+                config.cohort_points_mut(stake.cohort),
+                stake.points,
+                new_pts,
+            )?;
             stake.points = new_pts;
             stake.earnings_snap = live_principal;
             stake.eligible_accum = now as u128;
@@ -1361,8 +1396,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let tenure = Clock::get()?.slot.saturating_sub(stake.start_slot);
             let new_pts = floor_log2(tenure).saturating_mul(net_delta);
-            let slot = config.cohort_points_mut(stake.cohort);
-            *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
+            replace_cohort_points(
+                config.cohort_points_mut(stake.cohort),
+                stake.points,
+                new_pts,
+            )?;
             stake.points = new_pts;
             stake.earnings_snap = net_delta;
             stake.eligible_accum = if stake.cohort == COHORT_TRADER {
@@ -1384,8 +1422,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let counter = funding_payer_counter(long_paid, short_paid);
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let new_pts = net_delta;
-            let slot = config.cohort_points_mut(stake.cohort);
-            *slot = slot.saturating_sub(stake.points).saturating_add(new_pts);
+            replace_cohort_points(
+                config.cohort_points_mut(stake.cohort),
+                stake.points,
+                new_pts,
+            )?;
             stake.points = new_pts;
             stake.earnings_snap = net_delta;
             stake.eligible_accum = 0;
@@ -1575,6 +1616,9 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     }
     let cohort_supply = config.cohort_supply(stake.cohort);
     let frozen_denom = config.frozen_cohort_points(stake.cohort);
+    if stake.points > frozen_denom {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let amount = match stake.cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
             // Capital cohort: read LIVE Position principal and its resettable start clock atomically.
