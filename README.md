@@ -51,7 +51,9 @@ capital's own tenure.
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
   return custody only to that same pool. The pool-less compatibility handoff accepts only an empty
-  asset-0 insurance balance; later value must enter through the inbound-only donation path.
+  asset-0 insurance balance; later value must enter through the inbound-only donation path. After
+  resolution, TWAP can move a retained terminal floor to the canonical controller account only
+  after the bound pool itself attests that no owner principal or shares remain.
 - **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
   approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
   Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
@@ -64,11 +66,11 @@ capital's own tenure.
 |---|---|
 | `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers and retains controller-owned protocol insurance for terminal reclaim. |
-| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
+| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. Its terminal read-only attestation proves when that principal pool has no owner claims. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. It reads principal-bearing accounts but cannot debit them. |
-| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, and apply the exact trade/backing fee setters. Its recovery path is bound to the original genesis pool. |
+| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, and apply the exact trade/backing fee setters. Its recovery path is bound to the original genesis pool. After resolution and a zero-claim pool attestation, it can route the terminal protocol floor only to the canonical market-controller account. |
 | `twap/` | Host-side auction simulation and Percolator wire helpers. It does not expose the obsolete raw Squads/operator rotation conveniences; deployed custody transitions live in `subledger` and `twap-program`. |
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
@@ -176,6 +178,11 @@ If the slab instead records the controller itself as insurance authority, includ
 the resolved companion withdraws only the exact asset-local amount into the canonical controller
 account and leaves it there. It cannot select another destination. The balance reaches Squads only
 through the existing governance-signed terminal reclaim after Percolator accepts `CloseSlab`.
+
+The same terminal custody applies to TWAP-retained insurance after all genesis owners exit. The
+subledger program first attests that its bound principal pool has no outstanding principal or
+shares; only then can a permissionless TWAP crank route the exact resolved asset-0 remainder through
+canonical TWAP and controller accounts. No caller or governance proposal selects the recipient.
 
 Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
 reads both domains' complete principal and earnings from the pinned slab, atomically transfers the

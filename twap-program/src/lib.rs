@@ -57,12 +57,16 @@ const MIN_TIMELOCK_SECS: u32 = 7 * 24 * 60 * 60; // 604_800
 const ATA_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 
-fn bidder_coin_ata(bidder: &Pubkey, coin_mint: &Pubkey) -> Pubkey {
+fn canonical_token_account(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
-        &[bidder.as_ref(), spl_token::ID.as_ref(), coin_mint.as_ref()],
+        &[owner.as_ref(), spl_token::ID.as_ref(), mint.as_ref()],
         &ATA_PROGRAM_ID,
     )
     .0
+}
+
+fn bidder_coin_ata(bidder: &Pubkey, coin_mint: &Pubkey) -> Pubkey {
+    canonical_token_account(bidder, coin_mint)
 }
 
 // The twap_authority PDA seed — matches the `twap` lib's TWAP_AUTHORITY_SEED so the
@@ -96,6 +100,10 @@ const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 const SUBLEDGER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Sub1edger1111111111111111111111111111111111");
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
+const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
+const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
+const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
 
 const IX_INIT_CONFIG: u8 = 0;
 // Reconfigure the surplus buy/burn share. Gated on the Squads VAULT PDA, which can
@@ -154,6 +162,9 @@ const IX_RETURN_TO_SUBLEDGER: u8 = 16;
 const IX_DONATE_INSURANCE: u8 = 17;
 // Timelocked, fee-only Percolator policy update; no value accounts are accepted.
 const IX_SET_MARKET_FEES: u8 = 18;
+// Permissionless after resolution and after the bound pool proves all owner
+// principal is gone. Routes protocol insurance to terminal controller custody.
+const IX_RETURN_RESOLVED_PROTOCOL_INSURANCE: u8 = 19;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -495,6 +506,9 @@ pub fn process_instruction(
         IX_RETURN_TO_SUBLEDGER => process_return_to_subledger(program_id, accounts, data),
         IX_DONATE_INSURANCE => process_donate_insurance(program_id, accounts, data),
         IX_SET_MARKET_FEES => process_set_market_fees(program_id, accounts, data),
+        IX_RETURN_RESOLVED_PROTOCOL_INSURANCE => {
+            process_return_resolved_protocol_insurance(program_id, accounts, data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1073,6 +1087,206 @@ fn process_return_to_subledger(
             market_slab.clone(),
             percolator_program.clone(),
             subledger_program.clone(),
+        ],
+        &[&auth_seeds],
+    )
+}
+
+// return_resolved_protocol_insurance accounts:
+// [config, twap_authority, custody_pool, market(w), twap_canonical_ata(w),
+//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  percolator_program, subledger_program, token_program]
+//
+// Once the market is resolved and the bound principal pool attests that every
+// owner claim is gone, the monotonic retained floor is protocol insurance rather
+// than user principal. Anyone may move the exact remaining asset-0 balance into
+// the controller's canonical ATA, where the existing terminal close forwards it.
+fn process_return_resolved_protocol_insurance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let pool = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let twap_transit = next_account_info(iter)?;
+    let controller_transit = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let subledger_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !market_slab.is_writable
+        || !twap_transit.is_writable
+        || !controller_transit.is_writable
+        || !percolator_vault.is_writable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if config_account.owner != program_id || pool.owner != &SUBLEDGER_PROGRAM_ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *subledger_program.key != SUBLEDGER_PROGRAM_ID
+        || !subledger_program.executable
+        || *token_program.key != spl_token::ID
+        || !percolator_program.executable
+        || market_slab.owner != percolator_program.key
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if config.market_0_domain != 0
+        || config.custody_pool == Pubkey::default()
+        || *pool.key != config.custody_pool
+        || *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    // The subledger owns the claim accounting and its historical layouts. A
+    // successful read-only CPI is the proof that no owner principal or shares remain.
+    invoke(
+        &Instruction {
+            program_id: *subledger_program.key,
+            accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
+            data: vec![SUBLEDGER_IX_ASSERT_NO_PRINCIPAL],
+        },
+        &[pool.clone(), subledger_program.clone()],
+    )?;
+
+    let governance = squads_default_vault(&config.squads_multisig);
+    let controller = Pubkey::find_program_address(
+        &[
+            MARKET_CONTROLLER_SEED,
+            governance.as_ref(),
+            market_slab.key.as_ref(),
+            percolator_program.key.as_ref(),
+        ],
+        &MARKET_CONTROLLER_PROGRAM_ID,
+    )
+    .0;
+    let amount = {
+        let market_data = market_slab.try_borrow_data()?;
+        if percolator_accounting::read_market_authority(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != controller.to_bytes()
+            || !percolator_accounting::market_is_resolved_and_empty(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+            || percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != twap_authority.key.to_bytes()
+            || percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != twap_authority.key.to_bytes()
+            || percolator_accounting::read_asset_admin(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != twap_authority.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let amount = read_asset_insurance(&market_data, 0)?;
+        if amount == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        amount
+    };
+    let amount_u64 = as_u64(amount)?;
+
+    if twap_transit.owner != &spl_token::ID
+        || controller_transit.owner != &spl_token::ID
+        || twap_transit.key == controller_transit.key
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let twap_state = spl_token::state::Account::unpack(&twap_transit.try_borrow_data()?)?;
+    let controller_state =
+        spl_token::state::Account::unpack(&controller_transit.try_borrow_data()?)?;
+    if twap_state.state != spl_token::state::AccountState::Initialized
+        || controller_state.state != spl_token::state::AccountState::Initialized
+        || *twap_transit.key != canonical_token_account(twap_authority.key, &twap_state.mint)
+        || *controller_transit.key != canonical_token_account(&controller, &twap_state.mint)
+        || twap_state.owner != *twap_authority.key
+        || controller_state.owner != controller
+        || twap_state.mint != controller_state.mint
+        || twap_state.delegate.is_some()
+        || twap_state.delegated_amount != 0
+        || twap_state.close_authority.is_some()
+        || controller_state.delegate.is_some()
+        || controller_state.delegated_amount != 0
+        || controller_state.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
+    ix_data.extend_from_slice(&0u16.to_le_bytes());
+    ix_data.extend_from_slice(&amount.to_le_bytes());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*twap_authority.key, true),
+                AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new(*twap_transit.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*vault_authority.key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
+            ],
+            data: ix_data,
+        },
+        &[
+            twap_authority.clone(),
+            market_slab.clone(),
+            twap_transit.clone(),
+            percolator_vault.clone(),
+            vault_authority.clone(),
+            token_program.clone(),
+            percolator_program.clone(),
+        ],
+        &[&auth_seeds],
+    )?;
+
+    let complete_transit_amount =
+        spl_token::state::Account::unpack(&twap_transit.try_borrow_data()?)?.amount;
+    if complete_transit_amount < amount_u64 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    spl_transfer(
+        token_program,
+        twap_transit,
+        controller_transit,
+        twap_authority,
+        complete_transit_amount,
+        Some(&auth_seeds),
+    )?;
+    invoke_signed(
+        &spl_token::instruction::close_account(
+            token_program.key,
+            twap_transit.key,
+            controller_transit.key,
+            twap_authority.key,
+            &[],
+        )?,
+        &[
+            twap_transit.clone(),
+            controller_transit.clone(),
+            twap_authority.clone(),
+            token_program.clone(),
         ],
         &[&auth_seeds],
     )
