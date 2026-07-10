@@ -1546,11 +1546,19 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         return Err(ProgramError::IllegalOwner);
     }
     let ce = spl_token::state::Account::unpack(&coin_escrow.try_borrow_data()?)?;
-    if ce.owner != expected_escrow || ce.mint != *coin_mint.key || ce.amount != 0 {
+    if ce.state != spl_token::state::AccountState::Initialized
+        || ce.owner != expected_escrow
+        || ce.mint != *coin_mint.key
+        || ce.amount != 0
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     let su = spl_token::state::Account::unpack(&settlement_usd.try_borrow_data()?)?;
-    if su.owner != expected_escrow || su.mint != *collateral_mint.key || su.amount != 0 {
+    if su.state != spl_token::state::AccountState::Initialized
+        || su.owner != expected_escrow
+        || su.mint != *collateral_mint.key
+        || su.amount != 0
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     // The canonical USD holding must be a collateral token account owned by the twap_authority
@@ -1563,7 +1571,10 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         return Err(ProgramError::IllegalOwner);
     }
     let hs = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
-    if hs.owner != twap_authority || hs.mint != *collateral_mint.key {
+    if hs.state != spl_token::state::AccountState::Initialized
+        || hs.owner != twap_authority
+        || hs.mint != *collateral_mint.key
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     // In SEND mode, validate + record the COIN sink (a COIN token account); BURN mode ignores it.
@@ -1579,7 +1590,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
             return Err(ProgramError::IllegalOwner);
         }
         let s = spl_token::state::Account::unpack(&coin_sink.try_borrow_data()?)?;
-        if s.mint != *coin_mint.key {
+        if s.state != spl_token::state::AccountState::Initialized || s.mint != *coin_mint.key {
             return Err(ProgramError::InvalidAccountData);
         }
         *coin_sink.key
