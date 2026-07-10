@@ -31,9 +31,10 @@ recover their owner-bound share of the insurance pool, subject to market losses.
   recorded backing provider. Asset 0 instead has a fixed whole-market resolution path that derives
   and atomically returns both backing domains after Percolator proves the market empty. Raw
   `CloseSlab` is excluded; a fixed terminal cleanup forwards only vault dust and account rent to
-  Squads. Donating a creator-owned market preserves that creator when it is already the recorded
-  asset-0 backing provider; the handoff cannot collapse its backing into the controller or select
-  another provider.
+  Squads. Donating a creator-owned market preserves funded outgoing asset-0 insurance roles and the
+  recorded backing provider; the handoff cannot collapse that capital into the controller or select
+  another provider. A genesis-pool grant cannot rotate nonzero external insurance into pool custody:
+  its recorded owner exits first, after which the same grant can proceed.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
@@ -147,6 +148,14 @@ backing role to the controller, and returns the full value to the outgoing provi
 account. Before genesis custody moves, the controller is the constrained asset admin; after TWAP,
 custody first returns to the canonical pool, whose only backing action is invoking this same fixed
 cleanup. A failed domain CPI rolls back every earlier transfer and the authority change.
+
+Permissionless market donation transfers lifecycle control, not funded creator capital. If the
+outgoing market authority still owns nonzero asset-0 insurance, the controller atomically restores
+that exact insurance authority/operator after accepting `marketauth`, just as it preserves the
+recorded backing provider. Genesis custody cannot move to a pool until those external insurance
+roles hold no balance. The creator can withdraw through Percolator, then the unchanged grant path
+installs the canonical owner-bound pool; governance cannot convert the external balance into its own
+or pool-controlled insurance.
 
 At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved

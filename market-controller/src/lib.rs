@@ -50,6 +50,8 @@ const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_AUTH_INSURANCE: u8 = 1;
+const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 const ASSET_AUTH_BACKING_BUCKET: u8 = 3;
 const ASSET_AUTH_ORACLE: u8 = 4;
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
@@ -1114,6 +1116,20 @@ fn process_grant_genesis_pool<'a>(
         market,
         percolator_program,
     )?;
+    {
+        let market_data = market.try_borrow_data()?;
+        let remaining = percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if remaining != 0 {
+            let authority = percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            let operator = percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            if authority != controller.key.to_bytes() || operator != controller.key.to_bytes() {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+    }
     let bump_seed = [bump];
     let seeds = signer_seeds(
         governance.key,
@@ -1173,8 +1189,10 @@ fn process_grant_genesis_pool<'a>(
 // A permissionless creator can hand a market to the governance-bound controller;
 // governance does not need to participate in or approve the donation. Percolator's
 // market-authority update also rotates asset-0 roles that equal the outgoing key. If
-// that key is the recorded backing provider, restore only that same provider after
-// the handoff so donating lifecycle control cannot donate its backing principal too.
+// that key owns funded insurance or is the recorded backing provider, restore only
+// those same roles after the handoff so donating lifecycle control cannot donate
+// segregated capital too. A later genesis-pool grant requires the external insurance
+// balance to exit first.
 fn process_accept_market_authority<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1199,11 +1217,25 @@ fn process_accept_market_authority<'a>(
         market,
         percolator_program,
     )?;
-    let restore_outgoing_backing = {
+    let (restore_insurance_authority, restore_insurance_operator, restore_outgoing_backing) = {
         let market_data = market.try_borrow_data()?;
-        percolator_accounting::read_asset_backing_authority(&market_data, 0)
+        let current_bytes = current.key.to_bytes();
+        let has_insurance = percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?
-            == current.key.to_bytes()
+            != 0;
+        (
+            has_insurance
+                && percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?
+                    == current_bytes,
+            has_insurance
+                && percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?
+                    == current_bytes,
+            percolator_accounting::read_asset_backing_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                == current_bytes,
+        )
     };
     let mut ix_data = vec![PERC_IX_UPDATE_AUTHORITY];
     ix_data.extend_from_slice(controller.key.as_ref());
@@ -1233,10 +1265,17 @@ fn process_accept_market_authority<'a>(
         &[&seeds],
     )?;
 
-    if restore_outgoing_backing {
+    for (kind, restore) in [
+        (ASSET_AUTH_INSURANCE, restore_insurance_authority),
+        (ASSET_AUTH_INSURANCE_OPERATOR, restore_insurance_operator),
+        (ASSET_AUTH_BACKING_BUCKET, restore_outgoing_backing),
+    ] {
+        if !restore {
+            continue;
+        }
         let mut restore_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
         restore_data.extend_from_slice(&0u16.to_le_bytes());
-        restore_data.push(ASSET_AUTH_BACKING_BUCKET);
+        restore_data.push(kind);
         restore_data.extend_from_slice(current.key.as_ref());
         invoke_signed(
             &Instruction {

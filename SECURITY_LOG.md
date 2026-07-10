@@ -12077,3 +12077,25 @@ Percolator's delayed shutdown override, and forwards tokens and transit rent onl
 canonical ATA. The caller, DAO, and governance message select neither amount nor recipient. Generic tag 57 and
 all insurance-role mutations remain denied, and every failed CPI rolls back atomically. No reusable withdrawal
 key, new signer, DAO destination, or custody authority was added.
+
+## Tick — market donation could absorb creator-funded asset-0 insurance (surface A/C)
+
+Percolator's `UpdateAuthority` rewrites every asset-0 role still equal to the outgoing market authority. The
+controller's permissionless market-donation path already restored the outgoing backing provider, but left the
+insurance authority and operator rewritten to the controller. A creator who publicly funded asset-0 insurance
+before donating lifecycle control immediately lost its withdrawal key. Governance could then grant those
+nonzero units to the genesis pool, permanently converting external capital into pool custody without a depositor
+position or redemption claim.
+
+A fresh real Percolator + controller + subledger LiteSVM reproduction initialized a creator market, deposited
+`500,000` units through `TopUpInsuranceDomain`, and donated marketauth. The old controller SBF replaced the
+recorded creator with the controller. The retained regression initializes a valid canonical genesis pool and
+proves its signed grant is byte-atomic and rejected while the external balance remains; the creator then exits
+through Percolator's public withdrawal, and the identical grant succeeds with empty custody.
+
+FIX: before accepting marketauth, the controller snapshots whether nonzero asset-0 insurance is owned or
+operated by the outgoing signer. After Percolator's authority handoff, it atomically restores only those exact
+roles, alongside the existing exact backing-provider restoration. The genesis-pool grant now accepts nonzero
+insurance only when both recorded roles are already the controller; protocol donations remain adoptable, while
+external balances must exit first. No caller-selected key, destination, amount, withdrawal instruction, or new
+admin authority was added, and any restoration or grant CPI failure rolls the whole transaction back.
