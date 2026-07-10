@@ -945,6 +945,18 @@ fn process_accept_custody<'a>(
     {
         return Err(ProgramError::InvalidAccountData);
     }
+    // The pool-less compatibility path has no owner-bound recovery destination. It is safe only
+    // before insurance is funded; otherwise this rotation would place existing capital under the
+    // TWAP PDA with no public path that can return custody to its provider. Funded handoffs must
+    // come through the subledger, which binds `custody_pool` and imports its live principal floor.
+    if source_pool.is_none()
+        && read_asset_insurance(
+            &market_slab.try_borrow_data()?,
+            config.market_0_domain as usize,
+        )? != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let auth_bump = [config.authority_bump];
     let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
     let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)

@@ -48,7 +48,8 @@ capital's own tenure.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
-  return custody only to that same pool.
+  return custody only to that same pool. The pool-less compatibility handoff accepts only an empty
+  asset-0 insurance balance; later value must enter through the inbound-only donation path.
 - **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
   approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
   Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh

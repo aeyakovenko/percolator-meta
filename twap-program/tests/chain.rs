@@ -3355,6 +3355,163 @@ fn handoff_rotates_operator_to_twap_only_after_timelock() {
     send(&mut svm, &[exec], &[&dao]).expect("handoff executes after timelock (operator -> twap)");
 }
 
+// PUBLIC LOF PROBE: tag 3 is the compatibility handoff for an empty market and does not bind a
+// recovery pool. If it accepts already-funded insurance, the TWAP PDA becomes asset admin/operator
+// with a sentinel floor and there is no public path that can return custody to the depositor pool.
+#[test]
+fn legacy_handoff_rejects_funded_insurance_before_rotating_custody() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads,
+        &treasury,
+        &multisig,
+        &create_key.pubkey(),
+        &payer.pubkey(),
+        Some(&dao.pubkey()),
+        1,
+        &[(dao.pubkey(), PERM_ALL)],
+        TIMELOCK_1_WEEK_SECS,
+    );
+    send(&mut svm, &[&payer, &create_key], create_ix).expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_live_market(&slab, &collateral_mint, &squads_vault, 100),
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &coin_mint,
+            &slab,
+            &multisig,
+            &dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("twap config");
+    let config = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", config.as_ref()], &twap_id()).0;
+
+    let amount = 700_000u64;
+    let source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &source,
+        &collateral_mint,
+        &squads_vault,
+        amount,
+    );
+    let topup = build_topup_message(
+        &squads_vault,
+        &slab,
+        &source,
+        &percolator_vault,
+        &perc_id(),
+        amount as u128,
+    );
+    let topup_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(source, false),
+        AccountMeta::new(percolator_vault, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        1,
+        &topup,
+        &topup_remaining,
+    )
+    .expect("fund insurance before legacy handoff");
+    let market_before = svm.get_account(&slab).unwrap().data;
+
+    let handoff = build_accept_operator_message(
+        &squads_vault,
+        &slab,
+        &config,
+        &twap_authority,
+        &perc_id(),
+        &twap_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(config, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            2,
+            &handoff,
+            &handoff_remaining,
+        )
+        .is_err(),
+        "the pool-less compatibility handoff must reject funded insurance"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap().data,
+        market_before,
+        "all custody-role mutations roll back"
+    );
+    assert_eq!(token_amount(&svm, &percolator_vault), amount);
+}
+
 // accept_operator BINDING (the keystone authority transfer): even a fully-approved, timelock'd Squads
 // execute must rotate the operator ONLY on the config's OWN market via the config's OWN percolator program
 // (twap src line ~663: market_slab.key == config.market_slab && percolator_program.key ==
@@ -10244,9 +10401,9 @@ fn e2e_fresh_position_has_no_vote_weight() {
     .expect("vote succeeds once the position has held");
 }
 
-// Shared legacy-migration helper: build a fully handed-off market from an initially
-// unfunded Squads-admin setup, fund it, move all asset-0 custody roles to TWAP, and set
-// reserved_floor = principal. Canonical funded genesis uses the pool-bound helper paths.
+// Shared legacy-migration helper: move an empty Squads-admin market into TWAP custody,
+// fund it through TWAP's inbound-only donation, and set reserved_floor = principal.
+// Canonical funded genesis uses the pool-bound helper paths.
 // Returns the key accounts so a probe can focus purely on the attack.
 #[allow(dead_code)]
 struct HandoffEnv {
@@ -10339,31 +10496,27 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
 
     let principal = 1_000_000u64;
     let surplus = 500_000u64;
-    let src = Pubkey::new_unique();
-    set_token(
-        svm,
-        &src,
-        &collateral_mint,
-        &squads_vault,
-        principal + surplus,
-    );
-    let topup = build_topup_message(
-        &squads_vault,
-        &slab,
-        &src,
-        &perc_vault,
-        &perc_id(),
-        (principal + surplus) as u128,
-    );
-    let tr = vec![
+    // Preserve the historical Squads transaction indexes used by downstream auction fixtures with
+    // a harmless empty-market policy call. The pool-less custody handoff itself must happen before
+    // any insurance is funded.
+    let preliminary_policy =
+        build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+    let preliminary_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new(src, false),
-        AccountMeta::new(perc_vault, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(svm, &squads, &multisig, &dao, payer, 1, &topup, &tr).expect("fund insurance");
+    squads_execute(
+        svm,
+        &squads,
+        &multisig,
+        &dao,
+        payer,
+        1,
+        &preliminary_policy,
+        &preliminary_remaining,
+    )
+    .expect("empty-market policy setup");
     // (Index 2 was the asset-0 tag-33 UpdateInsurancePolicy — REMOVED from the latest percolator; the
     // policy is now baked into the slab's WrapperConfigV16 by make_live_market, and the tag-57 surplus
     // withdraw is operator-gated, not policy-gated. Keep the index slot with a benign DAO reconfigure.)
@@ -10392,6 +10545,50 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
         AccountMeta::new_readonly(twap_id(), false),
     ];
     squads_execute(svm, &squads, &multisig, &dao, payer, 3, &op, &or).expect("operator -> twap");
+
+    // Once empty custody is constrained to TWAP, bootstrap value enters through its inbound-only
+    // donation instruction. No external principal or recovery claim is represented by this legacy
+    // auction fixture; funded genesis uses the pool-bound handoff instead.
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        principal + surplus,
+    );
+    set_token(
+        svm,
+        &donation_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    let mut donation_data = vec![17u8];
+    donation_data.extend_from_slice(&(principal + surplus).to_le_bytes());
+    send(
+        svm,
+        &[&donor],
+        Instruction {
+            program_id: twap_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(donor.pubkey(), true),
+                AccountMeta::new_readonly(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(donor_source, false),
+                AccountMeta::new(donation_holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: donation_data,
+        },
+    )
+    .expect("fund constrained TWAP insurance through inbound donation");
     let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
