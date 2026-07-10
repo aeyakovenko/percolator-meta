@@ -11794,3 +11794,21 @@ overpull_the_floor FAILS at "must reject auction+savings > 10000 (would overpull
 112/112 chain green, src clean. SHARP. (The reconfigure direction 530 is separately pinned by
 reconfigure_must_hold_the_auction_plus_savings_invariant + reconfigure_rejects_a_bps_above_the_denominator.)
 The principal-protection joint cap is load-bearing + mutation-pinned on the savings-setting path. No code change.
+
+## Tick — fixed recovery/re-handoff left exited principal in the TWAP floor (fee-surplus DoS) (surface A/C)
+
+Fresh LiteSVM lifecycle probe extended the real Squads + subledger + TWAP + SPL Token + pinned Percolator chain
+through a path the prior recovery test stopped before: TWAP custody -> permissionless fee donation -> protected
+buffer -> fixed return to the canonical pool -> owner withdrawals -> pool-to-TWAP re-handoff -> public execute.
+The old re-handoff only applied `max(reserved_floor, live_outstanding)`. The first clean-room probe withdrew all
+`999,999` principal, leaving a `1,199,999` floor over `500,000` live insurance; `saturating_sub(insurance, floor)`
+made all fee surplus unavailable forever. The probe failed exactly at that stale-floor assertion, then was
+strengthened to leave principal live across the public crank before completing the final recovery.
+
+FIX: new TWAP configs persist the pool-principal component separately. Only the fixed, pool-signed re-handoff
+may replace that component with current `outstanding_principal`; the DAO floor setter remains monotonic and has
+no new lowering surface. Retained insurance and DAO-raised buffers are preserved exactly. The LiteSVM regression
+keeps `100,000` principal live across re-handoff, proves a public crank preserves that principal plus a `200,000`
+buffer, returns custody again so the owner recovers the final principal, and verifies the next re-handoff removes
+only that final principal. The predecessor 264-byte config remains readable and uses its conservative legacy
+behavior; new 272-byte configs carry the principal snapshot.

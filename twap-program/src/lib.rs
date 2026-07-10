@@ -69,7 +69,8 @@ const CONFIG_SEED: &[u8] = b"twap_config";
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
 const INITIAL_CONFIG_SIZE: usize = 200;
 const LEGACY_CONFIG_SIZE: usize = 232;
-const CONFIG_SIZE: usize = 264;
+const CUSTODY_CONFIG_SIZE: usize = 264;
+const CONFIG_SIZE: usize = 272;
 
 // Default surplus share routed to buy/burn (the rest is retained as insurance).
 const DEFAULT_SURPLUS_BUY_BURN_BPS: u16 = 8_000;
@@ -310,7 +311,8 @@ struct Config {
     /// depositor principal (+ any retained buffer). `execute`'s surplus pull may move at most
     /// `insurance - reserved_floor`. Initialized to u128::MAX (no pulls). A canonical
     /// funded handoff replaces the sentinel with at least the source pool's outstanding
-    /// principal; after that it can only rise.
+    /// principal. The DAO can only raise it; a fixed recovery/re-handoff may replace only
+    /// its recorded pool-principal component with the pool's new live principal.
     reserved_floor: u128,
     /// 4-way surplus economics (DAO-tunable, timelock'd). Each round's surplus splits:
     ///   auction     = surplus_buy_burn_bps           -> buy COIN; of the BOUGHT COIN, buyback_bps is
@@ -331,11 +333,17 @@ struct Config {
     /// exactly once by the pool -> TWAP transition and used as the only permitted
     /// recovery destination. Legacy unfunded direct migrations leave this unset.
     custody_pool: Pubkey,
+    /// Pool principal included in `reserved_floor` at the most recent custody handoff.
+    /// A later recovery/re-handoff may replace only this component with the pool's new
+    /// live outstanding principal; retained insurance and DAO-raised buffers stay locked.
+    custody_principal: u64,
 }
 
 impl Config {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if (data.len() != LEGACY_CONFIG_SIZE && data.len() < CONFIG_SIZE)
+        if (data.len() != LEGACY_CONFIG_SIZE
+            && data.len() != CUSTODY_CONFIG_SIZE
+            && data.len() < CONFIG_SIZE)
             || data[..8] != CONFIG_DISC
         {
             return Err(ProgramError::InvalidAccountData);
@@ -354,16 +362,24 @@ impl Config {
             base_unit_savings_bps: u16::from_le_bytes(data[189..191].try_into().unwrap()),
             buyback_bps: u16::from_le_bytes(data[191..193].try_into().unwrap()),
             base_unit_savings_account: Pubkey::new_from_array(data[193..225].try_into().unwrap()),
-            custody_pool: if data.len() >= CONFIG_SIZE {
+            custody_pool: if data.len() >= CUSTODY_CONFIG_SIZE {
                 Pubkey::new_from_array(data[225..257].try_into().unwrap())
             } else {
                 Pubkey::default()
+            },
+            custody_principal: if data.len() >= CONFIG_SIZE {
+                u64::from_le_bytes(data[257..265].try_into().unwrap())
+            } else {
+                0
             },
         })
     }
 
     fn serialize(&self, data: &mut [u8]) -> ProgramResult {
-        if data.len() != LEGACY_CONFIG_SIZE && data.len() < CONFIG_SIZE {
+        if data.len() != LEGACY_CONFIG_SIZE
+            && data.len() != CUSTODY_CONFIG_SIZE
+            && data.len() < CONFIG_SIZE
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         data[..8].copy_from_slice(&CONFIG_DISC);
@@ -380,9 +396,14 @@ impl Config {
         data[189..191].copy_from_slice(&self.base_unit_savings_bps.to_le_bytes());
         data[191..193].copy_from_slice(&self.buyback_bps.to_le_bytes());
         data[193..225].copy_from_slice(self.base_unit_savings_account.as_ref());
-        if data.len() >= CONFIG_SIZE {
+        if data.len() >= CUSTODY_CONFIG_SIZE {
             data[225..257].copy_from_slice(self.custody_pool.as_ref());
-            data[257..CONFIG_SIZE].fill(0);
+            if data.len() >= CONFIG_SIZE {
+                data[257..265].copy_from_slice(&self.custody_principal.to_le_bytes());
+                data[265..CONFIG_SIZE].fill(0);
+            } else {
+                data[257..CUSTODY_CONFIG_SIZE].fill(0);
+            }
         } else {
             data[225..LEGACY_CONFIG_SIZE].fill(0);
         }
@@ -555,6 +576,7 @@ fn process_init_config(
         buyback_bps: 0,
         base_unit_savings_account: Pubkey::default(),
         custody_pool: Pubkey::default(),
+        custody_principal: 0,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -815,15 +837,38 @@ fn process_accept_custody<'a>(
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     if let Some((pool, protected_floor)) = source_pool {
-        if !config_account.is_writable || config_account.data_len() < CONFIG_SIZE {
+        if !config_account.is_writable || config_account.data_len() < CUSTODY_CONFIG_SIZE {
             return Err(ProgramError::InvalidAccountData);
         }
         if config.custody_pool != Pubkey::default() && config.custody_pool != *pool.key {
             return Err(ProgramError::InvalidAccountData);
         }
+        let previous_pool_principal = config.custody_principal as u128;
+        let new_pool_principal =
+            u64::try_from(protected_floor).map_err(|_| ProgramError::InvalidAccountData)?;
+        let is_rehandoff = config.custody_pool == *pool.key;
         config.custody_pool = *pool.key;
-        if config.reserved_floor == u128::MAX || config.reserved_floor < protected_floor {
+        if config_account.data_len() >= CONFIG_SIZE && is_rehandoff {
+            // The fixed subledger CPI is the only path allowed to lower any part of the floor.
+            // Remove exactly the pool principal recorded at the previous handoff, preserving
+            // every retained/DAO-raised buffer, then add the pool's current live principal.
+            // This makes return -> owner exits -> re-handoff live without giving governance a
+            // selectable floor-decrease primitive or exposing any remaining user principal.
+            if config.reserved_floor == u128::MAX {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let retained_floor = config
+                .reserved_floor
+                .checked_sub(previous_pool_principal)
+                .ok_or(ProgramError::InvalidAccountData)?;
+            config.reserved_floor = retained_floor
+                .checked_add(protected_floor)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        } else if config.reserved_floor == u128::MAX || config.reserved_floor < protected_floor {
             config.reserved_floor = protected_floor;
+        }
+        if config_account.data_len() >= CONFIG_SIZE {
+            config.custody_principal = new_pool_principal;
         }
     }
     if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
@@ -2812,6 +2857,7 @@ mod tests {
             buyback_bps: 2_000,
             base_unit_savings_account: Pubkey::new_unique(),
             custody_pool: Pubkey::new_unique(),
+            custody_principal: 987_654_321,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf).unwrap();
@@ -2828,5 +2874,12 @@ mod tests {
         assert_eq!(d.buyback_bps, 2_000);
         assert_eq!(d.base_unit_savings_account, c.base_unit_savings_account);
         assert_eq!(d.custody_pool, c.custody_pool);
+        assert_eq!(d.custody_principal, c.custody_principal);
+
+        let mut predecessor = [0u8; CUSTODY_CONFIG_SIZE];
+        c.serialize(&mut predecessor).unwrap();
+        let old = Config::deserialize(&predecessor).unwrap();
+        assert_eq!(old.custody_pool, c.custody_pool);
+        assert_eq!(old.custody_principal, 0);
     }
 }
