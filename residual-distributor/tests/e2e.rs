@@ -7064,6 +7064,138 @@ fn pre_epoch_config_completes_register_crystallize_freeze_and_claim() {
     );
 }
 
+fn exercise_historical_frozen_stake_claim(linked_seed: bool, label: &str) {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+
+    set_slot(&mut svm, 100);
+    let lp = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        5_000,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &lp,
+        &lp.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    )
+    .expect("register current fixture stake");
+    set_slot(&mut svm, 1_500);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        12_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &lp, &portfolio).expect("crystallize");
+
+    let current_stake = stake_pda_for_cohort(&env, &lp.pubkey(), &portfolio, COHORT_LP);
+    let mut historical_stake = svm.get_account(&current_stake).unwrap();
+    let (historical_stake_key, historical_bump) = if linked_seed {
+        Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                env.rd_config.as_ref(),
+                lp.pubkey().as_ref(),
+                portfolio.as_ref(),
+            ],
+            &rd_id(),
+        )
+    } else {
+        Pubkey::find_program_address(
+            &[b"rd_stake", env.rd_config.as_ref(), lp.pubkey().as_ref()],
+            &rd_id(),
+        )
+    };
+    historical_stake.data[192] = historical_bump;
+    svm.set_account(historical_stake_key, historical_stake).unwrap();
+    svm.set_account(
+        current_stake,
+        Account {
+            lamports: 0,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    // These stake schemas predate the continuous-epoch tail and therefore pair
+    // with the exact 823-byte config restored by the preceding stacked fix.
+    let mut historical_config = svm.get_account(&env.rd_config).unwrap();
+    historical_config.data.truncate(823);
+    svm.set_account(env.rd_config, historical_config).unwrap();
+
+    let legacy_crystallize = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(env.rd_config, false),
+            AccountMeta::new(historical_stake_key, false),
+            AccountMeta::new_readonly(portfolio, false),
+        ],
+        data: vec![2u8],
+    };
+    assert!(
+        send(&mut svm, &payer, &[legacy_crystallize], &[]).is_err(),
+        "{label}: historical seed cannot re-enter point accrual"
+    );
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze denominators");
+
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    let claim_ix = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(env.rd_config, false),
+            AccountMeta::new(historical_stake_key, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(recipient, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(portfolio, false),
+        ],
+        data: vec![5u8],
+    };
+    send(&mut svm, &payer, &[claim_ix.clone()], &[])
+        .unwrap_or_else(|e| panic!("{label}: frozen historical stake can claim: {e}"));
+    assert_eq!(token_amount(&svm, &recipient), 400_000, "{label}: exact LP cohort paid");
+    assert_eq!(
+        svm.get_account(&historical_stake_key).unwrap().data[210],
+        1,
+        "{label}: historical stake consumed"
+    );
+    assert!(
+        send(&mut svm, &payer, &[claim_ix], &[]).is_err(),
+        "{label}: historical stake cannot replay"
+    );
+}
+
+// Frozen historical stakes may recover their already-counted reward, but only
+// claim recognizes old seeds. Register and crystallize remain V2 family-scoped.
+#[test]
+fn frozen_owner_only_and_linked_stakes_preserve_claims_without_reopening_accrual() {
+    exercise_historical_frozen_stake_claim(false, "owner-only V0 stake");
+    exercise_historical_frozen_stake_claim(true, "owner+linked V1 stake");
+}
+
 // SNAP MANIPULATION (trader cohort, NON-ZERO baseline — sweep tick D free-farm): the LP delta test above and
 // the churn test both register on a FRESH portfolio (snap = 0). The sharper trader-specific free-farm is to
 // bring a portfolio that ALREADY carries a large crystallized loss history and try to cash it in: register
