@@ -2,6 +2,34 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - retained TWAP insurance floor could block resolved market close (surface A/C)
+
+Every TWAP round can intentionally ratchet protocol insurance into the monotonic reserved floor.
+After resolution, custody could return to the canonical pool so every depositor recovered their
+owner-bound principal, and a zero-principal re-handoff correctly removed only that principal from
+the floor. The retained protocol component remained protected, however: the auction saw zero
+surplus forever, while CloseSlab required all insurance to be zero. No fixed path could distinguish
+that terminal protocol insurance from user principal, so a normal 50/50 retain/buyback lifecycle
+could permanently block whole-market closure after all users had exited.
+
+A fresh full-chain LiteSVM regression uses real Percolator, subledger, TWAP, controller, Squads,
+genesis-vote, and distribution binaries. It deposits user principal, hands custody to TWAP, donates
+surplus, and runs a real permissionless 50/50 round that moves half to the buyback budget and
+ratchets half into insurance. It then resolves, proves terminal recovery rejects while user
+principal exists, returns custody for the owner's resolved withdrawal, and re-hands off with zero
+principal. The prior binaries fail with `InvalidInstructionData` at the missing terminal instruction
+after the retained floor is shown to block CloseSlab.
+
+FIX: subledger exposes a read-only CPI attestation that succeeds only for the canonical principal
+insurance pool with zero outstanding principal and zero shares. TWAP's new permissionless resolved
+path requires that attestation, a resolved/empty controller-owned market, all three asset-0 custody
+roles on the config PDA, and exact config/market/program bindings. It derives the controller from
+the bound Squads vault, withdraws the exact slab-derived asset-0 remainder to the canonical TWAP
+ATA, forwards the complete transit balance only to the canonical controller ATA, and closes the
+transit. The regression proves a caller-selected destination rejects atomically and the existing
+terminal close then forwards the protocol atom; no governance withdrawal or user-principal path is
+added.
+
 ## Tick - public stale resolution could strand controller-owned insurance (surface A/C)
 
 The controller's public insurance-donation path could add asset-0 insurance while its PDA remained
