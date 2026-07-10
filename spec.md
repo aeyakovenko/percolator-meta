@@ -20,8 +20,9 @@ contract that changes to the programs must preserve.
 - `market-controller` permanently holds `marketauth` and exposes only the exact pinned Percolator
   lifecycle/oracle/fee allow-list. Live deposits, withdrawals, backing movement, portfolio calls,
   swaps, and authority mutation are denied.
-- Terminal `CloseSlab` is allowed only after Percolator proves every attributed balance and
-  portfolio is zero.
+- Raw `CloseSlab` is excluded from the generic proxy. The fixed terminal cleanup is allowed only
+  after Percolator proves every attributed balance and portfolio is zero, and atomically forwards
+  its mandatory controller-owned token and lamport destinations to governance.
 - Asset-0 custody moves only
   `market-controller -> genesis pool -> TWAP PDA -> original genesis pool`.
 - Squads authorizes transitions through a minimum one-week timelock but never receives a funded

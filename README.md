@@ -20,8 +20,9 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 - **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
   `marketauth` and can sign only a fixed allow-list of lifecycle, oracle, and fee-policy calls. Its
   generic proxy rejects live deposits, withdrawals, swaps, portfolio operations, and every
-  authority mutation. Terminal `CloseSlab` is allowed only after Percolator proves all attributed
-  balances and portfolios are zero.
+  authority mutation. Raw `CloseSlab` is excluded; a fixed atomic cleanup runs only after
+  Percolator proves all attributed balances and portfolios are zero, then forwards terminal vault
+  dust and account rent to Squads.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
@@ -34,7 +35,7 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 
 | Crate | Responsibility |
 |---|---|
-| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and cleanup of an empty slab. The controller cannot withdraw insurance/backing, trade, rotate keys, or move portfolio collateral. |
+| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. The controller cannot withdraw insurance/backing, trade, rotate keys, or move portfolio collateral. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; shares track tenure and live capital for rewards. Only a principal-policy pool can hand custody to TWAP; with-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
@@ -109,9 +110,11 @@ market-controller PDA -> owner-bound genesis pool -> config-bound TWAP PDA
 
 Squads can make the controller sign only the exact pinned allow-list. The allow-list includes market
 and asset lifecycle, approved oracle configuration, bounded fee policy, resolution, and empty-slab
-cleanup. It excludes deposits, withdrawals, swaps, portfolio operations, authority rotation, and
-backing-bucket movement. External backing providers retain their own asset-local withdrawal path;
-governance only sets the fee split that sends the configured share into insurance.
+cleanup. Raw `CloseSlab` is not proxied: the dedicated cleanup forwards its mandatory controller
+destinations atomically. The proxy excludes deposits, withdrawals, swaps, portfolio operations,
+authority rotation, and backing-bucket movement. External backing providers retain their own
+asset-local withdrawal path; governance only sets the fee split that sends the configured share
+into insurance.
 
 At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved
