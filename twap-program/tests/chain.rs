@@ -743,6 +743,153 @@ fn init_book_rejects_a_permanently_frozen_settlement_account() {
     );
 }
 
+// EXTERNAL CLOSE-AUTHORITY DOS: SPL owner rotation clears delegates but preserves an explicit
+// close authority on non-native accounts. Without this guard, the attacker can close the empty
+// canonical escrow after `init_book` commits it and permanently brick the singleton auction.
+#[test]
+fn init_book_rejects_a_pda_escrow_with_an_external_close_authority() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let attacker = Keypair::new();
+    let coin_escrow_keypair = Keypair::new();
+    let coin_escrow = coin_escrow_keypair.pubkey();
+    let create_escrow = solana_sdk::system_instruction::create_account(
+        &payer.pubkey(),
+        &coin_escrow,
+        svm.minimum_balance_for_rent_exemption(spl_token::state::Account::LEN),
+        spl_token::state::Account::LEN as u64,
+        &spl_token::ID,
+    );
+    let initialize_escrow = spl_token::instruction::initialize_account(
+        &spl_token::ID,
+        &coin_escrow,
+        &env.coin_mint,
+        &attacker.pubkey(),
+    )
+    .unwrap();
+    let retain_close_authority = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &coin_escrow,
+        Some(&attacker.pubkey()),
+        spl_token::instruction::AuthorityType::CloseAccount,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let rotate_owner = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &coin_escrow,
+        Some(&book_escrow),
+        spl_token::instruction::AuthorityType::AccountOwner,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            create_escrow,
+            initialize_escrow,
+            retain_close_authority,
+            rotate_owner,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &coin_escrow_keypair, &attacker],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .expect("create PDA-owned escrow while retaining attacker close authority");
+
+    let escrow_state =
+        spl_token::state::Account::unpack(&svm.get_account(&coin_escrow).unwrap().data).unwrap();
+    assert_eq!(escrow_state.owner, book_escrow);
+    assert_eq!(escrow_state.amount, 0);
+    assert_eq!(
+        escrow_state.close_authority,
+        COption::Some(attacker.pubkey()),
+        "SPL owner rotation preserves the external close authority"
+    );
+
+    let settlement_usd = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &settlement_usd,
+        &env.collateral_mint,
+        &book_escrow,
+        0,
+    );
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+
+    let msg = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        0,
+        1,
+        10,
+        0,
+        0,
+        None,
+    );
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &msg,
+            &rem,
+        )
+        .is_err(),
+        "init_book must reject a canonical escrow an outsider can close"
+    );
+    assert!(
+        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
+        "the rejected escrow cannot consume the singleton book PDA"
+    );
+}
+
 // ISSUE #42 REGRESSION: the Squads-gated setters must reject token-shaped accounts that are not actually
 // owned by SPL Token. Account::unpack only validates bytes; without an owner check a valid DAO transaction
 // can bind a system-owned fake sink and later brick execution when SPL Token receives it as a destination.

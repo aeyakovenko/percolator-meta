@@ -1550,6 +1550,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         || ce.owner != expected_escrow
         || ce.mint != *coin_mint.key
         || ce.amount != 0
+        || ce.close_authority.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -1558,6 +1559,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         || su.owner != expected_escrow
         || su.mint != *collateral_mint.key
         || su.amount != 0
+        || su.close_authority.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -1574,6 +1576,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if hs.state != spl_token::state::AccountState::Initialized
         || hs.owner != twap_authority
         || hs.mint != *collateral_mint.key
+        || hs.close_authority.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
     }
