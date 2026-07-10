@@ -279,6 +279,119 @@ fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypai
     svm.send_transaction(tx).unwrap();
 }
 
+fn translate_sealed_distribution_to_legacy(
+    env: &mut Env,
+    current_proposal: &Pubkey,
+    authority_bound: bool,
+) -> Pubkey {
+    let current_config = env.config;
+    let mut config_account = env.svm.get_account(&current_config).unwrap();
+    let mut proposal_account = env.svm.get_account(current_proposal).unwrap();
+    let proposal_id = u64::from_le_bytes(proposal_account.data[40..48].try_into().unwrap());
+    let (legacy_config, legacy_bump) = if authority_bound {
+        Pubkey::find_program_address(
+            &[
+                b"dist_config",
+                env.coin_mint.as_ref(),
+                env.authority.pubkey().as_ref(),
+            ],
+            &pid(),
+        )
+    } else {
+        Pubkey::find_program_address(&[b"dist_config", env.coin_mint.as_ref()], &pid())
+    };
+    let legacy_proposal = Pubkey::find_program_address(
+        &[
+            b"dist_proposal",
+            legacy_config.as_ref(),
+            &proposal_id.to_le_bytes(),
+        ],
+        &pid(),
+    )
+    .0;
+
+    config_account.data[120..152].copy_from_slice(legacy_proposal.as_ref());
+    config_account.data[160] = legacy_bump;
+    env.svm.set_account(legacy_config, config_account).unwrap();
+
+    proposal_account.data[8..40].copy_from_slice(legacy_config.as_ref());
+    env.svm.set_account(legacy_proposal, proposal_account).unwrap();
+
+    // Historical init made this config PDA the SPL vault authority.
+    let mut vault_account = env.svm.get_account(&env.vault).unwrap();
+    let mut vault_state = spl_token::state::Account::unpack(&vault_account.data).unwrap();
+    vault_state.owner = legacy_config;
+    spl_token::state::Account::pack(vault_state, &mut vault_account.data).unwrap();
+    env.svm.set_account(env.vault, vault_account).unwrap();
+
+    env.config = legacy_config;
+    legacy_proposal
+}
+
+// UPGRADE-INDUCED VAULT LOCK: the safe authority-bound config stayed 168 bytes when
+// claim_window joined its PDA seed. The current decoder accepts that generation,
+// but signing only the latest seeds strands recipient claims and the terminal burn.
+#[test]
+fn authority_bound_historical_distribution_preserves_claim_and_terminal_burn() {
+    let mut env = Env::new(100, 10);
+    let (recipient, recipient_ata) = env.new_recipient();
+    let proposal = env.create_proposal(7, 1);
+    env.append(&proposal, &[(recipient.pubkey(), 40)]).expect("append");
+    let authority = clone_kp(&env.authority);
+    env.seal(&proposal, &authority).expect("seal");
+    let legacy_proposal = translate_sealed_distribution_to_legacy(&mut env, &proposal, true);
+
+    env.claim(&legacy_proposal, &recipient, &recipient_ata, 0)
+        .expect("authority-bound historical recipient claim remains live");
+    assert_eq!(env.token_amount(&recipient_ata), 40, "recipient paid");
+    assert_eq!(env.token_amount(&env.vault), 60, "only the claim left the vault");
+
+    let seal_slot = u64::from_le_bytes(
+        env.svm.get_account(&env.config).unwrap().data[152..160]
+            .try_into()
+            .unwrap(),
+    );
+    env.set_slot(seal_slot + 10);
+    env.burn_unclaimed().expect("authority-bound historical terminal burn remains live");
+    assert_eq!(env.token_amount(&env.vault), 0, "no reward coins stranded");
+    let mint_supply = spl_token::state::Mint::unpack(
+        &env.svm.get_account(&env.coin_mint).unwrap().data,
+    )
+    .unwrap()
+    .supply;
+    assert_eq!(mint_supply, 40, "only the claimed reward remains in supply");
+}
+
+// The mint-only schema was retired by 418ca15 because a first writer could bind a
+// pre-funded vault to an attacker authority. Compatibility must never make that
+// quarantined config a signer again, even if its bytes otherwise decode cleanly.
+#[test]
+fn theft_vulnerable_mint_only_distribution_config_stays_inert() {
+    let mut env = Env::new(100, 10);
+    let (recipient, recipient_ata) = env.new_recipient();
+    let proposal = env.create_proposal(7, 1);
+    env.append(&proposal, &[(recipient.pubkey(), 100)]).expect("append");
+    let authority = clone_kp(&env.authority);
+    env.seal(&proposal, &authority).expect("seal");
+    let legacy_proposal = translate_sealed_distribution_to_legacy(&mut env, &proposal, false);
+
+    assert!(
+        env.claim(&legacy_proposal, &recipient, &recipient_ata, 0).is_err(),
+        "known-unsafe mint-only config must not regain a claim signer"
+    );
+    assert_eq!(env.token_amount(&recipient_ata), 0, "no attacker-directed claim moved coins");
+    assert_eq!(env.token_amount(&env.vault), 100, "quarantined vault unchanged");
+
+    let seal_slot = u64::from_le_bytes(
+        env.svm.get_account(&env.config).unwrap().data[152..160]
+            .try_into()
+            .unwrap(),
+    );
+    env.set_slot(seal_slot + 10);
+    assert!(env.burn_unclaimed().is_err(), "mint-only config must not regain any signer path");
+    assert_eq!(env.token_amount(&env.vault), 100, "quarantine remains atomic after burn attempt");
+}
+
 #[test]
 fn seal_then_recipients_claim_their_entries() {
     let mut env = Env::new(100, 1_000_000);
