@@ -12174,3 +12174,23 @@ base, Alice receives `500,000` (within the existing one-atom share-floor bound),
 bound), their sum equals the complete remaining insurance in either order, and both full chains return healthy
 principal exactly. Historical pre-share positions retain the old owner-bound pool-wide haircut so an upgrade
 cannot lock their funds. No signer, authority, destination, custody transition, or admin surface was added.
+
+## Tick - controller activation could give governance an external provider's withdrawal key (surface A/C)
+
+Percolator's secondary-asset activation wire accepts separate insurance authority and insurance operator
+keys. The controller generically proxied that lifecycle call without constraining the pair. Governance could
+therefore activate asset 1 with an external provider as the top-up authority and itself as operator, wait for
+the provider to deposit, then use Percolator's ordinary live withdrawal to send the complete balance to a
+governance-owned token account. The timelock delayed the theft but did not prevent it.
+
+A fresh controller + pinned-Percolator LiteSVM regression initialized a controller-owned appendable market,
+activated the split roles through the public proxy, deposited `700,000` units from the external provider, and
+proved the old SBF let governance withdraw all `700,000`. The retained test executes that drain before failing
+if the unsafe activation ever regresses. It also requires rejected activation to leave the slab byte-identical,
+then activates with both insurance roles bound to the provider, proves a governance withdrawal fails atomically,
+and returns every unit through the provider's live exit.
+
+FIX: the controller validates the exact pinned tag-40 activation wire before CPI and requires
+`insurance_authority == insurance_operator`. Backing and oracle providers remain independently selectable, and
+non-activation lifecycle actions remain unchanged. This adds no signer, authority, destination, withdrawal path,
+or admin surface; it removes governance's ability to construct split custody in the first place.
