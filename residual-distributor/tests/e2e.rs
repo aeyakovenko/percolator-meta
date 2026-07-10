@@ -6962,6 +6962,108 @@ fn lp_residual_delta_and_double_claim_rejected() {
     );
 }
 
+// UPGRADE-INDUCED REWARD VAULT LOCK: continuous epochs appended 626 bytes to the
+// legacy genesis config, growing it from 823 to 1,449 bytes without changing the
+// legacy config PDA or the already-current 211-byte stake. Rejecting that exact
+// pre-epoch size bricks register/crystallize/freeze/claim after program upgrade.
+#[test]
+fn pre_epoch_config_completes_register_crystallize_freeze_and_claim() {
+    const PRE_EPOCH_CONFIG_SIZE: usize = 823;
+
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup(&mut svm, &payer, supply);
+
+    let current_config = svm.get_account(&env.rd_config).unwrap();
+    assert_eq!(current_config.data.len(), 1_449, "current config fixture size");
+    let lp = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_slot(&mut svm, 100);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        5_000,
+        0,
+    );
+
+    let mut unsupported_partial = current_config.clone();
+    unsupported_partial.data.truncate(PRE_EPOCH_CONFIG_SIZE + 1);
+    svm.set_account(env.rd_config, unsupported_partial).unwrap();
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &lp,
+            &lp.pubkey(),
+            &portfolio,
+            COHORT_LP,
+        )
+        .is_err(),
+        "unknown partial layouts stay rejected"
+    );
+    assert!(
+        svm.get_account(&stake_pda_for_cohort(
+            &env,
+            &lp.pubkey(),
+            &portfolio,
+            COHORT_LP,
+        ))
+        .is_none(),
+        "rejected partial config created no stake"
+    );
+
+    let mut historical_config = current_config;
+    historical_config.data.truncate(PRE_EPOCH_CONFIG_SIZE);
+    svm.set_account(env.rd_config, historical_config).unwrap();
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &lp,
+        &lp.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    )
+    .expect("pre-epoch register remains live");
+
+    set_slot(&mut svm, 1_500);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        12_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &lp, &portfolio)
+        .expect("pre-epoch crystallize remains live");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("pre-epoch freeze remains live");
+    assert_eq!(
+        svm.get_account(&env.rd_config).unwrap().data.len(),
+        PRE_EPOCH_CONFIG_SIZE,
+        "compatibility never reallocates historical state"
+    );
+
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    claim(&mut svm, &payer, &env, &lp, &recipient, None)
+        .expect("pre-epoch claimant receives the frozen LP cohort");
+    assert_eq!(token_amount(&svm, &recipient), 400_000, "sole LP receives the 40% cohort");
+    assert_eq!(token_amount(&svm, &env.vault), 600_000, "only the earned reward leaves the vault");
+    assert!(
+        claim(&mut svm, &payer, &env, &lp, &recipient, None).is_err(),
+        "historical stake remains one-shot"
+    );
+}
+
 // SNAP MANIPULATION (trader cohort, NON-ZERO baseline — sweep tick D free-farm): the LP delta test above and
 // the churn test both register on a FRESH portfolio (snap = 0). The sharper trader-specific free-farm is to
 // bring a portfolio that ALREADY carries a large crystallized loss history and try to cash it in: register
