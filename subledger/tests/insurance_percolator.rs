@@ -2897,6 +2897,210 @@ fn vote_locked_principal_cannot_exit_until_retracted() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "insurance drained");
 }
 
+fn exercise_legacy_genesis_retract(config_size: usize, pool_bound: bool, label: &str) {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let voted_weight = 7_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+
+    let (legacy_config, legacy_config_bump) = if pool_bound {
+        Pubkey::find_program_address(
+            &[b"gv_config", env.coin_mint.as_ref(), pool.as_ref()],
+            &gv_id(),
+        )
+    } else {
+        Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id())
+    };
+    let distribution_config = Pubkey::new_unique();
+    let distribution_proposal = Pubkey::new_unique();
+    let (legacy_proposal, _) = Pubkey::find_program_address(
+        &[
+            b"gv_proposal",
+            legacy_config.as_ref(),
+            distribution_proposal.as_ref(),
+        ],
+        &gv_id(),
+    );
+    let (legacy_ballot, _) = Pubkey::find_program_address(
+        &[b"gv_ballot", legacy_config.as_ref(), alice.pubkey().as_ref()],
+        &gv_id(),
+    );
+
+    let mut config_data = vec![0u8; config_size];
+    config_data[..8].copy_from_slice(b"GVCONFG1");
+    config_data[8..40].copy_from_slice(env.coin_mint.as_ref());
+    config_data[40..72].copy_from_slice(dist_id().as_ref());
+    config_data[72..104].copy_from_slice(distribution_config.as_ref());
+    config_data[104..136].copy_from_slice(sub_id().as_ref());
+    config_data[136..168].copy_from_slice(pool.as_ref());
+    config_data[200..208].copy_from_slice(&amount.to_le_bytes());
+    if config_size == 232 {
+        config_data[208..216].copy_from_slice(&voted_weight.to_le_bytes());
+        config_data[216..224].copy_from_slice(&amount.to_le_bytes());
+        config_data[224] = legacy_config_bump;
+    } else {
+        config_data[208..224].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        config_data[224..232].copy_from_slice(&amount.to_le_bytes());
+        config_data[232] = legacy_config_bump;
+        if config_size == 248 {
+            config_data[233..241].copy_from_slice(&38_880_000u64.to_le_bytes());
+        }
+    }
+    env.svm
+        .set_account(
+            legacy_config,
+            Account {
+                lamports: 1_000_000_000,
+                data: config_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ballot_size = if config_size == 232 { 112 } else { 120 };
+    let contribution_end = if config_size == 232 { 88 } else { 96 };
+    let mut ballot_data = vec![0u8; ballot_size];
+    ballot_data[..8].copy_from_slice(b"GVBALOT1");
+    ballot_data[8..40].copy_from_slice(alice.pubkey().as_ref());
+    ballot_data[40..72].copy_from_slice(legacy_proposal.as_ref());
+    if config_size == 232 {
+        ballot_data[72..80].copy_from_slice(&voted_weight.to_le_bytes());
+        ballot_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    } else {
+        ballot_data[72..88].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        ballot_data[88..96].copy_from_slice(&amount.to_le_bytes());
+    }
+    env.svm
+        .set_account(
+            legacy_ballot,
+            Account {
+                lamports: 1_000_000_000,
+                data: ballot_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let proposal_size = if config_size == 232 { 104 } else { 112 };
+    let mut proposal_data = vec![0u8; proposal_size];
+    proposal_data[..8].copy_from_slice(b"GVPROPV1");
+    proposal_data[8..40].copy_from_slice(legacy_config.as_ref());
+    proposal_data[40..72].copy_from_slice(distribution_proposal.as_ref());
+    if config_size == 232 {
+        proposal_data[72..80].copy_from_slice(&voted_weight.to_le_bytes());
+        proposal_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    } else {
+        proposal_data[72..88].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        proposal_data[88..96].copy_from_slice(&amount.to_le_bytes());
+    }
+    env.svm
+        .set_account(
+            legacy_proposal,
+            Account {
+                lamports: 1_000_000_000,
+                data: proposal_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Preserve the exact cross-program state an old successful vote created.
+    let mut pool_account = env.svm.get_account(&pool).unwrap();
+    pool_account.data[160..192].copy_from_slice(legacy_config.as_ref());
+    env.svm.set_account(pool, pool_account).unwrap();
+    let position = env.position_pda(&alice.pubkey());
+    let mut position_account = env.svm.get_account(&position).unwrap();
+    position_account.data[97] = 1;
+    env.svm.set_account(position, position_account).unwrap();
+
+    let config_before = env.svm.get_account(&legacy_config).unwrap().data;
+    let ballot_before = env.svm.get_account(&legacy_ballot).unwrap().data;
+    let proposal_before = env.svm.get_account(&legacy_proposal).unwrap().data;
+    let vote_ix = |voter: Pubkey, action: u8| Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(voter, true),
+            AccountMeta::new(legacy_config, false),
+            AccountMeta::new(legacy_ballot, false),
+            AccountMeta::new(legacy_proposal, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, action],
+    };
+
+    // Compatibility never revives legacy governance: backing still rejects and
+    // cannot mutate the old ballot or release its capital lock.
+    assert!(env.send(&[vote_ix(alice.pubkey(), 1)], &[&alice]).is_err(), "{label}: backing stays disabled");
+    assert_eq!(env.svm.get_account(&legacy_ballot).unwrap().data, ballot_before, "{label}: rejected backing is atomic");
+    assert_eq!(env.svm.get_account(&position).unwrap().data[97], 1, "{label}: rejected backing keeps the lock");
+
+    // A different signer cannot use the recovery path to alter Alice's ballot.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000).unwrap();
+    assert!(env.send(&[vote_ix(attacker.pubkey(), 2)], &[&attacker]).is_err(), "{label}: non-owner retract rejected");
+    assert_eq!(env.svm.get_account(&legacy_ballot).unwrap().data, ballot_before, "{label}: non-owner changed no ballot state");
+    assert_eq!(env.svm.get_account(&position).unwrap().data[97], 1, "{label}: non-owner cannot release the lock");
+
+    env.send(&[vote_ix(alice.pubkey(), 2)], &[&alice])
+        .unwrap_or_else(|e| panic!("{label}: legacy owner can always retract: {e}"));
+
+    let ballot_after = env.svm.get_account(&legacy_ballot).unwrap().data;
+    assert_eq!(&ballot_after[40..72], Pubkey::default().as_ref(), "live ballot cleared");
+    assert!(ballot_after[40..contribution_end].iter().all(|byte| *byte == 0), "{label}: legacy contribution cleared");
+    assert_eq!(
+        env.svm.get_account(&position).unwrap().data[97],
+        0,
+        "subledger vote-lock released"
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_config).unwrap().data,
+        config_before,
+        "inert legacy governance tallies are not revived or rewritten"
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_proposal).unwrap().data,
+        proposal_before,
+        "inert legacy proposal tallies are not revived or rewritten"
+    );
+    assert!(env.send(&[vote_ix(alice.pubkey(), 2)], &[&alice]).is_err(), "{label}: cleared ballot cannot replay");
+    assert_eq!(env.svm.get_account(&legacy_ballot).unwrap().data, ballot_after, "{label}: replay changed no state");
+    assert_eq!(env.svm.get_account(&position).unwrap().data[97], 0, "{label}: replay cannot relock principal");
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount)
+        .unwrap_or_else(|e| panic!("{label}: owner recovers the full deposit after legacy retract: {e}"));
+    assert_eq!(env.token_amount(&alice_ata), amount, "{label}: principal returned");
+    assert_eq!(env.token_amount(&env.perc_vault), 0, "{label}: insurance principal exited");
+}
+
+// UPGRADE-INDUCED PRINCIPAL LOCK: the vote-lock spans four exact historical
+// config/PDA generations. Current decoders formerly rejected every one before the
+// SetVoteLock(0) CPI, permanently preventing a signed owner from withdrawing.
+#[test]
+fn every_legacy_genesis_ballot_generation_can_retract_and_recover_real_percolator_principal() {
+    for (config_size, pool_bound, label) in [
+        (232, false, "232-byte coin-only"),
+        (232, true, "232-byte pool-bound"),
+        (240, true, "240-byte widened"),
+        (248, true, "248-byte bootstrap-end"),
+    ] {
+        exercise_legacy_genesis_retract(config_size, pool_bound, label);
+    }
+}
+
 // CROSS-TAG FORFEITURE BYPASS: a voter whose insurance principal is vote-locked is refused the
 // insurance exit (tag 5, which checks vote_locked). The escape an attacker would reach for is the OTHER
 // withdraw — the own-vault `process_withdraw` (tag 2), which has NO vote_locked check at all (locking is
