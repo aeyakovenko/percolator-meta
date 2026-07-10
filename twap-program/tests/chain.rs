@@ -5013,9 +5013,10 @@ fn e2e_attacker_cannot_lower_surplus_floor_without_squads() {
 // imported atomically from pool accounting but locked. CRUCIALLY the lock is NOT permanent — the constrained
 // TWAP can return custody only to the canonical owner-bound pool. This test pins the full
 // lifecycle: exit works before the handoff, is blocked after, and is recoverable without ever
-// assigning a withdrawal-capable role to governance.
+// assigning a withdrawal-capable role to governance. It then re-hands custody with partial and
+// zero live principal, proving each public crank preserves exactly the still-protected components.
 #[test]
-fn e2e_subledger_exit_blocked_after_operator_handoff() {
+fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -5078,7 +5079,8 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let coin_mint = Pubkey::new_unique();
+    let coin_mint_authority = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_mint_authority.pubkey());
     let pool = sub_pool_pda(
         &collateral_mint,
         0,
@@ -5290,6 +5292,76 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
         "handoff must atomically protect the pool's live outstanding principal"
     );
 
+    // Accrue fee surplus while TWAP has custody, then protect a separate protocol buffer above
+    // depositor principal. Recovery must later subtract only principal that actually exited; it
+    // must neither leave that exited principal in the floor nor unlock this retained buffer.
+    let fee_surplus = 500_000u64;
+    let protected_buffer = 200_000u128;
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        fee_surplus,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    let mut donation_data = vec![17u8];
+    donation_data.extend_from_slice(&fee_surplus.to_le_bytes());
+    let donation = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(donor.pubkey(), true),
+            AccountMeta::new_readonly(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(donor_source, false),
+            AccountMeta::new(donation_holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: donation_data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[donation],
+        Some(&payer.pubkey()),
+        &[&payer, &donor],
+        bh,
+    ))
+    .expect("permissionless fee-surplus donation");
+
+    let buffered_floor = (amount - 1) as u128 + protected_buffer;
+    let buffer_msg = build_set_reserved_floor_message(&squads_vault, &twap_cfg, buffered_floor);
+    let buffer_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        4,
+        &buffer_msg,
+        &buffer_remaining,
+    )
+    .expect("protect retained insurance buffer");
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), buffered_floor);
+
     // AFTER the handoff: alice's subledger exit is now rejected — the pool is no longer the
     // insurance operator, so percolator refuses the pool-signed WithdrawInsuranceLimited.
     svm.expire_blockhash();
@@ -5360,16 +5432,16 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
         AccountMeta::new_readonly(twap_id(), false),
     ];
     assert!(
-    squads_execute(
-        &mut svm,
-        &squads,
-        &multisig,
-        &dao,
-        &payer,
-            4,
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            5,
             &decoy_return,
             &decoy_remaining,
-    )
+        )
         .is_err(),
         "recovery must reject a same-market decoy pool"
     );
@@ -5400,7 +5472,7 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
         &multisig,
         &dao,
         &payer,
-        5,
+        6,
         &regrant,
         &regrant_remaining,
     )
@@ -5419,6 +5491,200 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
         token_amount(&svm, &alice_ata) - before,
         100,
         "the previously-locked principal is recovered"
+    );
+
+    // Leave some principal live across the re-handoff. The new floor must protect that exact
+    // remainder in addition to the retained buffer, while removing only principal that exited.
+    let remaining_principal = amount - 1 - 100;
+    let live_principal = 100_000u64;
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[withdraw(remaining_principal - live_principal)],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        bh,
+    ))
+    .expect("owner recovers principal before re-handoff");
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        fee_surplus + live_principal
+    );
+
+    // Re-handoff must replace only the exited-principal component of the floor. Before this
+    // regression was fixed, the floor stayed at `buffered_floor` (> live insurance), so every
+    // permissionless execute saw zero surplus forever after the documented recovery flow.
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &op_msg,
+        &op_remaining,
+    )
+    .expect("pool re-hands custody to TWAP after owner exits");
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        protected_buffer + live_principal as u128,
+        "re-handoff removes exited principal while preserving the retained buffer"
+    );
+
+    // Prove the recovered surplus is live on the public crank path, not merely reflected in a
+    // config field. An empty book leaves the pulled auction budget in TWAP holding; no user funds
+    // or bidder escrow are involved.
+    let book = book_pda(&twap_cfg);
+    let book_escrow = book_escrow_pda(&twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let twap_holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &collateral_mint, &book_escrow, 0);
+    set_token(
+        &mut svm,
+        &twap_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
+    let round_length = 10u64;
+    let init_book = build_init_book_message(
+        &squads_vault,
+        &book,
+        &twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &twap_holding,
+        &coin_mint,
+        &collateral_mint,
+        0,
+        1,
+        round_length,
+        0,
+        0,
+        None,
+    );
+    let init_book_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        8,
+        &init_book,
+        &init_book_remaining,
+    )
+    .expect("initialize recovered TWAP round");
+
+    let round_end = u64::from_le_bytes(
+        svm.get_account(&book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, round_end);
+    let env = HandoffEnv {
+        squads,
+        multisig,
+        dao,
+        squads_vault,
+        slab,
+        collateral_mint,
+        coin_mint,
+        coin_mint_authority,
+        twap_cfg,
+        twap_authority,
+        perc_vault,
+        vault_authority,
+        principal: 0,
+        surplus: fee_surplus,
+    };
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &book,
+            &twap_holding,
+            &settlement_usd,
+            &book_escrow,
+            &coin_escrow,
+            None,
+        ),
+    )
+    .expect("permissionless crank can use recovered fee surplus");
+    let protected_after_rehandoff = protected_buffer + live_principal as u128;
+    let available_surplus = (fee_surplus + live_principal) as u128 - protected_after_rehandoff;
+    let auction_budget = available_surplus * 8_000 / 10_000;
+    let retained = available_surplus - auction_budget;
+    assert_eq!(token_amount(&svm, &twap_holding), auction_budget as u64);
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        (protected_after_rehandoff + retained) as u64
+    );
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        protected_after_rehandoff + retained,
+        "the public crank cannot cross live principal or the retained insurance buffer"
+    );
+
+    // A second fixed recovery restores the remaining owner's exit. Re-handing custody once more
+    // removes that final principal component and leaves every non-principal floor atom protected.
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        9,
+        &regrant,
+        &regrant_remaining,
+    )
+    .expect("return custody for final owner exit");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[withdraw(live_principal)],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        bh,
+    ))
+    .expect("owner recovers final protected principal");
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        (protected_buffer + retained) as u64
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        10,
+        &op_msg,
+        &op_remaining,
+    )
+    .expect("final re-handoff after all principal exits");
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        protected_buffer + retained,
+        "only retained protocol insurance remains protected"
     );
 }
 

@@ -68,9 +68,10 @@ The workspace pins `percolator-prog` to commit
    markets and set fee splits. Inbound-only donation instructions fund Percolator without giving
    governance an insurance key.
 7. **Handoff.** If capital remains for continuous operation, Squads authorizes the fixed
-   pool-to-TWAP transition. The transition records the exact pool identity and raises the TWAP floor
-   to at least current outstanding principal in the same transaction. Deposits and exits are closed
-   while TWAP holds custody; the fixed recovery transition restores owner exits.
+   pool-to-TWAP transition. The transition records the exact pool identity and live principal in
+   the TWAP floor. After a recovery, re-handoff replaces only that principal component; retained
+   insurance stays protected and exited principal no longer strands fee surplus. Deposits and exits
+   are closed while TWAP holds custody; the fixed recovery transition restores owner exits.
 
 ## Continuous Rewards
 
