@@ -4754,6 +4754,60 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
         "custody handoff cannot absorb the external backing provider"
     );
 
+    // Compatibility probe: deployed predecessor pools could carry a nonzero metadata
+    // asset_id even though every insurance CPI funded asset 0. Reproduce that historical
+    // public account/PDA schema and authority state; upgrades preserve its exit and cleanup
+    // paths rather than treating the stale metadata as a different Percolator asset.
+    let legacy_asset_id = 7u64;
+    let (cleanup_pool, cleanup_pool_bump) = Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            collateral_mint.as_ref(),
+            &legacy_asset_id.to_le_bytes(),
+            slab.as_ref(),
+            perc_id().as_ref(),
+        ],
+        &sub_id(),
+    );
+    let current_pool_account = svm.get_account(&pool).unwrap();
+    let mut legacy_pool_data = current_pool_account.data[..208].to_vec();
+    legacy_pool_data[40..48].copy_from_slice(&legacy_asset_id.to_le_bytes());
+    legacy_pool_data[89] = cleanup_pool_bump;
+    svm.set_account(
+        cleanup_pool,
+        Account {
+            lamports: current_pool_account.lamports,
+            data: legacy_pool_data,
+            owner: sub_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let mut historical_slab = svm.get_account(&slab).unwrap();
+    let mut historical_profile =
+        percolator_prog::state::read_asset_oracle_profile(&historical_slab.data, 0).unwrap();
+    let legacy_authority = cleanup_pool.to_bytes();
+    historical_profile.insurance_authority = legacy_authority;
+    historical_profile.insurance_operator = legacy_authority;
+    historical_profile.asset_admin = legacy_authority;
+    percolator_prog::state::write_asset_oracle_profile(
+        &mut historical_slab.data,
+        0,
+        &historical_profile,
+    )
+    .unwrap();
+    svm.set_account(slab, historical_slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        creator.pubkey().to_bytes(),
+        "historical custody metadata cannot change external backing attribution"
+    );
+
     let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
     resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
     let resolve = Instruction {
@@ -4779,7 +4833,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
 
     let pool_return = || {
         subledger_return_resolved_asset0_backing_ix(
-            &pool,
+            &cleanup_pool,
             &governance.pubkey(),
             &controller,
             &slab,
