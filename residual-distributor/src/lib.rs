@@ -86,6 +86,7 @@ const MAX_EXTRA_MARKETS: usize = 9;
 const MAX_REWARD_EPOCH_MARKETS: usize = 6;
 const CONFIG_FUNDING_TAIL_OFF: usize = 466 + 1 + MAX_EXTRA_MARKETS * 32;
 const CONFIG_EPOCH_TAIL_OFF: usize = CONFIG_FUNDING_TAIL_OFF + 68;
+const PRE_EPOCH_CONFIG_SIZE: usize = CONFIG_EPOCH_TAIL_OFF;
 const CONFIG_EXTRA_INSURANCE_POOLS_OFF: usize = CONFIG_EPOCH_TAIL_OFF + 50;
 const CONFIG_EXTRA_BACKING_POOLS_OFF: usize =
     CONFIG_EXTRA_INSURANCE_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
@@ -412,7 +413,8 @@ struct Config {
 }
 impl Config {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
-        if d.len() < CONFIG_SIZE || d[..8] != CONFIG_DISC {
+        let pre_epoch = d.len() == PRE_EPOCH_CONFIG_SIZE;
+        if (!pre_epoch && d.len() < CONFIG_SIZE) || d[..8] != CONFIG_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
         let config = Config {
@@ -483,27 +485,51 @@ impl Config {
                     .try_into()
                     .unwrap(),
             ),
-            epoch_authority: pk(d, CONFIG_EPOCH_TAIL_OFF),
-            epoch_id: u64::from_le_bytes(
-                d[CONFIG_EPOCH_TAIL_OFF + 32..CONFIG_EPOCH_TAIL_OFF + 40]
-                    .try_into()
-                    .unwrap(),
-            ),
-            emission_start_slot: u64::from_le_bytes(
-                d[CONFIG_EPOCH_TAIL_OFF + 40..CONFIG_EPOCH_TAIL_OFF + 48]
-                    .try_into()
-                    .unwrap(),
-            ),
-            reward_supply_mode: d[CONFIG_EPOCH_TAIL_OFF + 48],
-            config_kind: d[CONFIG_EPOCH_TAIL_OFF + 49],
-            extra_insurance_pools: {
+            epoch_authority: if pre_epoch {
+                Pubkey::default()
+            } else {
+                pk(d, CONFIG_EPOCH_TAIL_OFF)
+            },
+            epoch_id: if pre_epoch {
+                0
+            } else {
+                u64::from_le_bytes(
+                    d[CONFIG_EPOCH_TAIL_OFF + 32..CONFIG_EPOCH_TAIL_OFF + 40]
+                        .try_into()
+                        .unwrap(),
+                )
+            },
+            emission_start_slot: if pre_epoch {
+                0
+            } else {
+                u64::from_le_bytes(
+                    d[CONFIG_EPOCH_TAIL_OFF + 40..CONFIG_EPOCH_TAIL_OFF + 48]
+                        .try_into()
+                        .unwrap(),
+                )
+            },
+            reward_supply_mode: if pre_epoch {
+                REWARD_SUPPLY_FIXED
+            } else {
+                d[CONFIG_EPOCH_TAIL_OFF + 48]
+            },
+            config_kind: if pre_epoch {
+                CONFIG_KIND_LEGACY
+            } else {
+                d[CONFIG_EPOCH_TAIL_OFF + 49]
+            },
+            extra_insurance_pools: if pre_epoch {
+                Vec::new()
+            } else {
                 let mut pools = Vec::with_capacity(MAX_EXTRA_MARKETS);
                 for i in 0..MAX_EXTRA_MARKETS {
                     pools.push(pk(d, CONFIG_EXTRA_INSURANCE_POOLS_OFF + i * 32));
                 }
                 pools
             },
-            extra_backing_pools: {
+            extra_backing_pools: if pre_epoch {
+                Vec::new()
+            } else {
                 let mut pools = Vec::with_capacity(MAX_EXTRA_MARKETS);
                 for i in 0..MAX_EXTRA_MARKETS {
                     pools.push(pk(d, CONFIG_EXTRA_BACKING_POOLS_OFF + i * 32));
@@ -572,6 +598,11 @@ impl Config {
                 .reserved_frozen_funding_payer_total_points
                 .to_le_bytes(),
         );
+        // The exact predecessor layout ends here. It is already a complete legacy
+        // genesis config; continuous reward epoch metadata did not exist yet.
+        if d.len() == PRE_EPOCH_CONFIG_SIZE {
+            return;
+        }
         d[CONFIG_EPOCH_TAIL_OFF..CONFIG_EPOCH_TAIL_OFF + 32]
             .copy_from_slice(self.epoch_authority.as_ref());
         d[CONFIG_EPOCH_TAIL_OFF + 32..CONFIG_EPOCH_TAIL_OFF + 40]
