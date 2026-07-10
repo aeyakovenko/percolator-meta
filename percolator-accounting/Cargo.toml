@@ -1,0 +1,13 @@
+[package]
+name = "percolator-accounting"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "percolator_accounting"
+path = "src/lib.rs"
+
+[dependencies]
+percolator = { workspace = true }

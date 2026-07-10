@@ -731,26 +731,16 @@ fn payout(policy: u8, balance: u64, outstanding: u64, principal: u64) -> Result<
     }
 }
 
-// Byte offsets inside the pinned percolator market slab. Solana
-// account data is globally readable, so the LIVE insurance is read straight from the slab
-// bytes — no accessor API. The zero-copy MarketGroupV16 header is a repr(C) Pod of `[u8;N]`
-// newtypes (align 1) at MARKET_GROUP_OFF = HEADER_LEN(16)+WRAPPER_CONFIG_LEN(448)=464;
-// `insurance` sits at +301 within it (== offset_of!(MarketGroupV16HeaderAccount, insurance)).
-// NOTE: the adjacent `vault` field is at +285 (slab 749) and holds total tokens (insurance +
-// trader capital + pnl); reading vault would over-count the fund and under-charge the haircut.
-// The canary pins both constants against the real pinned wrapper and engine layouts.
-pub const PERC_MARKET_GROUP_OFFSET: usize = 464;
-pub const PERC_INSURANCE_OFFSET: usize = PERC_MARKET_GROUP_OFFSET + 301;
+// Shared offsets are derived from the exact Cargo-pinned engine structs. The LiteSVM canary
+// also pins the wrapper-owned prefix against the real pinned Percolator program.
+pub const PERC_MARKET_GROUP_OFFSET: usize = percolator_accounting::MARKET_GROUP_OFFSET;
+pub const PERC_INSURANCE_OFFSET: usize = percolator_accounting::INSURANCE_OFFSET;
 
-/// The market's LIVE asset-0 insurance, read straight from the slab account bytes. This is
-/// the authoritative figure (not the shared vault token balance) — it shrinks when the
-/// market draws on insurance to cover losses, which is exactly the impairment the pro-rata
-/// haircut must price in.
+/// Asset 0's live domain-budget remainder. The market header is global across all assets,
+/// so using it directly would let foreign insurance hide an asset-0 impairment.
 fn read_asset0_insurance(slab_data: &[u8]) -> Result<u64, ProgramError> {
-    let b = slab_data
-        .get(PERC_INSURANCE_OFFSET..PERC_INSURANCE_OFFSET + 16)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    let v = u128::from_le_bytes(b.try_into().unwrap());
+    let v = percolator_accounting::read_asset_insurance_remaining(slab_data, 0)
+        .map_err(|_| ProgramError::InvalidAccountData)?;
     Ok(u64::try_from(v).unwrap_or(u64::MAX))
 }
 

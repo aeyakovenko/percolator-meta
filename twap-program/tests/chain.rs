@@ -5380,6 +5380,46 @@ fn build_topup_message(
     m
 }
 
+// Squads message wrapping the public Percolator asset activation. Asset 0 remains under
+// TWAP custody; the newly appended asset is owned and funded by the external provider.
+fn build_activate_external_asset_message(
+    squads_vault: &Pubkey,
+    market: &Pubkey,
+    perc: &Pubkey,
+    asset_index: u16,
+    now_slot: u64,
+    provider: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // num_writable_non_signers (market)
+    m.push(3); // account_keys
+    m.extend_from_slice(squads_vault.as_ref());
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(perc.as_ref());
+    m.push(1); // instructions
+    m.push(2); // program_id_index -> percolator
+    m.push(2); // authority, market
+    m.push(0);
+    m.push(1);
+    let data = percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+        action: 0,
+        asset_index,
+        now_slot,
+        initial_price: 1_000_000,
+        insurance_authority: provider.to_bytes(),
+        insurance_operator: provider.to_bytes(),
+        backing_bucket_authority: provider.to_bytes(),
+        oracle_authority: provider.to_bytes(),
+    }
+    .encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 // Direct Squads calls to Percolator used by the malicious-DAO custody probe. These deliberately
 // bypass the constrained Meta programs and exercise the raw authority retained by the Squads vault.
 fn build_direct_operator_takeover_message(
@@ -5878,14 +5918,11 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     );
 }
 
-// CANARY: the twap reads the asset-0 `insurance` u128 straight from the market slab at a
-// hardcoded offset (twap src INSURANCE_OFFSET). Pin that offset against the REAL percolator
-// binary three ways: (1) the production market-group base must equal the pinned wrapper's
-// MARKET_GROUP_OFF; (2) the insurance offset must equal that base + offset_of!(header, insurance);
-// (3) fund insurance with a unique value via a Squads TopUp,
-// then bump the ADJACENT `vault` field to a different sentinel and assert the read still returns
-// the insurance value — proving we read `insurance`, not the (larger) `vault` total. Reading
-// `vault` is the finding-O failure class: trader capital would be pulled as "surplus".
+// CANARY: the shared asset-local reader derives engine offsets from the pinned engine structs,
+// while the wrapper-owned prefix remains a pinned Percolator-program ABI constant. Pin that
+// prefix and the global cap offset, fund asset 0 through a real Squads TopUp, then make the
+// adjacent vault field distinct and assert the complete reader still returns the funded
+// asset-0 domain balance rather than vault capital.
 #[test]
 fn insurance_offset_matches_real_percolator_slab() {
     // Pin the ACTUAL twap src constants (not re-declared copies) against both pieces of the
@@ -6010,6 +6047,11 @@ fn insurance_offset_matches_real_percolator_slab() {
         "insurance offset {} drifted — slab byte read ({}) does not match the funded insurance ({}); \
          if it matches the vault sentinel ({}) the offset is reading `vault`, not `insurance`",
         INSURANCE_OFFSET, read, unique, vault_sentinel);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(&data, 0).unwrap(),
+        unique as u128,
+        "the production asset-local reader matches the real funded asset-0 domains"
+    );
 }
 
 // ATTACK PROBE (finding O fix integrity): the surplus floor (reserved_floor) is the only
@@ -19623,6 +19665,129 @@ fn e2e_execute_pulls_nothing_when_insurance_below_floor() {
     );
 }
 
+// PUBLIC LOF PROBE: Percolator's header `insurance` is market-wide, but tag-57 withdraws
+// from one asset's two insurance domains. An external provider can permissionlessly fund a
+// second asset after governance activates it. That balance is not asset-0 surplus and must
+// never let a public TWAP crank withdraw asset-0 below its protected principal floor.
+#[test]
+fn e2e_external_asset_insurance_is_not_asset0_twap_surplus() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer); // asset 0: 1M floor + 500k surplus
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // Squads index 5
+
+    let provider = Keypair::new();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 101);
+    let activate = build_activate_external_asset_message(
+        &env.squads_vault,
+        &env.slab,
+        &perc_id(),
+        1,
+        101,
+        &provider.pubkey(),
+    );
+    let activate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &activate,
+        &activate_remaining,
+    )
+    .expect("governance activates externally insured asset 1");
+
+    let external_insurance = 500_000u64;
+    let provider_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_source,
+        &env.collateral_mint,
+        &provider.pubkey(),
+        external_insurance,
+    );
+    send(
+        &mut svm,
+        &[&provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(provider_source, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+                domain: 2,
+                amount: external_insurance as u128,
+            },
+        ),
+    )
+    .expect("external provider funds asset-1 long-domain insurance");
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 1_500_000);
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 1), 500_000);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), 2_000_000);
+
+    // Empty round: execute only pulls its 80% surplus share. The global-header bug sees
+    // (2M global - 1M floor) * 80% = 800k and takes 300k of protected asset-0 principal.
+    // Correct asset-local accounting sees only 500k of asset-0 surplus and takes 400k.
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("permissionless TWAP execute");
+
+    assert_eq!(
+        token_amount(&svm, &bk.holding),
+        400_000,
+        "only 80% of asset 0's own 500k surplus is withdrawable"
+    );
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &env.slab, 0),
+        1_100_000,
+        "asset-0 principal plus its retained surplus stay in asset 0"
+    );
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &env.slab, 1),
+        external_insurance as u128,
+        "the external provider's segregated asset-1 insurance is untouched"
+    );
+    assert_eq!(
+        read_reserved_floor(&svm, &env.twap_cfg),
+        1_100_000,
+        "the ratcheted floor is backed entirely by asset-0 insurance"
+    );
+}
+
 // PERMISSIONLESS-CLAIM ANTI-THEFT: claim is permissionless (any cranker may turn it), so the ONLY
 // guard stopping a cranker from redirecting a winner's USD/COIN to themselves is that usd_dest /
 // coin_ata must equal the bid's recorded (canonical) destinations. A substituted destination must
@@ -25474,6 +25639,20 @@ fn read_asset0_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
     let data = svm.get_account(market).unwrap().data;
     let (_, group) = percolator_prog::state::read_market(&data).unwrap();
     group.insurance
+}
+fn read_asset_insurance_remaining(svm: &LiteSVM, market: &Pubkey, asset_index: usize) -> u128 {
+    let data = svm.get_account(market).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&data).unwrap();
+    let long = asset_index * 2;
+    let short = long + 1;
+    group.insurance_domain_budget[long]
+        .saturating_sub(group.insurance_domain_spent[long])
+        .checked_add(
+            group.insurance_domain_budget[short]
+                .saturating_sub(group.insurance_domain_spent[short]),
+        )
+        .unwrap()
+        .min(group.insurance)
 }
 fn read_asset0_effective_price(svm: &LiteSVM, market: &Pubkey) -> u64 {
     let data = svm.get_account(market).unwrap().data;

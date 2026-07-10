@@ -316,26 +316,16 @@ fn validate_metadao_squads_control(data: &[u8], metadao: &Pubkey) -> ProgramResu
     Ok(())
 }
 
-// Byte offsets inside the pinned percolator market slab. Solana
-// account data is globally readable, so we read it straight from the slab bytes — no
-// accessor API, no percolator linkage. The slab's zero-copy MarketGroupV16 header is a
-// repr(C) Pod of `[u8;N]` newtypes (align 1, no padding) at MARKET_GROUP_OFF =
-// HEADER_LEN(16)+WRAPPER_CONFIG_LEN(448)=464; `insurance` sits at +301 within it
-// (== offset_of!(MarketGroupV16HeaderAccount, insurance)). CRITICAL: the adjacent `vault`
-// field at +285 (slab 749) holds total tokens (insurance + trader capital + pnl) — reading
-// vault here would let the surplus pull treat live trader/depositor capital as "surplus"
-// (the finding-O failure class). The `insurance_offset_matches_real_percolator_slab` canary
-// pins both the wrapper base and field offset against the real pinned program + engine structs.
-// These are pub so the canary pins the actual production constants rather than re-declared copies.
-pub const PERC_MARKET_GROUP_OFFSET: usize = 464;
-pub const INSURANCE_OFFSET: usize = PERC_MARKET_GROUP_OFFSET + 301;
+// Shared offsets are derived from the exact Cargo-pinned engine structs. The LiteSVM canary
+// also pins the wrapper-owned prefix against the real pinned Percolator program.
+pub const PERC_MARKET_GROUP_OFFSET: usize = percolator_accounting::MARKET_GROUP_OFFSET;
+pub const INSURANCE_OFFSET: usize = percolator_accounting::INSURANCE_OFFSET;
 
-/// Read the market's asset-0 insurance balance directly from the slab account bytes.
-fn read_asset0_insurance(slab_data: &[u8]) -> Result<u128, ProgramError> {
-    let b = slab_data
-        .get(INSURANCE_OFFSET..INSURANCE_OFFSET + 16)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    Ok(u128::from_le_bytes(b.try_into().unwrap()))
+/// Read one asset's domain-budget remainder. The header insurance value is market-wide
+/// and cannot safely price an asset-local tag-57 withdrawal.
+fn read_asset_insurance(slab_data: &[u8], asset_index: usize) -> Result<u128, ProgramError> {
+    percolator_accounting::read_asset_insurance_remaining(slab_data, asset_index)
+        .map_err(|_| ProgramError::InvalidAccountData)
 }
 
 // ---------------------------------------------------------------------------
@@ -2212,7 +2202,10 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 
     // 1) surplus and the 80/20 split. The retained share stays in insurance AND is ratcheted into
     //    the principal counter so it is protected and compounds; only the burn-share is pulled.
-    let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
+    let insurance = read_asset_insurance(
+        &market_slab.try_borrow_data()?,
+        config.market_0_domain as usize,
+    )?;
     let surplus = insurance.saturating_sub(config.reserved_floor);
     let burnable = surplus
         .checked_mul(config.surplus_buy_burn_bps as u128)

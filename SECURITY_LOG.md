@@ -11905,3 +11905,26 @@ discriminator checks remain required. The retained funded-chain regression rejec
 multisig and a threshold-1 mixed MetaDAO/attacker multisig, proves neither attacker TWAP config is created,
 and leaves Percolator insurance plus subledger outstanding principal byte-exact. No new signer, setter,
 withdrawal path, or custody authority was added.
+
+## Tick — market-wide insurance read crossed asset-local custody boundaries (surface A/C)
+
+TWAP and the insurance subledger both read Percolator's market-wide `header.insurance` while their
+withdrawal CPI used asset-local tag 57. A fresh real Percolator + Squads + TWAP LiteSVM probe activated
+asset 1 through governance, let its external authority publicly deposit `500,000` through
+`TopUpInsuranceDomain`, and executed an empty TWAP round. Asset 0 held `1,500,000` behind a `1,000,000`
+floor. The old global quote treated the foreign balance as surplus, pulled `800,000` instead of
+`400,000`, and left only `700,000` in asset 0. Percolator kept the provider's asset-1 balance segregated,
+but the Meta accounting had used it to authorize a withdrawal from the wrong asset, crossing protected
+principal through a permissionless crank.
+
+The same root caused an owner-exit DoS after an asset-0-only loss: global insurance remained above the
+subledger's outstanding principal because asset 1 was healthy, so the subledger requested full principal
+and tag 57 rejected it against asset 0's smaller capacity. The retained real-binary regression now pays
+the exact asset-0 pro-rata remainder and leaves external asset insurance untouched.
+
+FIX: a small shared read-only crate derives the pinned slab offsets from the exact engine structs and
+returns one asset's `long budget - spent + short budget - spent`, capped by global insurance, matching
+Percolator's own insurance-ledger observation. TWAP surplus and subledger haircuts now use that value.
+Temporary source-credit reservations remain enforced by the Percolator CPI and delay rather than
+crystallize an exit. No counter, signer, setter, token destination, withdrawal instruction, or admin
+authority was added.
