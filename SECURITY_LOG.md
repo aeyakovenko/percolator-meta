@@ -11885,3 +11885,23 @@ frozen, malformed, or non-SPL, its requested share deterministically joins the b
 or redirect this fallback. The impact regression closes the sink through real SPL, fills a real auction, and proves
 the whole bought-COIN amount burns while winner settlement remains fully funded. This changes only COIN routing;
 insurance pulls, the principal floor, bids, and user collateral are unchanged, and no admin surface was added.
+
+## Tick — Squads `config_authority` spoof could seize funded TWAP custody (surface A/C)
+
+TWAP init previously treated `multisig.config_authority == metadao_futarchy` as proof that MetaDAO
+controlled Squads vault transactions. Squads does not require that key to sign multisig creation. A
+fresh real-Squads LiteSVM probe created a 1-of-1 multisig with the victim MetaDAO merely named as
+`config_authority` and the attacker as the sole all-permissions member; the old TWAP accepted it. The
+impact probe then deposited `1,000,000` real base units through the canonical owner-bound subledger and
+proved the attacker could clear the one-week Squads flow and make that pool hand custody to the
+attacker-bound TWAP PDA without any MetaDAO signature. The imported principal floor still prevented a
+direct deposit drain, but the attacker acquired fee, reward-routing, shutdown, and custody-transition
+control and could indefinitely deny the intended futarchy.
+
+FIX: init now parses the real Squads v4 member vector and accepts only the minimal governance wrapper:
+threshold 1, exactly one member, and that member is the named MetaDAO with initiate, vote, and execute
+permissions. `config_authority`, the existing minimum one-week timelock, real-program ownership, and
+discriminator checks remain required. The retained funded-chain regression rejects both an attacker-only
+multisig and a threshold-1 mixed MetaDAO/attacker multisig, proves neither attacker TWAP config is created,
+and leaves Percolator insurance plus subledger outstanding principal byte-exact. No new signer, setter,
+withdrawal path, or custody authority was added.
