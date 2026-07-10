@@ -6219,6 +6219,58 @@ fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
     assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before);
 }
 
+// UPGRADE DOS PROBE: custody-pool binding extends the config layout, but an
+// already-deployed 232-byte config can still be the live Percolator authority.
+// Upgrading the program must not make every instruction reject that config and
+// strand its insurance custody. Legacy configs remain operable, while the new
+// pool-bound handoff is reserved for configs with room to persist the binding.
+#[test]
+fn e2e_legacy_twap_config_remains_operable_after_layout_upgrade() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let mut legacy = svm.get_account(&env.twap_cfg).unwrap();
+    legacy.data.truncate(232);
+    svm.set_account(env.twap_cfg, legacy).unwrap();
+    let insurance_before = token_amount(&svm, &env.perc_vault);
+
+    let message = build_twap_reconfigure_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &twap_id(),
+        7_500,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &message,
+        &remaining,
+    )
+    .expect("legacy config remains governable after program upgrade");
+    assert_eq!(read_bps(&svm, &env.twap_cfg), 7_500);
+    assert_eq!(svm.get_account(&env.twap_cfg).unwrap().data.len(), 232);
+    assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before);
+}
+
 // PARASITE CONFIG (rival genesis) cannot hijack the victim market's insurance operator (finding KO; the
 // AQ defense end-to-end). A second, fully-legitimate twap config B can be stood up on the SAME percolator
 // market+program (its PDA differs only by coin_mint+multisig), controlled by an ATTACKER DAO via a real

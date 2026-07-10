@@ -67,6 +67,7 @@ const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
 const CONFIG_SEED: &[u8] = b"twap_config";
 
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
+const LEGACY_CONFIG_SIZE: usize = 232;
 const CONFIG_SIZE: usize = 264;
 
 // Default surplus share routed to buy/burn (the rest is retained as insurance).
@@ -333,7 +334,9 @@ struct Config {
 
 impl Config {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < CONFIG_SIZE || data[..8] != CONFIG_DISC {
+        if (data.len() != LEGACY_CONFIG_SIZE && data.len() < CONFIG_SIZE)
+            || data[..8] != CONFIG_DISC
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -350,11 +353,18 @@ impl Config {
             base_unit_savings_bps: u16::from_le_bytes(data[189..191].try_into().unwrap()),
             buyback_bps: u16::from_le_bytes(data[191..193].try_into().unwrap()),
             base_unit_savings_account: Pubkey::new_from_array(data[193..225].try_into().unwrap()),
-            custody_pool: Pubkey::new_from_array(data[225..257].try_into().unwrap()),
+            custody_pool: if data.len() >= CONFIG_SIZE {
+                Pubkey::new_from_array(data[225..257].try_into().unwrap())
+            } else {
+                Pubkey::default()
+            },
         })
     }
 
-    fn serialize(&self, data: &mut [u8]) {
+    fn serialize(&self, data: &mut [u8]) -> ProgramResult {
+        if data.len() != LEGACY_CONFIG_SIZE && data.len() < CONFIG_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
         data[..8].copy_from_slice(&CONFIG_DISC);
         data[8..40].copy_from_slice(self.coin_mint.as_ref());
         data[40..72].copy_from_slice(self.market_slab.as_ref());
@@ -369,8 +379,13 @@ impl Config {
         data[189..191].copy_from_slice(&self.base_unit_savings_bps.to_le_bytes());
         data[191..193].copy_from_slice(&self.buyback_bps.to_le_bytes());
         data[193..225].copy_from_slice(self.base_unit_savings_account.as_ref());
-        data[225..257].copy_from_slice(self.custody_pool.as_ref());
-        data[257..CONFIG_SIZE].fill(0);
+        if data.len() >= CONFIG_SIZE {
+            data[225..257].copy_from_slice(self.custody_pool.as_ref());
+            data[257..CONFIG_SIZE].fill(0);
+        } else {
+            data[225..LEGACY_CONFIG_SIZE].fill(0);
+        }
+        Ok(())
     }
 }
 
@@ -527,7 +542,7 @@ fn process_init_config(
         base_unit_savings_account: Pubkey::default(),
         custody_pool: Pubkey::default(),
     };
-    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -573,7 +588,7 @@ fn process_reconfigure(
         return Err(ProgramError::InvalidInstructionData);
     }
     config.surplus_buy_burn_bps = new_bps;
-    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -632,7 +647,7 @@ fn process_set_economics(
     config.base_unit_savings_bps = savings_bps;
     config.buyback_bps = buyback_bps;
     config.base_unit_savings_account = *savings_account.key;
-    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -684,7 +699,7 @@ fn process_set_reserved_floor(
         return Err(ProgramError::InvalidArgument);
     }
     config.reserved_floor = new_floor;
-    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -786,7 +801,7 @@ fn process_accept_custody<'a>(
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     if let Some((pool, protected_floor)) = source_pool {
-        if !config_account.is_writable {
+        if !config_account.is_writable || config_account.data_len() < CONFIG_SIZE {
             return Err(ProgramError::InvalidAccountData);
         }
         if config.custody_pool != Pubkey::default() && config.custody_pool != *pool.key {
@@ -847,7 +862,7 @@ fn process_accept_custody<'a>(
         )?;
     }
     if source_pool.is_some() {
-        config.serialize(&mut config_account.try_borrow_mut_data()?);
+        config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     }
     Ok(())
 }
@@ -2266,7 +2281,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         )?;
     }
 
-    config.serialize(&mut config_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -2599,7 +2614,7 @@ mod tests {
             custody_pool: Pubkey::new_unique(),
         };
         let mut buf = [0u8; CONFIG_SIZE];
-        c.serialize(&mut buf);
+        c.serialize(&mut buf).unwrap();
         let d = Config::deserialize(&buf).unwrap();
         assert_eq!(d.coin_mint, c.coin_mint);
         assert_eq!(d.market_slab, c.market_slab);
