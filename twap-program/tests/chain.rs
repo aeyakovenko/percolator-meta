@@ -11308,6 +11308,266 @@ fn send(svm: &mut LiteSVM, signers: &[&Keypair], ix: Instruction) -> Result<(), 
     .map_err(|e| format!("{:?}", e.err))
 }
 
+// Commit 38d4081 inserted an eight-byte sink cutoff at the end of the book header. Simulate an
+// in-place program upgrade by retaining the exact immediately-preceding account bytes and owner.
+fn remove_book_sink_cutoff(svm: &mut LiteSVM, book: &Pubkey) {
+    const LEGACY_HEADER: usize = 292;
+    const CURRENT_HEADER: usize = 300;
+    const SLOT_SIZE: usize = 178;
+    const MAX_BIDS: usize = 32;
+
+    let mut account = svm.get_account(book).unwrap();
+    assert_eq!(account.data.len(), CURRENT_HEADER + MAX_BIDS * SLOT_SIZE);
+    account.data.drain(LEGACY_HEADER..CURRENT_HEADER);
+    assert_eq!(account.data.len(), LEGACY_HEADER + MAX_BIDS * SLOT_SIZE);
+    svm.set_account(*book, account).unwrap();
+}
+
+// UPGRADE LOF PROBE: the sink-cutoff field grew AuctionBook by eight bytes without migrating the
+// canonical PDA. A bid settled by the immediately-preceding binary remains part of the escrow
+// denominator, but the upgraded claim path must still release the bidder's USD and COIN refund.
+#[test]
+fn legacy_pre_cutoff_book_settled_bid_remains_claimable() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, 1_000_000);
+
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_ata,
+            &usd_ata,
+            &env.coin_mint,
+            &env.collateral_mint,
+            1_000_000,
+            1_000_000,
+            None,
+        ),
+    )
+    .expect("place bid before upgrade");
+    let round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("settle bid before upgrade");
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 600_000);
+
+    remove_book_sink_cutoff(&mut svm, &bk.book);
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &usd_ata,
+            &coin_ata,
+            0,
+        ),
+    )
+    .expect("settled legacy bid remains claimable after upgrade");
+    assert_eq!(token_amount(&svm, &usd_ata), 400_000);
+    assert_eq!(token_amount(&svm, &coin_ata), 600_000);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+}
+
+// The same upgrade must not strand an unsettled bid. Legacy compatibility is deliberately an
+// exit path only: it preserves the bidder signature, recorded destination, cooldown, and replay
+// guards while returning exactly the bidder's own escrow.
+#[test]
+fn legacy_pre_cutoff_book_unsettled_bid_remains_owner_cancellable() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let round_length = 10u64;
+    let bk = setup_auction(&mut svm, &payer, &env, round_length, 0, None, 0);
+    let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, 100_000);
+    let (attacker, attacker_coin_ata, attacker_usd_ata) = new_bidder(&mut svm, &payer, &env, 100);
+
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_ata,
+            &usd_ata,
+            &env.coin_mint,
+            &env.collateral_mint,
+            100_000,
+            100_000,
+            None,
+        ),
+    )
+    .expect("place bid before upgrade");
+    let round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    remove_book_sink_cutoff(&mut svm, &bk.book);
+    warp_to(&mut svm, round_end + round_length);
+
+    assert!(
+        send(
+            &mut svm,
+            &[&attacker],
+            place_bid_ix(
+                &attacker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &attacker_coin_ata,
+                &attacker_usd_ata,
+                &env.coin_mint,
+                &env.collateral_mint,
+                100,
+                100,
+                None,
+            ),
+        )
+        .is_err(),
+        "legacy compatibility cannot accept new bids"
+    );
+    let insurance_before = token_amount(&svm, &env.perc_vault);
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            execute_ix(
+                &payer.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                None,
+            ),
+        )
+        .is_err(),
+        "legacy compatibility cannot execute retired sink economics"
+    );
+    assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before);
+
+    assert!(
+        send(
+            &mut svm,
+            &[&attacker],
+            cancel_ix(
+                &attacker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_ata,
+                0,
+            ),
+        )
+        .is_err(),
+        "a non-owner cannot cancel a legacy bid"
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&bidder],
+            cancel_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &attacker_coin_ata,
+                0,
+            ),
+        )
+        .is_err(),
+        "the owner cannot redirect a legacy refund"
+    );
+    send(
+        &mut svm,
+        &[&bidder],
+        cancel_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_ata,
+            0,
+        ),
+    )
+    .expect("owner reclaims legacy bid after cooldown");
+    assert_eq!(token_amount(&svm, &coin_ata), 100_000);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert!(
+        send(
+            &mut svm,
+            &[&bidder],
+            cancel_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_ata,
+                0,
+            ),
+        )
+        .is_err(),
+        "a legacy bid cannot be refunded twice"
+    );
+}
+
 // ISSUE #41 REGRESSION: bids must enter while the active round is still open. A book remains
 // BOOK_STATE_OPEN after round_end until someone cranks execute, so place_bid itself must reject
 // `Clock::slot >= round_end`; otherwise a bidder can wait out the competition window, bid, and
