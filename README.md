@@ -90,8 +90,8 @@ capital's own tenure.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`624b13da8ed96f49b6049a4874052e05ae7a7cb6` and its engine layout dependency to
-`c8aab33814dd30878cf9b054eca89bcd6cf9f5e7`.
+`186e9c6e189735ec43923dac7fcad1f8991a7ddd` and its engine layout dependency to
+`143e68c4917ed0400a27b952f036a5677047cd84`.
 
 ## Genesis
 

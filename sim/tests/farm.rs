@@ -235,7 +235,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
         svm.expire_blockhash(); let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
             vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { now_slot: 110, close_q: 0, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
         )], Some(&payer.pubkey()), &[&payer], bh))
     };
     let mut market_cryst = 0u128; let mut market_recv = 0u128; let mut market_spent = 0u128;
@@ -405,7 +405,7 @@ fn churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder() {
     };
     let crank = |svm: &mut LiteSVM, market: &Pubkey, pf: &Pubkey| {
         tx(svm, &[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { now_slot: 110, close_q: 0, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] })], &[]).expect("crank");
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] })], &[]).expect("crank");
     };
 
     let (h_market, h_long, h_short, _hl, _hs) = setup_pair(&mut svm);
@@ -717,7 +717,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     }
     let crank = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, market: &Pubkey, pf: &Pubkey| {
         tx(svm, &[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { now_slot: 110, close_q: 0, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] })], &[]).map(|_| ())
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] })], &[]).map(|_| ())
     };
     let tx_unit = |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| tx(svm, ixs, extra).map(|_| ());
     for (_o, pf, _a, mi, _l) in &rational { let m = markets[*mi].0; let _ = crank(&mut svm, &tx_unit, &m, pf); let _ = crank(&mut svm, &tx_unit, &m, pf); }
@@ -1021,7 +1021,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     let crank = |svm: &mut LiteSVM, pf: &Pubkey, a: u16| {
         svm.expire_blockhash(); let bh = svm.latest_blockhash();
         let _ = svm.send_transaction(Transaction::new_signed_with_payer(&[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { now_slot: 110, close_q: 0, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: a, oracle_accounts: 0 }] })], Some(&payer.pubkey()), &[&payer], bh));
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: a, oracle_accounts: 0 }] })], Some(&payer.pubkey()), &[&payer], bh));
     };
     for (_o, pf, _a, legs) in &rational { for (a, _l) in legs { crank(&mut svm, pf, *a); crank(&mut svm, pf, *a); } }
     for (_o, pf, _a, assets) in &farmer { for a in assets { crank(&mut svm, pf, *a); crank(&mut svm, pf, *a); } }
@@ -1215,7 +1215,7 @@ fn cross_margin_crystallized_is_gross_not_net_single_portfolio_wash_probe() {
     let crank = |svm: &mut LiteSVM, a: u16| {
         svm.expire_blockhash(); let bh = svm.latest_blockhash();
         let _ = svm.send_transaction(Transaction::new_signed_with_payer(&[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(w_pf, false)],
-            PIx::PermissionlessCrank { now_slot: 110, close_q: 0, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: a, oracle_accounts: 0 }] })], Some(&payer.pubkey()), &[&payer], bh));
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: a, oracle_accounts: 0 }] })], Some(&payer.pubkey()), &[&payer], bh));
     };
     for a in 0..2u16 { crank(&mut svm, a); crank(&mut svm, a); }
 
@@ -1247,4 +1247,312 @@ fn cross_margin_crystallized_is_gross_not_net_single_portfolio_wash_probe() {
     // corrected/confirmed and future ticks don't re-probe.
     assert_eq!(w_spent, 0, "no churn -> spent stays 0; net-by-spent cannot bound a delta-neutral cross-asset wash");
     let _ = (net_counter, single_leg_loss, pnl_raw);
+}
+
+#[test]
+fn crossed_trade_cannot_self_finance_preexisting_oi_reduction() {
+    const PRICE: u64 = 1;
+    const OPEN_Q: i128 = 13_000 * percolator::POS_SCALE as i128;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let collateral = create_real_mint(&mut svm, &payer, &admin.pubkey());
+    let market = Pubkey::new_unique();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0; market_len],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let vault_authority = perc_vault_authority(&market);
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+
+    let send = |svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]| {
+        svm.expire_blockhash();
+        let blockhash = svm.latest_blockhash();
+        let mut all_signers = vec![&payer];
+        all_signers.extend_from_slice(signers);
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &all_signers,
+            blockhash,
+        ))
+    };
+
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 6_480_000,
+                initial_price: PRICE,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 500,
+                initial_margin_bps: 500,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 24,
+                max_accrual_dt_slots: 20,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 10_000_000,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 27,
+            },
+        ),
+        &[&admin],
+    )
+    .expect("initialize liquidation probe market");
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: PRICE,
+            },
+        ),
+        &[&admin],
+    )
+    .expect("configure authenticated mark");
+
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    svm.airdrop(&owner_a.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&owner_b.pubkey(), 1_000_000_000).unwrap();
+    let portfolio_a = Pubkey::new_unique();
+    let portfolio_b = Pubkey::new_unique();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    for (owner, portfolio, deposit) in [
+        (&owner_a, portfolio_a, 1_000u64),
+        (&owner_b, portfolio_b, 1_189u64),
+    ] {
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+            &[owner],
+        )
+        .expect("initialize portfolio");
+
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral,
+            &owner.pubkey(),
+            deposit,
+        );
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(deposit),
+                },
+            ),
+            &[owner],
+        )
+        .expect("deposit collateral");
+    }
+
+    svm.set_sysvar(&Clock {
+        slot: 8,
+        unix_timestamp: 8,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio_a, false),
+                AccountMeta::new(portfolio_b, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: OPEN_Q,
+                exec_price: PRICE,
+                fee_bps: 0,
+            },
+        ),
+        &[&owner_a, &owner_b],
+    )
+    .expect("open balanced interest");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+            &[],
+        )
+    };
+
+    svm.set_sysvar(&Clock {
+        slot: 27,
+        unix_timestamp: 27,
+        ..Clock::default()
+    });
+    crank(&mut svm, portfolio_a, 27).expect("refresh first side");
+
+    svm.set_sysvar(&Clock {
+        slot: 35,
+        unix_timestamp: 35,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio_b, false),
+            ],
+            PIx::SyncMaintenanceFee { now_slot: 35 },
+        ),
+        &[],
+    )
+    .expect("make second side partially liquidatable");
+    crank(&mut svm, portfolio_b, 35).expect("certify liquidation");
+    crank(&mut svm, portfolio_b, 35).expect("partially liquidate");
+
+    let market_data = svm.get_account(&market).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&market_data).unwrap();
+    let asset = group.assets[0];
+    let portfolio_data_a = svm.get_account(&portfolio_a).unwrap().data;
+    let portfolio_data_b = svm.get_account(&portfolio_b).unwrap().data;
+    let state_a = percolator_prog::state::read_portfolio(&portfolio_data_a).unwrap();
+    let state_b = percolator_prog::state::read_portfolio(&portfolio_data_b).unwrap();
+    let position_q = |state: &percolator::PortfolioAccountV16Account| {
+        state
+            .legs
+            .iter()
+            .filter_map(|leg| leg.try_to_runtime().ok())
+            .find(|leg| leg.active && leg.asset_index == 0)
+            .expect("active asset-0 leg")
+            .basis_pos_q
+    };
+    let survivor_q = position_q(&state_a).unsigned_abs();
+    let liquidated_q = position_q(&state_b).unsigned_abs();
+    assert_eq!(survivor_q, OPEN_Q.unsigned_abs());
+    assert!(
+        liquidated_q > 0 && liquidated_q < survivor_q,
+        "probe requires a partial liquidation, got {liquidated_q} of {survivor_q}"
+    );
+    assert_eq!(asset.oi_eff_long_q, liquidated_q);
+    assert_eq!(asset.oi_eff_short_q, liquidated_q);
+
+    let cross_q = liquidated_q + (survivor_q - liquidated_q) / 2;
+    let market_before = svm.get_account(&market).unwrap();
+    let portfolio_a_before = svm.get_account(&portfolio_a).unwrap();
+    let portfolio_b_before = svm.get_account(&portfolio_b).unwrap();
+    let vault_before = svm.get_account(&vault).unwrap();
+    let result = send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio_b, false),
+                AccountMeta::new(portfolio_a, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: cross_q as i128,
+                exec_price: PRICE,
+                fee_bps: 0,
+            },
+        ),
+        &[&owner_b, &owner_a],
+    );
+    assert!(
+        result.is_err(),
+        "a trade cannot reduce more OI than existed before that same instruction"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before);
+    assert_eq!(svm.get_account(&portfolio_a).unwrap(), portfolio_a_before);
+    assert_eq!(svm.get_account(&portfolio_b).unwrap(), portfolio_b_before);
+    assert_eq!(svm.get_account(&vault).unwrap(), vault_before);
 }
