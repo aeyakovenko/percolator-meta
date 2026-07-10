@@ -29697,7 +29697,7 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
 // cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
 // exact residual only through the canonical controller account.
 #[test]
-fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
+fn e2e_terminal_protocol_insurance_is_isolated_from_provider_returns() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -29744,6 +29744,72 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &donate_remaining,
     )
     .expect("Squads donates lifecycle authority to the constrained controller");
+
+    let backing_provider = Keypair::new();
+    svm.airdrop(&backing_provider.pubkey(), 1_000_000_000)
+        .unwrap();
+    let activate_secondary = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 0,
+            asset_index: 1,
+            now_slot: svm.get_sysvar::<Clock>().slot,
+            initial_price: 1_000_000,
+            insurance_authority: backing_provider.pubkey().to_bytes(),
+            insurance_operator: backing_provider.pubkey().to_bytes(),
+            backing_bucket_authority: backing_provider.pubkey().to_bytes(),
+            oracle_authority: backing_provider.pubkey().to_bytes(),
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &activate_secondary,
+        &donate_remaining,
+    )
+    .expect("controller activates an externally backed secondary market");
+    let backing_amount = 3u64;
+    let provider_destination = canonical_insurance_vault(
+        &backing_provider.pubkey(),
+        &env.collateral_mint,
+    );
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &env.collateral_mint,
+        &backing_provider.pubkey(),
+        backing_amount,
+    );
+    send(
+        &mut svm,
+        &[&payer, &backing_provider],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(backing_provider.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(provider_destination, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+                domain: 2,
+                amount: backing_amount as u128,
+                expiry_slot: 10_000,
+            }
+            .encode(),
+        },
+    )
+    .expect("external provider deposits secondary backing through Percolator");
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
 
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
@@ -29829,7 +29895,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &env.multisig,
         &env.dao,
         &payer,
-        3,
+        4,
         &handoff,
         &handoff_remaining,
     )
@@ -29891,7 +29957,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &env.multisig,
         &env.dao,
         &payer,
-        4,
+        5,
         &fifty_fifty,
         &reconfigure_remaining,
     )
@@ -29954,7 +30020,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &env.multisig,
         &env.dao,
         &payer,
-        5,
+        6,
         &init_book,
         &init_book_remaining,
     )
@@ -30055,7 +30121,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &env.multisig,
         &env.dao,
         &payer,
-        6,
+        7,
         &resolve,
         &resolve_remaining,
     )
@@ -30142,7 +30208,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &env.multisig,
         &env.dao,
         &payer,
-        7,
+        8,
         &return_to_pool,
         &return_remaining,
     )
@@ -30180,7 +30246,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
         &env.multisig,
         &env.dao,
         &payer,
-        8,
+        9,
         &handoff,
         &handoff_remaining,
     )
@@ -30235,7 +30301,7 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
             &env.multisig,
             &env.dao,
             &payer,
-            9,
+            10,
             &close,
             &close_remaining,
         )
@@ -30294,13 +30360,58 @@ fn e2e_resolved_zero_principal_terminal_reclaims_retained_protocol_insurance() {
     assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
     assert_eq!(token_amount(&svm, &controller_transit), retained_protocol_insurance);
 
+    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    let long_backing_ledger = Pubkey::new_unique();
+    let short_backing_ledger = Pubkey::new_unique();
+    for ledger in [long_backing_ledger, short_backing_ledger] {
+        svm.set_account(
+            ledger,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; backing_ledger_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    send(
+        &mut svm,
+        &[&payer],
+        controller_return_resolved_asset_backing_ix(
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &provider_destination,
+            &controller_transit,
+            &env.perc_vault,
+            &perc_vault_authority(&env.slab, &perc_id()),
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+            1,
+        ),
+    )
+    .expect("permissionless resolved cleanup returns the secondary provider's backing");
+    assert_eq!(
+        token_amount(&svm, &provider_destination),
+        backing_amount,
+        "provider receives backing only, never retained protocol insurance"
+    );
+    assert_eq!(
+        token_amount(&svm, &controller_transit),
+        retained_protocol_insurance,
+        "terminal protocol insurance remains in controller custody"
+    );
+
     squads_execute(
         &mut svm,
         &env.squads,
         &env.multisig,
         &env.dao,
         &payer,
-        10,
+        11,
         &close,
         &close_remaining,
     )

@@ -2,6 +2,28 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - provider cleanup could sweep retained protocol insurance (surface A/C)
+
+The controller used one canonical token account per market and mint for both protocol custody and
+temporary external-provider returns. Resolved TWAP cleanup could correctly leave retained protocol
+insurance in that account, but every later provider-bound insurance or backing cleanup forwarded
+the account's complete balance. Cleanup order therefore determined ownership: an external provider
+could receive its own attributed return plus protocol insurance retained by an earlier TWAP round.
+
+A fresh full-chain LiteSVM regression uses the real Percolator, subledger, TWAP, controller, Squads,
+genesis-vote, and distribution binaries. It deposits three atoms of external secondary backing,
+runs a real 50/50 TWAP buyback/retention round, resolves the market, lets the genesis owner exit,
+and routes five atoms of retained protocol insurance into the controller account. The old
+permissionless secondary-backing cleanup then gives the provider eight atoms instead of three.
+
+FIX: all five provider-bound shutdown and resolved cleanup paths now checked-sum the amount
+attributed by the pinned Percolator slab, transfer exactly that amount, and close the controller
+account only if it is empty. Any pre-existing protocol value or dust remains under the controller
+PDA for fixed terminal reclaim; it neither blocks the provider's return nor leaks to that provider.
+The regression proves the provider receives exactly three atoms, the five protocol atoms remain in
+controller custody, and terminal market cleanup sends those five atoms only to governance. Existing
+canonical-recipient, reassigned-ATA, and asset-0 backing return regressions remain green.
+
 ## Tick - retained TWAP insurance floor could block resolved market close (surface A/C)
 
 Every TWAP round can intentionally ratchet protocol insurance into the monotonic reserved floor.

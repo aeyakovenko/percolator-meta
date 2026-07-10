@@ -353,6 +353,61 @@ fn forward_and_close_token_account<'a>(
     )
 }
 
+fn forward_exact_and_close_if_empty<'a>(
+    controller: &AccountInfo<'a>,
+    lamport_destination: &AccountInfo<'a>,
+    transit: &AccountInfo<'a>,
+    destination: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    signer_seeds: &[&[u8]],
+    amount: u64,
+) -> ProgramResult {
+    let available = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?.amount;
+    if available < amount {
+        return Err(ProgramError::InsufficientFunds);
+    }
+    if amount > 0 {
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                transit.key,
+                destination.key,
+                controller.key,
+                &[],
+                amount,
+            )?,
+            &[
+                transit.clone(),
+                destination.clone(),
+                controller.clone(),
+                token_program.clone(),
+            ],
+            &[signer_seeds],
+        )?;
+    }
+    // A prior fixed cleanup may have retained protocol value in this canonical
+    // controller account. It belongs to terminal reclaim, not the current provider.
+    if spl_token::state::Account::unpack(&transit.try_borrow_data()?)?.amount != 0 {
+        return Ok(());
+    }
+    invoke_signed(
+        &spl_token::instruction::close_account(
+            token_program.key,
+            transit.key,
+            lamport_destination.key,
+            controller.key,
+            &[],
+        )?,
+        &[
+            transit.clone(),
+            lamport_destination.clone(),
+            controller.clone(),
+            token_program.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
 fn validate_provider_return_token_accounts(
     controller: &AccountInfo,
     provider: &Pubkey,
@@ -537,9 +592,10 @@ fn withdraw_backing_principal<'a>(
 //
 // Permissionless after Percolator's own asset-shutdown delay and empty-state checks.
 // The controller can exercise marketauth's shutdown override, but neither governance
-// nor the caller chooses the recipient: all value and transit rent go to the canonical
-// ATA of the backing authority recorded in the asset profile. Earnings are returned
-// first because Percolator refuses a final-principal exit while earnings remain.
+// nor the caller chooses the recipient: the attributed withdrawal and, when the
+// transit account is empty, its rent go to the canonical ATA of the backing authority
+// recorded in the asset profile. Earnings are returned first because Percolator
+// refuses a final-principal exit while earnings remain.
 fn process_return_shutdown_backing<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -611,6 +667,11 @@ fn process_return_shutdown_backing<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    let return_amount = principal
+        .checked_add(earnings)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let return_amount =
+        u64::try_from(return_amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
     withdraw_backing_earnings(
         controller,
         market,
@@ -636,13 +697,14 @@ fn process_return_shutdown_backing<'a>(
         domain,
         principal,
     )?;
-    forward_and_close_token_account(
+    forward_exact_and_close_if_empty(
         controller,
         provider_destination,
         controller_transit,
         provider_destination,
         token_program,
         &seeds,
+        return_amount,
     )
 }
 
@@ -775,13 +837,15 @@ fn process_return_shutdown_insurance<'a>(
         ],
         &[&seeds],
     )?;
-    forward_and_close_token_account(
+    let return_amount = u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
+    forward_exact_and_close_if_empty(
         controller,
         provider_destination,
         controller_transit,
         provider_destination,
         token_program,
         &seeds,
+        return_amount,
     )
 }
 
@@ -960,13 +1024,15 @@ fn process_return_resolved_asset_insurance<'a>(
     if controller_owned {
         Ok(())
     } else {
-        forward_and_close_token_account(
+        let return_amount = u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
+        forward_exact_and_close_if_empty(
             controller,
             provider_destination,
             controller_transit,
             provider_destination,
             token_program,
             &seeds,
+            return_amount,
         )
     }
 }
@@ -1080,6 +1146,14 @@ fn process_return_resolved_asset_backing<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    let return_amount = balances.iter().try_fold(0u128, |total, balance| {
+        total
+            .checked_add(balance.principal_atoms)
+            .and_then(|value| value.checked_add(balance.earnings_atoms))
+            .ok_or(ProgramError::ArithmeticOverflow)
+    })?;
+    let return_amount =
+        u64::try_from(return_amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
     rotate_asset_role_to_controller(
         controller,
         market,
@@ -1119,13 +1193,14 @@ fn process_return_resolved_asset_backing<'a>(
             balance.principal_atoms,
         )?;
     }
-    forward_and_close_token_account(
+    forward_exact_and_close_if_empty(
         controller,
         provider_destination,
         controller_transit,
         provider_destination,
         token_program,
         &seeds,
+        return_amount,
     )
 }
 
@@ -1228,6 +1303,14 @@ fn process_return_resolved_asset0_backing<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    let return_amount = balances.iter().try_fold(0u128, |total, balance| {
+        total
+            .checked_add(balance.principal_atoms)
+            .and_then(|value| value.checked_add(balance.earnings_atoms))
+            .ok_or(ProgramError::ArithmeticOverflow)
+    })?;
+    let return_amount =
+        u64::try_from(return_amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
     let mut rotate_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
     rotate_data.extend_from_slice(&0u16.to_le_bytes());
     rotate_data.push(ASSET_AUTH_BACKING_BUCKET);
@@ -1281,13 +1364,14 @@ fn process_return_resolved_asset0_backing<'a>(
             balance.principal_atoms,
         )?;
     }
-    forward_and_close_token_account(
+    forward_exact_and_close_if_empty(
         controller,
         provider_destination,
         controller_transit,
         provider_destination,
         token_program,
         &seeds,
+        return_amount,
     )
 }
 

@@ -163,16 +163,19 @@ remaining atom. After Squads shuts the asset down and Percolator's delay and emp
 anyone can return its complete asset-local insurance and each backing domain through the controller.
 The controller derives the insurance amount from the pinned slab and accepts no caller-selected
 amount. Each destination is the recorded provider's canonical token account, not a DAO-selected
-account; backing earnings are paid first and each temporary controller account is forwarded and
-closed atomically. While live, Percolator authorizes these returns only through its delayed
+account; backing earnings are paid first and the controller forwards exactly the value attributed
+to that provider. It closes the temporary controller account only when no unrelated balance
+remains. Protocol insurance or token dust already held there stays in controller custody for the
+fixed terminal reclaim. While live, Percolator authorizes these returns only through its delayed
 secondary-asset shutdown override.
 
 Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
 run. The resolved companions require the whole market to be resolved and empty, derive every amount
 from the slab, and use the controller's existing secondary `asset_admin` role to rotate only the
 relevant insurance or backing role. They then return all value to the outgoing recorded provider's
-canonical account. The caller and DAO still choose neither an amount nor a recipient, and any failed
-rotation, withdrawal, forwarding, or close rolls the entire operation back.
+canonical account, but only up to the exact amount attributed by that cleanup. The caller and DAO
+still choose neither an amount nor a recipient, and any failed rotation, withdrawal, forwarding, or
+close rolls the entire operation back.
 
 If the slab instead records the controller itself as insurance authority, including for asset 0,
 the resolved companion withdraws only the exact asset-local amount into the canonical controller
