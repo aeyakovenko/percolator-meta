@@ -4484,6 +4484,188 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
+// PUBLIC LOF: donating marketauth must not silently donate creator-funded insurance.
+// The controller may grant empty asset-0 custody to the canonical genesis pool, but it
+// cannot rotate a nonzero external insurance balance away from its recorded authority.
+#[test]
+fn e2e_market_donation_preserves_creator_insurance_until_owner_exit() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let governance = Keypair::new();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let insurance_amount = 500_000u64;
+    let creator_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &creator_token,
+        &collateral_mint,
+        &creator.pubkey(),
+        insurance_amount,
+    );
+    let top_up = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(creator_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+            domain: 0,
+            amount: insurance_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], top_up)
+        .expect("creator funds asset-0 insurance through the public path");
+    assert_eq!(token_amount(&svm, &creator_token), 0);
+    assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+    };
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("creator donates lifecycle control without donating insurance");
+
+    let slab_after_handoff = svm.get_account(&slab).unwrap();
+    let (config, _, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+        &slab_after_handoff.data,
+    )
+    .unwrap();
+    assert_eq!(config.marketauth, controller.to_bytes());
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&slab_after_handoff.data, 0).unwrap(),
+        creator.pubkey().to_bytes(),
+        "market donation must preserve the funded insurance authority"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&slab_after_handoff.data, 0).unwrap(),
+        creator.pubkey().to_bytes(),
+        "market donation must preserve the funded insurance withdrawal key"
+    );
+
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8];
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut pool_data);
+    let init_pool = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(percolator_vault, false),
+            AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
+        ],
+        data: pool_data,
+    };
+    send(&mut svm, &[&payer], init_pool).expect("initialize canonical genesis pool");
+
+    let grant = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![2u8], // IX_GRANT_GENESIS_POOL
+    };
+    let market_before_grant = svm.get_account(&slab).unwrap();
+    assert!(
+        send(&mut svm, &[&payer, &governance], grant.clone()).is_err(),
+        "governance cannot grant away a nonzero external insurance balance"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_grant);
+    assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
+
+    let withdraw = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(creator_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+            asset_index: 0,
+            amount: insurance_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&payer, &creator], withdraw)
+        .expect("recorded creator recovers insurance after donating lifecycle control");
+    assert_eq!(token_amount(&svm, &creator_token), insurance_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+
+    send(&mut svm, &[&payer, &governance], grant)
+        .expect("empty insurance custody can progress to the canonical genesis pool");
+    let granted_market = svm.get_account(&slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&granted_market.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&granted_market.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+}
+
 #[test]
 fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
     let mut svm =
