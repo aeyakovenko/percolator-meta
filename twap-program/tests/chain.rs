@@ -31114,6 +31114,16 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
                 .map_or(true, |account| account.lamports == 0 && account.data.is_empty()),
             "maintenance fee dematerializes the frozen trader witness"
         );
+        send(
+            &mut svm,
+            &[&payer],
+            solana_sdk::system_instruction::transfer(&payer.pubkey(), &loser_pf, 1),
+        )
+        .expect("an unaffiliated account dusts the closed reward witness");
+        let dusted_witness = svm.get_account(&loser_pf).unwrap();
+        assert_eq!(dusted_witness.lamports, 1);
+        assert!(dusted_witness.data.is_empty());
+        assert_eq!(dusted_witness.owner, perc_id());
     } else {
         // A portfolio's historical loss counters are the trader claim's live-cap
         // witness. Hand the market to the real controller, resolve it, and fully pay
