@@ -19,4 +19,4 @@ distribution-program = { path = "../distribution", features = ["no-entrypoint"] 
 subledger-program = { path = "../subledger", features = ["no-entrypoint"] }
 residual-distributor = { path = "../residual-distributor", features = ["no-entrypoint"] }
 percolator-prog = { workspace = true }
-percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "c8aab33814dd30878cf9b054eca89bcd6cf9f5e7" }
+percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "143e68c4917ed0400a27b952f036a5677047cd84" }

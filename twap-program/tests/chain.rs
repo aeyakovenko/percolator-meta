@@ -28044,7 +28044,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ],
                 PIx::PermissionlessCrank {
                     now_slot: slot,
-                    close_q: 0,
                     observations: vec![percolator_prog::ix::CrankObservationHint {
                         asset_index: 0,
                         oracle_accounts: 0,
@@ -29185,7 +29184,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ],
                 PIx::PermissionlessCrank {
                     now_slot: slot,
-                    close_q: 0,
                     observations: vec![percolator_prog::ix::CrankObservationHint {
                         asset_index: 0,
                         oracle_accounts: 0,
@@ -30500,7 +30498,6 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
                 ],
                 PIx::PermissionlessCrank {
                     now_slot: slot,
-                    close_q: 0,
                     observations: vec![percolator_prog::ix::CrankObservationHint {
                         asset_index: 0,
                         oracle_accounts: 0,
