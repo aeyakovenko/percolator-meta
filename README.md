@@ -89,6 +89,8 @@ The deterministic `residual-distributor` genesis path is tested with a 10% insur
 Those accounts are always read-only. Its only token CPI transfers the configured COIN mint from the
 epoch PDA's canonical vault to the stake's pre-bound recipient. The DAO can choose future market scopes
 and reward percentages, but cannot mutate an active epoch, redirect a claim, or sweep user principal.
+Each subledger pool may belong to only one capital cohort in an epoch, so one position cannot claim both
+the insurance and backing allocations through cross-market scope aliasing.
 
 The full LiteSVM chain test runs fixed-supply genesis, then three consecutive 15-day TWAP rounds into
 one dynamic reward epoch. Every round sends 50% of bought COIN to the epoch vault, burns 50%, pays the
