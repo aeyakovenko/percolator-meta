@@ -2,6 +2,30 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - zero-principal TWAP custody could strand absent asset-0 backing (surface A/C)
+
+A principal pool may legitimately re-hand custody to TWAP after every owner exits so retained
+protocol insurance can continue through buyback rounds. After resolution, the existing public path
+correctly moved that protocol insurance to the canonical controller account. It nevertheless kept
+`asset_admin` on the TWAP PDA because public return to an empty pool was unconditionally forbidden.
+Asset-0 has no per-asset shutdown override, so an absent backing provider then depended on Squads to
+return that role before the pool could invoke the fixed provider-bound backing cleanup. If Squads
+disappeared, the provider's backing and whole-market close remained stuck despite zero insurance.
+
+The clean-room full-chain LiteSVM regression funds asset-0 backing through a real timelocked Squads
+vault transaction, moves owner principal through TWAP, resolves, returns the principal, re-hands off
+with zero principal, and recovers retained protocol insurance to the controller. The old TWAP binary
+then fails the unaffiliated role return with `InvalidAccountData`, so the existing asset-0 cleanup
+cannot execute.
+
+FIX: the no-Squads return still requires the config-bound executable Percolator program and a
+resolved, empty slab. While asset-local insurance is nonzero, the canonical pool must still attest
+live owner principal. Once that insurance is zero, returning `asset_admin` and the two insurance
+roles moves no value; the downstream Subledger CPI still revalidates the exact config-bound pool PDA.
+The same unaffiliated cranker can then invoke the existing amountless asset-0 cleanup, which derives
+both backing domains and the recipient from Percolator. The regression proves asset-0 backing reaches
+only its recorded provider while retained protocol insurance stays isolated in controller custody.
+
 ## Tick - owner-only closed-witness recovery could strand PDA-owned rewards (surface C/D)
 
 Percolator portfolios may be owned by program PDAs: the owner program signs initialization and
@@ -109,9 +133,10 @@ principal, and a dedicated real-Percolator LiteSVM fixture proves that attestati
 historical owner's successful exit.
 The instruction still accepts no amount or destination and can rotate custody only through
 subledger's immutable pool derivation. The regression then re-hands off with zero principal and
-proves the same public call rejects byte-exact, preventing a caller from moving terminal protocol
-insurance into an empty pool. User exits are restored without adding a governance or public
-withdrawal surface.
+proves the same public call rejects byte-exact while terminal protocol insurance remains, preventing
+a caller from moving that value into an empty pool. A later audit permits only the value-less role
+return after canonical protocol recovery so asset-0 backing cannot become DAO-dependent. User exits
+are restored without adding a governance or public withdrawal surface.
 
 ## Tick - abandoned empty portfolio could block terminal market close (surface C)
 

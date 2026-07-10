@@ -1020,7 +1020,7 @@ fn process_accept_custody<'a>(
     Ok(())
 }
 
-// return_to_subledger accounts: [squads_vault(signer unless resolved + empty + principal), config,
+// return_to_subledger accounts: [squads_vault(signer unless resolved + empty + safe return), config,
 //   twap_authority(current_admin), pool, market_slab(w), percolator_program,
 //   subledger_program]
 //
@@ -1078,18 +1078,25 @@ fn process_return_to_subledger(
         {
             return Err(ProgramError::MissingRequiredSignature);
         }
+        let insurance = read_asset_insurance(&market_data, config.market_0_domain as usize)?;
         drop(market_data);
-        // The subledger owns both current and historical pool layouts. Its
-        // read-only attestation prevents a public caller from rotating terminal
-        // protocol insurance into a pool after every owner claim has exited.
-        invoke(
-            &Instruction {
-                program_id: *subledger_program.key,
-                accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
-                data: vec![SUBLEDGER_IX_ASSERT_PRINCIPAL],
-            },
-            &[pool.clone(), subledger_program.clone()],
-        )?;
+        if insurance != 0 {
+            // The subledger owns both current and historical pool layouts. Its
+            // read-only attestation prevents a public caller from rotating terminal
+            // protocol insurance into a pool after every owner claim has exited.
+            invoke(
+                &Instruction {
+                    program_id: *subledger_program.key,
+                    accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
+                    data: vec![SUBLEDGER_IX_ASSERT_PRINCIPAL],
+                },
+                &[pool.clone(), subledger_program.clone()],
+            )?;
+        }
+        // Once asset-local insurance is zero, returning asset_admin and the two
+        // insurance roles moves no value. The exact pool is still config-bound and
+        // its accept CPI revalidates the canonical Subledger PDA. This lets that
+        // pool invoke the fixed asset-0 backing cleanup when its provider is absent.
     }
 
     invoke_signed(

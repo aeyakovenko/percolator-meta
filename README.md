@@ -57,7 +57,9 @@ capital's own tenure.
   return custody only to that same pool. Squads must authorize that return while the market is live;
   after the bound Percolator market is resolved and empty, anyone can crank the same fixed return
   while the pool attests that owner principal remains, so owner exits do not depend on a surviving
-  DAO. An empty pool cannot pull terminal protocol insurance back from TWAP. The pool-less
+  DAO. An empty pool cannot pull terminal protocol insurance back from TWAP. After that insurance is
+  first recovered to the canonical controller account, anyone may return the now value-less roles to
+  the same pool so its fixed wrapper can release an absent asset-0 backing provider. The pool-less
   compatibility handoff accepts only an empty asset-0 insurance balance; later value must enter
   through the inbound-only donation path.
   After resolution, TWAP can move a retained terminal floor to the canonical controller account
@@ -202,7 +204,9 @@ through the existing governance-signed terminal reclaim after Percolator accepts
 The same terminal custody applies to TWAP-retained insurance after all genesis owners exit. The
 subledger program first attests that its bound principal pool has no outstanding principal or
 shares; only then can a permissionless TWAP crank route the exact resolved asset-0 remainder through
-canonical TWAP and controller accounts. No caller or governance proposal selects the recipient.
+canonical TWAP and controller accounts. No caller or governance proposal selects the recipient. Once
+the slab's asset-0 insurance is zero, a public role-only return to the same pool is safe and lets its
+existing fixed wrapper complete asset-0 backing cleanup without a surviving DAO.
 
 Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
 reads both domains' complete principal and earnings from the pinned slab, atomically transfers the
