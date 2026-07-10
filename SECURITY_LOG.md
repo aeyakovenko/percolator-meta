@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - abandoned empty portfolio could block terminal market close (surface C)
+
+Any user could fund and initialize an empty Percolator portfolio, which increments the market's
+`materialized_portfolio_count`. After resolution, Percolator allows either the portfolio owner or
+`marketauth` to close that empty account, but the controller PDA permanently holds `marketauth` and
+its generic proxy intentionally rejects portfolio instructions. If the owner disappeared, public
+`CloseResolved` could not deregister the account and `CloseSlab` remained blocked forever despite no
+user value being owed. One attacker-paid rent account was enough for persistent terminal DoS.
+
+A fresh LiteSVM regression initializes a controller-owned market permissionlessly, creates the
+attacker's portfolio through the System Program, materializes it with the real pinned Percolator
+binary, and also deposits one collateral atom into an independent victim portfolio. It resolves
+through the existing controller proxy and proves both an unaffiliated direct `ClosePortfolio` and
+terminal `CloseSlab` fail. Before the fix, the only proposed bounded cleanup fails at the controller
+with `InvalidInstructionData`.
+
+FIX: controller instruction 11 is a permissionless, stateless wrapper around only pinned Percolator
+`ClosePortfolio`. It derives the controller from the governance, market, and executable Percolator
+program; accepts no amount, token account, or destination; and lets Percolator enforce resolved mode
+and an actually empty portfolio. Portfolio rent goes only into the slab. The regression also proves
+the same crank rejects atomically while the market is live and while resolved collateral remains
+owed. Public `CloseResolved` first pays the victim's atom only to its canonical account; only then
+can the wrapper deregister that empty portfolio. It finally deregisters the abandoned account and
+allows the existing terminal reclaim to close the slab.
+
 ## Tick - provider cleanup could sweep retained protocol insurance (surface A/C)
 
 The controller used one canonical token account per market and mint for both protocol custody and

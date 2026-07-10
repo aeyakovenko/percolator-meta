@@ -6300,6 +6300,380 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
     );
 }
 
+// PUBLIC DOS: a user can materialize an empty portfolio and disappear. Percolator deliberately
+// lets marketauth close empty portfolios after resolution, but marketauth is the controller PDA,
+// so terminal cleanup needs a fixed permissionless wrapper for that exact operation.
+#[test]
+fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller-owned market init");
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    send(
+        &mut svm,
+        &[&attacker, &portfolio],
+        solana_sdk::system_instruction::create_account(
+            &attacker.pubkey(),
+            &portfolio.pubkey(),
+            portfolio_rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("attacker funds a real Percolator portfolio account");
+    send(
+        &mut svm,
+        &[&attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::InitPortfolio,
+        ),
+    )
+    .expect("attacker materializes an empty portfolio");
+
+    let victim = Keypair::new();
+    svm.airdrop(&victim.pubkey(), 10_000_000_000).unwrap();
+    let victim_portfolio = Keypair::new();
+    send(
+        &mut svm,
+        &[&victim, &victim_portfolio],
+        solana_sdk::system_instruction::create_account(
+            &victim.pubkey(),
+            &victim_portfolio.pubkey(),
+            portfolio_rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("victim funds a real Percolator portfolio account");
+    send(
+        &mut svm,
+        &[&victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::InitPortfolio,
+        ),
+    )
+    .expect("victim materializes a portfolio");
+    let victim_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_source,
+        &collateral_mint,
+        &victim.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(victim_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            percolator_prog::ix::Instruction::Deposit { amount: 1 },
+        ),
+    )
+    .expect("victim deposits one collateral atom");
+    let victim_destination = canonical_insurance_vault(&victim.pubkey(), &collateral_mint);
+    set_token(
+        &mut svm,
+        &victim_destination,
+        &collateral_mint,
+        &victim.pubkey(),
+        0,
+    );
+    let (_, live_group) =
+        percolator_prog::state::read_market(&svm.get_account(&slab).unwrap().data).unwrap();
+    assert_eq!(live_group.materialized_portfolio_count, 2);
+    assert_eq!(token_amount(&svm, &percolator_vault), 1);
+
+    let close_abandoned = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(portfolio.pubkey(), false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![11u8], // IX_CLOSE_RESOLVED_PORTFOLIO
+    };
+    let close_funded = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(victim_portfolio.pubkey(), false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![11u8], // IX_CLOSE_RESOLVED_PORTFOLIO
+    };
+    let live_market_before_cleanup = svm.get_account(&slab).unwrap();
+    let live_portfolio_before_cleanup = svm.get_account(&portfolio.pubkey()).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], close_abandoned.clone()).is_err(),
+        "the controller cannot close even an empty portfolio while the market is live"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), live_market_before_cleanup);
+    assert_eq!(
+        svm.get_account(&portfolio.pubkey()).unwrap(),
+        live_portfolio_before_cleanup
+    );
+
+    let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves the market through the fixed controller authority");
+
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                percolator_prog::ix::Instruction::ClosePortfolio,
+            ),
+        )
+        .is_err(),
+        "an unaffiliated cranker is not Percolator marketauth"
+    );
+
+    let funded_market_before_cleanup = svm.get_account(&slab).unwrap();
+    let funded_portfolio_before_cleanup = svm.get_account(&victim_portfolio.pubkey()).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], close_funded.clone()).is_err(),
+        "the controller cannot close a resolved portfolio while collateral is still owed"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), funded_market_before_cleanup);
+    assert_eq!(
+        svm.get_account(&victim_portfolio.pubkey()).unwrap(),
+        funded_portfolio_before_cleanup
+    );
+    assert_eq!(token_amount(&svm, &percolator_vault), 1);
+    assert_eq!(token_amount(&svm, &victim_destination), 0);
+
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(victim_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            percolator_prog::ix::Instruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+        ),
+    )
+    .expect("permissionless resolved close pays the bound victim before rent cleanup");
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+    assert_eq!(token_amount(&svm, &victim_destination), 1);
+
+    let slab_lamports_before_victim_cleanup = svm.get_account(&slab).unwrap().lamports;
+    send(&mut svm, &[&payer], close_funded)
+        .expect("any cranker deregisters the paid-out empty victim portfolio");
+    assert!(
+        svm.get_account(&victim_portfolio.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "the paid-out portfolio is closed only after its collateral exits"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap().lamports,
+        slab_lamports_before_victim_cleanup + portfolio_rent,
+        "the paid-out portfolio's rent also returns only to the slab"
+    );
+    let (_, one_abandoned_group) =
+        percolator_prog::state::read_market(&svm.get_account(&slab).unwrap().data).unwrap();
+    assert_eq!(one_abandoned_group.materialized_portfolio_count, 1);
+
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    svm.set_account(
+        controller,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let close_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new(governance.pubkey(), true),
+            AccountMeta::new(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new(controller_transit, false),
+            AccountMeta::new(governance_destination, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
+    };
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            close_market.clone(),
+        )
+        .is_err(),
+        "the abandoned materialized portfolio blocks terminal CloseSlab"
+    );
+
+    let slab_lamports_before_portfolio_cleanup = svm.get_account(&slab).unwrap().lamports;
+    send(&mut svm, &[&payer], close_abandoned)
+    .expect("any cranker closes the abandoned empty portfolio through marketauth");
+    assert!(
+        svm.get_account(&portfolio.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "portfolio rent returns to the slab"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap().lamports,
+        slab_lamports_before_portfolio_cleanup + portfolio_rent,
+        "the cranker cannot redirect the abandoned portfolio's rent"
+    );
+    let (_, resolved_group) =
+        percolator_prog::state::read_market(&svm.get_account(&slab).unwrap().data).unwrap();
+    assert_eq!(resolved_group.materialized_portfolio_count, 0);
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        close_market,
+    )
+    .expect("terminal reclaim succeeds after permissionless portfolio cleanup");
+    assert!(
+        svm.get_account(&slab)
+            .map_or(true, |account| account.lamports == 0),
+        "the abandoned empty portfolio cannot strand the slab"
+    );
+}
+
 #[test]
 fn e2e_provider_cannot_brick_resolved_cleanup_by_reassigning_its_canonical_ata() {
     let mut svm =

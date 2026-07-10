@@ -36,10 +36,12 @@ capital's own tenure.
   Percolator proves the market empty. Controller-owned protocol insurance is recovered only to the
   canonical controller account after resolution and stays there until terminal close. Raw
   `CloseSlab` is excluded; a fixed terminal cleanup forwards that protocol insurance, vault dust,
-  and account rent to Squads. Donating a creator-owned market preserves funded outgoing asset-0
-  insurance roles and the recorded backing provider; the handoff cannot collapse that capital into
-  the controller or select another provider. Donation is accepted only when every secondary slot is
-  fully retired because Percolator does not migrate secondary `asset_admin` roles with `marketauth`;
+  and account rent to Squads. Before that close, anyone can ask the controller to deregister an
+  abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
+  portfolio and returns its rent only to the slab. Donating a creator-owned market preserves funded
+  outgoing asset-0 insurance roles and the recorded backing provider; the handoff cannot collapse
+  that capital into the controller or select another provider. Donation is accepted only when every
+  secondary slot is fully retired because Percolator does not migrate secondary `asset_admin` roles with `marketauth`;
   multi-asset markets are
   instead initialized under the controller before governance-approved activation. The handoff also
   requires direct permissionless asset append to be disabled, and the controller cannot enable it.
@@ -65,7 +67,7 @@ capital's own tenure.
 | Crate | Responsibility |
 |---|---|
 | `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
-| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers and retains controller-owned protocol insurance for terminal reclaim. |
+| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, deregisters only empty resolved portfolios, and retains controller-owned protocol insurance for terminal reclaim. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. Its terminal read-only attestation proves when that principal pool has no owner claims. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
@@ -157,6 +159,12 @@ authority rotation, and backing-bucket movement. External backing providers reta
 asset-local withdrawal path; governance only sets the fee split that sends the configured share
 into insurance. Secondary activation may independently select backing and oracle providers, but its
 insurance authority and operator must be one key so deposit and withdrawal custody cannot diverge.
+
+Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
+cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
+fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Percolator rejects live or
+nonempty portfolios and sends the closed account's lamports only into the bound market slab. The
+wrapper accepts no amount, token account, or destination and exposes no generic portfolio authority.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one
 remaining atom. After Squads shuts the asset down and Percolator's delay and empty-state checks pass,

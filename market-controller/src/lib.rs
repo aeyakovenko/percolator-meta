@@ -5,6 +5,8 @@
 //! and all authority mutation tags are absent by construction. Fixed shutdown and
 //! resolved paths can return backing or insurance only to its recorded provider or
 //! retain controller-owned protocol insurance for terminal governance reclaim.
+//! Permissionless terminal cleanup can deregister only a resolved empty portfolio;
+//! its rent returns to the market slab and no token destination is accepted.
 //! Terminal cleanup runs only after Percolator proves every attributed balance is
 //! zero.
 #![no_std]
@@ -44,8 +46,10 @@ const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
 const IX_RETURN_SHUTDOWN_INSURANCE: u8 = 8;
 const IX_RETURN_RESOLVED_ASSET_INSURANCE: u8 = 9;
 const IX_RETURN_RESOLVED_ASSET_BACKING: u8 = 10;
+const IX_CLOSE_RESOLVED_PORTFOLIO: u8 = 11;
 
 const PERC_IX_INIT_MARKET: u8 = 0;
+const PERC_IX_CLOSE_PORTFOLIO: u8 = 8;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
@@ -193,6 +197,7 @@ pub fn process_instruction<'a>(
         IX_RETURN_RESOLVED_ASSET_BACKING => {
             process_return_resolved_asset_backing(program_id, accounts, data)
         }
+        IX_CLOSE_RESOLVED_PORTFOLIO => process_close_resolved_portfolio(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1372,6 +1377,64 @@ fn process_return_resolved_asset0_backing<'a>(
         token_program,
         &seeds,
         return_amount,
+    )
+}
+
+// close_resolved_portfolio accounts:
+// [governance, controller_pda, market(w), portfolio(w), percolator_program]
+//
+// Anyone can ask the controller to exercise Percolator's terminal marketauth
+// override. Percolator itself requires a resolved market and a genuinely empty
+// portfolio, deregisters the materialized account, and returns only its rent to
+// the market slab. There is no caller-selected amount or destination.
+fn process_close_resolved_portfolio<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let portfolio = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if iter.next().is_some() || !market.is_writable || !portfolio.is_writable {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let bump = controller_bump(
+        program_id,
+        governance,
+        controller,
+        market,
+        percolator_program,
+    )?;
+    let bump_seed = [bump];
+    let seeds = signer_seeds(
+        governance.key,
+        market.key,
+        percolator_program.key,
+        &bump_seed,
+    );
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*controller.key, true),
+                AccountMeta::new(*market.key, false),
+                AccountMeta::new(*portfolio.key, false),
+            ],
+            data: vec![PERC_IX_CLOSE_PORTFOLIO],
+        },
+        &[
+            controller.clone(),
+            market.clone(),
+            portfolio.clone(),
+            percolator_program.clone(),
+        ],
+        &[&seeds],
     )
 }
 
