@@ -12237,3 +12237,23 @@ The same chain now initializes a maximal six-market reward epoch through the rea
 checks the serialized legacy transaction against Solana's packet limit. Reusing the sole DAO member as fee
 payer keeps the maximal transaction at 1,188 bytes; a separate fee-payer signature would make it 1,284 bytes
 and non-broadcastable. This is governance-lifecycle coverage, not an additional authority.
+
+## Tick - the pool-less legacy handoff could permanently lock funded insurance (surface A/C)
+
+TWAP tag 3 rotates asset-0 insurance authority, operator, and cold admin from a Squads vault to the constrained
+TWAP PDA. It is the compatibility path for an unfunded market, so it records no owner-bound `custody_pool`.
+The implementation did not enforce the documented empty-balance precondition. A timelocked call could therefore
+move an already-funded market into TWAP custody with the sentinel floor and no public return destination. The
+auction could not pull the sentinel-protected value, and `return_to_subledger` rejected because no pool was bound,
+permanently locking the insurance even though governance never gained a withdrawal key.
+
+A retained pinned-Percolator + real-Squads + TWAP LiteSVM regression tops up `700,000` asset-0 insurance units
+through the public API, executes the legacy handoff through the one-week timelock, and requires rejection with
+the market bytes and canonical vault balance unchanged. It failed against the old SBF because all custody
+rotations succeeded.
+
+FIX: the pool-less handoff now reads the exact asset-local insurance remainder from the pinned accounting view
+and requires zero before the first role mutation. Funded genesis continues to use the subledger handoff, which
+atomically binds the sole recovery pool and live principal floor. Legacy auction fixtures now hand off while
+empty and fund afterward through TWAP's existing inbound-only donation. No recovery signer, destination, role,
+or admin surface was added.
