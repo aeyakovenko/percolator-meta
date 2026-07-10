@@ -10240,6 +10240,41 @@ fn build_set_market_fees_message(
     m
 }
 
+fn build_twap_restart_asset0_message(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    now_slot: u64,
+    initial_price: u64,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(1); // market writable
+    m.push(6);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(config.as_ref()); // 2
+    m.extend_from_slice(twap_authority.as_ref()); // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    m.extend_from_slice(twap_id().as_ref()); // 5 program
+    m.push(1);
+    m.push(5);
+    m.push(5);
+    for index in [0u8, 2, 3, 1, 4] {
+        m.push(index);
+    }
+    let mut data = vec![21u8];
+    data.extend_from_slice(&now_slot.to_le_bytes());
+    data.extend_from_slice(&initial_price.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 // IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
 // accounts: [squads_vault(signer), config(w), savings_account(ro)]; data: savings_bps(u16)||buyback_bps(u16)
 fn build_set_economics_message(
@@ -12439,6 +12474,199 @@ fn e2e_squads_cannot_terminally_drain_insurance_after_resolve() {
     );
     assert_eq!(token_amount(&svm, &env.perc_vault), before);
     assert_eq!(token_amount(&svm, &destination), 0);
+}
+
+// LIFECYCLE DOS PROBE: after the genesis custody handoff, the TWAP PDA is asset_admin.
+// Governance can still shut down asset 0 as marketauth, but Percolator correctly refuses to let
+// marketauth restart it. The constrained TWAP surface must therefore expose the fixed, value-neutral
+// asset-0 restart or a temporary oracle shutdown permanently strands an otherwise reusable market.
+#[test]
+fn e2e_post_genesis_twap_custody_can_restart_asset0() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+    );
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &donate_market,
+        &controller_remaining,
+    )
+    .expect("Squads donates post-genesis lifecycle to the constrained controller");
+
+    let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+    let active_before = svm.get_account(&env.slab).unwrap();
+    let premature_restart = build_twap_restart_asset0_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        shutdown_slot,
+        2_000_000,
+    );
+    let twap_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            6,
+            &premature_restart,
+            &twap_remaining,
+        )
+        .is_err(),
+        "restart cannot reset a live asset or rewrite its price"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), active_before);
+
+    let shutdown = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 0,
+            now_slot: shutdown_slot,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &shutdown,
+        &controller_remaining,
+    )
+    .expect("timelocked governance shuts down asset 0");
+
+    let shutdown_market = svm.get_account(&env.slab).unwrap();
+    let (_, shutdown_group) =
+        percolator_prog::state::read_market(&shutdown_market.data).unwrap();
+    let shutdown_profile =
+        percolator_prog::state::read_asset_oracle_profile(&shutdown_market.data, 0).unwrap();
+    assert_eq!(
+        shutdown_group.assets[0].lifecycle,
+        percolator::AssetLifecycleV16::Recovery
+    );
+    assert_eq!(shutdown_profile.asset_admin, env.twap_authority.to_bytes());
+    let old_market_id = shutdown_group.assets[0].market_id;
+    let accounting_before = (
+        shutdown_group.vault,
+        shutdown_group.c_tot,
+        shutdown_group.insurance,
+        shutdown_group.insurance_domain_budget,
+    );
+    let token_insurance_before = token_amount(&svm, &env.perc_vault);
+
+    svm.warp_to_slot(shutdown_slot + 1);
+    let restart_slot = svm.get_sysvar::<Clock>().slot;
+    let initial_price = 1_000_001;
+    let restart = build_twap_restart_asset0_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        restart_slot,
+        initial_price,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &restart,
+        &twap_remaining,
+    )
+    .expect("timelocked futarchy restarts asset 0 through its TWAP custodian");
+
+    let restarted_market = svm.get_account(&env.slab).unwrap();
+    let (restarted_config, restarted_group) =
+        percolator_prog::state::read_market(&restarted_market.data).unwrap();
+    let restarted_profile =
+        percolator_prog::state::read_asset_oracle_profile(&restarted_market.data, 0).unwrap();
+    assert_eq!(
+        restarted_group.assets[0].lifecycle,
+        percolator::AssetLifecycleV16::Active
+    );
+    assert!(restarted_group.assets[0].market_id > old_market_id);
+    assert_eq!(restarted_group.assets[0].effective_price, initial_price);
+    assert_eq!(restarted_config.marketauth, controller.to_bytes());
+    assert_eq!(restarted_profile.asset_admin, shutdown_profile.asset_admin);
+    assert_eq!(
+        restarted_profile.insurance_authority,
+        shutdown_profile.insurance_authority
+    );
+    assert_eq!(
+        restarted_profile.insurance_operator,
+        shutdown_profile.insurance_operator
+    );
+    assert_eq!(
+        restarted_profile.backing_bucket_authority,
+        shutdown_profile.backing_bucket_authority
+    );
+    assert_eq!(restarted_profile.oracle_authority, shutdown_profile.oracle_authority);
+    assert_eq!(
+        (
+            restarted_group.vault,
+            restarted_group.c_tot,
+            restarted_group.insurance,
+            restarted_group.insurance_domain_budget,
+        ),
+        accounting_before,
+        "restart changes no collateral or insurance accounting"
+    );
+    assert_eq!(token_amount(&svm, &env.perc_vault), token_insurance_before);
 }
 
 #[test]
