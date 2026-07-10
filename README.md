@@ -12,7 +12,8 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 ## Invariants
 
 - **Fixed supply.** Genesis allocates an existing COIN vault. It never mints. Unclaimed genesis
-  allocations are burned.
+  allocations are burned. A claim can pay only an initialized COIN account owned by its signing
+  recipient.
 - **Capital stays segregated.** Insurance and backing principal stays in Percolator or an
   owner-bound subledger vault. Insurance haircuts and TWAP surplus are computed from the selected
   asset's own long/short domain budgets, so another asset's backing cannot mask a loss or authorize
