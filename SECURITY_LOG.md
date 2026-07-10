@@ -11996,3 +11996,25 @@ FIX: distribution now requires the payout to be an initialized SPL Token account
 whose token authority is the signing recipient. Arbitrary recipient-owned accounts and historical claims stay
 supported; attacker accounts and the config-owned vault cannot pass. No signer, mint, admin, custody, amount,
 or claim authority was added.
+
+## Tick — market donation could absorb the creator's asset-0 backing authority (surface A/C)
+
+Percolator initializes asset 0 with the permissionless creator as both `marketauth` and backing provider. Its
+`UpdateAuthority` instruction intentionally rewrites every asset-0 role still equal to the outgoing market key.
+The controller's public `accept_market_authority` used that instruction without restoring backing, so a creator
+who funded the long or short backing bucket and then donated lifecycle control silently changed the recorded
+provider to the stateless controller. The creator's normal withdrawal became unauthorized, the generic controller
+proxy denied backing withdrawals and authority mutation, and the fixed abandoned-backing path could not attribute
+the controller-owned bucket back to the creator.
+
+A fresh real Percolator + controller LiteSVM reproduction initialized a market through the public API, deposited
+`500,000` asset-0 backing units as the creator, donated the market, and observed the old SBF replace the provider
+with the controller. The retained regression requires the creator to remain recorded and withdraw the complete
+bucket after the handoff. A symmetric real-binary probe first rotates backing to a distinct provider and proves
+the handoff leaves that provider unchanged.
+
+FIX: the creator-signed donation snapshots whether the outgoing market authority is the recorded asset-0 backing
+provider. After Percolator moves `marketauth` to the controller, one atomic fixed CPI restores only that exact
+outgoing provider; an unrelated provider takes no CPI and cannot be overwritten. The generic tag-65 proxy remains
+denied, governance cannot choose a recipient, and any failure rolls back the market-authority handoff with the
+restoration. No withdrawal, token destination, DAO signer, or reusable admin surface was added.
