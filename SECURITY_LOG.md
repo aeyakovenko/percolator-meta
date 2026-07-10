@@ -2,6 +2,29 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - public stale resolution could strand controller-owned insurance (surface A/C)
+
+The controller's public insurance-donation path could add asset-0 insurance while its PDA remained
+the recorded authority. If governance enabled Percolator's permissionless stale-resolution policy,
+any cranker could then resolve the market. CloseSlab still required that insurance to be zero, the
+generic proxy denied both insurance-withdrawal tags, and the fixed resolved-insurance return rejected
+asset 0 and controller-owned authority. A one-atom public donation could therefore become permanently
+stranded after the public resolution transition and block whole-market closure.
+
+A fresh real Percolator + controller LiteSVM regression initializes the market through the public
+controller wrapper, configures stale resolution through the governance allowlist, donates one atom
+through the public fixed path, and resolves through Percolator's public stale cranker. The old
+controller then fails with `InvalidArgument` at the only bounded cleanup path.
+
+FIX: the existing resolved-insurance instruction now recognizes insurance whose slab-recorded
+authority is the controller. It withdraws only the exact slab-derived amount into the same canonical
+controller ATA, leaves the ATA open, and relies on the existing governance-signed terminal reclaim
+to forward it after CloseSlab succeeds. It does not rotate an already-controller-owned role and still
+rejects externally owned asset-0 insurance. The LiteSVM regression proves an attacker-selected token
+account is rejected atomically, the valid recovery zeros insurance, and terminal close delivers the
+one atom only through the existing governance destination. External-provider and malicious-governance
+regressions remain green.
+
 ## Tick - provider-owned canonical ATA mutation could block terminal cleanup (surface A/C)
 
 Every fixed controller return pinned external backing and insurance to the provider's canonical ATA, but also

@@ -5929,10 +5929,314 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
     );
 }
 
-// PUBLIC LOF: the shutdown override used by IX_RETURN_SHUTDOWN_BACKING intentionally excludes
-// asset 0, while a resolved market still requires its absent provider's two backing domains to be
-// drained before CloseSlab can make progress. The fixed path must derive every amount and recipient,
-// reject while live, and atomically return all remaining principal and earnings after resolution.
+// PUBLIC DOS: anyone can donate to controller-owned asset-0 insurance and later trigger configured
+// stale resolution, but CloseSlab still requires that insurance to be empty. The fixed recovery
+// must retain protocol insurance in the canonical controller ATA for terminal governance reclaim
+// without exposing a caller-selected destination.
+#[test]
+fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller-owned market init");
+
+    let mut stale_config_data = vec![0u8]; // IX_PROXY_ADMIN
+    stale_config_data.extend_from_slice(
+        &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 1,
+            force_close_delay_slots: 1,
+        }
+        .encode(),
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: stale_config_data,
+        },
+    )
+    .expect("governance enables public stale resolution");
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let controller_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&payer, &donor],
+        controller_donate_insurance_ix(
+            &donor.pubkey(),
+            &governance.pubkey(),
+            &controller,
+            &slab,
+            &donor_source,
+            &controller_holding,
+            &percolator_vault,
+            1,
+        ),
+    )
+    .expect("public donor funds controller-owned asset-0 insurance");
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        1
+    );
+
+    svm.set_sysvar(&Clock {
+        slot: 102,
+        unix_timestamp: 102,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(slab, false)],
+            data: percolator_prog::ix::Instruction::ResolveStalePermissionless { now_slot: 102 }
+                .encode(),
+        },
+    )
+    .expect("unaffiliated cranker resolves the stale market");
+
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let insurance_ledger = Pubkey::new_unique();
+    svm.set_account(
+        insurance_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::insurance_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let attacker = Keypair::new();
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    let market_before_redirect = svm.get_account(&slab).unwrap();
+    let vault_before_redirect = token_amount(&svm, &percolator_vault);
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset_insurance_ix(
+                &governance.pubkey(),
+                &controller,
+                &slab,
+                &attacker_destination,
+                &controller_transit,
+                &percolator_vault,
+                &vault_authority,
+                &insurance_ledger,
+                &perc_id(),
+                0,
+            ),
+        )
+        .is_err(),
+        "public cleanup cannot redirect controller-owned insurance"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_redirect);
+    assert_eq!(token_amount(&svm, &percolator_vault), vault_before_redirect);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset_insurance_ix(
+                &governance.pubkey(),
+                &controller,
+                &slab,
+                &attacker_destination,
+                &attacker_destination,
+                &percolator_vault,
+                &vault_authority,
+                &insurance_ledger,
+                &perc_id(),
+                0,
+            ),
+        )
+        .is_err(),
+        "public cleanup cannot substitute one arbitrary account for both custody slots"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_redirect);
+    assert_eq!(token_amount(&svm, &percolator_vault), vault_before_redirect);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+
+    send(
+        &mut svm,
+        &[&payer],
+        controller_return_resolved_asset_insurance_ix(
+            &governance.pubkey(),
+            &controller,
+            &slab,
+            &controller_transit,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &insurance_ledger,
+            &perc_id(),
+            0,
+        ),
+    )
+    .expect("public cleanup recovers protocol insurance to the controller ATA");
+    assert_eq!(token_amount(&svm, &controller_transit), 1);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        0
+    );
+
+    svm.set_account(
+        controller,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new(governance.pubkey(), true),
+                AccountMeta::new(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new(controller_transit, false),
+                AccountMeta::new(governance_destination, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
+        },
+    )
+    .expect("resolved market closes after protocol insurance recovery");
+    assert_eq!(token_amount(&svm, &governance_destination), 1);
+    assert!(
+        svm.get_account(&slab)
+            .map_or(true, |account| account.lamports == 0),
+        "terminal reclaim closes the slab"
+    );
+}
+
 #[test]
 fn e2e_provider_cannot_brick_resolved_cleanup_by_reassigning_its_canonical_ata() {
     let mut svm =
