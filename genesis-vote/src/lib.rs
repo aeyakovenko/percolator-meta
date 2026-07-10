@@ -860,11 +860,9 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         ballot.voted_principal = 0;
     } else {
         let clock = Clock::get()?;
-        let weight = if start_slot == 0 {
-            0
-        } else {
-            vote_weight(principal, clock.slot.saturating_sub(start_slot))
-        };
+        // Slot zero is a valid configured bootstrap start and deposit timestamp. Principal zero
+        // and age below two already produce zero weight, so no timestamp sentinel is needed.
+        let weight = vote_weight(principal, clock.slot.saturating_sub(start_slot));
         if weight == 0 {
             msg!("position has no vote weight (unfunded or too recent)");
             return Err(ProgramError::InvalidAccountData);
