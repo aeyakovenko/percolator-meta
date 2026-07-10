@@ -1,17 +1,16 @@
-//! Market-0 TWAP buy/burn program — the percolator-facing link of the genesis
-//! authority chain:
+//! Market-0 TWAP buy/burn program: the post-genesis asset-custody link.
 //!
-//!   DAO (metadao_futarchy)  →  Squads multisig (1-week timelock)  →  THIS program
-//!       →  percolator market-0 insurance
+//!   owner-bound subledger pool -> THIS program -> Percolator asset-0 insurance
+//!   DAO -> Squads (1-week timelock) -> bounded TWAP policy instructions
 //!
 //! After the genesis mint, the percolator market-0 insurance authority/operator is
 //! rotated from the subledger to this program's `twap_authority` PDA. From then on
 //! the TWAP is what touches insurance: it pulls the configured surplus share and
 //! (in later slices) buys + burns COIN with it. The TWAP itself is *configured* only
 //! by its `squads` controller — a Squads multisig whose `config_authority` is the
-//! DAO — so the DAO controls percolator insurance only through the timelocked Squads
-//! path. The pull crank is permissionless (anyone may turn it) but bounded by the
-//! Squads-set parameters.
+//! DAO. Squads never receives a withdrawal-capable role; it can authorize only the
+//! fixed policy and custody transitions exposed here. The pull crank is
+//! permissionless but bounded by a monotonic principal floor.
 //!
 //! This slice wires the on-chain keystone: the config that pins the whole chain, and
 //! the `twap_authority` PDA signing the percolator insurance CPI. The Squads
@@ -68,7 +67,7 @@ const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
 const CONFIG_SEED: &[u8] = b"twap_config";
 
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
-const CONFIG_SIZE: usize = 232;
+const CONFIG_SIZE: usize = 264;
 
 // Default surplus share routed to buy/burn (the rest is retained as insurance).
 const DEFAULT_SURPLUS_BUY_BURN_BPS: u16 = 8_000;
@@ -80,24 +79,27 @@ const BPS_DENOMINATOR: u16 = 10_000;
 // tag-23 WithdrawInsuranceLimited (reconcile, finding JX). Accounts: [operator(s), market(w), dest(w),
 // vault(w), vault_authority, token_program, ledger(optional)] — same order the old tag-23 pull used.
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
+const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
+const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
+const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_AUTH_ADMIN: u8 = 0;
 const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance / deposits)
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
+const SUBLEDGER_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("Sub1edger1111111111111111111111111111111111");
+const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
 
 const IX_INIT_CONFIG: u8 = 0;
 // Reconfigure the surplus buy/burn share. Gated on the Squads VAULT PDA, which can
 // only sign via a multisig vault-transaction execute — i.e. after a DAO proposal
 // clears the 1-week Squads timelock. This is the on-chain Squads -> TWAP control.
 const IX_RECONFIGURE: u8 = 2;
-// Accept the percolator asset-0 INSURANCE_OPERATOR role for the twap_authority PDA.
-// This is the handoff: the squads vault (the current asset_admin) co-signs via a
-// timelock'd execute, and the program co-signs as twap_authority (percolator's
-// UpdateAssetAuthority requires the NEW authority to consent). After this the TWAP,
-// not the subledger, is the insurance operator.
+// Legacy direct handoff for an unfunded market whose Squads vault is still the raw
+// asset admin. Funded genesis uses IX_ACCEPT_FROM_SUBLEDGER.
 const IX_ACCEPT_OPERATOR: u8 = 3;
-// Set the surplus floor (reserved depositor principal). Squads-vault-gated like
-// reconfigure, so it only lands through a timelock'd DAO proposal. Lowering it below the
-// live reserved principal is the dangerous move and is exactly what the timelock guards.
+// Raise the surplus floor after its initial value. Canonical funded handoff derives
+// the initial minimum directly from the source pool's outstanding principal.
 const IX_SET_RESERVED_FLOOR: u8 = 4;
 // Create the buy/burn AuctionBook + its shared COIN escrow / settlement-USD token accounts.
 // Squads-vault-gated (timelock'd) — pins the reserve, round length, COIN sink and binding mints.
@@ -137,6 +139,14 @@ const IX_CANCEL_BID: u8 = 13;
 // the savings sink account. Squads-vault-gated. Validates auction + savings <= 100% (so insurance growth
 // stays >= 0 and the savings withdraw can never reach principal) and buyback <= auction.
 const IX_SET_ECONOMICS: u8 = 14;
+// Fixed pool -> TWAP custody transition, called only by the subledger pool PDA.
+const IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
+// Governance-authorized recovery transition back to the owner-bound subledger pool.
+const IX_RETURN_TO_SUBLEDGER: u8 = 16;
+// Permissionless inbound-only donation: donor -> TWAP holding -> Percolator insurance.
+const IX_DONATE_INSURANCE: u8 = 17;
+// Timelocked, fee-only Percolator policy update; no value accounts are accepted.
+const IX_SET_MARKET_FEES: u8 = 18;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -296,9 +306,9 @@ struct Config {
     authority_bump: u8,
     /// The asset-0 insurance amount that `execute` must NEVER pull below — the reserved
     /// depositor principal (+ any retained buffer). `execute`'s surplus pull may move at most
-    /// `insurance - reserved_floor`. Initialized to u128::MAX (no pulls) and lowered only
-    /// by the DAO through a timelock'd Squads `set_reserved_floor`, so a permissionless
-    /// crank can never reach principal (closes finding O).
+    /// `insurance - reserved_floor`. Initialized to u128::MAX (no pulls). A canonical
+    /// funded handoff replaces the sentinel with at least the source pool's outstanding
+    /// principal; after that it can only rise.
     reserved_floor: u128,
     /// 4-way surplus economics (DAO-tunable, timelock'd). Each round's surplus splits:
     ///   auction     = surplus_buy_burn_bps           -> buy COIN; of the BOUGHT COIN, buyback_bps is
@@ -315,6 +325,10 @@ struct Config {
     /// DAO/futarchy-owned account that receives the savings withdraw (a collateral token account) and,
     /// in SEND/buyback mode, the bought-back COIN sink. default() when both shares are 0.
     base_unit_savings_account: Pubkey,
+    /// The one owner-bound subledger pool that handed custody to this TWAP. Set
+    /// exactly once by the pool -> TWAP transition and used as the only permitted
+    /// recovery destination. Legacy unfunded direct migrations leave this unset.
+    custody_pool: Pubkey,
 }
 
 impl Config {
@@ -336,6 +350,7 @@ impl Config {
             base_unit_savings_bps: u16::from_le_bytes(data[189..191].try_into().unwrap()),
             buyback_bps: u16::from_le_bytes(data[191..193].try_into().unwrap()),
             base_unit_savings_account: Pubkey::new_from_array(data[193..225].try_into().unwrap()),
+            custody_pool: Pubkey::new_from_array(data[225..257].try_into().unwrap()),
         })
     }
 
@@ -354,7 +369,8 @@ impl Config {
         data[189..191].copy_from_slice(&self.base_unit_savings_bps.to_le_bytes());
         data[191..193].copy_from_slice(&self.buyback_bps.to_le_bytes());
         data[193..225].copy_from_slice(self.base_unit_savings_account.as_ref());
-        data[225..CONFIG_SIZE].fill(0);
+        data[225..257].copy_from_slice(self.custody_pool.as_ref());
+        data[257..CONFIG_SIZE].fill(0);
     }
 }
 
@@ -385,6 +401,10 @@ pub fn process_instruction(
         IX_SET_BID_FEE => process_set_bid_fee(program_id, accounts, data),
         IX_CANCEL_BID => process_cancel_bid(program_id, accounts, data),
         IX_SET_ECONOMICS => process_set_economics(program_id, accounts, data),
+        IX_ACCEPT_FROM_SUBLEDGER => process_accept_from_subledger(program_id, accounts, data),
+        IX_RETURN_TO_SUBLEDGER => process_return_to_subledger(program_id, accounts, data),
+        IX_DONATE_INSURANCE => process_donate_insurance(program_id, accounts, data),
+        IX_SET_MARKET_FEES => process_set_market_fees(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -497,13 +517,15 @@ fn process_init_config(
         market_0_domain: 0,
         config_bump,
         authority_bump,
-        // No pulls until the DAO sets a real floor via timelock'd set_reserved_floor.
+        // No pulls until a funded pool handoff imports principal or the legacy
+        // unfunded migration explicitly sets a real floor.
         reserved_floor: u128::MAX,
         // 4-way economics default: 80% burn / 0% savings / 0% buyback / 20% insurance growth. The DAO
         // tunes savings + buyback (and their sink accounts) later via timelock'd setters.
         base_unit_savings_bps: 0,
         buyback_bps: 0,
         base_unit_savings_account: Pubkey::default(),
+        custody_pool: Pubkey::default(),
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -617,11 +639,9 @@ fn process_set_economics(
 // set_reserved_floor accounts: [squads_vault(signer), config(w)]
 // data: new_reserved_floor (u128)
 //
-// Squads -> TWAP control (finding O): set the surplus floor — the asset-0 insurance amount
-// `execute` must never pull below (the reserved depositor principal). Only the config's
-// Squads vault may call it, and only as the executor of a timelock'd vault-transaction, so
-// lowering the floor (the dangerous direction — it exposes more insurance to the
-// permissionless crank) is delayed a full week in the clear.
+// Squads -> TWAP control: set or raise the surplus floor. Canonical funded custody
+// initializes the floor from subledger accounting during handoff. This setter remains
+// for unfunded legacy migration and conservative post-handoff increases.
 fn process_set_reserved_floor(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -668,13 +688,13 @@ fn process_set_reserved_floor(
     Ok(())
 }
 
-// accept_operator accounts: [squads_vault(signer), config, twap_authority(pda),
-//   market_slab(w), percolator_program]
+// accept_operator accounts: [squads_vault/current_admin(signer), config,
+//   twap_authority(pda), market_slab(w), percolator_program]
 //
-// The handoff. Gated on the config's Squads vault (the percolator asset-0
-// asset_admin) — reachable only via a timelock'd multisig execute. The program
-// co-signs as twap_authority (percolator requires the incoming authority to consent),
-// rotating the asset-0 INSURANCE_OPERATOR from the subledger to the twap_authority.
+// Legacy migration path for an unfunded market whose Squads vault is still the raw
+// asset_admin. It moves the insurance roles AND asset_admin to the constrained TWAP
+// PDA. Canonical funded genesis uses IX_ACCEPT_FROM_SUBLEDGER below, because the
+// owner-bound pool already holds asset_admin before the first user deposit.
 //
 // After this, `execute` (permissionless) is the operator's only insurance path, and it
 // is surplus-floor-bounded (finding O fixed): it pulls at most `insurance - reserved_floor`.
@@ -696,13 +716,87 @@ fn process_accept_operator(
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
 
-    if !squads_vault.is_signer {
+    process_accept_custody(
+        program_id,
+        squads_vault,
+        squads_vault,
+        config_account,
+        twap_authority,
+        market_slab,
+        percolator_program,
+        None,
+    )
+}
+
+// accept_from_subledger accounts: [squads_vault(signer), pool(current_admin signer),
+//   config, twap_authority, market_slab(w), percolator_program]
+// data: pool_outstanding_principal(u128), supplied by the fixed subledger CPI.
+//
+// The call is reachable through subledger::handoff_to_twap only: Squads chooses when
+// the handoff occurs, the owner-bound pool supplies the current-admin signature, and
+// this program supplies only its canonical config-bound incoming PDA signature.
+fn process_accept_from_subledger(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let protected_floor = u128::from_le_bytes(data.try_into().unwrap());
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let current_admin = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if current_admin.owner != &SUBLEDGER_PROGRAM_ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    process_accept_custody(
+        program_id,
+        squads_vault,
+        current_admin,
+        config_account,
+        twap_authority,
+        market_slab,
+        percolator_program,
+        Some((current_admin, protected_floor)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_accept_custody<'a>(
+    program_id: &Pubkey,
+    squads_vault: &AccountInfo<'a>,
+    current_admin: &AccountInfo<'a>,
+    config_account: &AccountInfo<'a>,
+    twap_authority: &AccountInfo<'a>,
+    market_slab: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    source_pool: Option<(&AccountInfo<'a>, u128)>,
+) -> ProgramResult {
+    if !squads_vault.is_signer || !current_admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if let Some((pool, protected_floor)) = source_pool {
+        if !config_account.is_writable {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if config.custody_pool != Pubkey::default() && config.custody_pool != *pool.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        config.custody_pool = *pool.key;
+        if config.reserved_floor == u128::MAX || config.reserved_floor < protected_floor {
+            config.reserved_floor = protected_floor;
+        }
+    }
     if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
         return Err(ProgramError::IllegalOwner);
     }
@@ -719,60 +813,306 @@ fn process_accept_operator(
         return Err(ProgramError::InvalidSeeds);
     }
 
-    // UpdateAssetAuthority(asset 0, INSURANCE_OPERATOR, new = twap_authority).
-    // Signers: squads_vault (current asset_admin, propagated from the execute) and
-    // twap_authority (the consenting new authority, via invoke_signed seeds).
-    let mut ix_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
-    ix_data.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
-    ix_data.push(ASSET_AUTH_INSURANCE_OPERATOR);
-    ix_data.extend_from_slice(twap_authority.key.as_ref());
+    // Move both insurance roles and finally asset_admin to the constrained PDA.
+    // Percolator's insurance authority is also its resolved-mode terminal withdrawal
+    // key, so even a nominally top-up-only governance key would be a principal drain
+    // after resolution. Fresh donations use IX_DONATE_INSURANCE instead.
+    for (kind, incoming) in [
+        (ASSET_AUTH_INSURANCE_OPERATOR, twap_authority.key),
+        (ASSET_AUTH_INSURANCE, twap_authority.key),
+        (ASSET_AUTH_ADMIN, twap_authority.key),
+    ] {
+        let mut ix_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+        ix_data.extend_from_slice(&0u16.to_le_bytes());
+        ix_data.push(kind);
+        ix_data.extend_from_slice(incoming.as_ref());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*current_admin.key, true),
+                    AccountMeta::new_readonly(*incoming, true),
+                    AccountMeta::new(*market_slab.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                current_admin.clone(),
+                squads_vault.clone(),
+                twap_authority.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
+            ],
+            &[&auth_seeds],
+        )?;
+    }
+    if source_pool.is_some() {
+        config.serialize(&mut config_account.try_borrow_mut_data()?);
+    }
+    Ok(())
+}
+
+// return_to_subledger accounts: [squads_vault(signer), config,
+//   twap_authority(current_admin), pool, market_slab(w), percolator_program,
+//   subledger_program]
+//
+// This is the only recovery key transition exposed by the TWAP. It cannot select an
+// arbitrary replacement: the fixed subledger program re-derives the market-bound pool
+// and hardcodes all incoming authorities to that pool PDA.
+fn process_return_to_subledger(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let pool = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let subledger_program = next_account_info(iter)?;
+
+    if !squads_vault.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *subledger_program.key != SUBLEDGER_PROGRAM_ID || !subledger_program.executable {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+        || config.custody_pool == Pubkey::default()
+        || *pool.key != config.custody_pool
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    invoke_signed(
+        &Instruction {
+            program_id: *subledger_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*twap_authority.key, true),
+                AccountMeta::new_readonly(*pool.key, false),
+                AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new_readonly(*percolator_program.key, false),
+            ],
+            data: vec![SUBLEDGER_IX_ACCEPT_OPERATOR],
+        },
+        &[
+            twap_authority.clone(),
+            pool.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+            subledger_program.clone(),
+        ],
+        &[&auth_seeds],
+    )
+}
+
+// donate_insurance accounts: [donor(s), config, twap_authority,
+//   donor_source(w), twap_holding(w), market_slab(w), percolator_vault(w),
+//   percolator_program, token_program]
+// data: amount (u64)
+//
+// This replaces the unsafe pattern of leaving insurance_authority on governance.
+// It can only move donor-owned collateral inward: donor -> a TWAP-owned holding ->
+// the config-bound Percolator market. Any downstream failure rolls back both CPIs.
+fn process_donate_insurance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount = u64::from_le_bytes(data.try_into().unwrap());
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let iter = &mut accounts.iter();
+    let donor = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let donor_source = next_account_info(iter)?;
+    let twap_holding = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+
+    if !donor.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *token_program.key != spl_token::ID {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+        || !percolator_program.executable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let source = spl_token::state::Account::unpack(&donor_source.try_borrow_data()?)?;
+    let holding = spl_token::state::Account::unpack(&twap_holding.try_borrow_data()?)?;
+    if source.owner != *donor.key
+        || holding.owner != *twap_authority.key
+        || source.mint != holding.mint
+        || source.amount < amount
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    invoke(
+        &spl_token::instruction::transfer(
+            token_program.key,
+            donor_source.key,
+            twap_holding.key,
+            donor.key,
+            &[],
+            amount,
+        )?,
+        &[
+            donor_source.clone(),
+            twap_holding.clone(),
+            donor.clone(),
+            token_program.clone(),
+        ],
+    )?;
+
+    let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE];
+    ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
     invoke_signed(
         &Instruction {
             program_id: *percolator_program.key,
             accounts: vec![
-                AccountMeta::new_readonly(*squads_vault.key, true),
                 AccountMeta::new_readonly(*twap_authority.key, true),
                 AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new(*twap_holding.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
             ],
             data: ix_data,
         },
         &[
-            squads_vault.clone(),
             twap_authority.clone(),
             market_slab.clone(),
+            twap_holding.clone(),
+            percolator_vault.clone(),
+            token_program.clone(),
             percolator_program.clone(),
         ],
         &[&auth_seeds],
-    )?;
+    )
+}
 
-    // Finding S: atomically rotate the asset-0 insurance AUTHORITY (kind 1, which gates
-    // TopUpInsurance / deposits) away from the subledger pool to the Squads vault. Otherwise
-    // the pool keeps kind 1 and subledger deposits still work AFTER the handoff — and since
-    // the surplus floor is a static snapshot, such a post-handoff deposit raises insurance
-    // above the floor and a permissionless cranker drains its principal as "surplus" (LOF).
-    // Both `current` and `new` are the Squads vault (the asset_admin), which co-signs here
-    // (propagated from the timelock'd execute), so no extra consent is needed. After this no
-    // one can deposit into market-0 insurance, so the static floor is sound.
-    let mut auth_ix = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
-    auth_ix.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
-    auth_ix.push(ASSET_AUTH_INSURANCE);
-    auth_ix.extend_from_slice(squads_vault.key.as_ref()); // new = the Squads vault
-    invoke(
-        &Instruction {
-            program_id: *percolator_program.key,
-            accounts: vec![
-                AccountMeta::new_readonly(*squads_vault.key, true), // current asset_admin
-                AccountMeta::new_readonly(*squads_vault.key, true), // new (co-signs, same key)
-                AccountMeta::new(*market_slab.key, false),
+// set_market_fees accounts:
+// [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program]
+// data: trade_fee(u64) || long_fee(u16) || long_insurance_share(u16) ||
+//       short_fee(u16) || short_insurance_share(u16)
+//
+// Percolator gates these three policy updates on insurance_authority, which is the
+// constrained TWAP PDA after handoff. This instruction exposes exactly those fee
+// setters and accepts no token account or amount-bearing withdrawal instruction.
+fn process_set_market_fees(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 16 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let trade_fee = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let long_fee = u16::from_le_bytes(data[8..10].try_into().unwrap());
+    let long_insurance = u16::from_le_bytes(data[10..12].try_into().unwrap());
+    let short_fee = u16::from_le_bytes(data[12..14].try_into().unwrap());
+    let short_insurance = u16::from_le_bytes(data[14..16].try_into().unwrap());
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if !squads_vault.is_signer || iter.next().is_some() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+        || !percolator_program.executable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let mut trade_data = vec![PERC_IX_UPDATE_TRADE_FEE_POLICY];
+    trade_data.extend_from_slice(&trade_fee.to_le_bytes());
+    let mut long_data = vec![PERC_IX_UPDATE_BACKING_FEE_POLICY];
+    long_data.extend_from_slice(&0u16.to_le_bytes());
+    long_data.extend_from_slice(&long_fee.to_le_bytes());
+    long_data.extend_from_slice(&long_insurance.to_le_bytes());
+    let mut short_data = vec![PERC_IX_UPDATE_BACKING_FEE_POLICY];
+    short_data.extend_from_slice(&1u16.to_le_bytes());
+    short_data.extend_from_slice(&short_fee.to_le_bytes());
+    short_data.extend_from_slice(&short_insurance.to_le_bytes());
+    for ix_data in [trade_data, long_data, short_data] {
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*twap_authority.key, true),
+                    AccountMeta::new(*market_slab.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                twap_authority.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
             ],
-            data: auth_ix,
-        },
-        &[
-            squads_vault.clone(),
-            market_slab.clone(),
-            percolator_program.clone(),
-        ],
-    )?;
+            &[&auth_seeds],
+        )?;
+    }
     Ok(())
 }
 
@@ -2256,6 +2596,7 @@ mod tests {
             base_unit_savings_bps: 1_500,
             buyback_bps: 2_000,
             base_unit_savings_account: Pubkey::new_unique(),
+            custody_pool: Pubkey::new_unique(),
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf);
@@ -2271,5 +2612,6 @@ mod tests {
         assert_eq!(d.base_unit_savings_bps, 1_500);
         assert_eq!(d.buyback_bps, 2_000);
         assert_eq!(d.base_unit_savings_account, c.base_unit_savings_account);
+        assert_eq!(d.custody_pool, c.custody_pool);
     }
 }

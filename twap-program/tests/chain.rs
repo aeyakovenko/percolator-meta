@@ -24,6 +24,13 @@ fn twap_id() -> Pubkey {
 fn squads_id() -> Pubkey {
     Pubkey::from_str("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf").unwrap()
 }
+fn controller_id() -> Pubkey {
+    market_controller_program::id()
+}
+
+fn controller_pda(governance: &Pubkey, market: &Pubkey, perc: &Pubkey) -> Pubkey {
+    market_controller_program::controller_address(governance, market, perc).0
+}
 
 const IX_MULTISIG_CREATE_V2: [u8; 8] = [50, 221, 199, 93, 40, 245, 139, 233];
 const ACCT_PROGRAM_CONFIG: [u8; 8] = [196, 210, 90, 231, 144, 149, 140, 63];
@@ -1910,6 +1917,34 @@ fn perc_so() -> String {
     pinned
 }
 
+fn controller_init_market_data(max_assets: u16) -> Vec<u8> {
+    percolator_prog::ix::Instruction::InitMarket {
+        max_portfolio_assets: max_assets,
+        h_min: 0,
+        h_max: 10,
+        initial_price: 1_000_000,
+        min_nonzero_mm_req: 1,
+        min_nonzero_im_req: 2,
+        maintenance_margin_bps: 10_000,
+        initial_margin_bps: 10_000,
+        max_trading_fee_bps: 10_000,
+        trade_fee_base_bps: 3,
+        liquidation_fee_bps: 0,
+        liquidation_fee_cap: 0,
+        min_liquidation_abs: 0,
+        max_price_move_bps_per_slot: 10_000,
+        max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 0,
+        min_funding_lifetime_slots: 1,
+        max_account_b_settlement_chunks: 1,
+        max_bankrupt_close_chunks: 1,
+        max_bankrupt_close_lifetime_slots: 1,
+        public_b_chunk_atoms: 1,
+        maintenance_fee_per_slot: 0,
+    }
+    .encode()
+}
+
 fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot: u64) -> Vec<u8> {
     make_live_market_with_options(slab, mint, marketauth, init_slot, false)
 }
@@ -2651,8 +2686,8 @@ fn canonical_insurance_vault(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey 
     .0
 }
 
-// Squads TransactionMessage wrapping subledger.accept_operator (the pool consents to
-// receive the asset-0 insurance authority+operator from the Squads vault asset_admin).
+// Squads TransactionMessage wrapping subledger.accept_operator. The pool receives the
+// asset-0 insurance authority, operator, and asset-admin roles atomically.
 // subledger.accept_operator accounts: [asset_admin(signer), pool, market_slab(w), perc].
 fn build_subledger_accept_operator_message(
     squads_vault: &Pubkey,
@@ -2680,6 +2715,168 @@ fn build_subledger_accept_operator_message(
     let data = [7u8]; // IX_ACCEPT_OPERATOR
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
+    m.push(0); // address_table_lookups
+    m
+}
+
+fn build_controller_proxy_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    percolator_data: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(0);
+    m.push(1); // market writable
+    m.push(5);
+    m.extend_from_slice(governance.as_ref()); // 0
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(controller.as_ref()); // 2
+    m.extend_from_slice(percolator_program.as_ref()); // 3
+    m.extend_from_slice(controller_id().as_ref()); // 4 program
+    m.push(1);
+    m.push(4);
+    m.push(4);
+    for index in [0u8, 2, 1, 3] {
+        m.push(index);
+    }
+    let mut data = vec![0u8]; // IX_PROXY_ADMIN
+    data.extend_from_slice(percolator_data);
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_controller_grant_pool_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    pool: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(1); // market writable
+    m.push(7);
+    m.extend_from_slice(governance.as_ref()); // 0
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(controller.as_ref()); // 2
+    m.extend_from_slice(pool.as_ref()); // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    m.extend_from_slice(sub_id().as_ref()); // 5
+    m.extend_from_slice(controller_id().as_ref()); // 6 program
+    m.push(1);
+    m.push(6);
+    m.push(6);
+    for index in [0u8, 2, 3, 1, 4, 5] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(2); // IX_GRANT_GENESIS_POOL
+    m.push(0);
+    m
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_donate_insurance_ix(
+    donor: &Pubkey,
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    donor_source: &Pubkey,
+    controller_holding: &Pubkey,
+    percolator_vault: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut data = vec![4u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*donor, true),
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new_readonly(*controller, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*donor_source, false),
+            AccountMeta::new(*controller_holding, false),
+            AccountMeta::new(*percolator_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
+// Squads -> subledger.handoff_to_twap -> twap.accept_from_subledger -> Percolator.
+// Governance authorizes the transition, while the current pool PDA and incoming TWAP
+// PDA provide the only two custody signatures.
+fn build_subledger_handoff_to_twap_message(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(2); // market_slab + twap_config
+    m.push(8); // account_keys count
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market_slab.as_ref()); // 1 writable
+    m.extend_from_slice(twap_config.as_ref()); // 2 writable
+    m.extend_from_slice(pool.as_ref()); // 3
+    m.extend_from_slice(twap_authority.as_ref()); // 4
+    m.extend_from_slice(percolator_program.as_ref()); // 5
+    m.extend_from_slice(twap_id().as_ref()); // 6
+    m.extend_from_slice(sub_id().as_ref()); // 7 program id
+    m.push(1); // instructions count
+    m.push(7); // program_id_index -> subledger
+    m.push(7); // account_indexes count
+    for index in [0u8, 3, 2, 4, 1, 5, 6] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(8); // IX_HANDOFF_TO_TWAP
+    m.push(0); // address_table_lookups
+    m
+}
+
+// Squads -> twap.return_to_subledger -> subledger.accept_operator -> Percolator.
+fn build_return_to_subledger_message(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // market_slab
+    m.push(8); // account_keys count
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market_slab.as_ref()); // 1 writable
+    m.extend_from_slice(twap_config.as_ref()); // 2
+    m.extend_from_slice(twap_authority.as_ref()); // 3
+    m.extend_from_slice(pool.as_ref()); // 4
+    m.extend_from_slice(percolator_program.as_ref()); // 5
+    m.extend_from_slice(sub_id().as_ref()); // 6
+    m.extend_from_slice(twap_id().as_ref()); // 7 program id
+    m.push(1); // instructions count
+    m.push(7); // program_id_index -> twap
+    m.push(7); // account_indexes count
+    for index in [0u8, 2, 3, 4, 1, 5, 6] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(16); // IX_RETURN_TO_SUBLEDGER
     m.push(0); // address_table_lookups
     m
 }
@@ -2760,6 +2957,8 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
         .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let squads = squads_id();
@@ -2818,7 +3017,15 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
 
     // init the subledger insurance pool (permissionless; vote_authority is the canonical gv config PDA).
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
@@ -2920,6 +3127,571 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         0,
         "depositor collateral moved into insurance"
     );
+
+    // PUBLIC LOF REGRESSION: after the canonical genesis grant, Squads is no
+    // longer asset_admin. Even a fully approved and matured proposal cannot retake
+    // the withdrawal operator directly from the owner-bound pool.
+    let takeover = build_direct_operator_takeover_message(&squads_vault, &slab, &perc_id());
+    let takeover_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            2,
+            &takeover,
+            &takeover_remaining,
+        )
+        .is_err(),
+        "governance must not retake a withdrawal-capable role during genesis"
+    );
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        amount,
+        "failed governance takeover leaves depositor insurance untouched"
+    );
+}
+
+// Canonical authority chain: permissionless controller-owned market init, then
+// Squads-authorized controller -> owner-bound subledger custody. Governance keeps
+// lifecycle/policy control but never receives a Percolator value-moving authority.
+#[test]
+fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads,
+        &treasury,
+        &multisig,
+        &create_key.pubkey(),
+        &payer.pubkey(),
+        Some(&dao.pubkey()),
+        1,
+        &[(dao.pubkey(), PERM_ALL)],
+        TIMELOCK_1_WEEK_SECS,
+    );
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create_ix],
+        Some(&payer.pubkey()),
+        &[&payer, &create_key],
+        bh,
+    ))
+    .expect("multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+        svm.set_account(
+            slab,
+            Account {
+                lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let controller = controller_pda(&squads_vault, &slab, &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    let init = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(payer.pubkey(), true),
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: init_data,
+    };
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[init],
+        Some(&payer.pubkey()),
+        &[&payer],
+        bh,
+    ))
+    .expect("any payer can initialize a controller-governed market");
+    let slab_account = svm.get_account(&slab).unwrap();
+    let (cfg, _, configured_slots, capacity) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
+    assert_eq!(cfg.marketauth, controller.to_bytes());
+    assert_eq!((configured_slots, capacity), (1, 1));
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8];
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_WITH_SURPLUS);
+    append_test_genesis_schedule(&mut pool_data);
+    let init_pool = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(perc_vault, false),
+            AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
+        ],
+        data: pool_data,
+    };
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+        &[init_pool],
+            Some(&payer.pubkey()),
+        &[&payer],
+            bh,
+        ))
+    .expect("init genesis pool");
+
+    let grant =
+        build_controller_grant_pool_message(&squads_vault, &controller, &pool, &slab, &perc_id());
+    let grant_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        1,
+        &grant,
+        &grant_remaining,
+    )
+    .expect("controller grants custody to the owner-bound pool");
+    let slab_account = svm.get_account(&slab).unwrap();
+    let (cfg_after_grant, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
+    assert_eq!(
+        cfg_after_grant.marketauth,
+        controller.to_bytes(),
+        "asset-local custody grant must not rotate marketauth"
+    );
+
+    let alice = Keypair::new();
+    svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let alice_ata = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &alice_ata,
+        &collateral_mint,
+        &alice.pubkey(),
+        amount,
+    );
+    set_token(&mut svm, &holding, &collateral_mint, &pool, 0);
+    let position = sub_position_pda(&pool, &alice.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&amount.to_le_bytes());
+    let deposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: deposit_data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[deposit],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        bh,
+    ))
+    .expect("owner deposits through constrained custody");
+
+    // Governance can update policy through the allowlist.
+    let fee_data =
+        percolator_prog::ix::Instruction::UpdateFeeRedirectPolicy { redirect_bps: 777 }.encode();
+    let fee =
+        build_controller_proxy_message(&squads_vault, &controller, &slab, &perc_id(), &fee_data);
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        2,
+        &fee,
+        &controller_remaining,
+    )
+    .expect("allowlisted fee update");
+    let slab_account = svm.get_account(&slab).unwrap();
+    let (cfg, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
+    assert_eq!(cfg.fee_redirect_to_market_0_bps, 777);
+
+    // Configure shutdown, activate asset 1 with an EXTERNAL backing authority,
+    // and fund its long-side bucket through the real Percolator program.
+    let configure_shutdown = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 1_000,
+            force_close_delay_slots: 10,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        3,
+        &configure_shutdown,
+        &controller_remaining,
+    )
+    .expect("controller configures shutdown delay");
+    let backing_provider = Keypair::new();
+    svm.airdrop(&backing_provider.pubkey(), 1_000_000_000)
+        .unwrap();
+    let activate = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 0,
+            asset_index: 1,
+            now_slot: 100,
+            initial_price: 1_000_000,
+            insurance_authority: backing_provider.pubkey().to_bytes(),
+            insurance_operator: backing_provider.pubkey().to_bytes(),
+            backing_bucket_authority: backing_provider.pubkey().to_bytes(),
+            oracle_authority: backing_provider.pubkey().to_bytes(),
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        4,
+        &activate,
+        &controller_remaining,
+    )
+    .expect("controller activates externally backed asset");
+    let backing_amount = 100_000u64;
+    let backing_account = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_account,
+        &collateral_mint,
+        &backing_provider.pubkey(),
+        backing_amount,
+    );
+    let backing_topup = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(backing_provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(backing_account, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+            domain: 2,
+            amount: backing_amount as u128,
+            expiry_slot: 10_000,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&backing_provider], backing_topup).expect("external backing deposit");
+    assert_eq!(token_amount(&svm, &backing_account), 0);
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 110;
+    svm.set_sysvar(&clock);
+    let shutdown = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 1,
+            now_slot: 110,
+            initial_price: 0,
+            insurance_authority: [0u8; 32],
+            insurance_operator: [0u8; 32],
+            backing_bucket_authority: [0u8; 32],
+            oracle_authority: [0u8; 32],
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        5,
+        &shutdown,
+        &controller_remaining,
+    )
+    .expect("controller shuts down the asset");
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 121;
+    svm.set_sysvar(&clock);
+
+    // Every Percolator value mover is rejected before CPI, even after a valid
+    // Squads vote and timelock.
+    let forbidden_data = percolator_prog::ix::Instruction::WithdrawBackingBucket {
+        domain: 2,
+        amount: 1,
+    }
+    .encode();
+    let forbidden = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &forbidden_data,
+    );
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            6,
+            &forbidden,
+            &controller_remaining,
+        )
+        .is_err(),
+        "controller must deny backing and insurance withdrawals"
+    );
+
+    // Squads also cannot bypass the controller by calling Percolator directly,
+    // even though the asset is now in the marketauth shutdown-drain state.
+    let dao_backing_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &dao_backing_destination,
+        &collateral_mint,
+        &squads_vault,
+        0,
+    );
+    let direct_backing = build_direct_backing_withdraw_message(
+        &squads_vault,
+        &slab,
+        &dao_backing_destination,
+        &perc_vault,
+        &vault_authority,
+        &perc_id(),
+        2,
+        backing_amount as u128,
+    );
+    let direct_backing_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(dao_backing_destination, false),
+        AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            7,
+            &direct_backing,
+            &direct_backing_remaining,
+        )
+        .is_err(),
+        "governance cannot exercise Percolator's shutdown backing override"
+    );
+    assert_eq!(token_amount(&svm, &dao_backing_destination), 0);
+
+    // The segregated provider remains live and withdraws its own principal.
+    let backing_withdraw = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(backing_provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(backing_account, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawBackingBucket {
+            domain: 2,
+            amount: backing_amount as u128,
+        }
+        .encode(),
+    };
+    send(&mut svm, &[&backing_provider], backing_withdraw)
+        .expect("external provider withdraws its own backing after shutdown");
+    assert_eq!(token_amount(&svm, &backing_account), backing_amount);
+
+    // Lifecycle remains governed: resolve is allowlisted. Squads itself still
+    // cannot use the terminal insurance withdrawal key after resolution.
+    let resolve = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        8,
+        &resolve,
+        &controller_remaining,
+    )
+    .expect("controller may resolve the market");
+    let destination = Pubkey::new_unique();
+    set_token(&mut svm, &destination, &collateral_mint, &squads_vault, 0);
+    let terminal = build_direct_terminal_insurance_withdraw_message(
+        &squads_vault,
+        &slab,
+        &destination,
+        &perc_vault,
+        &vault_authority,
+        &perc_id(),
+        amount as u128,
+    );
+    let terminal_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(destination, false),
+        AccountMeta::new(perc_vault, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            9,
+            &terminal,
+            &terminal_remaining,
+        )
+        .is_err(),
+        "governance cannot bypass the controller after resolve"
+    );
+
+    let mut withdraw_data = vec![5u8];
+    withdraw_data.extend_from_slice(&amount.to_le_bytes());
+    let withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: withdraw_data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[withdraw],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        bh,
+    ))
+    .expect("owner recovers principal after governed resolve");
+    assert_eq!(token_amount(&svm, &alice_ata), amount);
+    assert_eq!(token_amount(&svm, &destination), 0);
 }
 
 // ATTACK PROBE (subledger genesis-grant binding — the mirror of handoff_rejects_a_substituted_market). The
@@ -2977,7 +3749,15 @@ fn e2e_subledger_genesis_grant_rejects_substituted_market_or_percolator() {
     let perc_vault = canonical_insurance_vault(&va, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &va, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab_a, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab_a,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
@@ -3069,7 +3849,12 @@ const DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E: u64 = 1_000_000;
 fn dist_config_pda_e2e(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
     let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS_E2E.to_le_bytes();
     Pubkey::find_program_address(
-        &[b"dist_config", coin_mint.as_ref(), authority.as_ref(), &claim_window],
+        &[
+            b"dist_config",
+            coin_mint.as_ref(),
+            authority.as_ref(),
+            &claim_window,
+        ],
         &dist_id_e2e(),
     )
     .0
@@ -3131,6 +3916,170 @@ fn build_topup_message(
     m.push(4);
     let mut data = vec![9u8];
     data.extend_from_slice(&amount.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+// Direct Squads calls to Percolator used by the malicious-DAO custody probe. These deliberately
+// bypass the constrained Meta programs and exercise the raw authority retained by the Squads vault.
+fn build_direct_operator_takeover_message(
+    squads_vault: &Pubkey,
+    market: &Pubkey,
+    perc: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(1); // num_writable_non_signers (market)
+    m.push(3); // account_keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer: current admin and incoming operator
+    m.extend_from_slice(market.as_ref()); // 1 w
+    m.extend_from_slice(perc.as_ref()); // 2 program
+    m.push(1); // instructions
+    m.push(2); // program_id_index -> percolator
+    m.push(3); // current admin, incoming operator, market
+    m.push(0);
+    m.push(0);
+    m.push(1);
+    let data = percolator_prog::ix::Instruction::UpdateAssetAuthority {
+        asset_index: 0,
+        kind: 2, // insurance_operator
+        new_pubkey: squads_vault.to_bytes(),
+    }
+    .encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_direct_insurance_withdraw_message(
+    squads_vault: &Pubkey,
+    market: &Pubkey,
+    destination: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    perc: &Pubkey,
+    amount: u128,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(3); // num_writable_non_signers (market, destination, vault)
+    m.push(7); // account_keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer/operator
+    m.extend_from_slice(market.as_ref()); // 1 w
+    m.extend_from_slice(destination.as_ref()); // 2 w
+    m.extend_from_slice(vault.as_ref()); // 3 w
+    m.extend_from_slice(vault_authority.as_ref()); // 4 ro
+    m.extend_from_slice(spl_token::ID.as_ref()); // 5 ro
+    m.extend_from_slice(perc.as_ref()); // 6 program
+    m.push(1); // instructions
+    m.push(6); // program_id_index -> percolator
+    m.push(6); // operator, market, destination, vault, vault authority, token program
+    m.push(0);
+    m.push(1);
+    m.push(2);
+    m.push(3);
+    m.push(4);
+    m.push(5);
+    let data = percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+        asset_index: 0,
+        amount,
+    }
+    .encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_direct_resolve_message(marketauth: &Pubkey, market: &Pubkey, perc: &Pubkey) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(1); // market
+    m.push(3);
+    m.extend_from_slice(marketauth.as_ref());
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(perc.as_ref());
+    m.push(1);
+    m.push(2);
+    m.push(2);
+    m.push(0);
+    m.push(1);
+    let data = percolator_prog::ix::Instruction::ResolveMarket.encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_direct_terminal_insurance_withdraw_message(
+    authority: &Pubkey,
+    market: &Pubkey,
+    destination: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    perc: &Pubkey,
+    amount: u128,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(3); // market, destination, vault
+    m.push(7);
+    m.extend_from_slice(authority.as_ref());
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(destination.as_ref());
+    m.extend_from_slice(vault.as_ref());
+    m.extend_from_slice(vault_authority.as_ref());
+    m.extend_from_slice(spl_token::ID.as_ref());
+    m.extend_from_slice(perc.as_ref());
+    m.push(1);
+    m.push(6);
+    m.push(6);
+    for index in [0u8, 1, 2, 3, 4, 5] {
+        m.push(index);
+    }
+    let data = percolator_prog::ix::Instruction::WithdrawInsurance { amount }.encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_direct_backing_withdraw_message(
+    authority: &Pubkey,
+    market: &Pubkey,
+    destination: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    perc: &Pubkey,
+    domain: u16,
+    amount: u128,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(3);
+    m.push(7);
+    m.extend_from_slice(authority.as_ref());
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(destination.as_ref());
+    m.extend_from_slice(vault.as_ref());
+    m.extend_from_slice(vault_authority.as_ref());
+    m.extend_from_slice(spl_token::ID.as_ref());
+    m.extend_from_slice(perc.as_ref());
+    m.push(1);
+    m.push(6);
+    m.push(6);
+    for index in [0u8, 1, 2, 3, 4, 5] {
+        m.push(index);
+    }
+    let data = percolator_prog::ix::Instruction::WithdrawBackingBucket { domain, amount }.encode();
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -3235,6 +4184,48 @@ fn build_set_reserved_floor_message(
     m
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_set_market_fees_message(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    trade_fee_bps: u64,
+    backing_long_bps: u16,
+    backing_long_insurance_bps: u16,
+    backing_short_bps: u16,
+    backing_short_insurance_bps: u16,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(1); // market writable
+    m.push(6);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(config.as_ref()); // 2
+    m.extend_from_slice(twap_authority.as_ref()); // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    m.extend_from_slice(twap_id().as_ref()); // 5 program
+    m.push(1);
+    m.push(5);
+    m.push(5);
+    for index in [0u8, 2, 3, 1, 4] {
+        m.push(index);
+    }
+    let mut data = vec![18u8];
+    data.extend_from_slice(&trade_fee_bps.to_le_bytes());
+    data.extend_from_slice(&backing_long_bps.to_le_bytes());
+    data.extend_from_slice(&backing_long_insurance_bps.to_le_bytes());
+    data.extend_from_slice(&backing_short_bps.to_le_bytes());
+    data.extend_from_slice(&backing_short_insurance_bps.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 // IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
 // accounts: [squads_vault(signer), config(w), savings_account(ro)]; data: savings_bps(u16)||buyback_bps(u16)
 fn build_set_economics_message(
@@ -3312,6 +4303,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     ))
     .expect("multisig");
     let squads_vault = vault_pda(&squads, &multisig, 0);
+    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
 
     let collateral_mint = Pubkey::new_unique();
     let slab = Pubkey::new_unique();
@@ -3337,7 +4329,15 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
@@ -3703,10 +4703,10 @@ fn e2e_attacker_cannot_lower_surplus_floor_without_squads() {
 // closes the subledger exit path — insurance_withdraw signs as the pool, which is the insurance
 // OPERATOR only until the handoff. A depositor who has NOT exited before the (1-week-timelock'd)
 // handoff can no longer withdraw via the subledger: their principal is protected by the floor
-// (the twap can't pull it) but locked. CRUCIALLY the lock is NOT permanent — the DAO can rotate
-// the operator BACK to the pool and the depositor exits. This test pins the full lifecycle:
-// exit works before the handoff, is blocked after, and is recoverable via a DAO re-grant — so
-// a non-exiter's principal is never permanently lost.
+// imported atomically from pool accounting but locked. CRUCIALLY the lock is NOT permanent — the constrained
+// TWAP can return custody only to the canonical owner-bound pool. This test pins the full
+// lifecycle: exit works before the handoff, is blocked after, and is recoverable without ever
+// assigning a withdrawal-capable role to governance.
 #[test]
 fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let mut svm =
@@ -3772,7 +4772,15 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
@@ -3896,7 +4904,8 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     ))
     .expect("pre-handoff exit works");
 
-    // Handoff: rotate the operator to the twap.
+    // Handoff: Squads authorizes pool PDA -> TWAP PDA. Governance never becomes
+    // current or incoming asset_admin on this funded market.
     let twap_init = init_config_ix(
         &payer.pubkey(),
         &coin_mint,
@@ -3917,20 +4926,13 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
     let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
-    let op_msg = build_accept_operator_message(
-        &squads_vault,
-        &slab,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-        &twap_id(),
-    );
-    let op_remaining = vec![
+    // ATTACK: governance pre-arms the one-time floor setter with zero. The
+    // custody transition must derive its floor from the owner-bound pool rather
+    // than trusting this first-write value.
+    let zero_floor = build_set_reserved_floor_message(&squads_vault, &twap_cfg, 0);
+    let zero_floor_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
     squads_execute(
@@ -3940,28 +4942,28 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
         &dao,
         &payer,
         2,
-        &op_msg,
-        &op_remaining,
+        &zero_floor,
+        &zero_floor_remaining,
     )
-    .expect("operator -> twap");
+    .expect("hostile initial floor = 0");
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), 0);
 
-    // AFTER the handoff: alice's subledger exit is now rejected — the pool is no longer the
-    // insurance operator, so percolator refuses the pool-signed WithdrawInsuranceLimited.
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[withdraw(100)], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
-        "post-handoff the subledger exit path is closed — depositors must exit during the timelock window");
-
-    // RECOVERY: the lock is NOT permanent. The DAO, via a timelock'd Squads execute, rotates
-    // the insurance operator+authority BACK to the subledger pool (subledger.accept_operator,
-    // which the pool consents to), and alice can then exit her principal. So a non-exiter's
-    // principal is never permanently lost — at worst it is locked until the DAO acts.
-    let regrant = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
-    let regrant_remaining = vec![
+    let op_msg = build_subledger_handoff_to_twap_message(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let op_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(
@@ -3971,6 +4973,127 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
         &dao,
         &payer,
         3,
+        &op_msg,
+        &op_remaining,
+    )
+    .expect("operator -> twap");
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        (amount - 1) as u128,
+        "handoff must atomically protect the pool's live outstanding principal"
+    );
+
+    // AFTER the handoff: alice's subledger exit is now rejected — the pool is no longer the
+    // insurance operator, so percolator refuses the pool-signed WithdrawInsuranceLimited.
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[withdraw(100)], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
+        "post-handoff the subledger exit path is closed — depositors must exit during the timelock window");
+
+    // PUBLIC CUSTODY/DOS PROBE: a second valid insurance pool can be created for the
+    // same market under a different COIN/schedule seed. Recovery must not grant that
+    // decoy custody: doing so closes the original owners' exit path and makes recovery
+    // depend on another governance round-trip. The share virtual offset bounds a dust
+    // redemption attempt, but it does not make mutable custody identity acceptable.
+    let decoy_coin = Pubkey::new_unique();
+    let decoy_pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &decoy_coin,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
+    let decoy_vote_auth = gv_config_pda_e2e(&decoy_coin, &decoy_pool);
+    let mut decoy_init_data = vec![3u8];
+    decoy_init_data.extend_from_slice(&0u64.to_le_bytes());
+    decoy_init_data.push(POLICY_WITH_SURPLUS);
+    append_test_genesis_schedule(&mut decoy_init_data);
+    let decoy_init = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new(decoy_pool, false),
+            AccountMeta::new_readonly(perc_vault, false),
+            AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(decoy_vote_auth, false),
+            AccountMeta::new_readonly(decoy_coin, false),
+        ],
+        data: decoy_init_data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[decoy_init],
+        Some(&payer.pubkey()),
+        &[&payer],
+        bh,
+    ))
+    .expect("permissionless decoy pool is a reachable public state");
+    let decoy_return = build_return_to_subledger_message(
+        &squads_vault,
+        &decoy_pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let decoy_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(decoy_pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+            4,
+            &decoy_return,
+            &decoy_remaining,
+    )
+        .is_err(),
+        "recovery must reject a same-market decoy pool"
+    );
+
+    // RECOVERY: Squads authorizes the TWAP's only outgoing custody transition. The
+    // fixed subledger program re-derives `pool`; no arbitrary recipient is accepted.
+    let regrant = build_return_to_subledger_message(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let regrant_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        5,
         &regrant,
         &regrant_remaining,
     )
@@ -3997,7 +5120,7 @@ fn e2e_subledger_exit_blocked_after_operator_handoff() {
 // subledger insurance_deposit (TopUp) still worked AFTER the handoff. With a STATIC surplus
 // floor, such a post-handoff deposit raised insurance above the floor and a cranker drained
 // the new principal as "surplus" (LOF). Fix: accept_operator now atomically rotates kind 1 to
-// the Squads vault too, so post-handoff deposits are rejected and no unprotected principal can
+// the TWAP PDA too, so post-handoff deposits are rejected and no unprotected principal can
 // enter. This pins that the deposit is blocked after the handoff.
 #[test]
 fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
@@ -4064,7 +5187,15 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut dpool = vec![3u8];
     dpool.extend_from_slice(&0u64.to_le_bytes());
@@ -4178,21 +5309,23 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
-    let op = build_accept_operator_message(
+    let op = build_subledger_handoff_to_twap_message(
         &squads_vault,
+        &pool,
         &slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
-        &twap_id(),
     );
     let or = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &op, &or)
         .expect("operator -> twap");
@@ -4257,7 +5390,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     ));
 
     // Finding S FIXED: accept_operator atomically rotated the insurance AUTHORITY (kind 1)
-    // to the Squads vault, so the post-handoff subledger deposit is REJECTED — no new
+    // to the TWAP PDA, so the post-handoff subledger deposit is REJECTED — no new
     // (unprotected) principal can enter, so there is nothing for a cranker to drain.
     assert!(
         dep_res.is_err(),
@@ -4347,7 +5480,15 @@ fn e2e_fresh_position_has_no_vote_weight() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
@@ -4626,9 +5767,9 @@ fn e2e_fresh_position_has_no_vote_weight() {
     .expect("vote succeeds once the position has held");
 }
 
-// Shared helper: build a fully handed-off market — Squads multisig, market-0 with
-// asset_admin = the Squads vault, twap config, insurance funded with principal + surplus,
-// policy rotated to surplus-mode, operator handed to the twap, and reserved_floor = principal.
+// Shared legacy-migration helper: build a fully handed-off market from an initially
+// unfunded Squads-admin setup, fund it, move all asset-0 custody roles to TWAP, and set
+// reserved_floor = principal. Canonical funded genesis uses the pool-bound helper paths.
 // Returns the key accounts so a probe can focus purely on the attack.
 #[allow(dead_code)]
 struct HandoffEnv {
@@ -4800,6 +5941,284 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
     }
 }
 
+// PUBLIC LOF PROBE: the DAO-controlled Squads vault is the raw Percolator asset_admin. If it can
+// bypass the constrained Meta programs, rotate insurance_operator to itself, and then call
+// WithdrawInsuranceAsset, the advertised principal floor is irrelevant and depositor collateral is
+// custodial to the DAO. At least one of those two timelocked public actions must fail by construction.
+#[test]
+fn e2e_squads_asset_admin_cannot_reassign_operator_and_drain_principal() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let insurance_before = token_amount(&svm, &env.perc_vault);
+    assert_eq!(insurance_before, env.principal + env.surplus);
+    let dao_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &dao_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+
+    let takeover = build_direct_operator_takeover_message(&env.squads_vault, &env.slab, &perc_id());
+    let takeover_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    let takeover_result = squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &takeover,
+        &takeover_accounts,
+    );
+
+    let withdraw_result = if takeover_result.is_ok() {
+        let withdraw = build_direct_insurance_withdraw_message(
+            &env.squads_vault,
+            &env.slab,
+            &dao_destination,
+            &env.perc_vault,
+            &env.vault_authority,
+            &perc_id(),
+            insurance_before as u128,
+        );
+        let withdraw_accounts = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(dao_destination, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            6,
+            &withdraw,
+            &withdraw_accounts,
+        )
+    } else {
+        Err("operator takeover rejected".to_string())
+    };
+
+    assert!(
+        takeover_result.is_err() || withdraw_result.is_err(),
+        "DAO Squads must not be able to take the operator and withdraw depositor insurance"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.perc_vault),
+        insurance_before,
+        "all depositor principal and surplus remain in canonical Percolator custody"
+    );
+    assert_eq!(
+        token_amount(&svm, &dao_destination),
+        0,
+        "DAO receives no depositor collateral"
+    );
+}
+
+// PUBLIC LOF PROBE: Percolator's resolved-mode WithdrawInsurance (tag 41) is
+// authorized by insurance_authority rather than insurance_operator. A key retained
+// only for live-mode top-ups must therefore not be governance-controlled, or Squads
+// can resolve an empty market and terminally withdraw all depositor insurance.
+#[test]
+fn e2e_squads_cannot_terminally_drain_insurance_after_resolve() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let before = token_amount(&svm, &env.perc_vault);
+
+    let resolve = build_direct_resolve_message(&env.squads_vault, &env.slab, &perc_id());
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &resolve,
+        &resolve_remaining,
+    )
+    .expect("governance may resolve the empty market");
+
+    let terminal = build_direct_terminal_insurance_withdraw_message(
+        &env.squads_vault,
+        &env.slab,
+        &destination,
+        &env.perc_vault,
+        &env.vault_authority,
+        &perc_id(),
+        before as u128,
+    );
+    let terminal_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(destination, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            6,
+            &terminal,
+            &terminal_remaining,
+        )
+        .is_err(),
+        "governance must not hold the resolved-mode insurance withdrawal key"
+    );
+    assert_eq!(token_amount(&svm, &env.perc_vault), before);
+    assert_eq!(token_amount(&svm, &destination), 0);
+}
+
+#[test]
+fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let insurance_before = token_amount(&svm, &env.perc_vault);
+    let message = build_set_market_fees_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        7,
+        8,
+        2_000,
+        9,
+        3_000,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &message,
+        &remaining,
+    )
+    .expect("timelocked futarchy fee update");
+    let slab = svm.get_account(&env.slab).unwrap();
+    let (cfg, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&slab.data).unwrap();
+    assert_eq!(cfg.trade_fee_base_bps, 7);
+    assert_eq!(cfg.backing_trade_fee_bps_long, 8);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 2_000);
+    assert_eq!(cfg.backing_trade_fee_bps_short, 9);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 3_000);
+    assert_eq!(
+        token_amount(&svm, &env.perc_vault),
+        insurance_before,
+        "fee configuration cannot move insurance"
+    );
+
+    // The third CPI is deliberately invalid: Percolator rejects an insurance
+    // split on a zero backing fee. The outer transaction must roll back the
+    // otherwise-valid trade and long-side updates that ran first.
+    let rejected = build_set_market_fees_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        10,
+        11,
+        4_000,
+        0,
+        1,
+    );
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            6,
+            &rejected,
+            &remaining,
+        )
+        .is_err(),
+        "invalid short-side fee policy must reject the whole batch"
+    );
+    let slab = svm.get_account(&env.slab).unwrap();
+    let (cfg, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&slab.data).unwrap();
+    assert_eq!(cfg.trade_fee_base_bps, 7);
+    assert_eq!(cfg.backing_trade_fee_bps_long, 8);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 2_000);
+    assert_eq!(cfg.backing_trade_fee_bps_short, 9);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 3_000);
+    assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before);
+}
+
 // PARASITE CONFIG (rival genesis) cannot hijack the victim market's insurance operator (finding KO; the
 // AQ defense end-to-end). A second, fully-legitimate twap config B can be stood up on the SAME percolator
 // market+program (its PDA differs only by coin_mint+multisig), controlled by an ATTACKER DAO via a real
@@ -4808,8 +6227,8 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
 // across deployments). That is blocked at the root: the percolator insurance OPERATOR was granted to
 // config A's twap_authority (a PDA bound to config A, authority_seeds = [seed, config]); config B's
 // twap_authority is a DIFFERENT PDA. So config B can neither (a) GRANT itself the operator — accept_operator
-// CPIs UpdateAssetAuthority, which the percolator gates on the market's CURRENT asset_admin (config A's
-// Squads vault, unchanged by the handoff), and config B's Squads vault is not it — nor would (b) any
+// CPIs UpdateAssetAuthority, which Percolator gates on the market's CURRENT asset_admin (config A's
+// TWAP PDA after handoff), and config B's Squads vault is not it — nor would (b) any
 // execute it cranks be accepted (its twap_authority isn't the operator). This pins (a), the grant root, end
 // to end against the REAL Squads + percolator: a rival real-Squads multisig is rejected (stronger than the
 // raw-key e2e_attacker_cannot_grant_operator_bypassing_squads), and the victim's insurance is untouched.
@@ -4826,7 +6245,7 @@ fn parasite_config_cannot_grant_itself_the_victims_insurance_operator() {
         .unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let env = setup_handoff(&mut svm, &payer); // config A is the operator on env.slab; asset_admin = A's vault
+    let env = setup_handoff(&mut svm, &payer); // config A's TWAP holds operator + asset_admin
 
     let insurance_before = token_amount(&svm, &env.perc_vault);
 
@@ -4910,7 +6329,7 @@ fn parasite_config_cannot_grant_itself_the_victims_insurance_operator() {
         &op_b,
         &or_b,
     );
-    assert!(r.is_err(), "a rival config's Squads cannot grant itself the operator (market asset_admin is config A's vault)");
+    assert!(r.is_err(), "a rival config's Squads cannot grant itself the operator (market asset_admin is config A's TWAP PDA)");
     assert_eq!(
         token_amount(&svm, &env.perc_vault),
         insurance_before,
@@ -5303,7 +6722,15 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_PRINCIPAL, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
     let mut dp = vec![3u8];
@@ -9581,6 +11008,32 @@ fn place_bid_ix(
     }
 }
 
+fn donate_insurance_ix(
+    donor: &Pubkey,
+    env: &HandoffEnv,
+    donor_source: &Pubkey,
+    holding: &Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut data = vec![17u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*donor, true),
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new(*donor_source, false),
+            AccountMeta::new(*holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_ix(
     cranker: &Pubkey,
@@ -11745,7 +13198,15 @@ fn e2e_full_genesis_to_buy_burn() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
 
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
@@ -12170,21 +13631,23 @@ fn e2e_full_genesis_to_buy_burn() {
     .expect("dao reconfigure (obsolete policy step)");
 
     // operator -> twap.
-    let op_msg = build_accept_operator_message(
+    let op_msg = build_subledger_handoff_to_twap_message(
         &squads_vault,
+        &pool,
         &slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
-        &twap_id(),
     );
     let op_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(
         &mut svm,
@@ -15131,40 +16594,23 @@ fn e2e_ratchet_pulls_fresh_surplus_across_rounds() {
         "insurance = floor after round 1"
     );
 
-    // Inject 500k of FRESH surplus via a timelock'd Squads TopUp (market profit / DAO top-up).
+    // Inject 500k of FRESH surplus through the inbound-only TWAP donation path.
+    // Governance no longer retains Percolator's insurance_authority because that
+    // key becomes a terminal withdrawal key after resolution.
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
     let src = Pubkey::new_unique();
     set_token(
         &mut svm,
         &src,
         &env.collateral_mint,
-        &env.squads_vault,
+        &donor.pubkey(),
         500_000,
     );
-    let topup = build_topup_message(
-        &env.squads_vault,
-        &env.slab,
-        &src,
-        &env.perc_vault,
-        &perc_id(),
-        500_000u128,
-    );
-    let tr = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new(src, false),
-        AccountMeta::new(env.perc_vault, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(perc_id(), false),
-    ];
-    squads_execute(
+    send(
         &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        6,
-        &topup,
-        &tr,
+        &[&donor],
+        donate_insurance_ix(&donor.pubkey(), &env, &src, &bk.holding, 500_000),
     )
     .expect("inject fresh surplus");
     assert_eq!(
@@ -18660,6 +20106,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
         .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     svm.add_program_from_file(
         twap_id(),
@@ -18699,11 +20147,13 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ))
     .expect("multisig");
     let squads_vault = vault_pda(&squads, &multisig, 0);
+    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
 
     let collateral_mint = Pubkey::new_unique();
     let slab = Pubkey::new_unique();
+    let controller = controller_pda(&squads_vault, &slab, &perc_id());
     let initial_price = 1_000_000u64;
-    let slab_data = make_live_funding_market(&slab, &collateral_mint, &squads_vault, 100);
+    let slab_data = make_live_funding_market(&slab, &collateral_mint, &controller, 100);
     svm.set_account(
         slab,
         Account {
@@ -18720,19 +20170,26 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         unix_timestamp: 100,
         ..Clock::default()
     });
-    let oracle_cfg = build_configure_ewma_mark_message(
+    let oracle_cfg = build_controller_proxy_message(
         &squads_vault,
+        &controller,
         &slab,
         &perc_id(),
-        100,
-        initial_price,
-        1,
-        0,
+        &PIx::ConfigureEwmaMark {
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: initial_price,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        }
+        .encode(),
     );
     let oracle_cfg_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
         &mut svm,
@@ -18748,40 +20205,74 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    // The market earns 500k surplus during genesis — a REAL TopUpInsurance while the Squads vault is
-    // still the insurance authority (consistent percolator accounting, vs a raw slab poke), so the
-    // twap's slab-insurance read is honest at handoff time.
+    // The market earns 500k surplus during genesis through the controller's
+    // inbound-only donation path. Governance never receives an insurance key.
     let surplus = 500_000u64;
+    let surplus_donor = Keypair::new();
+    svm.airdrop(&surplus_donor.pubkey(), 1_000_000_000).unwrap();
     let surplus_src = Pubkey::new_unique();
+    let controller_holding = Pubkey::new_unique();
     set_token(
         &mut svm,
         &surplus_src,
         &collateral_mint,
-        &squads_vault,
+        &surplus_donor.pubkey(),
         surplus,
     );
-    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
-    let topup = build_topup_message(
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&surplus_donor],
+        controller_donate_insurance_ix(
+            &surplus_donor.pubkey(),
         &squads_vault,
+            &controller,
         &slab,
         &surplus_src,
+            &controller_holding,
         &perc_vault,
+            surplus,
+        ),
+    )
+    .expect("market earns surplus (controller donation)");
+    let bootstrap_policy = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
         &perc_id(),
-        surplus as u128,
+        &PIx::UpdateFeeRedirectPolicy {
+            redirect_bps: 2_000,
+        }
+        .encode(),
     );
-    let tur = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new(surplus_src, false),
-        AccountMeta::new(perc_vault, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(perc_id(), false),
-    ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &topup, &tur)
-        .expect("market earns surplus (real topup)");
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        2,
+        &bootstrap_policy,
+        &oracle_cfg_remaining,
+    )
+    .expect("controller applies the governed bootstrap fee policy");
 
     let coin_mint = Pubkey::new_unique();
-    let pool = sub_pool_pda(&collateral_mint, 0, &slab, &perc_id(), &coin_mint, POLICY_WITH_SURPLUS, DOMAIN_INSURANCE);
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
     let no_market = Pubkey::default();
     let backing_pool = sub_pool_pda(
         &collateral_mint,
@@ -18823,14 +20314,17 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ))
     .expect("init insurance pool");
 
-    // DAO->Squads grants the insurance operator to the pool, then a depositor tops up REAL insurance.
-    let message = build_subledger_accept_operator_message(&squads_vault, &pool, &slab, &perc_id());
+    // DAO->Squads->controller grants custody to the pool, then a depositor tops up real insurance.
+    let message =
+        build_controller_grant_pool_message(&squads_vault, &controller, &pool, &slab, &perc_id());
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
         &mut svm, &squads, &multisig, &dao, &payer, 3, &message, &remaining,
@@ -18961,8 +20455,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let dual_payer = Keypair::new();
     svm.airdrop(&dual_payer.pubkey(), 1_000_000_000).unwrap();
     let dual_receiver = Keypair::new();
-    svm.airdrop(&dual_receiver.pubkey(), 1_000_000_000)
-        .unwrap();
+    svm.airdrop(&dual_receiver.pubkey(), 1_000_000_000).unwrap();
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
     let long_payer_pf = Pubkey::new_unique();
     let short_receiver_pf = Pubkey::new_unique();
@@ -19399,8 +20892,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         crank_refresh(&mut svm, &long_payer_pf, premium_slot).expect("premium refresh long payer");
         crank_refresh(&mut svm, &short_payer_pf, premium_slot)
             .expect("premium refresh short payer");
-        crank_refresh(&mut svm, &dual_payer_pf, premium_slot)
-            .expect("premium refresh dual payer");
+        crank_refresh(&mut svm, &dual_payer_pf, premium_slot).expect("premium refresh dual payer");
         crank_refresh(&mut svm, &dual_receiver_pf, premium_slot)
             .expect("premium refresh dual receiver");
     }
@@ -19416,8 +20908,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         crank_refresh(&mut svm, &long_payer_pf, funding_slot).expect("funding refresh long payer");
         crank_refresh(&mut svm, &short_payer_pf, funding_slot)
             .expect("funding refresh short payer");
-        crank_refresh(&mut svm, &dual_payer_pf, funding_slot)
-            .expect("funding refresh dual payer");
+        crank_refresh(&mut svm, &dual_payer_pf, funding_slot).expect("funding refresh dual payer");
         crank_refresh(&mut svm, &dual_receiver_pf, funding_slot)
             .expect("funding refresh dual receiver");
     }
@@ -19482,7 +20973,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     );
     let dual_long_paid = read_portfolio_funding_long_paid(&svm, &dual_payer_pf);
     let dual_short_received = read_portfolio_funding_short_received(&svm, &dual_receiver_pf);
-    assert!(dual_long_paid > 0, "dual payer first pays from its long side");
+    assert!(
+        dual_long_paid > 0,
+        "dual payer first pays from its long side"
+    );
     assert!(
         dual_short_received > 0 && dual_short_received <= dual_long_paid,
         "dual receiver receives, but never more than the first long-side debit"
@@ -19627,7 +21121,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     );
     let dual_short_paid = read_portfolio_funding_short_paid(&svm, &dual_payer_pf);
     let dual_long_received = read_portfolio_funding_long_received(&svm, &dual_receiver_pf);
-    assert!(dual_short_paid > 0, "the flipped portfolio pays from its short side");
+    assert!(
+        dual_short_paid > 0,
+        "the flipped portfolio pays from its short side"
+    );
     assert!(
         dual_long_received > 0 && dual_long_received <= dual_short_paid,
         "dual receiver receives, but never more than the second short-side debit"
@@ -20185,21 +21682,23 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 6, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
-    let op = build_accept_operator_message(
+    let op = build_subledger_handoff_to_twap_message(
         &squads_vault,
+        &pool,
         &slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
-        &twap_id(),
     );
     let or = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 7, &op, &or)
         .expect("operator -> twap (handoff)");
