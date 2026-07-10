@@ -11308,19 +11308,41 @@ fn send(svm: &mut LiteSVM, signers: &[&Keypair], ix: Instruction) -> Result<(), 
     .map_err(|e| format!("{:?}", e.err))
 }
 
-// Commit 38d4081 inserted an eight-byte sink cutoff at the end of the book header. Simulate an
-// in-place program upgrade by retaining the exact immediately-preceding account bytes and owner.
-fn remove_book_sink_cutoff(svm: &mut LiteSVM, book: &Pubkey) {
-    const LEGACY_HEADER: usize = 292;
+// Simulate an in-place program upgrade by retaining one exact historical AuctionBook generation.
+// Every header field was appended and every slot field was appended, so each old account is the
+// corresponding prefix plus the same 32 tightly-packed slot prefixes.
+fn rewrite_book_layout(svm: &mut LiteSVM, book: &Pubkey, header: usize, slot_size: usize) {
     const CURRENT_HEADER: usize = 300;
-    const SLOT_SIZE: usize = 178;
+    const CURRENT_SLOT_SIZE: usize = 178;
     const MAX_BIDS: usize = 32;
 
     let mut account = svm.get_account(book).unwrap();
-    assert_eq!(account.data.len(), CURRENT_HEADER + MAX_BIDS * SLOT_SIZE);
-    account.data.drain(LEGACY_HEADER..CURRENT_HEADER);
-    assert_eq!(account.data.len(), LEGACY_HEADER + MAX_BIDS * SLOT_SIZE);
+    assert_eq!(
+        account.data.len(),
+        CURRENT_HEADER + MAX_BIDS * CURRENT_SLOT_SIZE
+    );
+    let current = account.data;
+    let mut historical = Vec::with_capacity(header + MAX_BIDS * slot_size);
+    historical.extend_from_slice(&current[..header]);
+    for i in 0..MAX_BIDS {
+        let current_slot = CURRENT_HEADER + i * CURRENT_SLOT_SIZE;
+        historical.extend_from_slice(&current[current_slot..current_slot + slot_size]);
+    }
+    account.data = historical;
+    assert_eq!(account.data.len(), header + MAX_BIDS * slot_size);
     svm.set_account(*book, account).unwrap();
+}
+
+// Commit 38d4081 inserted an eight-byte sink cutoff at the end of the book header.
+fn remove_book_sink_cutoff(svm: &mut LiteSVM, book: &Pubkey) {
+    rewrite_book_layout(svm, book, 292, 178);
+}
+
+fn use_initial_twap_config_layout(svm: &mut LiteSVM, config: &Pubkey) {
+    let mut account = svm.get_account(config).unwrap();
+    account.data.truncate(200);
+    assert_eq!(&account.data[..8], b"TWAPCFG1");
+    svm.set_account(*config, account).unwrap();
 }
 
 // UPGRADE LOF PROBE: the sink-cutoff field grew AuctionBook by eight bytes without migrating the
@@ -11566,6 +11588,164 @@ fn legacy_pre_cutoff_book_unsettled_bid_remains_owner_cancellable() {
         .is_err(),
         "a legacy bid cannot be refunded twice"
     );
+}
+
+// UPGRADE LOF MATRIX: the first four auction generations used the original 200-byte config. The
+// book/config PDAs and escrow signer never changed, so settled users must retain both legs of their
+// fixed-destination claim across every exact header/slot generation.
+#[test]
+fn every_initial_config_twap_book_generation_preserves_settled_claims() {
+    for (header, slot_size) in [(252usize, 162usize), (284, 162), (292, 162), (292, 178)] {
+        let mut svm = LiteSVM::new().with_compute_budget(
+            solana_program_runtime::compute_budget::ComputeBudget {
+                compute_unit_limit: 1_400_000,
+                heap_size: 256 * 1024,
+                ..solana_program_runtime::compute_budget::ComputeBudget::default()
+            },
+        );
+        svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+        svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+            .unwrap();
+        let payer = Keypair::new();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+        let env = setup_handoff(&mut svm, &payer);
+        let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+        let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, 1_000_000);
+
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_ata,
+                &usd_ata,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1_000_000,
+                1_000_000,
+                None,
+            ),
+        )
+        .expect("place bid before historical upgrade");
+        let round_end = {
+            let book = svm.get_account(&bk.book).unwrap();
+            u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&payer],
+            execute_ix(
+                &payer.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                None,
+            ),
+        )
+        .expect("settle before historical upgrade");
+        assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000);
+        assert_eq!(token_amount(&svm, &bk.coin_escrow), 600_000);
+
+        rewrite_book_layout(&mut svm, &bk.book, header, slot_size);
+        use_initial_twap_config_layout(&mut svm, &env.twap_cfg);
+        send(
+            &mut svm,
+            &[&payer],
+            claim_ix(
+                &payer.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &usd_ata,
+                &coin_ata,
+                0,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("historical {header}/{slot_size} claim failed: {e}"));
+        assert_eq!(token_amount(&svm, &usd_ata), 400_000);
+        assert_eq!(token_amount(&svm, &coin_ata), 600_000);
+        assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+        assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    }
+}
+
+// Pre-cancel slots have no placement timestamp and can exit immediately because legacy placement
+// and execute remain unavailable. The later 178-byte generation preserves its recorded cooldown.
+#[test]
+fn every_initial_config_twap_book_generation_preserves_owner_cancellation() {
+    for (header, slot_size) in [(252usize, 162usize), (284, 162), (292, 162), (292, 178)] {
+        let mut svm = LiteSVM::new().with_compute_budget(
+            solana_program_runtime::compute_budget::ComputeBudget {
+                compute_unit_limit: 1_400_000,
+                heap_size: 256 * 1024,
+                ..solana_program_runtime::compute_budget::ComputeBudget::default()
+            },
+        );
+        svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+        svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+            .unwrap();
+        let payer = Keypair::new();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+        let env = setup_handoff(&mut svm, &payer);
+        let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+        let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, 100_000);
+
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_ata,
+                &usd_ata,
+                &env.coin_mint,
+                &env.collateral_mint,
+                100_000,
+                100_000,
+                None,
+            ),
+        )
+        .expect("place bid before historical upgrade");
+        let round_end = {
+            let book = svm.get_account(&bk.book).unwrap();
+            u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+        };
+        rewrite_book_layout(&mut svm, &bk.book, header, slot_size);
+        use_initial_twap_config_layout(&mut svm, &env.twap_cfg);
+        if slot_size == 178 {
+            warp_to(&mut svm, round_end + 10);
+        }
+
+        send(
+            &mut svm,
+            &[&bidder],
+            cancel_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_ata,
+                0,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("historical {header}/{slot_size} cancel failed: {e}"));
+        assert_eq!(token_amount(&svm, &coin_ata), 100_000);
+        assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    }
 }
 
 // ISSUE #41 REGRESSION: bids must enter while the active round is still open. A book remains
