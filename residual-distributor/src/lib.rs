@@ -1604,7 +1604,8 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 
 // claim accounts: [cranker(s), config, stake(w), vault(w), recipient_ata(w), token_program]
 //   insurance/backing cohorts append one more: the subledger position (for the live HE cap).
-//   LP/trader cohorts append one more: the Percolator portfolio (for the residual live cap).
+//   LP/trader cohorts append one more: the Percolator portfolio (for the residual live cap), or its
+//   exact dematerialized account key for the frozen terminal fallback.
 //
 // PERMISSIONLESS self-service claim (replaces the cranker-assembled seal for the portfolio
 // cohort). Pays the stake's OWN deterministic share —
@@ -1703,7 +1704,8 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     // irreversible claimed-flag would lock in the reduced (or zero) payout, stranding the remainder
     // (finding KM). So a capital claim must be authorized by the stake's OWN owner (the depositor who
     // controls the position and bears the soft-veto timing). Portfolio-flow cohorts pay frozen points from
-    // account counters, so their claim slot is irrelevant and stays permissionless.
+    // account counters, so their claim slot is irrelevant and stays permissionless even if Percolator
+    // has already dematerialized the witness; payout still goes only to the bound recipient.
     if matches!(stake.cohort, COHORT_INSURANCE | COHORT_BACKING) && cranker.key != &stake.owner {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -1747,25 +1749,40 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: live-cap the frozen points against a post-crystallize net drop.
             let portfolio = next_account_info(iter)?;
-            if *portfolio.key != stake.backing_ledger
-                || *portfolio.owner != config.percolator_program
-            {
+            if *portfolio.key != stake.backing_ledger {
                 return Err(ProgramError::InvalidAccountData);
             }
-            let data = portfolio.try_borrow_data()?;
-            validate_portfolio_identity(&config, &data, &stake.owner)?;
-            let (received, crystallized, spent) = read_portfolio_residual(&data)?;
-            let live_net = residual_counter(stake.cohort, received, crystallized, spent)
-                .saturating_sub(stake.residual_snap);
-            let frozen_net = stake.earnings_snap; // net_delta captured at the last crystallize
-            let cap_net = if stake.cohort == COHORT_TRADER {
-                let spent_since_crystallize = spent.saturating_sub(stake.eligible_accum);
-                core::cmp::min(frozen_net.saturating_sub(spent_since_crystallize), live_net)
+            let dematerialized = portfolio.lamports() == 0
+                && portfolio.data_len() == 0
+                && (*portfolio.owner == config.percolator_program
+                    || *portfolio.owner == solana_program::system_program::ID);
+            if dematerialized {
+                // Percolator can dematerialize an empty portfolio through maintenance-fee or
+                // resolved-market cleanup. The historical counters then no longer exist for the
+                // normal live cap. The recipient remains bound and payout is still bounded by the
+                // frozen cohort denominator, so keeping this path permissionless avoids stranding
+                // PDA-owned portfolios. A close can at worst avoid a later points cap; it cannot
+                // redirect COIN, change the cohort supply, or touch collateral custody.
+                points_to_amount(cohort_supply, stake.points, frozen_denom)
             } else {
-                live_net
-            };
-            let pts = cap_residual_points(stake.points, frozen_net, cap_net)?;
-            points_to_amount(cohort_supply, pts, frozen_denom)
+                if *portfolio.owner != config.percolator_program {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let data = portfolio.try_borrow_data()?;
+                validate_portfolio_identity(&config, &data, &stake.owner)?;
+                let (received, crystallized, spent) = read_portfolio_residual(&data)?;
+                let live_net = residual_counter(stake.cohort, received, crystallized, spent)
+                    .saturating_sub(stake.residual_snap);
+                let frozen_net = stake.earnings_snap; // net_delta captured at the last crystallize
+                let cap_net = if stake.cohort == COHORT_TRADER {
+                    let spent_since_crystallize = spent.saturating_sub(stake.eligible_accum);
+                    core::cmp::min(frozen_net.saturating_sub(spent_since_crystallize), live_net)
+                } else {
+                    live_net
+                };
+                let pts = cap_residual_points(stake.points, frozen_net, cap_net)?;
+                points_to_amount(cohort_supply, pts, frozen_denom)
+            }
         }
         _ => {
             // Funding-payer cohort: crystallize authenticated the bound Percolator portfolio and froze points

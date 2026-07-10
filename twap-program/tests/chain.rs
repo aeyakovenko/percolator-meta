@@ -29254,8 +29254,9 @@ fn read_portfolio_funding_short_received(svm: &LiteSVM, pf: &Pubkey) -> u128 {
     let d = svm.get_account(pf).unwrap().data;
     u128::from_le_bytes(d[292..308].try_into().unwrap()) // HEADER_LEN(16) + offset_of(funding_short_received) 276
 }
-#[test]
-fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
+fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
+    maintenance_fee_cleanup: bool,
+) {
     use percolator_prog::ix::Instruction as PIx;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -29265,10 +29266,15 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         });
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let admin = Keypair::new();
     svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
     svm.set_sysvar(&Clock {
         slot: 100,
         unix_timestamp: 100,
@@ -29330,7 +29336,7 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
                 max_bankrupt_close_chunks: 1,
                 max_bankrupt_close_lifetime_slots: 100,
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
-                maintenance_fee_per_slot: 0,
+                maintenance_fee_per_slot: u128::from(maintenance_fee_cleanup),
             },
         )],
         Some(&payer.pubkey()),
@@ -29359,6 +29365,37 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         ))
     };
     auth_mark(&mut svm, initial_price, init_slot).expect("configure auth mark");
+
+    let backing_provider_destination =
+        canonical_insurance_vault(&admin.pubkey(), &collateral);
+    if !maintenance_fee_cleanup {
+        set_token(
+            &mut svm,
+            &backing_provider_destination,
+            &collateral,
+            &admin.pubkey(),
+            1,
+        );
+        send(
+            &mut svm,
+            &[&admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(backing_provider_destination, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::TopUpBackingBucket {
+                    domain: 0,
+                    amount: 1,
+                    expiry_slot: 10_000,
+                },
+            ),
+        )
+        .expect("external provider deposits backing before the reward lifecycle");
+    }
 
     // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
@@ -29638,6 +29675,74 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         bh,
     ))
     .expect("crystallize");
+
+    if maintenance_fee_cleanup {
+        // Flatten through the real trading path, then leave one collateral atom. The public
+        // maintenance sync below can consume that atom and trigger Percolator's intended dust close.
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: -pos,
+                    exec_price: initial_price / 2,
+                    fee_bps: 0,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &winner, &loser],
+            bh,
+        ))
+        .expect("flatten organic loss portfolios");
+        for pf in [&winner_pf, &loser_pf] {
+            crank(&mut svm, pf, 110).expect("settle flattened portfolio");
+        }
+
+        let loser_state = svm.get_account(&loser_pf).unwrap();
+        let loser_capital = percolator_prog::state::read_portfolio(&loser_state.data)
+            .unwrap()
+            .capital
+            .get();
+        assert!(loser_capital > 1, "loser retains withdrawable capital");
+        let loser_collateral = canonical_insurance_vault(&loser.pubkey(), &collateral);
+        set_token(
+            &mut svm,
+            &loser_collateral,
+            &collateral,
+            &loser.pubkey(),
+            0,
+        );
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                    AccountMeta::new(loser_collateral, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw {
+                    amount: loser_capital - 1,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &loser],
+            bh,
+        ))
+        .expect("leave one atom in frozen trader portfolio");
+    }
     svm.set_sysvar(&Clock {
         slot: 700,
         unix_timestamp: 700,
@@ -29661,24 +29766,120 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         bh,
     ))
     .expect("freeze");
+
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    if maintenance_fee_cleanup {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::SyncMaintenanceFee { now_slot: 700 },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .expect("unaffiliated maintenance crank consumes dust and closes reward witness");
+        assert!(
+            svm.get_account(&loser_pf)
+                .map_or(true, |account| account.lamports == 0 && account.data.is_empty()),
+            "maintenance fee dematerializes the frozen trader witness"
+        );
+    } else {
+        // A portfolio's historical loss counters are the trader claim's live-cap
+        // witness. Hand the market to the real controller, resolve it, and fully pay
+        // the trader so its Percolator account is otherwise safe to dematerialize.
+        send(
+            &mut svm,
+            &[&admin],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+            },
+        )
+        .expect("creator donates the live market to the fixed controller");
+        let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
+        resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+        send(
+            &mut svm,
+            &[&governance],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: resolve_data,
+            },
+        )
+        .expect("governance resolves through the controller");
+
+        let loser_collateral = canonical_insurance_vault(&loser.pubkey(), &collateral);
+        set_token(
+            &mut svm,
+            &loser_collateral,
+            &collateral,
+            &loser.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(loser.pubkey(), false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                    AccountMeta::new(loser_collateral, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+        )
+        .expect("public resolved close pays and empties the reward-bearing trader");
+        assert!(
+            read_portfolio_crystallized(&svm, &loser_pf) > 0,
+            "terminal payout preserves the monotonic reward witness"
+        );
+
+    }
+
     let loser_coin = Pubkey::new_unique();
     set_token(&mut svm, &loser_coin, &coin_mint, &loser.pubkey(), 0);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let claim = Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new(t_stake, false),
+            AccountMeta::new(rd_vault, false),
+            AccountMeta::new(loser_coin, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(loser_pf, false), // trader live-cap portfolio (stake.backing_ledger)
+        ],
+        data: vec![5u8],
+    };
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[Instruction {
-            program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(rd_config, false),
-                AccountMeta::new(t_stake, false),
-                AccountMeta::new(rd_vault, false),
-                AccountMeta::new(loser_coin, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(loser_pf, false), // trader live-cap portfolio (stake.backing_ledger)
-            ],
-            data: vec![5u8],
-        }],
+        &[claim],
         Some(&payer.pubkey()),
         &[&payer],
         bh,
@@ -29690,6 +29891,135 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
         supply,
         "trader cohort earns the organically-settled residual loss"
     );
+
+    if !maintenance_fee_cleanup {
+        // Once the bound reward has been paid, an absent portfolio owner or DAO must not leave the
+        // materialized account as a permanent gate on resolved insurance/backing withdrawals.
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![11u8],
+            },
+        )
+        .expect("any cranker retires the consumed reward witness");
+        assert!(
+            svm.get_account(&loser_pf)
+                .map_or(true, |account| account.lamports == 0),
+            "claimed portfolio is dematerialized"
+        );
+
+        let winner_collateral = canonical_insurance_vault(&winner.pubkey(), &collateral);
+        set_token(
+            &mut svm,
+            &winner_collateral,
+            &collateral,
+            &winner.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(winner.pubkey(), false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(winner_collateral, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+        )
+        .expect("public resolved close pays the absent counterparty");
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![11u8],
+            },
+        )
+        .expect("any cranker retires the paid counterparty portfolio");
+        let (_, empty_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(empty_group.materialized_portfolio_count, 0);
+
+        let controller_transit = canonical_insurance_vault(&controller, &collateral);
+        set_token(
+            &mut svm,
+            &controller_transit,
+            &collateral,
+            &controller,
+            0,
+        );
+        let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+        let long_backing_ledger = Pubkey::new_unique();
+        let short_backing_ledger = Pubkey::new_unique();
+        for ledger in [long_backing_ledger, short_backing_ledger] {
+            svm.set_account(
+                ledger,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; backing_ledger_len],
+                    owner: perc_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        }
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset0_backing_ix(
+                &governance.pubkey(),
+                &controller,
+                &controller,
+                &market,
+                &backing_provider_destination,
+                &controller_transit,
+                &perc_vault,
+                &vault_authority,
+                &long_backing_ledger,
+                &short_backing_ledger,
+                &perc_id(),
+            ),
+        )
+        .expect("reward telemetry cannot lock the external provider's backing");
+        assert_eq!(token_amount(&svm, &backing_provider_destination), 1);
+    }
+}
+
+#[test]
+fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(false);
+}
+
+#[test]
+fn e2e_public_maintenance_close_cannot_lock_frozen_trader_reward() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(true);
 }
 
 // PUBLIC DOS: a canonical TWAP handoff preserves retained protocol insurance above depositor
