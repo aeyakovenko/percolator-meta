@@ -537,7 +537,14 @@ fn process_init_pool(
         return Err(ProgramError::IllegalOwner);
     }
     let vault_state = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
-    if vault_state.mint != *mint.key || vault_state.owner != expected_pool {
+    if vault_state.state != spl_token::state::AccountState::Initialized
+        || vault_state.mint != *mint.key
+        || vault_state.owner != expected_pool
+        || vault_state.delegate.is_some()
+        || vault_state.delegated_amount != 0
+        || vault_state.close_authority.is_some()
+        || vault_state.is_native.is_some()
+    {
         return Err(ProgramError::InvalidAccountData);
     }
 
