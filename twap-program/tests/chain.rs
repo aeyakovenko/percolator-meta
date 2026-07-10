@@ -10,6 +10,8 @@ use solana_sdk::{
     account::Account,
     clock::Clock,
     instruction::{AccountMeta, Instruction},
+    program_option::COption,
+    program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_program,
@@ -580,6 +582,164 @@ fn init_book_rejects_a_non_spl_owned_coin_escrow_fail_fast() {
     assert!(
         svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
         "the rejected init_book left the book PDA uninitialized"
+    );
+}
+
+// FAIL-FAST LOF GUARD: a freeze authority can freeze a token account and then revoke itself,
+// leaving an otherwise valid SPL account permanently unusable. `init_book` must reject that
+// terminal state before it consumes the one canonical book PDA.
+#[test]
+fn init_book_rejects_a_permanently_frozen_settlement_account() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // setup_handoff uses a synthetic collateral mint because SPL transfers only inspect the token
+    // accounts. Install the matching real mint here so this probe can exercise freeze + revocation
+    // through the SPL Token processor.
+    let freeze_authority = Keypair::new();
+    let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::Some(freeze_authority.pubkey()),
+        },
+        &mut mint_data,
+    )
+    .unwrap();
+    svm.set_account(
+        env.collateral_mint,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN),
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(
+        &mut svm,
+        &settlement_usd,
+        &env.collateral_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &settlement_usd,
+        &env.collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &env.collateral_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[freeze, revoke],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx)
+        .expect("freeze settlement and permanently revoke thaw authority");
+
+    let settlement_state = spl_token::state::Account::unpack(
+        &svm.get_account(&settlement_usd).unwrap().data,
+    )
+    .unwrap();
+    let mint_state =
+        spl_token::state::Mint::unpack(&svm.get_account(&env.collateral_mint).unwrap().data)
+            .unwrap();
+    assert_eq!(
+        settlement_state.state,
+        spl_token::state::AccountState::Frozen
+    );
+    assert!(mint_state.freeze_authority.is_none());
+
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+    let msg = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        0,
+        1,
+        10,
+        0,
+        0,
+        None,
+    );
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &msg,
+            &rem,
+        )
+        .is_err(),
+        "init_book must not bind a permanently frozen settlement account"
+    );
+    assert!(
+        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
+        "the rejected init_book leaves the canonical book PDA available for retry"
     );
 }
 
