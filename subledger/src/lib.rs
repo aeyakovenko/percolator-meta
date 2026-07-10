@@ -145,8 +145,8 @@ const IX_SET_VOTE_LOCK: u8 = 6;
 // Taking asset_admin away from the governance vault is what prevents governance from
 // later reassigning the operator to itself and bypassing owner-bound withdrawals.
 const IX_ACCEPT_OPERATOR: u8 = 7;
-// Governance-authorized, hardcoded pool -> TWAP custody handoff. The pool remains the
-// current asset_admin until the TWAP atomically receives all three roles.
+// Governance-authorized, hardcoded principal-only pool -> TWAP custody handoff. The pool
+// remains the current asset_admin until the TWAP atomically receives all three roles.
 const IX_HANDOFF_TO_TWAP: u8 = 8;
 
 // Percolator CPI tags (verified against the real v16 program, percolator-prog 5349b2f).
@@ -1976,8 +1976,11 @@ fn process_accept_operator(
 // The governance signer authorizes timing, but never receives a Percolator role. The
 // pool signs a CPI to the fixed TWAP program, which hardcodes the only incoming
 // authority to its config-bound PDA and atomically protects this pool's live
-// outstanding principal. Percolator verifies that this pool is the current
-// asset_admin, while the TWAP verifies the Squads vault and all market bindings.
+// outstanding principal. Only POLICY_PRINCIPAL may cross this boundary: TWAP moves
+// protocol surplus, while POLICY_WITH_SURPLUS makes the live balance part of depositor
+// share value, so combining them could socialize a protocol pull into user principal.
+// Percolator verifies that this pool is the current asset_admin, while the TWAP verifies
+// the Squads vault and all market bindings.
 fn process_handoff_to_twap(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2006,6 +2009,7 @@ fn process_handoff_to_twap(
     }
     let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     if !pool.is_insurance()
+        || pool.policy != POLICY_PRINCIPAL
         || *market_slab.key != pool.market_slab
         || *percolator_program.key != pool.percolator_program
     {

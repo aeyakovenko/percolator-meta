@@ -11812,3 +11812,21 @@ keeps `100,000` principal live across re-handoff, proves a public crank preserve
 buffer, returns custody again so the owner recovers the final principal, and verifies the next re-handoff removes
 only that final principal. The predecessor 264-byte config remains readable and uses its conservative legacy
 behavior; new 272-byte configs carry the principal snapshot.
+
+## Tick — share-value genesis handoff socialized TWAP surplus pulls into user principal (surface A/C)
+
+The grand-unified LiteSVM test previously stopped after the buy/burn winner claimed USD. Extending that same
+real Squads + genesis-vote + distribution + subledger + TWAP + pinned Percolator chain through fixed recovery,
+vote retract, and owner withdrawal exposed a principal loss: the genesis pool used POLICY_WITH_SURPLUS, a user
+deposited `1,000,000` behind `500,000` pre-existing protocol insurance, and TWAP auctioned `400,000`. Although
+live insurance remained healthy at `1,100,000` against `1,000,000` outstanding, share redemption returned only
+`733,333`. Pricing shares against the pre-existing balance correctly prevented the user from capturing protocol
+surplus, but removing that surplus later reduced the value of every user share and crossed into principal.
+
+FIX: TWAP handoff is now accepted only from POLICY_PRINCIPAL insurance pools. Canonical genesis and the 45-day
+continuous-reward E2E use that policy; both policies still mint the same tenure-fair shares for vote/reward
+accounting. Standalone POLICY_WITH_SURPLUS remains supported and keeps its intended pro-rata rewards, but it can
+never enter a custody regime that removes protocol surplus from its share-value balance. A separate real-binary
+probe proves the rejected handoff leaves the with-surplus owner able to withdraw directly. The completed genesis
+E2E now returns the full `1,000,000` and leaves exactly `100,000` retained protocol insurance. No new authority,
+admin path, or asset-moving instruction was added.

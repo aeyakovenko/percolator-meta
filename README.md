@@ -35,7 +35,7 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 | Crate | Responsibility |
 |---|---|
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and cleanup of an empty slab. The controller cannot withdraw insurance/backing, trade, rotate keys, or move portfolio collateral. |
-| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; share accounting determines the loss/surplus-adjusted exit value. The pool receives the three asset-0 custody roles through one fixed self-grant and can hand them only to the fixed TWAP program. |
+| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; shares track tenure and live capital for rewards. Only a principal-policy pool can hand custody to TWAP; with-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. It reads principal-bearing accounts but cannot debit them. |
@@ -60,18 +60,18 @@ The workspace pins `percolator-prog` to commit
 4. **Seal 100% of supply.** After the deadline, anyone can trigger a qualifying proposal. The
    winning allocation is immutable; recipients claim from the fixed vault and expired claims burn.
 5. **Return deposits.** The intended genesis flow keeps custody in the owner-bound pool while
-   initial risk takers redeem up to their loss-adjusted share. If TWAP already holds custody, its
-   fixed recovery path returns it to that same pool first. Sealed votes are no longer governance
-   authority. A principal-only pool leaves fee surplus in insurance; a with-surplus pool returns it
-   pro rata.
+   initial risk takers redeem up to their loss-adjusted principal. If TWAP already holds custody,
+   its fixed recovery path returns it to that same pool first. Sealed votes are no longer governance
+   authority. Standalone with-surplus pools return their live share value pro rata but are never
+   eligible for TWAP custody.
 6. **Kickstart.** Futarchy can use retained surplus to initialize insurance/backing for approved
    markets and set fee splits. Inbound-only donation instructions fund Percolator without giving
    governance an insurance key.
 7. **Handoff.** If capital remains for continuous operation, Squads authorizes the fixed
-   pool-to-TWAP transition. The transition records the exact pool identity and live principal in
-   the TWAP floor. After a recovery, re-handoff replaces only that principal component; retained
-   insurance stays protected and exited principal no longer strands fee surplus. Deposits and exits
-   are closed while TWAP holds custody; the fixed recovery transition restores owner exits.
+   principal-pool-to-TWAP transition. The transition records the exact pool identity and live
+   principal in the TWAP floor. After a recovery, re-handoff replaces only that principal component;
+   retained insurance stays protected and exited principal no longer strands fee surplus. Deposits
+   and exits are closed while TWAP holds custody; the fixed recovery transition restores owner exits.
 
 ## Continuous Rewards
 

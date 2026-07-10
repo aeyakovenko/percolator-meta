@@ -2377,8 +2377,9 @@ fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
     // percolator bounds insurance withdrawals at the pool level. The percolator sets this at CONSTRUCTION via the
     // wrapper config (the old UpdateInsurancePolicy instruction was removed — see SECURITY_LOG #11), so pin it on
     // the readback alongside the fee config. NOTE: surplus DISTRIBUTION is governed by the SUBLEDGER pool policy,
-    // not this flag — the genesis pool is POLICY_WITH_SURPLUS, so depositors redeem shares INCLUDING a pro-rata
-    // slice of any surplus (a deployer wanting principal-only retention configures POLICY_PRINCIPAL instead).
+    // not this flag. The canonical TWAP handoff pool is POLICY_PRINCIPAL so protocol surplus can be auctioned
+    // without changing depositor principal; standalone POLICY_WITH_SURPLUS pools retain pro-rata yield and never
+    // cross into TWAP custody.
     assert_eq!(
         cfg.insurance_withdraw_deposits_only, 1,
         "genesis insurance market is deposits_only (pool-level withdrawal bound)"
@@ -3266,6 +3267,8 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         .unwrap();
     svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
         .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let squads = squads_id();
@@ -3463,6 +3466,94 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         amount,
         "failed governance takeover leaves depositor insurance untouched"
     );
+
+    // PUBLIC LOF PROBE: this pool promises share-value redemption. Handing it to TWAP would let
+    // permissionless auctions remove protocol surplus from the same balance and socialize that
+    // pull across user shares (the full genesis regression reproduced a 1M -> 733,333 haircut).
+    // Only a principal-policy pool may cross the custody boundary.
+    let twap_init = init_config_ix(
+        &payer.pubkey(),
+        &coin_mint,
+        &slab,
+        &multisig,
+        &dao.pubkey(),
+        &perc_id(),
+    );
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[twap_init],
+        Some(&payer.pubkey()),
+        &[&payer],
+        bh,
+    ))
+    .expect("initialize TWAP config for handoff probe");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+    let handoff = build_subledger_handoff_to_twap_message(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            3,
+            &handoff,
+            &handoff_remaining,
+        )
+        .is_err(),
+        "a with-surplus pool cannot enter protocol-surplus TWAP custody"
+    );
+    assert_eq!(token_amount(&svm, &perc_vault), amount);
+
+    let mut withdraw_data = vec![5u8];
+    withdraw_data.extend_from_slice(&amount.to_le_bytes());
+    let withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: withdraw_data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[withdraw],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        bh,
+    ))
+    .expect("with-surplus owner retains the direct exit path");
+    assert_eq!(token_amount(&svm, &alice_ata), amount);
+    assert_eq!(token_amount(&svm, &perc_vault), 0);
 }
 
 // Canonical authority chain: permissionless controller-owned market init, then
@@ -14269,7 +14360,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &slab,
         &perc_id(),
         &coin_mint,
-        POLICY_WITH_SURPLUS,
+        POLICY_PRINCIPAL,
         DOMAIN_INSURANCE,
     );
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
@@ -14278,7 +14369,7 @@ fn e2e_full_genesis_to_buy_burn() {
     // subledger insurance pool (vote_authority = gv config PDA, per finding R).
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
-    d.push(1); // POLICY_WITH_SURPLUS (genesis vote pool = shares)
+    d.push(0); // POLICY_PRINCIPAL (genesis risk capital exits at nominal principal when healthy)
     append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
@@ -14653,7 +14744,7 @@ fn e2e_full_genesis_to_buy_burn() {
         "winner claimed the full COIN supply"
     );
 
-    // --- Handoff: DAO rotates the insurance policy to surplus-mode, then the operator to the twap ---
+    // --- Handoff: DAO configures the TWAP auction share, then hands it custody. ---
     // twap config for this market.
     let twap_init = init_config_ix(
         &payer.pubkey(),
@@ -14676,7 +14767,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
 
-    // policy -> surplus mode (deposits_only = 0, max_bps < 1e4, cooldown != 0).
+    // Configure 80% of protocol surplus for the auction.
     let policy_msg = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -14888,6 +14979,93 @@ fn e2e_full_genesis_to_buy_burn() {
         token_amount(&svm, &r_usd),
         400_000,
         "winner received the surplus USD at the clearing price"
+    );
+
+    // Complete the advertised lifecycle: return custody to the canonical pool, retract the sealed
+    // ballot, and recover the genesis deposit. Insurance is still healthy (1.1M >= 1M outstanding),
+    // so TWAP's protocol-surplus auction must not turn into a depositor-principal haircut.
+    let return_message = build_return_to_subledger_message(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let return_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &return_message,
+        &return_remaining,
+    )
+    .expect("return custody for genesis deposit recovery");
+
+    let retract = Instruction {
+        program_id: gv_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(gv_config, false),
+            AccountMeta::new(gv_ballot, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, 2u8],
+    };
+    let mut withdraw_data = vec![5u8];
+    withdraw_data.extend_from_slice(&principal.to_le_bytes());
+    let withdrawal_holding = Pubkey::new_unique();
+    set_token(&mut svm, &withdrawal_holding, &collateral_mint, &pool, 0);
+    let withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(withdrawal_holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: withdraw_data,
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[retract, withdraw],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        bh,
+    ))
+    .expect("sealed voter recovers genesis deposit");
+    assert_eq!(
+        token_amount(&svm, &alice_ata),
+        principal,
+        "a protocol-surplus auction cannot haircut healthy depositor principal"
+    );
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        surplus - 400_000,
+        "the retained protocol insurance remains after principal recovery"
     );
 }
 
@@ -21435,7 +21613,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &slab,
         &perc_id(),
         &coin_mint,
-        POLICY_WITH_SURPLUS,
+        POLICY_PRINCIPAL,
         DOMAIN_INSURANCE,
     );
     let no_market = Pubkey::default();
@@ -21449,11 +21627,12 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         DOMAIN_BACKING,
     );
 
-    // subledger insurance pool, POLICY_WITH_SURPLUS (the soft-veto / tenure-fair cohort).
+    // Principal-only genesis insurance pool. It still mints tenure-fair shares for reward points,
+    // while collateral redemption remains independent from protocol-surplus TWAP pulls.
     let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
     let mut d = vec![3u8];
     d.extend_from_slice(&0u64.to_le_bytes());
-    d.push(1); // POLICY_WITH_SURPLUS
+    d.push(0); // POLICY_PRINCIPAL
     append_test_genesis_schedule(&mut d);
     let init_pool = Instruction {
         program_id: sub_id(),
