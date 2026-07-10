@@ -17342,6 +17342,106 @@ fn e2e_full_book_of_worst_case_rates_cannot_dos_execute() {
     );
 }
 
+// PUBLIC CU-DOS (reserve filtering): the old exact continued-fraction comparator took 85 divisions
+// for each equal Fibonacci-rate bid. Filling all 32 permissionless slots consumed the full 1.4M CU
+// and made every execute fail. The fixed-work 256-bit cross-product keeps the same exact ordering
+// while ensuring the full adversarial book remains executable with substantial headroom.
+#[test]
+fn e2e_full_book_equal_to_worst_case_reserve_cannot_dos_execute() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // F(86)/F(87) requires 85 Euclidean steps, and 32 * F(86) still fits the shared u64 escrow.
+    let reserve_num = 420_196_140_727_489_673u128;
+    let reserve_den = 679_891_637_638_612_258u128;
+    assert!(reserve_num * 32 <= u64::MAX as u128);
+    let rm = build_set_reserve_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        reserve_num,
+        reserve_den,
+    );
+    let rr = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &rm,
+        &rr,
+    )
+    .expect("set worst-case reserve");
+
+    for _ in 0..32 {
+        let (bidder, src, usd) = new_bidder(&mut svm, &payer, &env, reserve_num as u64);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &src,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                reserve_num,
+                reserve_den,
+                None,
+            ),
+        )
+        .expect("fill worst-case bid");
+    }
+
+    warp_to(&mut svm, 111);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let ix = execute_ix(
+        &payer.pubkey(),
+        &env,
+        &bk.book,
+        &bk.holding,
+        &bk.settlement_usd,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        None,
+    );
+    let meta = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .expect("full worst-case reserve book must remain executable");
+    assert!(
+        meta.compute_units_consumed < 500_000,
+        "fixed-work reserve filtering must stay bounded, got {} CU",
+        meta.compute_units_consumed
+    );
+}
+
 // LIVENESS (multi-round ratchet over fresh surplus): the buy/burn repeats. Each execute pulls the
 // burn-share of the CURRENT surplus and ratchets the retained share into the principal counter; as
 // NEW surplus accrues (market profit / DAO top-up), later rounds must pull it too — the ratchet

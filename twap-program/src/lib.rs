@@ -1338,52 +1338,36 @@ fn load_exit_book_header(d: &[u8]) -> Result<(BookHeader, BookLayout), ProgramEr
 // amounts bounded to u64 at place_bid, so the cross-products fit in u128 exactly (u64*u64 < 2^128) —
 // no continued-fraction loop. This is what bid-vs-bid ranking uses, so a hostile full book of
 // close, long-continued-fraction rates can NOT make the O(N^2) sort blow the compute budget (the
-// finding-AC DOS). cmp_rate (Euclidean) is kept only for the O(N) bid-vs-reserve check, where the
+// finding-AC DOS). The bid-vs-reserve path below uses a fixed-work wide cross-product because the
 // DAO-set reserve may be a large u128.
 fn cmp_bid(coin_a: u128, usdc_a: u128, coin_b: u128, usdc_b: u128) -> core::cmp::Ordering {
     (coin_a * usdc_b).cmp(&(coin_b * usdc_a))
 }
 
-// Compare a_num/a_den vs b_num/b_den as exact rationals using the continued-fraction (Euclidean)
-// algorithm — overflow-safe, no floats. All denominators must be > 0. Ported from the twap lib's
-// `compare_fraction`. Returns the ordering of the first rate relative to the second.
-fn cmp_rate(mut an: u128, mut ad: u128, mut bn: u128, mut bd: u128) -> core::cmp::Ordering {
-    use core::cmp::Ordering;
-    let mut reversed = false;
-    loop {
-        let aq = an / ad;
-        let bq = bn / bd;
-        if aq != bq {
-            let o = aq.cmp(&bq);
-            return if reversed { o.reverse() } else { o };
-        }
-        let ar = an % ad;
-        let br = bn % bd;
-        match (ar == 0, br == 0) {
-            (true, true) => return Ordering::Equal,
-            (true, false) => {
-                return if reversed {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
-            (false, true) => {
-                return if reversed {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                }
-            }
-            (false, false) => {
-                an = ad;
-                ad = ar;
-                bn = bd;
-                bd = br;
-                reversed = !reversed;
-            }
-        }
-    }
+// Exact u128*u128 as high/low u128 limbs. Four fixed-width u64 products avoid both overflow and
+// attacker-controlled Euclidean loops in the reserve comparator.
+fn wide_product(a: u128, b: u128) -> (u128, u128) {
+    const MASK: u128 = u64::MAX as u128;
+    let a0 = a & MASK;
+    let a1 = a >> 64;
+    let b0 = b & MASK;
+    let b1 = b >> 64;
+
+    let p00 = a0 * b0;
+    let p01 = a0 * b1;
+    let p10 = a1 * b0;
+    let p11 = a1 * b1;
+    let middle = (p00 >> 64) + (p01 & MASK) + (p10 & MASK);
+    let low = ((middle & MASK) << 64) | (p00 & MASK);
+    let high = p11 + (p01 >> 64) + (p10 >> 64) + (middle >> 64);
+    (high, low)
+}
+
+// Compare a_num/a_den vs b_num/b_den exactly by comparing 256-bit cross-products. All
+// denominators are validated as nonzero at their write paths. Unlike continued fractions, this
+// takes constant work for every public bid, including adversarial Fibonacci ratios.
+fn cmp_rate(an: u128, ad: u128, bn: u128, bd: u128) -> core::cmp::Ordering {
+    wide_product(an, bd).cmp(&wide_product(bn, ad))
 }
 
 fn mul_div_floor(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
@@ -2682,6 +2666,76 @@ mod tests {
             Ordering::Greater
         );
         assert_eq!(cmp_rate(u128::MAX, 3, u128::MAX, 4), Ordering::Greater);
+    }
+
+    #[test]
+    fn wide_product_is_exact_at_u128_boundaries() {
+        assert_eq!(wide_product(u128::MAX, u128::MAX), (u128::MAX - 1, 1));
+        assert_eq!(wide_product(u128::MAX, 2), (1, u128::MAX - 1));
+        assert_eq!(wide_product(1u128 << 127, 1u128 << 127), (1u128 << 126, 0));
+        assert_eq!(wide_product(u128::MAX, 1), (0, u128::MAX));
+    }
+
+    #[test]
+    fn fixed_work_rate_compare_matches_exact_reference() {
+        use core::cmp::Ordering;
+
+        fn reference(mut an: u128, mut ad: u128, mut bn: u128, mut bd: u128) -> Ordering {
+            let mut reversed = false;
+            loop {
+                let aq = an / ad;
+                let bq = bn / bd;
+                if aq != bq {
+                    let ordering = aq.cmp(&bq);
+                    return if reversed {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+                let ar = an % ad;
+                let br = bn % bd;
+                match (ar == 0, br == 0) {
+                    (true, true) => return Ordering::Equal,
+                    (true, false) => {
+                        return if reversed {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    (false, true) => {
+                        return if reversed {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (false, false) => {
+                        an = ad;
+                        ad = ar;
+                        bn = bd;
+                        bd = br;
+                        reversed = !reversed;
+                    }
+                }
+            }
+        }
+
+        let mut state = u128::MAX - 58;
+        for _ in 0..2_048 {
+            let an = state;
+            state ^= state << 23;
+            state ^= state >> 17;
+            state ^= state << 26;
+            let ad = state | 1;
+            state = state.wrapping_mul(0xda94_2042_e4dd_58b5_da94_2042_e4dd_58b5);
+            let bn = state;
+            state ^= state << 19;
+            state ^= state >> 29;
+            let bd = state | 1;
+            assert_eq!(cmp_rate(an, ad, bn, bd), reference(an, ad, bn, bd));
+        }
     }
 
     #[test]
