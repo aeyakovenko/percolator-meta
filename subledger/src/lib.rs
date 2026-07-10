@@ -79,8 +79,8 @@ pub const POS_PRINCIPAL_OFF: usize = 72;
 pub const POS_WITHDRAWN_OFF: usize = 88;
 pub const POS_START_SLOT_OFF: usize = 89;
 pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) — the share-value points source.
-// Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
-// + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
+                                       // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
+                                       // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
 pub const POOL_OUTSTANDING_PRINCIPAL_OFF: usize = 80;
 pub const POOL_DEPOSIT_DEADLINE_SLOT_OFF: usize = 240;
 pub const POOL_DEPOSIT_WINDOW_SLOTS_OFF: usize = 248;
@@ -128,12 +128,13 @@ const IX_INSURANCE_WITHDRAW: u8 = 5;
 // the lock. This binds the vote's principal snapshot to capital that is still at
 // risk (closes the vote-outlives-capital vector).
 const IX_SET_VOTE_LOCK: u8 = 6;
-// Consent to RECEIVE the asset-0 insurance authority + operator roles from the market's
-// asset_admin (the Squads vault). The subledger never rotates keys itself — the Squads
-// vault (driven by the DAO) is the asset_admin and the only thing that calls percolator
-// UpdateAssetAuthority; this instruction only provides the pool's incoming co-signature
-// so the grant can land. Mirror of the twap's accept_operator.
+// Atomically receive the asset-0 insurance authority, operator, and asset-admin roles.
+// Taking asset_admin away from the governance vault is what prevents governance from
+// later reassigning the operator to itself and bypassing owner-bound withdrawals.
 const IX_ACCEPT_OPERATOR: u8 = 7;
+// Governance-authorized, hardcoded pool -> TWAP custody handoff. The pool remains the
+// current asset_admin until the TWAP atomically receives all three roles.
+const IX_HANDOFF_TO_TWAP: u8 = 8;
 
 // Percolator CPI tags (verified against the real v16 program, percolator-prog 5349b2f).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -143,8 +144,12 @@ const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 // insurance; the subledger's own per-owner owed computation is the depositor-principal cap on top.
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const ASSET_AUTH_ADMIN: u8 = 0;
 const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance)
 const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates WithdrawInsuranceLimited)
+const TWAP_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("TwapBuyBurn11111111111111111111111111111111");
+const TWAP_IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -458,7 +463,8 @@ fn payout(policy: u8, balance: u64, outstanding: u64, principal: u64) -> Result<
     if outstanding == 0 || principal == 0 || principal > outstanding {
         return Err(ProgramError::InvalidAccountData);
     }
-    let pro_rata = mul_div_floor(balance, principal, outstanding).ok_or(ProgramError::ArithmeticOverflow)?;
+    let pro_rata =
+        mul_div_floor(balance, principal, outstanding).ok_or(ProgramError::ArithmeticOverflow)?;
     match policy {
         POLICY_PRINCIPAL => {
             if balance >= outstanding {
@@ -516,6 +522,7 @@ pub fn process_instruction(
         IX_INSURANCE_WITHDRAW => process_insurance_withdraw(program_id, accounts, &mut data),
         IX_SET_VOTE_LOCK => process_set_vote_lock(program_id, accounts, &mut data),
         IX_ACCEPT_OPERATOR => process_accept_operator(program_id, accounts, &mut data),
+        IX_HANDOFF_TO_TWAP => process_handoff_to_twap(program_id, accounts, &mut data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -641,7 +648,14 @@ fn process_init_pool(
         &bootstrap_delay_seed,
         &bump_arr,
     ];
-    create_pda_robust(payer, pool_account, system_program, program_id, &seeds, POOL_SIZE)?;
+    create_pda_robust(
+        payer,
+        pool_account,
+        system_program,
+        program_id,
+        &seeds,
+        POOL_SIZE,
+    )?;
 
     let pool = Pool {
         mint: *mint.key,
@@ -723,7 +737,14 @@ fn process_deposit(
             owner.key.as_ref(),
             &bump_arr,
         ];
-        create_pda_robust(owner, position_account, system_program, program_id, &seeds, POSITION_SIZE)?;
+        create_pda_robust(
+            owner,
+            position_account,
+            system_program,
+            program_id,
+            &seeds,
+            POSITION_SIZE,
+        )?;
         Position {
             pool: *pool_account.key,
             owner: *owner.key,
@@ -772,7 +793,12 @@ fn process_deposit(
             &[],
             amount,
         )?,
-        &[owner_ata.clone(), vault.clone(), owner.clone(), token_program.clone()],
+        &[
+            owner_ata.clone(),
+            vault.clone(),
+            owner.clone(),
+            token_program.clone(),
+        ],
     )?;
 
     pool.outstanding_principal = pool
@@ -886,7 +912,15 @@ fn process_withdraw(
         let stb = position.shares;
         (redeem_shares(stb, balance, pool.total_shares)?, stb)
     } else {
-        (payout(pool.policy, balance, pool.outstanding_principal, position.principal)?, 0u128)
+        (
+            payout(
+                pool.policy,
+                balance,
+                pool.outstanding_principal,
+                position.principal,
+            )?,
+            0u128,
+        )
     };
 
     if paid > 0 {
@@ -914,7 +948,12 @@ fn process_withdraw(
                 &[],
                 paid,
             )?,
-            &[vault.clone(), owner_ata.clone(), pool_account.clone(), token_program.clone()],
+            &[
+                vault.clone(),
+                owner_ata.clone(),
+                pool_account.clone(),
+                token_program.clone(),
+            ],
             &[&seeds],
         )?;
     }
@@ -1140,7 +1179,14 @@ fn process_init_insurance_pool(
         &bootstrap_delay_seed,
         &bump_arr,
     ];
-    create_pda_robust(payer, pool_account, system_program, program_id, &seeds, POOL_SIZE)?;
+    create_pda_robust(
+        payer,
+        pool_account,
+        system_program,
+        program_id,
+        &seeds,
+        POOL_SIZE,
+    )?;
 
     let pool = Pool {
         mint: *mint.key,
@@ -1284,7 +1330,14 @@ fn process_insurance_deposit(
             owner.key.as_ref(),
             &pbump,
         ];
-        create_pda_robust(owner, position_account, system_program, program_id, &seeds, POSITION_SIZE)?;
+        create_pda_robust(
+            owner,
+            position_account,
+            system_program,
+            program_id,
+            &seeds,
+            POSITION_SIZE,
+        )?;
         Position {
             pool: *pool_account.key,
             owner: *owner.key,
@@ -1316,7 +1369,12 @@ fn process_insurance_deposit(
             &[],
             amount,
         )?,
-        &[owner_ata.clone(), holding.clone(), owner.clone(), token_program.clone()],
+        &[
+            owner_ata.clone(),
+            holding.clone(),
+            owner.clone(),
+            token_program.clone(),
+        ],
     )?;
 
     // 2) holding -> Percolator insurance vault, signed by the pool PDA as the
@@ -1509,12 +1567,8 @@ fn process_insurance_withdraw(
     let shares_to_burn = if position.principal == 0 {
         0u128
     } else {
-        wide_mul_div_floor(
-            position.shares,
-            amount as u128,
-            position.principal as u128,
-        )
-        .ok_or(ProgramError::ArithmeticOverflow)?
+        wide_mul_div_floor(position.shares, amount as u128, position.principal as u128)
+            .ok_or(ProgramError::ArithmeticOverflow)?
     };
     let owed = if pool.policy == POLICY_WITH_SURPLUS {
         redeem_shares(shares_to_burn, insurance, pool.total_shares)?
@@ -1580,7 +1634,12 @@ fn process_insurance_withdraw(
                 &[],
                 owed,
             )?,
-            &[holding.clone(), owner_ata.clone(), pool_account.clone(), token_program.clone()],
+            &[
+                holding.clone(),
+                owner_ata.clone(),
+                pool_account.clone(),
+                token_program.clone(),
+            ],
             &[&seeds],
         )?;
     }
@@ -1670,21 +1729,11 @@ fn process_set_vote_lock(
 // accept_operator accounts: [asset_admin(signer), pool, market_slab(w), percolator_program]
 // data: none
 //
-// This is NOT a key-rotation instruction and gives the subledger no power over keys.
-// Squads is the asset_admin and the ONLY party that rotates the percolator operator; the
-// subledger merely supplies the pool's mandatory incoming CONSENT so a Squads-initiated
-// grant can land. percolator's UpdateAssetAuthority requires a non-zero incoming key to
-// co-sign (asset-0 insurance has no consent-free grant path), and a PDA can only co-sign
-// via its program — so without this one-line consent hook the Squads grant cannot complete.
-// It is deliberately powerless: it hardcodes the new operator/authority to THIS pool's own
-// PDA (never an arbitrary key), and it only succeeds when the real asset_admin (the Squads
-// vault, reachable only via a timelock'd execute) co-signs — percolator enforces that.
-// So: Squads rotates the key; the subledger only says "yes, I will hold the funds." The
-// granted asset-0 insurance authority (kind 1, gates TopUpInsurance) + operator (kind 2,
-// gates WithdrawInsuranceLimited) are what let insurance_deposit/withdraw sign as the pool
-// during genesis. Later the DAO, via Squads, rotates the operator onward to the twap (whose
-// own accept_operator is the exact mirror of this). Safe to leave permissionless: it can
-// only ever make the canonical, market-bound pool the operator, and only with Squads' sig.
+// The incoming pool PDA co-signs every rotation. Asset-admin moves LAST, after the
+// insurance roles, so all three changes are atomic and the old externally controlled
+// admin cannot recapture them after this instruction commits. This program exposes no
+// arbitrary authority setter: the pool can sign only for this self-grant and the fixed
+// TWAP handoff below.
 fn process_accept_operator(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1694,7 +1743,7 @@ fn process_accept_operator(
         return Err(ProgramError::InvalidInstructionData);
     }
     let iter = &mut accounts.iter();
-    let asset_admin = next_account_info(iter)?; // the market's current asset_admin (Squads vault)
+    let asset_admin = next_account_info(iter)?; // controller on first grant; TWAP on recovery
     let pool_account = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
@@ -1752,10 +1801,13 @@ fn process_accept_operator(
         &bootstrap_delay_seed,
         core::slice::from_ref(&pool.bump),
     ];
-    // Receive BOTH the insurance authority (TopUp) and operator (Withdraw) roles for
-    // asset 0. percolator requires the current asset_admin (asset_admin) and the incoming
-    // key (the pool) to co-sign each rotation.
-    for kind in [ASSET_AUTH_INSURANCE, ASSET_AUTH_INSURANCE_OPERATOR] {
+    // Receive the two insurance roles and then asset_admin. The final rotation removes
+    // governance's direct path to reassign either role and withdraw principal.
+    for kind in [
+        ASSET_AUTH_INSURANCE,
+        ASSET_AUTH_INSURANCE_OPERATOR,
+        ASSET_AUTH_ADMIN,
+    ] {
         let mut ix_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
         ix_data.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
         ix_data.push(kind);
@@ -1780,6 +1832,117 @@ fn process_accept_operator(
         )?;
     }
     Ok(())
+}
+
+// handoff_to_twap accounts:
+// [squads_vault(signer), pool(current asset_admin), twap_config,
+//  twap_authority, market_slab(w), percolator_program, twap_program]
+// data: none
+//
+// The governance signer authorizes timing, but never receives a Percolator role. The
+// pool signs a CPI to the fixed TWAP program, which hardcodes the only incoming
+// authority to its config-bound PDA and atomically protects this pool's live
+// outstanding principal. Percolator verifies that this pool is the current
+// asset_admin, while the TWAP verifies the Squads vault and all market bindings.
+fn process_handoff_to_twap(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let squads_vault = next_account_info(iter)?;
+    let pool_account = next_account_info(iter)?;
+    let twap_config = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let twap_program = next_account_info(iter)?;
+
+    if !squads_vault.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *twap_program.key != TWAP_PROGRAM_ID || !twap_program.executable {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    if !pool.is_insurance()
+        || *market_slab.key != pool.market_slab
+        || *percolator_program.key != pool.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let asset_id_bytes = pool.asset_id.to_le_bytes();
+    let policy_seed = [pool.policy];
+    let domain_seed = [pool.domain];
+    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
+    let deposit_start_seed = pool.deposit_start_slot.to_le_bytes();
+    let bootstrap_delay_seed = pool.bootstrap_delay_slots.to_le_bytes();
+    let (expected_pool, bump) = Pubkey::find_program_address(
+        &pool_seeds_full(
+            &pool.mint,
+            &asset_id_bytes,
+            &pool.market_slab,
+            &pool.percolator_program,
+            &pool.coin_mint,
+            &policy_seed,
+            &domain_seed,
+            &deposit_window_seed,
+            &deposit_start_seed,
+            &bootstrap_delay_seed,
+        ),
+        program_id,
+    );
+    if *pool_account.key != expected_pool || bump != pool.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let seeds: [&[u8]; 12] = [
+        b"subledger_pool",
+        pool.mint.as_ref(),
+        &asset_id_bytes,
+        pool.market_slab.as_ref(),
+        pool.percolator_program.as_ref(),
+        pool.coin_mint.as_ref(),
+        &policy_seed,
+        &domain_seed,
+        &deposit_window_seed,
+        &deposit_start_seed,
+        &bootstrap_delay_seed,
+        core::slice::from_ref(&pool.bump),
+    ];
+
+    let mut handoff_data = vec![TWAP_IX_ACCEPT_FROM_SUBLEDGER];
+    handoff_data.extend_from_slice(&(pool.outstanding_principal as u128).to_le_bytes());
+    invoke_signed(
+        &Instruction {
+            program_id: *twap_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*squads_vault.key, true),
+                AccountMeta::new_readonly(*pool_account.key, true),
+                AccountMeta::new(*twap_config.key, false),
+                AccountMeta::new_readonly(*twap_authority.key, false),
+                AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new_readonly(*percolator_program.key, false),
+            ],
+            data: handoff_data,
+        },
+        &[
+            squads_vault.clone(),
+            pool_account.clone(),
+            twap_config.clone(),
+            twap_authority.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+            twap_program.clone(),
+        ],
+        &[&seeds],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1811,9 +1974,23 @@ mod tests {
         p.serialize(&mut d);
         assert_eq!(&d[POS_POOL_OFF..POS_POOL_OFF + 32], pool.as_ref());
         assert_eq!(&d[POS_OWNER_OFF..POS_OWNER_OFF + 32], owner.as_ref());
-        assert_eq!(u64::from_le_bytes(d[POS_PRINCIPAL_OFF..POS_PRINCIPAL_OFF + 8].try_into().unwrap()), p.principal);
+        assert_eq!(
+            u64::from_le_bytes(
+                d[POS_PRINCIPAL_OFF..POS_PRINCIPAL_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            p.principal
+        );
         assert_eq!(d[POS_WITHDRAWN_OFF], 1);
-        assert_eq!(u64::from_le_bytes(d[POS_START_SLOT_OFF..POS_START_SLOT_OFF + 8].try_into().unwrap()), p.start_slot);
+        assert_eq!(
+            u64::from_le_bytes(
+                d[POS_START_SLOT_OFF..POS_START_SLOT_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            p.start_slot
+        );
     }
 
     #[test]
@@ -1864,11 +2041,7 @@ mod tests {
             Some(amount)
         );
         assert_eq!(
-            wide_mul_div_floor(
-                amount,
-                shares + VIRTUAL_SHARES,
-                amount + 1,
-            ),
+            wide_mul_div_floor(amount, shares + VIRTUAL_SHARES, amount + 1,),
             Some(shares)
         );
         assert_eq!(
@@ -1906,7 +2079,11 @@ mod tests {
         pool.serialize(&mut buf);
         // Canary the exported quorum-denominator offset (finding ID) so consumers can cross-pin it.
         assert_eq!(
-            u64::from_le_bytes(buf[POOL_OUTSTANDING_PRINCIPAL_OFF..POOL_OUTSTANDING_PRINCIPAL_OFF + 8].try_into().unwrap()),
+            u64::from_le_bytes(
+                buf[POOL_OUTSTANDING_PRINCIPAL_OFF..POOL_OUTSTANDING_PRINCIPAL_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
             12345,
             "Pool.outstanding_principal must serialize at POOL_OUTSTANDING_PRINCIPAL_OFF"
         );
@@ -1992,16 +2169,28 @@ mod tests {
         // didn't earn).
         let alice = mint_shares(100, 0, 0).unwrap();
         let bob = mint_shares(100, alice, 150).unwrap();
-        assert!(bob < alice, "late bob mints fewer shares than early alice for the same principal");
+        assert!(
+            bob < alice,
+            "late bob mints fewer shares than early alice for the same principal"
+        );
         let total = alice + bob;
         // Pool balance 250. Alice redeems ~her principal + the 50 tenure surplus (~150); Bob redeems
         // only ~his principal (~100), capturing ~none of the pre-existing surplus (dust to the
         // virtual offset). A late entrant cannot extract early backers' surplus — the soft-veto base.
         let alice_out = redeem_shares(alice, 250, total).unwrap();
         let bob_out = redeem_shares(bob, 250 - alice_out, total - alice).unwrap();
-        assert!((148..=150).contains(&alice_out), "alice gets principal+tenure surplus ~150: {alice_out}");
-        assert!((99..=100).contains(&bob_out), "bob gets ~principal, ~0 pre-existing surplus: {bob_out}");
-        assert!(bob_out < alice_out, "the late depositor cannot capture the early backer's surplus");
+        assert!(
+            (148..=150).contains(&alice_out),
+            "alice gets principal+tenure surplus ~150: {alice_out}"
+        );
+        assert!(
+            (99..=100).contains(&bob_out),
+            "bob gets ~principal, ~0 pre-existing surplus: {bob_out}"
+        );
+        assert!(
+            bob_out < alice_out,
+            "the late depositor cannot capture the early backer's surplus"
+        );
     }
 
     // Inflation/donation skim — the classic ERC4626 first-depositor attack — is bounded AND
@@ -2024,7 +2213,10 @@ mod tests {
         let a_shares = mint_shares(attacker_deposit, 0, 0).unwrap();
         let balance_after_donation = attacker_deposit + donation; // no shares minted for the donation
         let v_shares = mint_shares(victim_deposit, a_shares, balance_after_donation).unwrap();
-        assert!(v_shares > 0, "victim still mints non-zero shares — no round-to-zero griefing");
+        assert!(
+            v_shares > 0,
+            "victim still mints non-zero shares — no round-to-zero griefing"
+        );
 
         let total = a_shares + v_shares;
         let pool_balance = balance_after_donation + victim_deposit;
@@ -2035,11 +2227,17 @@ mod tests {
 
         // (a) The attack is strictly self-defeating: the attacker gets back less than deposit+donation.
         let a_in = attacker_deposit + donation;
-        assert!(a_out < a_in, "inflation attack is self-defeating: attacker out {a_out} < in {a_in}");
+        assert!(
+            a_out < a_in,
+            "inflation attack is self-defeating: attacker out {a_out} < in {a_in}"
+        );
         // (b) The victim recovers essentially all principal — the skim is dust (« 0.1%).
         let max_skim = victim_deposit / 1000 + 2;
-        assert!(v_out + max_skim >= victim_deposit,
-            "victim recovers ~all principal: out {v_out} of {victim_deposit} (skim {})", victim_deposit - v_out);
+        assert!(
+            v_out + max_skim >= victim_deposit,
+            "victim recovers ~all principal: out {v_out} of {victim_deposit} (skim {})",
+            victim_deposit - v_out
+        );
     }
 
     // IMPAIRED-POOL CONSERVATION (share redemption under a market loss). POLICY_WITH_SURPLUS exits redeem
@@ -2065,16 +2263,28 @@ mod tests {
             let owed = redeem_shares(sh, balance, shares_left).unwrap();
             // Each holder takes the SAME ~60% haircut regardless of exit order (pro-rata fairness).
             let pct = owed * 100 / principal;
-            assert!((59..=60).contains(&pct), "pro-rata haircut ~60% for principal {principal}: got {owed} ({pct}%)");
+            assert!(
+                (59..=60).contains(&pct),
+                "pro-rata haircut ~60% for principal {principal}: got {owed} ({pct}%)"
+            );
             // Never pay more than the pool currently holds (no over-redemption).
-            assert!(owed <= balance, "a redemption can never exceed the live balance");
+            assert!(
+                owed <= balance,
+                "a redemption can never exceed the live balance"
+            );
             balance -= owed; // saturating not needed: owed <= balance pinned above
             shares_left -= sh;
             redeemed += owed;
         }
         // Conservation: the sum of all exits equals the impaired balance — nothing minted, nothing stranded,
         // and the LAST exiter drained the pool to exactly empty (no insolvency, no leftover dust trapped).
-        assert_eq!(redeemed, 600, "all exits sum to exactly the impaired insurance — pool conserved");
-        assert_eq!(balance, 0, "the pool drains to zero; the last exiter is not stranded");
+        assert_eq!(
+            redeemed, 600,
+            "all exits sum to exactly the impaired insurance — pool conserved"
+        );
+        assert_eq!(
+            balance, 0,
+            "the pool drains to zero; the last exiter is not stranded"
+        );
     }
 }

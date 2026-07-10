@@ -1,9 +1,5 @@
 use crate::{
-    percolator_v16::{
-        update_asset_authority_ix, update_market_0_insurance_operator_by_asset_admin_ix,
-        withdraw_insurance_domain_ix, WithdrawInsuranceAccounts, ASSET_AUTH_INSURANCE_OPERATOR,
-        MARKET_0_ASSET_INDEX,
-    },
+    percolator_v16::{withdraw_insurance_domain_ix, WithdrawInsuranceAccounts},
     Amount, Slot,
 };
 use solana_program::{instruction::Instruction, pubkey::Pubkey};
@@ -235,30 +231,6 @@ impl TwapProgramConfig {
             vault_authority: self.withdraw_accounts.percolator_vault_authority,
             token_program: self.withdraw_accounts.token_program,
         })
-    }
-
-    pub fn retire_current_operator_to_squads_ix(self) -> Instruction {
-        update_asset_authority_ix(
-            self.withdraw_accounts.percolator_program,
-            self.authority_chain.twap_pda,
-            self.authority_chain.squads,
-            self.authority_chain.market,
-            MARKET_0_ASSET_INDEX,
-            ASSET_AUTH_INSURANCE_OPERATOR,
-        )
-    }
-
-    pub fn install_current_operator_from_squads_ix(self) -> Instruction {
-        self.replace_current_operator_from_squads_ix()
-    }
-
-    pub fn replace_current_operator_from_squads_ix(self) -> Instruction {
-        update_market_0_insurance_operator_by_asset_admin_ix(
-            self.withdraw_accounts.percolator_program,
-            self.authority_chain.squads,
-            self.authority_chain.twap_pda,
-            self.authority_chain.market,
-        )
     }
 
     pub fn accept_bids_permissionlessly(
