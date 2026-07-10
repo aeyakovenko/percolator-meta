@@ -116,6 +116,8 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const GENESIS_VOTE_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("GenesisVote11111111111111111111111111111111");
+const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
 fn canonical_vault_address(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
@@ -148,8 +150,11 @@ const IX_ACCEPT_OPERATOR: u8 = 7;
 // Governance-authorized, hardcoded principal-only pool -> TWAP custody handoff. The pool
 // remains the current asset_admin until the TWAP atomically receives all three roles.
 const IX_HANDOFF_TO_TWAP: u8 = 8;
+// Permissionless resolved-mode backing return. The pool signs only the controller's
+// fixed, recipient-free asset-0 cleanup after custody has returned from TWAP.
+const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 9;
 
-// Percolator CPI tags (verified against the real v16 program, percolator-prog 5349b2f).
+// Percolator CPI tags (verified against the pinned v16 program, percolator-prog 624b13d).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 // tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
 // insurance-operator-gated, during-Live insurance withdraw that REPLACED the removed asset-0 tag-23
@@ -163,6 +168,7 @@ const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates Withdr
 const TWAP_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("TwapBuyBurn11111111111111111111111111111111");
 const TWAP_IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
+const CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -766,6 +772,9 @@ pub fn process_instruction(
         IX_SET_VOTE_LOCK => process_set_vote_lock(program_id, accounts, &mut data),
         IX_ACCEPT_OPERATOR => process_accept_operator(program_id, accounts, &mut data),
         IX_HANDOFF_TO_TWAP => process_handoff_to_twap(program_id, accounts, &mut data),
+        IX_RETURN_RESOLVED_ASSET0_BACKING => {
+            process_return_resolved_asset0_backing(program_id, accounts, &mut data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1976,6 +1985,98 @@ fn process_accept_operator(
         )?;
     }
     Ok(())
+}
+
+// return_resolved_asset0_backing accounts:
+// [pool(current asset_admin), governance, controller, market(w), provider_ata(w),
+//  controller_transit(w), percolator_vault(w), vault_authority,
+//  long_backing_ledger(w), short_backing_ledger(w), percolator_program,
+//  market_controller_program, token_program]
+//
+// Returning TWAP custody restores asset_admin to this market-bound insurance pool.
+// Anyone may then crank the controller's fixed resolved cleanup, but this wrapper
+// can sign only for the canonical pool PDA and exposes no amount or recipient.
+fn process_return_resolved_asset0_backing(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let pool_account = next_account_info(iter)?;
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let provider_destination = next_account_info(iter)?;
+    let controller_transit = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let long_backing_ledger = next_account_info(iter)?;
+    let short_backing_ledger = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let controller_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if *controller_program.key != MARKET_CONTROLLER_PROGRAM_ID
+        || !controller_program.executable
+        || *token_program.key != spl_token::ID
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    if !pool.is_insurance()
+        || pool.asset_id != 0
+        || pool.domain != DOMAIN_INSURANCE
+        || *market_slab.key != pool.market_slab
+        || *percolator_program.key != pool.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
+    invoke_signed_for_pool(
+        &pool,
+        pool_seed_version,
+        &Instruction {
+            program_id: *controller_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*governance.key, false),
+                AccountMeta::new_readonly(*controller.key, false),
+                AccountMeta::new_readonly(*pool_account.key, true),
+                AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new(*provider_destination.key, false),
+                AccountMeta::new(*controller_transit.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*vault_authority.key, false),
+                AccountMeta::new(*long_backing_ledger.key, false),
+                AccountMeta::new(*short_backing_ledger.key, false),
+                AccountMeta::new_readonly(*percolator_program.key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
+            ],
+            data: vec![CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING],
+        },
+        &[
+            governance.clone(),
+            controller.clone(),
+            pool_account.clone(),
+            market_slab.clone(),
+            provider_destination.clone(),
+            controller_transit.clone(),
+            percolator_vault.clone(),
+            vault_authority.clone(),
+            long_backing_ledger.clone(),
+            short_backing_ledger.clone(),
+            percolator_program.clone(),
+            token_program.clone(),
+            controller_program.clone(),
+        ],
+    )
 }
 
 // handoff_to_twap accounts:

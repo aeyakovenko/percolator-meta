@@ -12018,3 +12018,32 @@ provider. After Percolator moves `marketauth` to the controller, one atomic fixe
 outgoing provider; an unrelated provider takes no CPI and cannot be overwritten. The generic tag-65 proxy remains
 denied, governance cannot choose a recipient, and any failure rolls back the market-authority handoff with the
 restoration. No withdrawal, token destination, DAO signer, or reusable admin surface was added.
+
+## Tick — asset-0 backing could block terminal market cleanup (surface A/C)
+
+Percolator's marketauth shutdown override deliberately excludes asset 0 and ends at whole-market resolution.
+The controller's permissionless abandoned-backing return therefore worked for secondary assets only: a direct
+asset-0 probe reached the pinned binary after resolution and failed authorization. If the recorded provider had
+disappeared, its remaining long/short principal or earnings kept the market vault nonzero forever, so the fixed
+`CloseSlab` path could never complete even after every portfolio and insurance depositor exited.
+
+A fresh real-binary LiteSVM regression initialized a permissionless creator market, funded both asset-0 backing
+domains, included the separately covered reachable earnings state on both sides, donated marketauth without
+donating backing, handed asset-admin custody to the canonical genesis pool, and resolved the empty market. The
+old controller/subledger binaries failed the required return with `InvalidInstructionData`. The retained test
+also proves a live crank changes nothing and that the former controller admin cannot bypass the pool after
+custody moves.
+
+FIX: a read-only pinned-layout parser derives the market authority, resolved/empty state, and complete
+withdrawable principal/earnings for both asset-0 domains. A new fixed controller operation requires the named
+controller to remain marketauth, accepts no recipient or amount, atomically rotates only backing from the current
+asset admin to the controller, executes every withdrawal through Percolator, and forwards the complete transit
+balance only to the outgoing provider's canonical ATA. Before handoff the controller can supply the current-admin
+signature; after TWAP recovery the canonical market-bound insurance pool has a parameter-free wrapper that signs
+only this exact controller instruction. Generic authority and value-moving proxies remain denied.
+
+The late-failure probe supplies a valid long earnings ledger and malformed short earnings ledger. It reaches the
+short CPI only after long earnings/principal and the authority rotation, then requires Solana to roll back the
+market, vault, transit, destination, and both ledgers byte-for-byte. Replacing the bad ledger permits a public
+retry that pays both principals and both earnings totals. No DAO destination, amount, withdrawal key, or
+reusable asset-admin surface was added.

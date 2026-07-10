@@ -3726,6 +3726,75 @@ fn controller_return_shutdown_backing_ix(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn controller_return_resolved_asset0_backing_ix(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    current_asset_admin: &Pubkey,
+    market: &Pubkey,
+    provider_destination: &Pubkey,
+    controller_transit: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new_readonly(*controller, false),
+            AccountMeta::new_readonly(*current_asset_admin, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*provider_destination, false),
+            AccountMeta::new(*controller_transit, false),
+            AccountMeta::new(*vault, false),
+            AccountMeta::new_readonly(*vault_authority, false),
+            AccountMeta::new(*long_backing_ledger, false),
+            AccountMeta::new(*short_backing_ledger, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![7u8], // IX_RETURN_RESOLVED_ASSET0_BACKING
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subledger_return_resolved_asset0_backing_ix(
+    pool: &Pubkey,
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    provider_destination: &Pubkey,
+    controller_transit: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*pool, false),
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new_readonly(*controller, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*provider_destination, false),
+            AccountMeta::new(*controller_transit, false),
+            AccountMeta::new(*vault, false),
+            AccountMeta::new_readonly(*vault_authority, false),
+            AccountMeta::new(*long_backing_ledger, false),
+            AccountMeta::new(*short_backing_ledger, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(controller_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![9u8], // IX_RETURN_RESOLVED_ASSET0_BACKING
+    }
+}
+
 fn build_controller_grant_pool_message(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -4448,6 +4517,425 @@ fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
         provider.pubkey().to_bytes(),
         "the fixed handoff cannot select or overwrite an unrelated provider"
     );
+}
+
+// PUBLIC LOF: the shutdown override used by IX_RETURN_SHUTDOWN_BACKING intentionally excludes
+// asset 0, while a resolved market still requires its absent provider's two backing domains to be
+// drained before CloseSlab can make progress. The fixed path must derive every amount and recipient,
+// reject while live, and atomically return all remaining principal and earnings after resolution.
+#[test]
+fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let long_principal = 500_000u64;
+    let short_principal = 300_000u64;
+    let provider_destination =
+        canonical_insurance_vault(&creator.pubkey(), &collateral_mint);
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral_mint,
+        &creator.pubkey(),
+        long_principal + short_principal,
+    );
+    for (domain, amount) in [(0u16, long_principal), (1u16, short_principal)] {
+        let top_up = Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(provider_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+                domain,
+                amount: amount as u128,
+                expiry_slot: 10_000,
+            }
+            .encode(),
+        };
+        send(&mut svm, &[&payer, &creator], top_up)
+            .expect("creator funds both real asset-0 backing domains");
+    }
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8],
+    };
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("creator donates lifecycle control without donating backing");
+
+    // Add the exact state produced by Percolator's separately covered backing-fee path. The new
+    // cleanup still executes every withdrawal through the pinned binary; this setup only avoids a
+    // full trade lifecycle unrelated to the asset-0 authorization regression.
+    let long_provider_earnings = 10_000u64;
+    let short_provider_earnings = 7_000u64;
+    let provider_earnings = long_provider_earnings + short_provider_earnings;
+    let mint_earnings = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        &collateral_mint,
+        &percolator_vault,
+        &mint_authority.pubkey(),
+        &[],
+        provider_earnings,
+    )
+    .unwrap();
+    send(&mut svm, &[&payer, &mint_authority], mint_earnings)
+        .expect("fund reachable asset-0 backing earnings");
+    let mut slab_with_earnings = svm.get_account(&slab).unwrap();
+    {
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut slab_with_earnings.data).unwrap();
+        group.header.vault =
+            percolator::V16PodU128::new(group.header.vault.get() + provider_earnings as u128);
+        group.header.backing_provider_earnings_total =
+            percolator::V16PodU128::new(provider_earnings as u128);
+        group.markets[0].engine.backing_long.utilization_fee_earnings =
+            percolator::V16PodU128::new(long_provider_earnings as u128);
+        group.markets[0].engine.backing_short.utilization_fee_earnings =
+            percolator::V16PodU128::new(short_provider_earnings as u128);
+    }
+    svm.set_account(slab, slab_with_earnings).unwrap();
+
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let long_backing_ledger = Pubkey::new_unique();
+    let short_backing_ledger = Pubkey::new_unique();
+    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    svm.set_account(
+        long_backing_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; backing_ledger_len],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_account(
+        short_backing_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; backing_ledger_len - 1],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let return_backing = || {
+        controller_return_resolved_asset0_backing_ix(
+            &governance.pubkey(),
+            &controller,
+            &controller,
+            &slab,
+            &provider_destination,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+        )
+    };
+
+    let live_market = svm.get_account(&slab).unwrap();
+    let live_vault = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], return_backing()).is_err(),
+        "an external crank cannot force a live backing provider to exit"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), live_market);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), live_vault);
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+
+    // Move asset-admin custody through the same owner-bound pool used by genesis.
+    // Backing remains externally attributed, while the pool becomes the only PDA
+    // that can authorize the fixed post-resolution cleanup.
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut pool_data);
+    let init_pool = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(percolator_vault, false),
+            AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(vote_auth, false),
+            AccountMeta::new_readonly(coin_mint, false),
+        ],
+        data: pool_data,
+    };
+    send(&mut svm, &[&payer], init_pool).expect("initialize the canonical genesis pool");
+    let grant_pool = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![2u8], // IX_GRANT_GENESIS_POOL
+    };
+    send(&mut svm, &[&payer, &governance], grant_pool)
+        .expect("controller hands asset-admin custody to the owner-bound pool");
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        creator.pubkey().to_bytes(),
+        "custody handoff cannot absorb the external backing provider"
+    );
+
+    let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    let resolve = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: resolve_data,
+    };
+    send(&mut svm, &[&payer, &governance], resolve).expect("governance resolves the empty market");
+
+    let resolved_market = svm.get_account(&slab).unwrap();
+    let resolved_vault = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], return_backing()).is_err(),
+        "the old controller admin cannot bypass the pool after custody handoff"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), resolved_market);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), resolved_vault);
+
+    let pool_return = || {
+        subledger_return_resolved_asset0_backing_ix(
+            &pool,
+            &governance.pubkey(),
+            &controller,
+            &slab,
+            &provider_destination,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+        )
+    };
+    let market_before_bad_ledger = svm.get_account(&slab).unwrap();
+    let vault_before_bad_ledger = svm.get_account(&percolator_vault).unwrap();
+    let destination_before_bad_ledger = svm.get_account(&provider_destination).unwrap();
+    let transit_before_bad_ledger = svm.get_account(&controller_transit).unwrap();
+    let long_ledger_before_bad_ledger = svm.get_account(&long_backing_ledger).unwrap();
+    let short_ledger_before_bad_ledger = svm.get_account(&short_backing_ledger).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], pool_return()).is_err(),
+        "a late short-ledger failure must reject the complete two-domain return"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_bad_ledger);
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_bad_ledger
+    );
+    assert_eq!(
+        svm.get_account(&provider_destination).unwrap(),
+        destination_before_bad_ledger
+    );
+    assert_eq!(
+        svm.get_account(&controller_transit).unwrap(),
+        transit_before_bad_ledger
+    );
+    assert_eq!(
+        svm.get_account(&long_backing_ledger).unwrap(),
+        long_ledger_before_bad_ledger,
+        "the successful long-domain CPIs must roll back with the later failure"
+    );
+    assert_eq!(
+        svm.get_account(&short_backing_ledger).unwrap(),
+        short_ledger_before_bad_ledger
+    );
+
+    svm.set_account(
+        short_backing_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; backing_ledger_len],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    send(&mut svm, &[&payer], pool_return())
+        .expect("any cranker returns backing through the canonical pool admin");
+    assert_eq!(
+        token_amount(&svm, &provider_destination),
+        long_principal + short_principal + provider_earnings,
+        "the recorded provider receives both domains and all earnings"
+    );
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+    assert!(
+        svm.get_account(&controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "the fixed controller transit closes after forwarding its complete balance"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        controller.to_bytes(),
+        "only after a complete atomic return may the empty backing role leave the provider"
+    );
+    let long_ledger = percolator_prog::state::read_backing_domain_ledger(
+        &svm.get_account(&long_backing_ledger).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(long_ledger.authority, controller.to_bytes());
+    assert_eq!(long_ledger.domain, 0);
+    assert_eq!(
+        long_ledger.total_earnings_withdrawn_atoms,
+        long_provider_earnings as u128
+    );
+    let short_ledger = percolator_prog::state::read_backing_domain_ledger(
+        &svm.get_account(&short_backing_ledger).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(short_ledger.authority, controller.to_bytes());
+    assert_eq!(short_ledger.domain, 1);
+    assert_eq!(
+        short_ledger.total_earnings_withdrawn_atoms,
+        short_provider_earnings as u128
+    );
+
+    // The recovered backing was the terminal blocker: once it is gone, the
+    // fixed controller cleanup can close the resolved empty market end to end.
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    svm.set_account(
+        controller,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    let close_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new(governance.pubkey(), true),
+            AccountMeta::new(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new(controller_transit, false),
+            AccountMeta::new(governance_destination, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
+    };
+    send(&mut svm, &[&payer, &governance], close_market)
+        .expect("asset-0 recovery unblocks fixed terminal market cleanup");
+    assert!(
+        svm.get_account(&slab)
+            .map_or(true, |account| account.lamports == 0),
+        "the resolved slab closes after every attributed balance exits"
+    );
+    assert!(
+        svm.get_account(&percolator_vault)
+            .map_or(true, |account| account.lamports == 0),
+        "the empty Percolator vault closes with the slab"
+    );
+    assert_eq!(token_amount(&svm, &governance_destination), 0);
 }
 
 // Canonical authority chain: permissionless controller-owned market init, then

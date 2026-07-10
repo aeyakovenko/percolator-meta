@@ -2,7 +2,8 @@
 
 use core::mem::{offset_of, size_of};
 use percolator::{
-    EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount, V16ConfigAccount,
+    BackingBucketV16Account, EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount,
+    V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -11,6 +12,7 @@ pub const ASSET_WRAPPER_LEN: usize = 512;
 pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
+pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
 // Pinned `AssetOracleProfileV16`: four u8s, one u32, five u16s, six bytes
 // of padding, then two 32-byte authorities precede the backing authority.
 pub const BACKING_AUTHORITY_PROFILE_OFFSET: usize = 88;
@@ -25,6 +27,12 @@ pub enum ReadError {
     InvalidAsset,
     InvalidAccounting,
     Truncated,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackingDomainBalance {
+    pub principal_atoms: u128,
+    pub earnings_atoms: u128,
 }
 
 fn bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], ReadError> {
@@ -92,6 +100,68 @@ fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
     asset_wrapper_offset(asset_index)?
         .checked_add(ASSET_WRAPPER_LEN)
         .ok_or(ReadError::Truncated)
+}
+
+/// Returns the market-level authority in the pinned wrapper config.
+pub fn read_market_authority(data: &[u8]) -> Result<[u8; 32], ReadError> {
+    validate_market(data)?;
+    bytes(data, MARKET_AUTHORITY_OFFSET)
+}
+
+/// Returns true only after Percolator has resolved the market and every materialized
+/// portfolio/capital balance has exited. Value-moving CPIs repeat these checks; this
+/// view prevents a fixed authority transition from running before its first CPI.
+pub fn market_is_resolved_and_empty(data: &[u8]) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    let header = MARKET_GROUP_OFFSET;
+    let mode = data
+        .get(header + offset_of!(MarketGroupV16HeaderAccount, mode))
+        .copied()
+        .ok_or(ReadError::Truncated)?;
+    let c_tot = read_u128(
+        data,
+        header + offset_of!(MarketGroupV16HeaderAccount, c_tot),
+    )?;
+    let portfolios = read_u64(
+        data,
+        header + offset_of!(MarketGroupV16HeaderAccount, materialized_portfolio_count),
+    )?;
+    Ok(mode == 1 && c_tot == 0 && portfolios == 0)
+}
+
+/// Returns the withdrawable principal and provider earnings for both domains of one
+/// asset. Principal is stored as `BOUND_SCALE` numerators by the engine; deposits and
+/// withdrawal deltas are atom-exact, so a non-integral value is invalid accounting.
+pub fn read_asset_backing_balances(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[BackingDomainBalance; 2], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    let engine = asset_engine_offset(asset_index)?;
+    let read_bucket = |bucket_offset: usize| -> Result<BackingDomainBalance, ReadError> {
+        let bucket = engine
+            .checked_add(bucket_offset)
+            .ok_or(ReadError::Truncated)?;
+        let principal_num = read_u128(
+            data,
+            bucket + offset_of!(BackingBucketV16Account, fresh_unliened_backing_num),
+        )?;
+        if principal_num % BOUND_SCALE != 0 {
+            return Err(ReadError::InvalidAccounting);
+        }
+        Ok(BackingDomainBalance {
+            principal_atoms: principal_num / BOUND_SCALE,
+            earnings_atoms: read_u128(
+                data,
+                bucket + offset_of!(BackingBucketV16Account, utilization_fee_earnings),
+            )?,
+        })
+    };
+    Ok([
+        read_bucket(offset_of!(EngineAssetSlotV16Account, backing_long))?,
+        read_bucket(offset_of!(EngineAssetSlotV16Account, backing_short))?,
+    ])
 }
 
 /// Returns the backing authority recorded in one pinned-v16 asset profile.
