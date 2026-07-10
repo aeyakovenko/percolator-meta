@@ -41,6 +41,8 @@ const IX_CLOSE_MARKET_AND_RECLAIM: u8 = 5;
 const IX_RETURN_SHUTDOWN_BACKING: u8 = 6;
 const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
 const IX_RETURN_SHUTDOWN_INSURANCE: u8 = 8;
+const IX_RETURN_RESOLVED_ASSET_INSURANCE: u8 = 9;
+const IX_RETURN_RESOLVED_ASSET_BACKING: u8 = 10;
 
 const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -158,6 +160,12 @@ pub fn process_instruction<'a>(
         }
         IX_RETURN_SHUTDOWN_INSURANCE => {
             process_return_shutdown_insurance(program_id, accounts, data)
+        }
+        IX_RETURN_RESOLVED_ASSET_INSURANCE => {
+            process_return_resolved_asset_insurance(program_id, accounts, data)
+        }
+        IX_RETURN_RESOLVED_ASSET_BACKING => {
+            process_return_resolved_asset_backing(program_id, accounts, data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -708,6 +716,338 @@ fn process_return_shutdown_insurance<'a>(
         ],
         &[&seeds],
     )?;
+    forward_and_close_token_account(
+        controller,
+        provider_destination,
+        controller_transit,
+        provider_destination,
+        token_program,
+        &seeds,
+    )
+}
+
+fn rotate_asset_role_to_controller<'a>(
+    controller: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    signer_seeds: &[&[u8]],
+    asset_index: u16,
+    kind: u8,
+) -> ProgramResult {
+    let mut data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.push(kind);
+    data.extend_from_slice(controller.key.as_ref());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*controller.key, true),
+                AccountMeta::new_readonly(*controller.key, true),
+                AccountMeta::new(*market.key, false),
+            ],
+            data,
+        },
+        &[
+            controller.clone(),
+            controller.clone(),
+            market.clone(),
+            percolator_program.clone(),
+        ],
+        &[signer_seeds],
+    )
+}
+
+// return_resolved_asset_insurance accounts:
+// [governance, controller_pda, market(w), authority_canonical_ata(w),
+//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  controller_insurance_ledger(w), percolator_program, token_program]
+// data: asset_index(u16)
+//
+// Global permissionless resolution may race the live shutdown return above. In
+// resolved mode marketauth no longer has a withdrawal override, but the controller
+// remains the secondary asset's constrained asset_admin. This fixed path rotates
+// only insurance_authority to the controller, withdraws the exact asset-local
+// remainder read from the pinned slab, and forwards it to the outgoing authority's
+// canonical ATA. Any failed rotation, withdrawal, or transfer rolls the role back.
+fn process_return_resolved_asset_insurance<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let asset_index = u16::from_le_bytes(data.try_into().unwrap());
+    if asset_index == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    let iter = &mut accounts.iter();
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let provider_destination = next_account_info(iter)?;
+    let controller_transit = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let insurance_ledger = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !market.is_writable
+        || !provider_destination.is_writable
+        || !controller_transit.is_writable
+        || !percolator_vault.is_writable
+        || !insurance_ledger.is_writable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *token_program.key != spl_token::ID || insurance_ledger.owner != percolator_program.key {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let bump = controller_bump(
+        program_id,
+        governance,
+        controller,
+        market,
+        percolator_program,
+    )?;
+    let (provider, amount) = {
+        let market_data = market.try_borrow_data()?;
+        if percolator_accounting::read_market_authority(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != controller.key.to_bytes()
+            || !percolator_accounting::market_is_resolved_and_empty(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let authority = percolator_accounting::read_asset_insurance_authority(
+            &market_data,
+            usize::from(asset_index),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        let amount = percolator_accounting::read_asset_insurance_remaining(
+            &market_data,
+            usize::from(asset_index),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        if authority == [0u8; 32] || authority == controller.key.to_bytes() || amount == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        (Pubkey::new_from_array(authority), amount)
+    };
+    validate_provider_return_token_accounts(
+        controller,
+        &provider,
+        controller_transit,
+        provider_destination,
+    )?;
+
+    let bump_seed = [bump];
+    let seeds = signer_seeds(
+        governance.key,
+        market.key,
+        percolator_program.key,
+        &bump_seed,
+    );
+    rotate_asset_role_to_controller(
+        controller,
+        market,
+        percolator_program,
+        &seeds,
+        asset_index,
+        ASSET_AUTH_INSURANCE,
+    )?;
+
+    let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
+    ix_data.extend_from_slice(&asset_index.to_le_bytes());
+    ix_data.extend_from_slice(&amount.to_le_bytes());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*controller.key, true),
+                AccountMeta::new(*market.key, false),
+                AccountMeta::new(*controller_transit.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*vault_authority.key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
+                AccountMeta::new(*insurance_ledger.key, false),
+            ],
+            data: ix_data,
+        },
+        &[
+            controller.clone(),
+            market.clone(),
+            controller_transit.clone(),
+            percolator_vault.clone(),
+            vault_authority.clone(),
+            token_program.clone(),
+            insurance_ledger.clone(),
+            percolator_program.clone(),
+        ],
+        &[&seeds],
+    )?;
+    forward_and_close_token_account(
+        controller,
+        provider_destination,
+        controller_transit,
+        provider_destination,
+        token_program,
+        &seeds,
+    )
+}
+
+// return_resolved_asset_backing accounts:
+// [governance, controller_pda, market(w), provider_canonical_ata(w),
+//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  long_backing_ledger(w), short_backing_ledger(w), percolator_program,
+//  token_program]
+// data: asset_index(u16)
+//
+// Resolved-mode companion to the shutdown backing return. The controller can
+// rotate only the backing role it already administers, and all principal and
+// earnings are slab-derived and returned to the outgoing recorded provider.
+fn process_return_resolved_asset_backing<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 2 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let asset_index = u16::from_le_bytes(data.try_into().unwrap());
+    if asset_index == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let long_domain = asset_index
+        .checked_mul(2)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    let short_domain = long_domain
+        .checked_add(1)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
+    let iter = &mut accounts.iter();
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let provider_destination = next_account_info(iter)?;
+    let controller_transit = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let long_backing_ledger = next_account_info(iter)?;
+    let short_backing_ledger = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !market.is_writable
+        || !provider_destination.is_writable
+        || !controller_transit.is_writable
+        || !percolator_vault.is_writable
+        || !long_backing_ledger.is_writable
+        || !short_backing_ledger.is_writable
+        || long_backing_ledger.key == short_backing_ledger.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *token_program.key != spl_token::ID
+        || long_backing_ledger.owner != percolator_program.key
+        || short_backing_ledger.owner != percolator_program.key
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let bump = controller_bump(
+        program_id,
+        governance,
+        controller,
+        market,
+        percolator_program,
+    )?;
+    let (provider, balances) = {
+        let market_data = market.try_borrow_data()?;
+        if percolator_accounting::read_market_authority(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != controller.key.to_bytes()
+            || !percolator_accounting::market_is_resolved_and_empty(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let authority = percolator_accounting::read_asset_backing_authority(
+            &market_data,
+            usize::from(asset_index),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        let balances = percolator_accounting::read_asset_backing_balances(
+            &market_data,
+            usize::from(asset_index),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        if authority == [0u8; 32]
+            || authority == controller.key.to_bytes()
+            || !balances
+                .iter()
+                .any(|balance| balance.principal_atoms != 0 || balance.earnings_atoms != 0)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        (Pubkey::new_from_array(authority), balances)
+    };
+    validate_provider_return_token_accounts(
+        controller,
+        &provider,
+        controller_transit,
+        provider_destination,
+    )?;
+
+    let bump_seed = [bump];
+    let seeds = signer_seeds(
+        governance.key,
+        market.key,
+        percolator_program.key,
+        &bump_seed,
+    );
+    rotate_asset_role_to_controller(
+        controller,
+        market,
+        percolator_program,
+        &seeds,
+        asset_index,
+        ASSET_AUTH_BACKING_BUCKET,
+    )?;
+
+    for (domain, balance, backing_ledger) in [
+        (long_domain, balances[0], long_backing_ledger),
+        (short_domain, balances[1], short_backing_ledger),
+    ] {
+        withdraw_backing_earnings(
+            controller,
+            market,
+            backing_ledger,
+            controller_transit,
+            percolator_vault,
+            vault_authority,
+            token_program,
+            percolator_program,
+            &seeds,
+            domain,
+            balance.earnings_atoms,
+        )?;
+        withdraw_backing_principal(
+            controller,
+            market,
+            controller_transit,
+            percolator_vault,
+            vault_authority,
+            token_program,
+            percolator_program,
+            &seeds,
+            domain,
+            balance.principal_atoms,
+        )?;
+    }
     forward_and_close_token_account(
         controller,
         provider_destination,

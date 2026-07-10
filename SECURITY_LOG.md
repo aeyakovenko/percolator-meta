@@ -12099,3 +12099,27 @@ roles, alongside the existing exact backing-provider restoration. The genesis-po
 insurance only when both recorded roles are already the controller; protocol donations remain adoptable, while
 external balances must exit first. No caller-selected key, destination, amount, withdrawal instruction, or new
 admin authority was added, and any restoration or grant CPI failure rolls the whole transaction back.
+
+## Tick — public stale resolution could strand secondary provider capital (surface A/C)
+
+Percolator's secondary-asset shutdown override lets marketauth return abandoned insurance and backing only while
+the market is live. Its configured global stale resolver is public and signerless; once it resolves the whole
+market, that override ends and only the recorded asset-local provider can withdraw. A cranker could therefore
+win the race against cleanup after an external provider disappeared, permanently blocking terminal market
+closure with that provider's insurance, backing principal, or earnings still in the vault.
+
+A fresh pinned-Percolator + Squads + controller LiteSVM regression activated asset 1, funded both insurance
+domains and both backing sides, shut the asset down, and left fresh short-side principal, earnings, and insurance
+after exercising the live return. It then invoked public `ResolveStalePermissionless` without a DAO or provider
+signature. The old controller SBF failed the required post-resolution return with `InvalidInstructionData`.
+The retained test rejects both paths while live, rejects DAO-owned destinations after resolution, proves the old
+shutdown path is dead, recovers every atom to the recorded provider, and continues through depositor exit and
+real `CloseSlab` cleanup.
+
+FIX: controller tags 9 and 10 require a secondary asset in a resolved, empty controller-owned market. They read
+the outgoing insurance or backing authority and exact complete balances from the pinned slab, use the
+controller's existing asset-admin role to rotate only that value role, invoke Percolator's resolved withdrawal,
+and atomically forward and close the transit account to the outgoing provider's canonical ATA. Backing handles
+both domains and earnings before principal. No governance signer, caller-selected amount, DAO recipient, generic
+authority mutation, or reusable withdrawal key was added; a failed CPI rolls the role change and all transfers
+back.

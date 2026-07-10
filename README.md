@@ -26,10 +26,11 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 - **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
   `marketauth` and can sign only a fixed allow-list of lifecycle, oracle, and fee-policy calls. Its
   generic proxy rejects live deposits, withdrawals, swaps, portfolio operations, and every
-  authority mutation. After a secondary asset's shutdown matures, fixed permissionless paths return
-  its remaining insurance only to the recorded insurance authority and its backing only to the
-  recorded backing provider. Asset 0 instead has a fixed whole-market resolution path that derives
-  and atomically returns both backing domains after Percolator proves the market empty. Raw
+  authority mutation. Fixed permissionless paths return a secondary asset's remaining insurance
+  only to the recorded insurance authority and its backing only to the recorded backing provider,
+  both after shutdown matures and after a public stale resolver wins the race. Asset 0 instead has a
+  fixed whole-market resolution path that derives and atomically returns both backing domains after
+  Percolator proves the market empty. Raw
   `CloseSlab` is excluded; a fixed terminal cleanup forwards only vault dust and account rent to
   Squads. Donating a creator-owned market preserves funded outgoing asset-0 insurance roles and the
   recorded backing provider; the handoff cannot collapse that capital into the controller or select
@@ -138,9 +139,15 @@ anyone can return its complete asset-local insurance and each backing domain thr
 The controller derives the insurance amount from the pinned slab and accepts no caller-selected
 amount. Each destination is the recorded provider's canonical token account, not a DAO-selected
 account; backing earnings are paid first and each temporary controller account is forwarded and
-closed atomically. The insurance path rejects a controller-owned live operator, so Percolator can
-authorize it only through the secondary-asset shutdown override. These returns must run before
-market resolution, when that override ends.
+closed atomically. While live, Percolator authorizes these returns only through its delayed
+secondary-asset shutdown override.
+
+Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
+run. The resolved companions require the whole market to be resolved and empty, derive every amount
+from the slab, and use the controller's existing secondary `asset_admin` role to rotate only the
+relevant insurance or backing role. They then return all value to the outgoing recorded provider's
+canonical account. The caller and DAO still choose neither an amount nor a recipient, and any failed
+rotation, withdrawal, forwarding, or close rolls the entire operation back.
 
 Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
 reads both domains' complete principal and earnings from the pinned slab, atomically transfers the
@@ -161,8 +168,8 @@ At genesis-pool grant, the controller moves the oracle role to Squads and then a
 insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved
 builder, but it cannot use that role to move insurance or backing. Post-genesis, TWAP receives both
 insurance roles and `asset_admin`; its exposed Percolator CPIs are fixed-purpose and accept no
-arbitrary withdrawal destination. Resolved-mode insurance withdrawal therefore remains unavailable
-to governance as well.
+arbitrary withdrawal destination. Governance therefore has no arbitrary resolved-mode insurance
+withdrawal; only the provider-bound fixed cleanup is available.
 
 ## Build And Test
 
