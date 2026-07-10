@@ -3,9 +3,10 @@
 //! A controller PDA permanently holds `marketauth`. Governance can make it sign
 //! only a fixed set of lifecycle and policy instructions. Generic value movement
 //! and all authority mutation tags are absent by construction. Fixed shutdown and
-//! resolved paths can return backing or insurance only to its recorded provider,
-//! and terminal cleanup runs only after Percolator proves every attributed balance
-//! is zero.
+//! resolved paths can return backing or insurance only to its recorded provider or
+//! retain controller-owned protocol insurance for terminal governance reclaim.
+//! Terminal cleanup runs only after Percolator proves every attributed balance is
+//! zero.
 #![no_std]
 extern crate alloc;
 
@@ -394,6 +395,36 @@ fn validate_provider_return_token_accounts(
         || *destination.key != canonical_destination
         || transit_state.owner != *controller.key
         || transit_state.mint != destination_state.mint
+        || transit_state.delegate.is_some()
+        || transit_state.delegated_amount != 0
+        || transit_state.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+fn validate_controller_insurance_transit(
+    controller: &AccountInfo,
+    transit: &AccountInfo,
+    destination: &AccountInfo,
+) -> ProgramResult {
+    if transit.key != destination.key || transit.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
+    let canonical_transit = Pubkey::find_program_address(
+        &[
+            controller.key.as_ref(),
+            spl_token::ID.as_ref(),
+            transit_state.mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0;
+    if transit_state.state != spl_token::state::AccountState::Initialized
+        || *transit.key != canonical_transit
+        || transit_state.owner != *controller.key
         || transit_state.delegate.is_some()
         || transit_state.delegated_amount != 0
         || transit_state.close_authority.is_some()
@@ -792,12 +823,12 @@ fn rotate_asset_role_to_controller<'a>(
 //  controller_insurance_ledger(w), percolator_program, token_program]
 // data: asset_index(u16)
 //
-// Global permissionless resolution may race the live shutdown return above. In
-// resolved mode marketauth no longer has a withdrawal override, but the controller
-// remains the secondary asset's constrained asset_admin. This fixed path rotates
-// only insurance_authority to the controller, withdraws the exact asset-local
-// remainder read from the pinned slab, and forwards it to the outgoing authority's
-// canonical ATA. Any failed rotation, withdrawal, or transfer rolls the role back.
+// Global permissionless resolution may race the live shutdown return above. For an
+// external secondary provider, this fixed path rotates only insurance_authority to
+// the controller, withdraws the exact asset-local remainder read from the pinned
+// slab, and forwards it to the outgoing authority's canonical ATA. Controller-owned
+// protocol insurance, including asset 0, stays in the canonical controller ATA for
+// the existing terminal governance reclaim. Any failed operation rolls back.
 fn process_return_resolved_asset_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -807,9 +838,6 @@ fn process_return_resolved_asset_insurance<'a>(
         return Err(ProgramError::InvalidInstructionData);
     }
     let asset_index = u16::from_le_bytes(data.try_into().unwrap());
-    if asset_index == 0 {
-        return Err(ProgramError::InvalidArgument);
-    }
 
     let iter = &mut accounts.iter();
     let governance = next_account_info(iter)?;
@@ -841,7 +869,7 @@ fn process_return_resolved_asset_insurance<'a>(
         market,
         percolator_program,
     )?;
-    let (provider, amount) = {
+    let (provider, amount, controller_owned) = {
         let market_data = market.try_borrow_data()?;
         if percolator_accounting::read_market_authority(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
@@ -861,17 +889,26 @@ fn process_return_resolved_asset_insurance<'a>(
             usize::from(asset_index),
         )
         .map_err(|_| ProgramError::InvalidAccountData)?;
-        if authority == [0u8; 32] || authority == controller.key.to_bytes() || amount == 0 {
+        let controller_owned = authority == controller.key.to_bytes();
+        if authority == [0u8; 32] || amount == 0 || (asset_index == 0 && !controller_owned) {
             return Err(ProgramError::InvalidAccountData);
         }
-        (Pubkey::new_from_array(authority), amount)
+        (Pubkey::new_from_array(authority), amount, controller_owned)
     };
-    validate_provider_return_token_accounts(
-        controller,
-        &provider,
-        controller_transit,
-        provider_destination,
-    )?;
+    if controller_owned {
+        validate_controller_insurance_transit(
+            controller,
+            controller_transit,
+            provider_destination,
+        )?;
+    } else {
+        validate_provider_return_token_accounts(
+            controller,
+            &provider,
+            controller_transit,
+            provider_destination,
+        )?;
+    }
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -880,14 +917,16 @@ fn process_return_resolved_asset_insurance<'a>(
         percolator_program.key,
         &bump_seed,
     );
-    rotate_asset_role_to_controller(
-        controller,
-        market,
-        percolator_program,
-        &seeds,
-        asset_index,
-        ASSET_AUTH_INSURANCE,
-    )?;
+    if !controller_owned {
+        rotate_asset_role_to_controller(
+            controller,
+            market,
+            percolator_program,
+            &seeds,
+            asset_index,
+            ASSET_AUTH_INSURANCE,
+        )?;
+    }
 
     let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
     ix_data.extend_from_slice(&asset_index.to_le_bytes());
@@ -918,14 +957,18 @@ fn process_return_resolved_asset_insurance<'a>(
         ],
         &[&seeds],
     )?;
-    forward_and_close_token_account(
-        controller,
-        provider_destination,
-        controller_transit,
-        provider_destination,
-        token_program,
-        &seeds,
-    )
+    if controller_owned {
+        Ok(())
+    } else {
+        forward_and_close_token_account(
+            controller,
+            provider_destination,
+            controller_transit,
+            provider_destination,
+            token_program,
+            &seeds,
+        )
+    }
 }
 
 // return_resolved_asset_backing accounts:
