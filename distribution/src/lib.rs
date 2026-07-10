@@ -425,7 +425,10 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
         return Err(ProgramError::IllegalOwner);
     }
     let vault_state = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
-    if vault_state.mint != *coin_mint.key || vault_state.owner != expected_config {
+    if vault_state.state != spl_token::state::AccountState::Initialized
+        || vault_state.mint != *coin_mint.key
+        || vault_state.owner != expected_config
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     // Solvency invariant: the vault must already hold the full promised supply. The

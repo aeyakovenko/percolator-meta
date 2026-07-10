@@ -1557,6 +1557,140 @@ fn init_config_rejects_a_freezable_coin() {
     );
 }
 
+// PERMANENT VAULT-FREEZE DOS: revoking a mint's freeze authority does not thaw accounts that were
+// frozen first. The mint then satisfies both fixed-supply authority checks, but the config PDA can
+// never transfer or burn the vault balance. Init must reject the terminal Frozen account state.
+#[test]
+fn init_config_rejects_an_already_frozen_vault_after_freeze_authority_revocation() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+
+    let mint = Keypair::new();
+    let rent = svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN);
+    let ixs = [
+        system_instruction::create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            rent,
+            spl_token::state::Mint::LEN as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_mint(
+            &spl_token::ID,
+            &mint.pubkey(),
+            &mint_authority.pubkey(),
+            Some(&freeze_authority.pubkey()),
+            6,
+        )
+        .unwrap(),
+    ];
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[&payer, &mint],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).unwrap();
+    let coin_mint = mint.pubkey();
+
+    let authority = Pubkey::new_unique();
+    let config = dist_config_pda(&coin_mint, &authority, 1_000_000);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    mint_to(
+        &mut svm,
+        &payer,
+        &coin_mint,
+        &mint_authority,
+        &vault,
+        100,
+    );
+
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &vault,
+        &coin_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke_mint = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &coin_mint,
+        None,
+        spl_token::instruction::AuthorityType::MintTokens,
+        &mint_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke_freeze = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &coin_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[freeze, revoke_mint, revoke_freeze],
+        Some(&payer.pubkey()),
+        &[&payer, &mint_authority, &freeze_authority],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).unwrap();
+
+    let mint_state = spl_token::state::Mint::unpack(&svm.get_account(&coin_mint).unwrap().data)
+        .unwrap();
+    let vault_state = spl_token::state::Account::unpack(&svm.get_account(&vault).unwrap().data)
+        .unwrap();
+    assert!(mint_state.mint_authority.is_none());
+    assert!(mint_state.freeze_authority.is_none());
+    assert_eq!(mint_state.supply, 100);
+    assert_eq!(vault_state.amount, 100);
+    assert_eq!(
+        vault_state.state,
+        spl_token::state::AccountState::Frozen,
+        "revocation leaves the vault permanently frozen"
+    );
+
+    let mut data = vec![0u8];
+    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let init = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[init],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
+    );
+    assert!(
+        svm.send_transaction(tx).is_err(),
+        "a permanently frozen full-supply vault must not initialize distribution"
+    );
+    assert_eq!(
+        svm.get_account(&config).map(|account| account.data.len()),
+        None,
+        "a rejected frozen vault cannot consume the canonical config PDA"
+    );
+}
+
 // Once the entire COIN supply is the distribution pool (and mint authority revoked),
 // the config is accepted — proving every COIN that exists is in this vault.
 #[test]
