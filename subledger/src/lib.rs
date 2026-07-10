@@ -1763,7 +1763,10 @@ fn process_insurance_withdraw(
     // move tokens when there is something to pay (percolator rejects a zero-amount withdraw).
     if owed > 0 {
         let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
-        ix_data.extend_from_slice(&(pool.asset_id as u16).to_le_bytes()); // asset_index (0 for genesis insurance)
+        // TopUpInsurance has always credited asset 0. Historical public init accepted
+        // nonzero metadata IDs, but those remain PDA seed material only; routing an
+        // exit by that stale value would strand the asset-0 principal it actually funded.
+        ix_data.extend_from_slice(&0u16.to_le_bytes());
         ix_data.extend_from_slice(&(owed as u128).to_le_bytes());
         invoke_signed_for_pool(
             &pool,
