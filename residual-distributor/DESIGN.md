@@ -69,7 +69,10 @@ redirect, lock, or confiscate insurance/backing principal.
   residual and paid-funding rewards without double-registering across LP/trader cohorts.
 - Percolator stays subledger-free: this program snapshot-deltas its monotonic portfolio counters
   (LP/trader residual counters plus optional funding-paid counters). Offsets are pinned with
-  `offset_of!` against the real Percolator structs.
+  `offset_of!` against the real Percolator structs. Live LP/trader claims re-read those counters for
+  their cap and remain permissionless. If maintenance-fee or resolved-market cleanup has already
+  dematerialized the exact linked account, any cranker may pay the frozen numerator only to the bound
+  recipient; the fixed cohort denominator still constrains it.
 
 ## Status
 - Done + unit/e2e-tested: point math (residual log2 / window / pro-rata); Config + Stake state;

@@ -2,6 +2,87 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - owner-only closed-witness recovery could strand PDA-owned rewards (surface C/D)
+
+Percolator portfolios may be owned by program PDAs: the owner program signs initialization and
+trading CPIs, while residual claims are intentionally permissionless and pay only the stake's bound
+recipient. The interim dematerialized-account fallback required that portfolio owner to sign. A
+public maintenance or resolved cleanup could therefore turn an otherwise permissionless frozen
+claim into one that an absent or non-claim-capable owner program could never execute.
+
+The clean-room real-binary maintenance regression closes the organically loss-bearing portfolio and
+then claims without the trader key. The owner-only residual binary fails solely with
+`MissingRequiredSignature`. The final path remains permissionless: exact stake/config/account-key
+binding, zero lamports plus zero data, frozen points and denominator, immutable vault, and the bound
+recipient still constrain every output. A self-close can at worst avoid a later points cap within the
+fixed cohort allocation; it cannot redirect COIN, change supply, or touch collateral.
+
+## Tick - reward-witness governance guard could lock insurance/backing exits (surface A/C/D)
+
+The interim controller guard preserved any portfolio with monotonic reward counters unless
+governance signed its cleanup. In resolved mode, pinned Percolator refuses every insurance and
+backing withdrawal while `materialized_portfolio_count != 0`. An absent reward owner could therefore
+be paid permissionlessly, leave its otherwise empty account behind, and make external backing plus
+subledger insurance principal depend forever on a surviving DAO. The guard protected COIN points by
+putting segregated principal at risk, contrary to the custody priority.
+
+The clean-room regression extends the organic real-trade fixture: an external provider deposits
+backing, a trader takes and settles a real loss, the residual epoch crystallizes/freezes, and the
+market resolves. A third party pays the reward to its bound recipient without either owner or DAO.
+The old controller then fails the exact public cleanup with `MissingRequiredSignature`, leaving
+Percolator's resolved withdrawal gate armed.
+
+FIX: terminal controller cleanup no longer interprets reward telemetry. Pinned Percolator still
+proves resolved mode and zero collateral, PnL, positions, receipts, and capital before it accepts
+`ClosePortfolio`; the wrapper still exposes no amount or destination. The residual distributor's
+owner-signed dematerialized-account path preserves a frozen allocation if cleanup happened before
+claim. The regression permissionlessly retires both absent portfolios and returns the provider's
+exact backing atom through the real controller and Percolator binaries. Thus a cleanup bug can affect
+only fixed-supply reward points, never hold insurance or backing principal hostage.
+
+## Tick - public maintenance sync could erase a frozen residual witness (surface C/D)
+
+Pinned Percolator intentionally lets unsigned `SyncMaintenanceFee` consume a flat portfolio's final
+capital and immediately dematerialize it. Its empty predicate excludes monotonic reward counters.
+After residual crystallization/freeze, any caller could therefore wait for accrued maintenance to
+cover a dust balance, sync the victim, erase the LP/trader live-cap witness, and leave every claim
+failing on the now-empty account. The controller guard from the prior tick cannot intercept this
+direct Percolator instruction.
+
+A clean-room LiteSVM regression uses the pinned Percolator SBF binary to initialize a real market,
+open a real long/short trade, move the authenticated mark, permissionlessly settle an organic loss,
+crystallize the trader counter, flatten by trading, and owner-withdraw to one atom. After freeze, an
+unaffiliated maintenance sync consumes that atom and closes the portfolio. The old residual binary
+then fails the valid claim with `AccountDataTooSmall`.
+
+FIX: a live Percolator account keeps the existing permissionless live-cap path unchanged. For the
+exact stake-linked account only, zero lamports plus zero data under Percolator or the system program
+is treated as terminal dematerialization and pays only already-frozen points to the already-bound
+recipient. A close can at worst bypass a later points cap within the fixed cohort allocation; it
+cannot redirect COIN, increase the cohort supply, or touch collateral.
+
+## Tick - public terminal cleanup could erase frozen reward claims (surface C/D, interim fix superseded)
+
+Percolator intentionally excludes monotonic reward telemetry from its empty-portfolio predicate.
+That permits terminal dematerialization after every collateral, PnL, position, and receipt exits,
+but the residual distributor still needs the same portfolio account to live-cap LP and trader
+claims. The controller's new permissionless empty-portfolio wrapper therefore let any caller close
+an otherwise empty reward-bearing portfolio after crystallization/freeze and before claim. Closing
+returned rent to the slab and erased the only authenticated claim witness, permanently locking that
+backer's COIN allocation in the reward vault.
+
+A fresh LiteSVM regression initializes the real pinned Percolator and residual-distributor binaries,
+opens a real trade, moves the oracle, permissionlessly settles a real loss, and crystallizes/freezes
+the resulting trader points. It then hands the market to the real controller, resolves it, and pays
+the trader through public `CloseResolved`, leaving an economically empty portfolio with its organic
+loss counter intact. Against the old controller binary, an unaffiliated tag-11 cleanup succeeds and
+the regression fails because the portfolio disappears before claim.
+
+INTERIM FIX (superseded): a pinned-layout reader required governance to close reward-bearing
+portfolios. The next audit tick showed that this could freeze segregated principal because
+Percolator gates resolved withdrawals on every materialized account. The final construction moves
+closed-witness recovery into the residual distributor and keeps controller cleanup permissionless.
+
 ## Tick - resolved owner principal depended on a surviving DAO (surface A/C)
 
 After the genesis pool handed asset-0 custody to TWAP, subledger exits correctly remained closed

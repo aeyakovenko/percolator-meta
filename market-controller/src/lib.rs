@@ -1386,7 +1386,9 @@ fn process_return_resolved_asset0_backing<'a>(
 // Anyone can ask the controller to exercise Percolator's terminal marketauth
 // override. Percolator itself requires a resolved market and a genuinely empty
 // portfolio, deregisters the materialized account, and returns only its rent to
-// the market slab. There is no caller-selected amount or destination.
+// the market slab. Residual rewards bind to the dematerialized key and frozen
+// recipient, so historical counters cannot become a gate on insurance/backing
+// exits. There is no caller-selected amount or destination.
 fn process_close_resolved_portfolio<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],

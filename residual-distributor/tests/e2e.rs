@@ -3427,7 +3427,8 @@ fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
 // the live portfolio (for the residual live cap). Funding-payer claims are frozen-counter only and do not
 // require the Percolator portfolio at claim time; extra accounts are ignored.
 // `cranker` is the claim trigger (first account, must sign). Share-value cohorts (insurance/backing)
-// require it to be the stake owner (finding KM); portfolio-flow cohorts accept any cranker. The helper takes the
+// require it to be the stake owner (finding KM); portfolio-flow cohorts accept any cranker while their live
+// witness exists, and require the owner only for terminal dematerialized-witness recovery. The helper takes the
 // cranker keypair explicitly so tests can model both the owner's own claim and a foreign forced claim.
 fn claim_as(
     svm: &mut LiteSVM,
