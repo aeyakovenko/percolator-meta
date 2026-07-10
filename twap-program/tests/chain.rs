@@ -4064,7 +4064,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     );
     assert_eq!(token_amount(&svm, &dao_backing_destination), 0);
 
-    // The segregated provider remains live and withdraws its own principal.
+    // The segregated provider remains live and withdraws part of its own principal.
+    let live_withdraw_amount = 40_000u64;
     let backing_withdraw = Instruction {
         program_id: perc_id(),
         accounts: vec![
@@ -4077,13 +4078,13 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         ],
         data: percolator_prog::ix::Instruction::WithdrawBackingBucket {
             domain: 2,
-            amount: backing_amount as u128,
+            amount: live_withdraw_amount as u128,
         }
         .encode(),
     };
     send(&mut svm, &[&backing_provider], backing_withdraw)
-        .expect("external provider withdraws its own backing after shutdown");
-    assert_eq!(token_amount(&svm, &backing_account), backing_amount);
+        .expect("external provider partially withdraws its own backing after shutdown");
+    assert_eq!(token_amount(&svm, &backing_account), live_withdraw_amount);
 
     // Lifecycle remains governed: resolve is allowlisted. Squads itself still
     // cannot use the terminal insurance withdrawal key after resolution.
@@ -4139,6 +4140,31 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         .is_err(),
         "governance cannot bypass the controller after resolve"
     );
+
+    let resolved_withdraw_amount = backing_amount - live_withdraw_amount;
+    let resolved_backing_withdraw = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(backing_provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(backing_account, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawBackingBucket {
+            domain: 2,
+            amount: resolved_withdraw_amount as u128,
+        }
+        .encode(),
+    };
+    send(
+        &mut svm,
+        &[&backing_provider],
+        resolved_backing_withdraw,
+    )
+    .expect("external provider withdraws its remaining backing after resolve");
+    assert_eq!(token_amount(&svm, &backing_account), backing_amount);
 
     let mut withdraw_data = vec![5u8];
     withdraw_data.extend_from_slice(&amount.to_le_bytes());

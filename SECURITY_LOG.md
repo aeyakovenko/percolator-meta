@@ -11849,4 +11849,6 @@ omitting a configured secondary collateral vault rolls back atomically, both pri
 are forwarded, temporary accounts close, and controller/vault/slab rent is conserved exactly. The temporary
 destination is pinned to the controller's canonical ATA for the Percolator-validated collateral mint; its complete
 balance is forwarded, so a public one-atom transfer during the Squads timelock cannot DoS cleanup while governance
-still cannot select and sweep an arbitrary controller-owned token account.
+still cannot select and sweep an arbitrary controller-owned token account. The same full lifecycle now splits an
+external provider's backing exit across live shutdown and resolved mode, proving controller-mediated resolve does
+not rotate, confiscate, or strand the provider's remaining backing before terminal cleanup.
