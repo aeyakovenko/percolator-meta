@@ -47,6 +47,7 @@ use solana_program::{
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
+    instruction::Instruction,
     program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
@@ -143,6 +144,77 @@ impl Config {
 
     fn is_sealed(&self) -> bool {
         self.sealed_proposal != Pubkey::default()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConfigSeedVersion {
+    Authority,
+    ClaimWindow,
+}
+
+fn config_seed_version(
+    program_id: &Pubkey,
+    config_key: &Pubkey,
+    config: &Config,
+) -> Result<ConfigSeedVersion, ProgramError> {
+    let claim_window_bytes = config.claim_window_slots.to_le_bytes();
+    let (window_key, window_bump) = Pubkey::find_program_address(
+        &config_seeds(
+            &config.coin_mint,
+            &config.authority,
+            &claim_window_bytes,
+        ),
+        program_id,
+    );
+    if *config_key == window_key && config.bump == window_bump {
+        return Ok(ConfigSeedVersion::ClaimWindow);
+    }
+    let (authority_key, authority_bump) = Pubkey::find_program_address(
+        &[
+            b"dist_config",
+            config.coin_mint.as_ref(),
+            config.authority.as_ref(),
+        ],
+        program_id,
+    );
+    if *config_key == authority_key && config.bump == authority_bump {
+        return Ok(ConfigSeedVersion::Authority);
+    }
+    // Never revive the older mint-only signer. That schema let a first writer bind
+    // a pre-funded vault to an attacker authority (fixed by 418ca15).
+    Err(ProgramError::InvalidSeeds)
+}
+
+fn invoke_config_signed<'a>(
+    program_id: &Pubkey,
+    config_key: &Pubkey,
+    config: &Config,
+    instruction: &Instruction,
+    account_infos: &[AccountInfo<'a>],
+) -> ProgramResult {
+    let bump = [config.bump];
+    match config_seed_version(program_id, config_key, config)? {
+        ConfigSeedVersion::Authority => {
+            let seeds: [&[u8]; 4] = [
+                b"dist_config",
+                config.coin_mint.as_ref(),
+                config.authority.as_ref(),
+                &bump,
+            ];
+            invoke_signed(instruction, account_infos, &[&seeds])
+        }
+        ConfigSeedVersion::ClaimWindow => {
+            let claim_window_bytes = config.claim_window_slots.to_le_bytes();
+            let seeds: [&[u8]; 5] = [
+                b"dist_config",
+                config.coin_mint.as_ref(),
+                config.authority.as_ref(),
+                claim_window_bytes.as_ref(),
+                &bump,
+            ];
+            invoke_signed(instruction, account_infos, &[&seeds])
+        }
     }
 }
 
@@ -636,26 +708,20 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Prog
         return Err(ProgramError::InvalidInstructionData); // already claimed
     }
 
-    let bump_arr = [config.bump];
-    let claim_window_bytes = config.claim_window_slots.to_le_bytes();
-    let seeds: [&[u8]; 5] = [
-        b"dist_config",
-        config.coin_mint.as_ref(),
-        config.authority.as_ref(),
-        claim_window_bytes.as_ref(),
-        &bump_arr,
-    ];
-    invoke_signed(
-        &spl_token::instruction::transfer(
-            token_program.key,
-            vault.key,
-            recipient_ata.key,
-            config_account.key,
-            &[],
-            amount,
-        )?,
+    let transfer_ix = spl_token::instruction::transfer(
+        token_program.key,
+        vault.key,
+        recipient_ata.key,
+        config_account.key,
+        &[],
+        amount,
+    )?;
+    invoke_config_signed(
+        program_id,
+        config_account.key,
+        &config,
+        &transfer_ix,
         &[vault.clone(), recipient_ata.clone(), config_account.clone(), token_program.clone()],
-        &[&seeds],
     )?;
 
     // Zero the entry so it cannot be re-claimed.
@@ -702,26 +768,20 @@ fn burn_unclaimed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 
     let remaining = token_balance(vault, &config.coin_mint)?;
     if remaining > 0 {
-        let bump_arr = [config.bump];
-        let claim_window_bytes = config.claim_window_slots.to_le_bytes();
-        let seeds: [&[u8]; 5] = [
-            b"dist_config",
-            config.coin_mint.as_ref(),
-            config.authority.as_ref(),
-            claim_window_bytes.as_ref(),
-            &bump_arr,
-        ];
-        invoke_signed(
-            &spl_token::instruction::burn(
-                token_program.key,
-                vault.key,
-                coin_mint.key,
-                config_account.key,
-                &[],
-                remaining,
-            )?,
+        let burn_ix = spl_token::instruction::burn(
+            token_program.key,
+            vault.key,
+            coin_mint.key,
+            config_account.key,
+            &[],
+            remaining,
+        )?;
+        invoke_config_signed(
+            program_id,
+            config_account.key,
+            &config,
+            &burn_ix,
             &[vault.clone(), coin_mint.clone(), config_account.clone(), token_program.clone()],
-            &[&seeds],
         )?;
     }
     Ok(())
