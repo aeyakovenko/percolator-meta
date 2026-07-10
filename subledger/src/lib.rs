@@ -2248,7 +2248,7 @@ fn process_assert_principal(
     if !pool.is_insurance()
         || pool.policy != POLICY_PRINCIPAL
         || pool.outstanding_principal == 0
-        || pool.total_shares == 0
+        || (pool_account.data_len() >= POOL_SIZE_SHARES && pool.total_shares == 0)
     {
         return Err(ProgramError::InvalidAccountData);
     }

@@ -1344,6 +1344,48 @@ fn legacy_master_insurance_pool_rejects_new_deposits_but_owner_can_withdraw() {
     assert_eq!(env.svm.get_account(&legacy_pool).unwrap().data.len(), 208);
 }
 
+// PR #115 COMPATIBILITY PROBE: pre-share insurance pools have live owner
+// principal but no `total_shares` field. The positive read-only attestation used
+// by TWAP's resolved recovery must recognize that legitimate historical claim.
+#[test]
+fn pre_share_insurance_pool_attests_live_principal_and_preserves_owner_exit() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let current_pool = env.pool;
+    let current_holding = create_holding(&mut env, &current_pool);
+    env.insurance_deposit(&alice, &alice_ata, &current_holding, amount)
+        .expect("fund real Percolator insurance before translating the fixture");
+
+    let legacy_pool = translate_funded_pool_to_legacy(&mut env, &alice.pubkey(), ASSET_ID);
+    let mut pool_account = env.svm.get_account(&legacy_pool).unwrap();
+    pool_account.data.truncate(192);
+    env.svm.set_account(legacy_pool, pool_account).unwrap();
+    let legacy_position = env.position_pda(&alice.pubkey());
+    let mut position_account = env.svm.get_account(&legacy_position).unwrap();
+    position_account.data.truncate(104);
+    env.svm.set_account(legacy_position, position_account).unwrap();
+
+    env.send(
+        &[Instruction {
+            program_id: sub_id(),
+            accounts: vec![AccountMeta::new_readonly(legacy_pool, false)],
+            data: vec![11u8], // IX_ASSERT_PRINCIPAL
+        }],
+        &[],
+    )
+    .expect("historical outstanding principal is a live owner claim");
+
+    let legacy_holding = create_holding(&mut env, &legacy_pool);
+    env.insurance_withdraw(&alice, &alice_ata, &legacy_holding, &alice, amount)
+        .expect("the attested historical owner recovers real Percolator principal");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 // LEGACY UPGRADE LOF PROBE: before commit 4e72483, permissionless insurance
 // init accepted any u64 asset_id even though TopUpInsurance always credited
 // asset 0. The owner must therefore exit from asset 0 as well; using the stale
