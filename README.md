@@ -41,6 +41,8 @@ capital's own tenure.
   Percolator does not migrate secondary `asset_admin` roles with `marketauth`; multi-asset markets are
   instead initialized under the controller before governance-approved activation. The handoff also
   requires direct permissionless asset append to be disabled, and the controller cannot enable it.
+  Inbound bootstrap donations additionally require the controller to hold `marketauth`, both asset-0
+  insurance roles, and asset-0 `asset_admin`, excluding any surviving key that could rotate and drain.
   A genesis-pool grant cannot rotate nonzero external insurance into pool custody: its recorded owner
   exits first, after which the same grant can proceed.
 - **Custody transitions are fixed.** Asset-0 custody moves
@@ -91,7 +93,8 @@ The workspace pins `percolator-prog` to commit
    eligible for TWAP custody.
 6. **Kickstart.** Futarchy can use retained surplus to initialize insurance/backing for approved
    markets and set fee splits. Inbound-only donation instructions fund Percolator without giving
-   governance an insurance key.
+   governance an insurance key and reject unless every asset-0 insurance withdrawal/rotation role is
+   already the constrained controller.
 7. **Handoff.** If capital remains for continuous operation, Squads authorizes the fixed
    principal-pool-to-TWAP transition. The transition records the exact pool identity and live
    principal in the TWAP floor. After a recovery, re-handoff replaces only that principal component;

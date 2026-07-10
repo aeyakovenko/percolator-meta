@@ -1719,6 +1719,25 @@ fn process_donate_insurance<'a>(
         market,
         percolator_program,
     )?;
+    {
+        let market_data = market.try_borrow_data()?;
+        let controller_key = controller.key.to_bytes();
+        if percolator_accounting::read_market_authority(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != controller_key
+            || percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != controller_key
+            || percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != controller_key
+            || percolator_accounting::read_asset_admin(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != controller_key
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
     let source = spl_token::state::Account::unpack(&donor_source.try_borrow_data()?)?;
     let holding = spl_token::state::Account::unpack(&controller_holding.try_borrow_data()?)?;
     if source.owner != *donor.key
