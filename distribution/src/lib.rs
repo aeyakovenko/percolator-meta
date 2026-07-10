@@ -320,6 +320,24 @@ fn token_balance(account: &AccountInfo, expected_mint: &Pubkey) -> Result<u64, P
     Ok(st.amount)
 }
 
+fn validate_recipient_token_destination(
+    account: &AccountInfo,
+    expected_owner: &Pubkey,
+    expected_mint: &Pubkey,
+) -> ProgramResult {
+    if account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let token = spl_token::state::Account::unpack(&account.try_borrow_data()?)?;
+    if token.state != spl_token::state::AccountState::Initialized
+        || token.owner != *expected_owner
+        || token.mint != *expected_mint
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 // Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
 // System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so a 1-
 // lamport transfer to the address (no signature needed) would PERMANENTLY brick init — the lamports
@@ -710,6 +728,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Prog
     if amount == 0 {
         return Err(ProgramError::InvalidInstructionData); // already claimed
     }
+    validate_recipient_token_destination(recipient_ata, recipient.key, &config.coin_mint)?;
 
     let transfer_ix = spl_token::instruction::transfer(
         token_program.key,

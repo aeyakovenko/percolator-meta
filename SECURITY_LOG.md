@@ -11978,3 +11978,21 @@ of the pool mint whose token authority is the signing position owner. It permits
 account, preserving historical exits and PDA owners, while structurally excluding attacker destinations,
 pool vaults, and insurance holding accounts. No signer, admin, policy, amount, share, or custody authority
 was added.
+
+## Tick — owner-signed genesis claims could redirect or consume COIN (surface C)
+
+The distribution claim authenticated the recipient named at an entry but passed its caller-supplied token
+destination directly into a distribution-PDA-signed transfer. A malicious transaction builder could obtain
+the recipient's valid signature on a claim naming an attacker-owned same-mint account, receive the allocation,
+and zero the victim's entry. Naming the distribution vault itself was worse: SPL Token accepts an authorized
+self-transfer as a successful no-op, after which the program still zeroed the entry and left the allocation
+to burn as unclaimed.
+
+A fresh LiteSVM probe used two live entries for one recipient. Against the old SBF, both the owner-signed
+attacker redirect and vault-to-itself claim succeeded. The retained regression requires both to reject,
+asserts the proposal and vault remain byte-exact, and then claims both entries normally to the recipient.
+
+FIX: distribution now requires the payout to be an initialized SPL Token account of the configured COIN mint
+whose token authority is the signing recipient. Arbitrary recipient-owned accounts and historical claims stay
+supported; attacker accounts and the config-owned vault cannot pass. No signer, mint, admin, custody, amount,
+or claim authority was added.

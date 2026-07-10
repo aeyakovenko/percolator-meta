@@ -564,6 +564,47 @@ fn claim_requires_the_named_recipients_signature_no_third_party_redirect_theft()
     assert_eq!(env.token_amount(&victim_ata), 100, "victim recovers their full entry");
 }
 
+// OWNER-SIGNED PAYOUT REDIRECT: authenticating the named recipient is not enough when the
+// distribution PDA signs the vault transfer. A malicious transaction builder must not be able to
+// obtain the recipient's valid signature on a claim paying an attacker-owned token account. The
+// vault itself is the sharper alias: SPL Token accepts an authorized self-transfer as a no-op, so
+// an unchecked vault destination would consume the entry without paying anyone.
+#[test]
+fn owner_signed_claim_cannot_redirect_or_self_alias_the_payout() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 2);
+    let (victim, victim_ata) = env.new_recipient();
+    let (_attacker, attacker_ata) = env.new_recipient();
+    env.append(
+        &proposal,
+        &[(victim.pubkey(), 40), (victim.pubkey(), 60)],
+    )
+    .expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+
+    let proposal_before = env.svm.get_account(&proposal).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let redirected = env.claim(&proposal, &victim, &attacker_ata, 0);
+    let vault = env.vault;
+    let self_aliased = env.claim(&proposal, &victim, &vault, 1);
+
+    assert!(
+        redirected.is_err() && self_aliased.is_err(),
+        "recipient-signed redirects must both fail: foreign={redirected:?}, self-alias={self_aliased:?}"
+    );
+    assert_eq!(env.svm.get_account(&proposal).unwrap(), proposal_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+
+    env.claim(&proposal, &victim, &victim_ata, 0)
+        .expect("victim claims the first entry");
+    env.claim(&proposal, &victim, &victim_ata, 1)
+        .expect("victim claims the second entry");
+    assert_eq!(env.token_amount(&victim_ata), 100);
+    assert_eq!(env.token_amount(&env.vault), 0);
+}
+
 // REINIT A SEALED CONFIG (vault-redirect, finding AJ for distribution): re-initializing a LIVE, sealed
 // config would reset config.sealed_proposal + seal_slot — un-sealing it so an attacker could re-seal to
 // THEIR proposal and redirect the entire COIN vault, or re-open the claim window. End-to-end safety test
