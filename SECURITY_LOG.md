@@ -12047,3 +12047,9 @@ short CPI only after long earnings/principal and the authority rotation, then re
 market, vault, transit, destination, and both ledgers byte-for-byte. Replacing the bad ledger permits a public
 retry that pays both principals and both earnings totals. No DAO destination, amount, withdrawal key, or
 reusable asset-admin surface was added.
+
+A compatibility subprobe replaces the current pool fixture with a legitimately deployed predecessor PDA whose
+nonzero metadata `asset_id` still routed every insurance CPI to asset 0. Rejecting that metadata would strand the
+same resolved cleanup after an upgrade. The wrapper therefore accepts every supported historical insurance-pool
+seed schema, while still requiring its immutable market/program/domain binding, PDA signature, and Percolator's
+live current-admin check; the stale metadata cannot select an asset, controller, recipient, or amount.

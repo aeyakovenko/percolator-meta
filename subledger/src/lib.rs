@@ -2031,8 +2031,10 @@ fn process_return_resolved_asset0_backing(
         return Err(ProgramError::IllegalOwner);
     }
     let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    // Historical insurance pools could carry a nonzero metadata asset_id even
+    // though their public CPIs always funded asset 0. PDA validation plus the
+    // immutable market/program/domain binding identifies them safely here.
     if !pool.is_insurance()
-        || pool.asset_id != 0
         || pool.domain != DOMAIN_INSURANCE
         || *market_slab.key != pool.market_slab
         || *percolator_program.key != pool.percolator_program
