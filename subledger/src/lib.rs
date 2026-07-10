@@ -13,11 +13,11 @@
 //!     any fees/yield transferred in, minus impairment).
 //!
 //! Exit policy:
-//!   - `Principal`    — pay `principal` when healthy (`balance >= outstanding`),
-//!     pro-rata `balance * principal / outstanding` when impaired. Surplus stays
-//!     in the pool.
-//!   - `WithSurplus`  — always pro-rata `balance * principal / outstanding`, so
-//!     local fees/yield are returned to depositors.
+//!   - `Principal`    - pay at most principal, with impairment allocated by shares
+//!     priced against `min(balance, outstanding)`. Surplus stays in the pool. Historical
+//!     pre-share positions retain their pool-wide pro-rata exit.
+//!   - `WithSurplus`  - redeem live-priced shares, so local fees/yield are returned
+//!     to depositors according to their entry price.
 
 #![no_std]
 extern crate alloc;
@@ -1529,11 +1529,16 @@ fn process_insurance_deposit(
         }
     }
 
-    // Tenure-fair shares (POLICY_WITH_SURPLUS): price this deposit by the LIVE insurance
-    // balance BEFORE the top-up below, so a late depositor cannot claim pre-existing surplus
-    // (and cannot extract early backers' surplus on exit — the soft-veto fairness prerequisite).
+    // Price shares before the top-up. WITH_SURPLUS uses the complete live balance so
+    // pre-existing yield stays with earlier capital. PRINCIPAL excludes protocol surplus
+    // and prices only the loss-bearing portion of the pool.
     let insurance_before = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
-    let shares_minted = mint_shares(amount, pool.total_shares, insurance_before)?;
+    let priced_balance_before = if pool.policy == POLICY_PRINCIPAL {
+        core::cmp::min(insurance_before, pool.outstanding_principal)
+    } else {
+        insurance_before
+    };
+    let shares_minted = mint_shares(amount, pool.total_shares, priced_balance_before)?;
     // Inflation/rounding guard (finding HB): never accept principal for ZERO shares. If a large
     // surplus has inflated the share price (balance >> total_shares) so this deposit would round to
     // 0 shares, the depositor would hand over principal that the existing shareholders' shares then
@@ -1747,19 +1752,19 @@ fn process_insurance_withdraw(
         return Err(ProgramError::InsufficientFunds);
     }
 
-    // PRO-RATA HAIRCUT under impairment (finding L): read the LIVE asset-0 insurance straight
-    // from the slab. When it can still fully back `outstanding`, the exit pays `amount` 1:1;
-    // when the market has drawn insurance below outstanding, every exit instead receives
-    // insurance*amount/outstanding — the loss is shared PROPORTIONALLY and the exit is
-    // ORDER-INDEPENDENT (no first-come race that strands late exiters; cf. the own-vault
-    // payout). The full `amount` always leaves the outstanding accounting; the owner collects
-    // only their pro-rata share `owed`. (POLICY_WITH_SURPLUS pools always pro-rata, returning
-    // any yield too.)
+    // Read live asset-0 insurance from the slab. Current positions use shares priced
+    // at deposit, so losses follow the capital that was present when they happened;
+    // equal-entry positions remain pro-rata and exit-order independent. The full
+    // requested principal leaves outstanding accounting even when the payout is impaired.
     let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
-    // Burn the share fraction matching the withdrawn principal fraction for BOTH policies. The payout
-    // policy remains separate: WITH_SURPLUS redeems those shares at the live balance, while PRINCIPAL keeps
-    // the principal-only/pro-rata-haircut payout. This keeps RD's live share-value cap aligned with capital
-    // still at risk even for a principal-policy partial exit.
+    let priced_balance = if pool.policy == POLICY_PRINCIPAL {
+        core::cmp::min(insurance, pool.outstanding_principal)
+    } else {
+        insurance
+    };
+    // Burn the share fraction matching the withdrawn principal fraction for both policies.
+    // WITH_SURPLUS redeems the live share value; PRINCIPAL uses it only as a loss cap
+    // and never pays more than requested principal.
     let share_accounting = pool_account.data_len() >= POOL_SIZE_SHARES;
     if share_accounting && position_account.data_len() < POSITION_SIZE {
         return Err(ProgramError::InvalidAccountData);
@@ -1771,9 +1776,25 @@ fn process_insurance_withdraw(
             .ok_or(ProgramError::ArithmeticOverflow)?
     };
     let owed = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
-        redeem_shares(shares_to_burn, insurance, pool.total_shares)?
+        redeem_shares(shares_to_burn, priced_balance, pool.total_shares)?
     } else {
-        payout(pool.policy, insurance, pool.outstanding_principal, amount)?
+        if share_accounting && position.shares != 0 {
+            if pool.total_shares == 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // Principal policy keeps all upside in the protocol, but loss follows
+            // each position's priced entry. A deposit made after an impairment
+            // therefore cannot recapitalize an older position at par.
+            core::cmp::min(
+                amount,
+                redeem_shares(shares_to_burn, priced_balance, pool.total_shares)?,
+            )
+        } else {
+            // Historical principal positions predate share accounting. Preserve
+            // their owner-bound pro-rata exit instead of turning an upgrade into
+            // a custody lock.
+            payout(pool.policy, insurance, pool.outstanding_principal, amount)?
+        }
     };
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,

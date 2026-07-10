@@ -1479,6 +1479,79 @@ fn impaired_insurance_exit_is_pro_rata() {
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
 }
 
+// PUBLIC LOF: a principal-policy deposit made after an impairment must not recapitalize
+// earlier positions at par. Alice bore the loss before Bob arrived, so Bob's new principal
+// must buy in at the live share price. Otherwise the pool-wide principal ratio lets Alice
+// take part of Bob's deposit while both public withdrawals still appear pro rata.
+#[test]
+fn principal_pool_late_deposit_does_not_socialize_an_earlier_loss() {
+    for bob_exits_first in [false, true] {
+        let mut env = Env::new();
+        env.init_insurance_pool();
+
+        let amount = 1_000_000u64;
+        let (alice, alice_ata) = new_depositor(&mut env, amount);
+        let pool = env.pool;
+        let alice_holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&alice, &alice_ata, &alice_holding, amount)
+            .expect("alice deposits before the loss");
+
+        let impaired = amount / 2;
+        impair_market(&mut env, impaired as u128);
+        env.svm
+            .set_account(
+                env.perc_vault,
+                Account {
+                    lamports: 1_000_000,
+                    data: token_account_data(&env.mint, &env.vault_authority, impaired),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        let (bob, bob_ata) = new_depositor(&mut env, amount);
+        let bob_holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&bob, &bob_ata, &bob_holding, amount)
+            .expect("bob deposits after the loss while the genesis window remains open");
+        assert_eq!(
+            env.token_amount(&env.perc_vault),
+            impaired + amount,
+            "Bob contributes one full unit of fresh principal"
+        );
+
+        if bob_exits_first {
+            env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, amount)
+                .expect("Bob exits first without inheriting Alice's historical loss");
+            env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
+                .expect("Alice realizes only the loss from her own tenure");
+        } else {
+            env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
+                .expect("Alice realizes only the loss from her own tenure");
+            env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, amount)
+                .expect("Bob exits second without inheriting Alice's historical loss");
+        }
+        let alice_received = env.token_amount(&alice_ata);
+        let bob_received = env.token_amount(&bob_ata);
+        assert!(
+            (impaired..=impaired + 1).contains(&alice_received),
+            "Alice cannot recover her historical loss from Bob's later deposit"
+        );
+        assert!(
+            (amount - 1..=amount).contains(&bob_received),
+            "Bob's post-loss capital is protected in either exit order"
+        );
+        assert_eq!(
+            alice_received + bob_received,
+            impaired + amount,
+            "the one-atom share-floor remainder cannot create or strand value"
+        );
+        assert_eq!(env.token_amount(&env.perc_vault), 0);
+        assert_eq!(env.pool_outstanding(), 0);
+    }
+}
+
 // CROSS-ASSET EXIT DOS: the market header's `insurance` is global, while tag-57 debits
 // only asset 0. If asset 0 is impaired and an external asset keeps the global total above
 // outstanding principal, a global quote asks Percolator for more than asset 0 owns and the

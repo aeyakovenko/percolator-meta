@@ -12154,3 +12154,23 @@ reopened after handoff. The real-binary test proves nonzero-fee rejection, creat
 governance-signed proxy attempt with market bytes unchanged. Whole-market initialization remains permissionless;
 secondary activation is governance-approved and can still name external insurance, backing, and oracle roles
 while setting the constrained controller as activator/admin.
+
+## Tick - a late principal deposit could recapitalize an earlier insurance loss (surface B)
+
+Principal-policy insurance withdrawals used the pool-wide ratio `insurance * amount / outstanding` even though
+current deposits already mint shares at the live insurance price. If Alice deposited `1,000,000`, the market
+lost half before Bob arrived, and Bob then deposited `1,000,000` during the still-open genesis window, the ratio
+treated both positions as if they had entered before the loss. The current SBF paid Alice `750,000` instead of
+her pre-Bob value `500,000`, transferring `250,000` of Bob's fresh principal to the older position. Reversing
+withdrawal order still split the loss equally, so Bob could not protect himself by exiting first.
+
+A retained real-Percolator LiteSVM regression performs both public deposits and withdrawals around a valid
+asset-local impairment and exercises both exit orders. It failed against the old SBF at the `750,000` transfer.
+Current share-accounted principal positions now receive `min(requested principal, live share redemption)`, with
+shares priced and redeemed against `min(asset insurance, outstanding principal)`. The latter excludes protocol
+surplus: the first full-workspace probe caught raw insurance pricing misclassifying a legitimate TWAP surplus
+pull as a depositor loss in both the genesis-to-buyback and 45-day continuous-reward chains. With the loss-bearing
+base, Alice receives `500,000` (within the existing one-atom share-floor bound), Bob receives `1,000,000` (same
+bound), their sum equals the complete remaining insurance in either order, and both full chains return healthy
+principal exactly. Historical pre-share positions retain the old owner-bound pool-wide haircut so an upgrade
+cannot lock their funds. No signer, authority, destination, custody transition, or admin surface was added.

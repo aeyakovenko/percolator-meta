@@ -4,7 +4,8 @@ A non-custodial governance bootstrap and continuous reward system for Percolator
 Participants put base units at risk in market insurance during a short deposit window, run a
 configurable bootstrap (six 30-day months by default), and vote on allocation of 100% of a fixed,
 pre-existing COIN supply. After sealing, the votes have no further authority and depositors can
-recover their owner-bound share of the insurance pool, subject to market losses.
+recover their owner-bound share of the insurance pool, subject to losses incurred during their
+capital's own tenure.
 
 > **Status:** experimental, educational-use-only, and provided **AS IS**. Participants can lose
 > capital to market losses or program defects. See [LICENSE](LICENSE).
@@ -45,8 +46,10 @@ recover their owner-bound share of the insurance pool, subject to market losses.
   pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
   return custody only to that same pool.
 - **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
-  approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses;
-  it cannot redirect a depositor's withdrawal to itself.
+  approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
+  Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
+  capital does not recapitalize an older position's historical loss and protocol-surplus pulls do
+  not look like depositor losses; governance still cannot redirect a depositor's withdrawal.
 
 ## Programs
 
@@ -54,7 +57,7 @@ recover their owner-bound share of the insurance pool, subject to market losses.
 |---|---|
 | `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns insurance and backing only to their recorded providers. |
-| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; shares track tenure and live capital for rewards. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
+| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP; after recovery it can sign only the controller's fixed resolved asset-0 backing return, including for supported historical pool schemas. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries totaling the fixed supply. Claims are permissionless; unclaimed COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. It reads principal-bearing accounts but cannot debit them. |
