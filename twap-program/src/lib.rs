@@ -108,6 +108,7 @@ const SUBLEDGER_IX_ASSERT_PRINCIPAL: u8 = 11;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
+const MARKET_CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
 
 const IX_INIT_CONFIG: u8 = 0;
 // Reconfigure the surplus buy/burn share. Gated on the Squads VAULT PDA, which can
@@ -170,6 +171,9 @@ const IX_SET_MARKET_FEES: u8 = 18;
 // Permissionless after resolution and after the bound pool proves all owner
 // principal is gone. Routes protocol insurance to terminal controller custody.
 const IX_RETURN_RESOLVED_PROTOCOL_INSURANCE: u8 = 19;
+// Permissionless, amountless wrapper for the controller's provider-bound asset-0
+// backing return while a pool-less config's TWAP PDA remains asset_admin.
+const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 20;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -526,6 +530,9 @@ pub fn process_instruction(
         IX_SET_MARKET_FEES => process_set_market_fees(program_id, accounts, data),
         IX_RETURN_RESOLVED_PROTOCOL_INSURANCE => {
             process_return_resolved_protocol_insurance(program_id, accounts, data)
+        }
+        IX_RETURN_RESOLVED_ASSET0_BACKING => {
+            process_return_resolved_asset0_backing(program_id, accounts, data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -1359,6 +1366,128 @@ fn process_return_resolved_protocol_insurance(
             controller_transit.clone(),
             twap_authority.clone(),
             token_program.clone(),
+        ],
+        &[&auth_seeds],
+    )
+}
+
+// return_resolved_asset0_backing accounts:
+// [config, twap_authority, governance, controller, market(w), provider_ata(w),
+//  controller_transit(w), percolator_vault(w), vault_authority,
+//  long_backing_ledger(w), short_backing_ledger(w), percolator_program,
+//  market_controller_program, token_program]
+//
+// A pool-less config has no Subledger PDA to sign the controller's fixed asset-0
+// cleanup. This wrapper supplies only the config-bound TWAP signer. The controller
+// derives the backing provider and both withdrawal amounts from the pinned slab.
+fn process_return_resolved_asset0_backing(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let provider_destination = next_account_info(iter)?;
+    let controller_transit = next_account_info(iter)?;
+    let percolator_vault = next_account_info(iter)?;
+    let vault_authority = next_account_info(iter)?;
+    let long_backing_ledger = next_account_info(iter)?;
+    let short_backing_ledger = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let controller_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !market_slab.is_writable
+        || !provider_destination.is_writable
+        || !controller_transit.is_writable
+        || !percolator_vault.is_writable
+        || !long_backing_ledger.is_writable
+        || !short_backing_ledger.is_writable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *controller_program.key != MARKET_CONTROLLER_PROGRAM_ID
+        || !controller_program.executable
+        || *token_program.key != spl_token::ID
+        || !percolator_program.executable
+        || market_slab.owner != percolator_program.key
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if config.market_0_domain != 0
+        || config.custody_pool != Pubkey::default()
+        || *market_slab.key != config.market_slab
+        || *percolator_program.key != config.percolator_program
+        || *governance.key != squads_default_vault(&config.squads_multisig)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let expected_controller = Pubkey::find_program_address(
+        &[
+            MARKET_CONTROLLER_SEED,
+            governance.key.as_ref(),
+            market_slab.key.as_ref(),
+            percolator_program.key.as_ref(),
+        ],
+        &MARKET_CONTROLLER_PROGRAM_ID,
+    )
+    .0;
+    if *controller.key != expected_controller {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    invoke_signed(
+        &Instruction {
+            program_id: *controller_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*governance.key, false),
+                AccountMeta::new_readonly(*controller.key, false),
+                AccountMeta::new_readonly(*twap_authority.key, true),
+                AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new(*provider_destination.key, false),
+                AccountMeta::new(*controller_transit.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*vault_authority.key, false),
+                AccountMeta::new(*long_backing_ledger.key, false),
+                AccountMeta::new(*short_backing_ledger.key, false),
+                AccountMeta::new_readonly(*percolator_program.key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
+            ],
+            data: vec![MARKET_CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING],
+        },
+        &[
+            governance.clone(),
+            controller.clone(),
+            twap_authority.clone(),
+            market_slab.clone(),
+            provider_destination.clone(),
+            controller_transit.clone(),
+            percolator_vault.clone(),
+            vault_authority.clone(),
+            long_backing_ledger.clone(),
+            short_backing_ledger.clone(),
+            percolator_program.clone(),
+            token_program.clone(),
+            controller_program.clone(),
         ],
         &[&auth_seeds],
     )

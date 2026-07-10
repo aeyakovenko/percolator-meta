@@ -3654,6 +3654,245 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
     assert_eq!(token_amount(&svm, &controller_transit), amount);
 }
 
+// PUBLIC DOS: a pool-less TWAP config has no Subledger PDA that can sign the controller's fixed
+// asset-0 backing return. Once an absent provider's market is resolved, the TWAP PDA must expose
+// the same amountless/provider-bound wrapper or its asset_admin role strands backing and close.
+#[test]
+fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let protocol_insurance = env.principal + env.surplus;
+    let backing_amount = 9u64;
+    let provider_destination = canonical_insurance_vault(&env.squads_vault, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        backing_amount,
+    );
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market_and_back = build_controller_accept_and_top_up_asset0_backing_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &provider_destination,
+        &env.perc_vault,
+        &perc_id(),
+        backing_amount as u128,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(provider_destination, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &donate_market_and_back,
+        &donate_remaining,
+    )
+    .expect("Squads records external backing before donating lifecycle authority");
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()[0]
+            .principal_atoms,
+        backing_amount as u128
+    );
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 5_000;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(env.slab, false)],
+            data: percolator_prog::ix::Instruction::ResolveStalePermissionless {
+                now_slot: clock.slot,
+            }
+            .encode(),
+        },
+    )
+    .expect("unaffiliated stale resolver ends the externally backed market");
+
+    let twap_transit = canonical_insurance_vault(&env.twap_authority, &env.collateral_mint);
+    let controller_transit = canonical_insurance_vault(&controller, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &twap_transit,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_resolved_protocol_insurance_ix(
+            &env.twap_cfg,
+            &env.twap_authority,
+            &system_program::ID,
+            &env.slab,
+            &twap_transit,
+            &controller_transit,
+            &env.perc_vault,
+            &env.vault_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("unaffiliated cranker isolates protocol insurance in controller custody");
+    assert_eq!(token_amount(&svm, &controller_transit), protocol_insurance);
+
+    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    let long_backing_ledger = Pubkey::new_unique();
+    let short_backing_ledger = Pubkey::new_unique();
+    for ledger in [long_backing_ledger, short_backing_ledger] {
+        svm.set_account(
+            ledger,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; backing_ledger_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let market_before_forged_return = svm.get_account(&env.slab).unwrap();
+    let vault_before_forged_return = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset0_backing_ix(
+                &env.squads_vault,
+                &controller,
+                &env.twap_authority,
+                &env.slab,
+                &provider_destination,
+                &controller_transit,
+                &env.perc_vault,
+                &env.vault_authority,
+                &long_backing_ledger,
+                &short_backing_ledger,
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "an external caller cannot forge the TWAP asset-admin signer"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_forged_return);
+    assert_eq!(
+        svm.get_account(&env.perc_vault).unwrap(),
+        vault_before_forged_return
+    );
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        0,
+    );
+    let market_before_redirect = svm.get_account(&env.slab).unwrap();
+    let vault_before_redirect = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_resolved_asset0_backing_ix(
+                &env.twap_cfg,
+                &env.twap_authority,
+                &env.squads_vault,
+                &controller,
+                &env.slab,
+                &attacker_destination,
+                &controller_transit,
+                &env.perc_vault,
+                &env.vault_authority,
+                &long_backing_ledger,
+                &short_backing_ledger,
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "the TWAP signer wrapper cannot redirect the recorded provider's backing"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_redirect);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_redirect);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_resolved_asset0_backing_ix(
+            &env.twap_cfg,
+            &env.twap_authority,
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &provider_destination,
+            &controller_transit,
+            &env.perc_vault,
+            &env.vault_authority,
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker returns pool-less asset-0 backing through the TWAP signer");
+    assert_eq!(token_amount(&svm, &provider_destination), backing_amount);
+    assert_eq!(token_amount(&svm, &controller_transit), protocol_insurance);
+    assert_eq!(token_amount(&svm, &env.perc_vault), 0);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        controller.to_bytes()
+    );
+}
+
 // accept_operator BINDING (the keystone authority transfer): even a fully-approved, timelock'd Squads
 // execute must rotate the operator ONLY on the config's OWN market via the config's OWN percolator program
 // (twap src line ~663: market_slab.key == config.market_slab && percolator_program.key ==
@@ -4601,6 +4840,43 @@ fn twap_return_resolved_protocol_insurance_ix(
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
         data: vec![19u8], // IX_RETURN_RESOLVED_PROTOCOL_INSURANCE
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn twap_return_resolved_asset0_backing_ix(
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    provider_destination: &Pubkey,
+    controller_transit: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new_readonly(*twap_authority, false),
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new_readonly(*controller, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*provider_destination, false),
+            AccountMeta::new(*controller_transit, false),
+            AccountMeta::new(*vault, false),
+            AccountMeta::new_readonly(*vault_authority, false),
+            AccountMeta::new(*long_backing_ledger, false),
+            AccountMeta::new(*short_backing_ledger, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(controller_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![20u8], // IX_RETURN_RESOLVED_ASSET0_BACKING
     }
 }
 
@@ -30814,6 +31090,49 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     );
     assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_empty_pool_return);
     assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_empty_pool_return);
+
+    let bypass_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    let bypass_long_ledger = Pubkey::new_unique();
+    let bypass_short_ledger = Pubkey::new_unique();
+    for ledger in [bypass_long_ledger, bypass_short_ledger] {
+        svm.set_account(
+            ledger,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; bypass_ledger_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    let market_before_pool_bypass = svm.get_account(&env.slab).unwrap();
+    let vault_before_pool_bypass = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_resolved_asset0_backing_ix(
+                &twap_cfg,
+                &twap_authority,
+                &env.squads_vault,
+                &controller,
+                &env.slab,
+                &asset0_provider_destination,
+                &controller_transit,
+                &env.perc_vault,
+                &perc_vault_authority(&env.slab, &perc_id()),
+                &bypass_long_ledger,
+                &bypass_short_ledger,
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "the pool-less TWAP wrapper cannot bypass a recorded Subledger pool"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_pool_bypass);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_pool_bypass);
 
     svm.set_account(
         controller,

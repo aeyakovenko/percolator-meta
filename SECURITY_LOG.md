@@ -2,6 +2,30 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - pool-less TWAP custody could strand asset-0 backing (surface A/C)
+
+The controller's resolved asset-0 cleanup derives both backing-domain balances and the recorded
+provider, but it requires the current `asset_admin` to sign before rotating the backing role. A
+genesis pool already had a fixed Subledger signer wrapper. A pool-less compatibility config left
+`asset_admin` on the TWAP PDA and exposed no equivalent instruction, so an absent external provider
+could leave its backing and whole-market close permanently stuck after public stale resolution.
+
+A fresh real-binary LiteSVM regression performs the empty TWAP handoff through a timelocked Squads
+vault, deposits real backing from that vault through pinned Percolator, donates market lifecycle to
+the controller, and resolves permissionlessly. It first proves an external caller cannot forge the
+TWAP signer. The old TWAP binary then rejects the required fixed wrapper with
+`InvalidInstructionData`. The fixed test also attempts an attacker destination and verifies the
+failed transaction preserves the slab and vault byte-exact.
+
+FIX: TWAP tag 20 is an amountless CPI wrapper around only controller tag 7. It validates the
+config-bound market, executable Percolator program, Squads governance vault, derived controller,
+TWAP PDA, controller program, and token program, and it is unavailable when a current config records
+a Subledger custody pool. The controller still derives the provider and both principal/earnings
+amounts from the pinned slab and validates canonical token accounts. The regression proves backing
+reaches only that provider while previously recovered protocol insurance remains in controller
+custody. The wrapper never moves insurance or accepts an admin-selected recipient or amount, so it
+is also safe for historical no-pool layouts.
+
 ## Tick - pool-less TWAP protocol insurance had no terminal recovery (surface A/C)
 
 The compatibility TWAP handoff intentionally accepted only an empty asset-0 insurance balance, and
