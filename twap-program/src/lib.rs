@@ -677,8 +677,32 @@ fn process_set_economics(
     if savings_bps > 0 && *savings_account.key == Pubkey::default() {
         return Err(ProgramError::InvalidAccountData);
     }
-    if savings_bps > 0 && savings_account.owner != &spl_token::ID {
-        return Err(ProgramError::IllegalOwner);
+    if savings_bps > 0 {
+        if savings_account.owner != &spl_token::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let sink = spl_token::state::Account::unpack(&savings_account.try_borrow_data()?)?;
+        let authority_bump = [config.authority_bump];
+        let expected_authority = Pubkey::create_program_address(
+            &[
+                TWAP_AUTHORITY_SEED,
+                config_account.key.as_ref(),
+                &authority_bump,
+            ],
+            program_id,
+        )
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+        // SPL owner rotation clears a delegate but preserves a non-native account's explicit
+        // close authority. Reject every externally mutable sink before the timelocked config
+        // commits it; otherwise the retained close signer can brick all permissionless rounds.
+        if sink.state != spl_token::state::AccountState::Initialized
+            || sink.owner != expected_authority
+            || sink.delegate.is_some()
+            || sink.delegated_amount != 0
+            || sink.close_authority.is_some()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
     }
     config.base_unit_savings_bps = savings_bps;
     config.buyback_bps = buyback_bps;

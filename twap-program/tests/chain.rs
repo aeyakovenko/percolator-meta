@@ -890,6 +890,158 @@ fn init_book_rejects_a_pda_escrow_with_an_external_close_authority() {
     );
 }
 
+// EXTERNAL CLOSE-AUTHORITY DOS (savings sink): set_economics commits one collateral account for every
+// permissionless savings pull. SPL preserves a non-native token account's explicit close authority when its
+// owner rotates to the TWAP PDA, so an attacker can prepare an otherwise-valid PDA-owned sink and close it
+// after the timelocked update. Every execute then reverts until another timelock changes the sink. Reject the
+// latent close key at configuration time; the PDA itself has no generic token-authority escape hatch.
+#[test]
+fn set_economics_rejects_a_savings_sink_with_external_close_authority() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    // setup_handoff uses a synthetic collateral mint. Install the equivalent initialized SPL mint so
+    // account creation and both authority rotations below run through the real token processor.
+    let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        },
+        &mut mint_data,
+    )
+    .unwrap();
+    svm.set_account(
+        env.collateral_mint,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN),
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let sink_keypair = Keypair::new();
+    let savings_sink = sink_keypair.pubkey();
+    let create_sink = solana_sdk::system_instruction::create_account(
+        &payer.pubkey(),
+        &savings_sink,
+        svm.minimum_balance_for_rent_exemption(spl_token::state::Account::LEN),
+        spl_token::state::Account::LEN as u64,
+        &spl_token::ID,
+    );
+    let initialize_sink = spl_token::instruction::initialize_account(
+        &spl_token::ID,
+        &savings_sink,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+    )
+    .unwrap();
+    let retain_close_authority = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &savings_sink,
+        Some(&attacker.pubkey()),
+        spl_token::instruction::AuthorityType::CloseAccount,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let rotate_owner = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &savings_sink,
+        Some(&env.twap_authority),
+        spl_token::instruction::AuthorityType::AccountOwner,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[
+            create_sink,
+            initialize_sink,
+            retain_close_authority,
+            rotate_owner,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &sink_keypair, &attacker],
+        bh,
+    ))
+    .expect("create TWAP-owned savings sink retaining attacker close authority");
+    let sink_state =
+        spl_token::state::Account::unpack(&svm.get_account(&savings_sink).unwrap().data).unwrap();
+    assert_eq!(sink_state.owner, env.twap_authority);
+    assert_eq!(sink_state.mint, env.collateral_mint);
+    assert_eq!(sink_state.amount, 0);
+    assert_eq!(
+        sink_state.close_authority,
+        COption::Some(attacker.pubkey()),
+        "real SPL owner rotation preserves the attacker's close key"
+    );
+
+    let economics = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings_sink,
+        1_000,
+        0,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &economics,
+            &remaining,
+        )
+        .is_err(),
+        "set_economics must reject a savings sink an external signer can close"
+    );
+    assert_eq!(read_savings_bps(&svm, &env.twap_cfg), 0);
+    assert_eq!(
+        read_savings_account(&svm, &env.twap_cfg),
+        Pubkey::default(),
+        "rejected sink cannot consume the timelocked configuration"
+    );
+
+    let close_sink = spl_token::instruction::close_account(
+        &spl_token::ID,
+        &savings_sink,
+        &attacker.pubkey(),
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    send(&mut svm, &[&attacker], close_sink).expect("attacker retains the public close path");
+    assert!(svm.get_account(&savings_sink).map_or(true, |a| a.lamports == 0));
+}
+
 // ISSUE #42 REGRESSION: the Squads-gated setters must reject token-shaped accounts that are not actually
 // owned by SPL Token. Account::unpack only validates bytes; without an owner check a valid DAO transaction
 // can bind a system-owned fake sink and later brick execution when SPL Token receives it as a destination.
@@ -1970,8 +2122,16 @@ fn set_economics_rejects_an_over_allocation_that_would_overpull_the_floor() {
     );
 
     let vault = vault_pda(&squads, &multisig, 0);
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", cfg_pda.as_ref()], &twap_id()).0;
     let savings_acct = Keypair::new().pubkey();
-    set_token(&mut svm, &savings_acct, &coin_mint, &vault, 0);
+    set_token(
+        &mut svm,
+        &savings_acct,
+        &coin_mint,
+        &twap_authority,
+        0,
+    );
     let remaining = |savings: &Pubkey| {
         vec![
             AccountMeta::new_readonly(vault, false),
@@ -2122,8 +2282,16 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
     .expect("init twap config");
     let cfg_pda = twap_config_pda(&market, &multisig, &coin_mint, &percolator_program);
     let vault = vault_pda(&squads, &multisig, 0);
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", cfg_pda.as_ref()], &twap_id()).0;
     let savings_acct = Keypair::new().pubkey();
-    set_token(&mut svm, &savings_acct, &coin_mint, &vault, 0);
+    set_token(
+        &mut svm,
+        &savings_acct,
+        &coin_mint,
+        &twap_authority,
+        0,
+    );
     let recfg_remaining = vec![
         AccountMeta::new_readonly(vault, false),
         AccountMeta::new(cfg_pda, false),

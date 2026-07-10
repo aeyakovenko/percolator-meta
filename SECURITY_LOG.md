@@ -11852,3 +11852,19 @@ balance is forwarded, so a public one-atom transfer during the Squads timelock c
 still cannot select and sweep an arbitrary controller-owned token account. The same full lifecycle now splits an
 external provider's backing exit across live shutdown and resolved mode, proving controller-mediated resolve does
 not rotate, confiscate, or strand the provider's remaining backing before terminal cleanup.
+
+## Tick — externally closable TWAP savings sink could stall every surplus round (surface A)
+
+`set_economics` previously checked only that a nonzero savings sink account was owned by the SPL Token program.
+A fresh real System + SPL Token + Squads + TWAP LiteSVM probe created a collateral account under an attacker,
+assigned the attacker as close authority, then rotated the token owner to the TWAP PDA. SPL owner rotation clears
+delegates but preserves a non-native account's explicit close authority. The old timelocked setter accepted that
+otherwise-correct sink, after which the attacker could close it and make every permissionless savings-enabled
+`execute` revert until another one-week governance update replaced the account.
+
+FIX: `set_economics` now unpacks the sink before committing it and requires initialized state, the exact TWAP
+authority owner, no delegate/delegated balance, and no close authority. The retained LiteSVM regression builds the
+attack state through the real SPL program, proves the vulnerable setter accepted it before the fix, proves the
+fixed setter rejects it without changing bps or sink identity, and independently exercises the attacker's live
+close path. Valid savings-only and full four-way rounds remain green. No signer, withdrawal, or admin surface was
+added; the check only removes an external liveness key.
