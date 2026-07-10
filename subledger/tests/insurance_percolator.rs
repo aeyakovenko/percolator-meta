@@ -115,6 +115,19 @@ fn insurance_pool_pda_with_schedule(
     .0
 }
 
+fn legacy_master_insurance_pool_pda(mint: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            slab.as_ref(),
+            perc_id().as_ref(),
+        ],
+        &sub_id(),
+    )
+}
+
 struct Env {
     svm: LiteSVM,
     payer: Keypair,
@@ -1118,6 +1131,108 @@ fn deposit_into_real_percolator_insurance_records_position() {
     assert_eq!(start_slot, 100, "start_slot = clock at deposit");
     assert!(!withdrawn);
     assert_eq!(env.pool_outstanding(), amount);
+}
+
+// UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
+// market-binding PDA seeds. A program upgrade must preserve its existing owners'
+// exit path, but must not reopen that pre-window genesis pool to new deposits.
+// Build a funded fixture through the real Percolator binary, translate only the
+// subledger account/PDA to its historical wire format, then exercise both sides.
+#[test]
+fn legacy_master_insurance_pool_rejects_new_deposits_but_owner_can_withdraw() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let current_pool = env.pool;
+    let current_holding = create_holding(&mut env, &current_pool);
+    env.insurance_deposit(&alice, &alice_ata, &current_holding, amount)
+        .expect("fund real Percolator insurance before translating the fixture");
+
+    let current_pool_account = env.svm.get_account(&current_pool).unwrap();
+    let current_position = env.position_pda(&alice.pubkey());
+    let current_position_account = env.svm.get_account(&current_position).unwrap();
+    let (legacy_pool, legacy_bump) = legacy_master_insurance_pool_pda(&env.mint, &env.slab);
+
+    let mut legacy_pool_data = current_pool_account.data[..208].to_vec();
+    legacy_pool_data[89] = legacy_bump;
+    env.svm
+        .set_account(
+            legacy_pool,
+            Account {
+                lamports: current_pool_account.lamports,
+                data: legacy_pool_data,
+                owner: sub_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let legacy_position = Pubkey::find_program_address(
+        &[
+            b"subledger_position",
+            legacy_pool.as_ref(),
+            alice.pubkey().as_ref(),
+        ],
+        &sub_id(),
+    )
+    .0;
+    let mut legacy_position_data = current_position_account.data;
+    legacy_position_data[8..40].copy_from_slice(legacy_pool.as_ref());
+    env.svm
+        .set_account(
+            legacy_position,
+            Account {
+                lamports: current_position_account.lamports,
+                data: legacy_position_data,
+                owner: sub_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // A historical market initialized with this PDA stored it in every asset-0
+    // authority field. Rewrite the already-funded fixture through Percolator's
+    // public state codec so the real binary enforces that exact authority.
+    let mut slab_account = env.svm.get_account(&env.slab).unwrap();
+    let mut profile = percolator_prog::state::read_asset_oracle_profile(&slab_account.data, 0)
+        .expect("read asset-0 profile");
+    let legacy_authority = legacy_pool.to_bytes();
+    profile.insurance_authority = legacy_authority;
+    profile.insurance_operator = legacy_authority;
+    profile.backing_bucket_authority = legacy_authority;
+    profile.oracle_authority = legacy_authority;
+    profile.asset_admin = legacy_authority;
+    percolator_prog::state::write_asset_oracle_profile(&mut slab_account.data, 0, &profile)
+        .expect("write historical asset-0 authority");
+    env.svm.set_account(env.slab, slab_account).unwrap();
+    env.pool = legacy_pool;
+
+    let legacy_holding = create_holding(&mut env, &legacy_pool);
+    let (bob, bob_ata) = new_depositor(&mut env, 1);
+    let bob_holding = create_holding(&mut env, &legacy_pool);
+    assert!(
+        env.insurance_deposit(&bob, &bob_ata, &bob_holding, 1)
+            .is_err(),
+        "an upgrade must not reopen an unbounded legacy genesis deposit period"
+    );
+    assert_eq!(env.token_amount(&bob_ata), 1);
+    assert_eq!(env.token_amount(&bob_holding), 0);
+    assert!(env
+        .svm
+        .get_account(&env.position_pda(&bob.pubkey()))
+        .is_none());
+    assert_eq!(env.token_amount(&env.perc_vault), amount);
+
+    env.insurance_withdraw(&alice, &alice_ata, &legacy_holding, &alice, amount)
+        .expect("legacy owner withdrawal remains live through real Percolator");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.svm.get_account(&legacy_pool).unwrap().data.len(), 208);
 }
 
 // SYBIL/FREE-FARM PROBE (vote-weight tenure gaming, sweep tick B): vote weight = floor(log2(now - start_slot)) *

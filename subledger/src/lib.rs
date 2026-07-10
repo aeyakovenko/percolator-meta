@@ -24,7 +24,7 @@ extern crate alloc;
 
 #[allow(unused_imports)]
 use alloc::format; // required by the entrypoint!/msg! macro in SBF builds
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     clock::Clock,
@@ -55,7 +55,20 @@ const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // Position grows by `shares` (u128 @104). All cross-program reads (genesis-vote
 // principal@72 / start_slot@89 / outstanding@80) keep their offsets — the new fields are
 // appended, so those programs are unaffected.
+// Historical accounts cannot be reallocated by an upgrade. Keep every deployed
+// wire size readable so owners retain an exit path, while new pools always use
+// the current layout. Sizes that never existed remain invalid.
+const POOL_SIZE_BASE: usize = 96;
+const POOL_SIZE_MARKET: usize = 160;
+const POOL_SIZE_VOTE: usize = 192;
+const POOL_SIZE_SHARES: usize = 208;
+const POOL_SIZE_DEADLINE_ONLY: usize = 216;
+const POOL_SIZE_COIN: usize = 240;
+const POOL_SIZE_WINDOW: usize = 256;
+const POOL_SIZE_START: usize = 264;
 const POOL_SIZE: usize = 272;
+const POSITION_SIZE_BASE: usize = 96;
+const POSITION_SIZE_TENURE: usize = 104;
 const POSITION_SIZE: usize = 120;
 // One week at ~400ms/slot. `init_insurance_pool` accepts an optional explicit
 // slot window, but defaults to this short bootstrap deposit window.
@@ -254,7 +267,7 @@ struct Pool {
 
 impl Pool {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < POOL_SIZE || data[..8] != POOL_DISC {
+        if !supported_pool_size(data.len()) || data[..8] != POOL_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
         let policy = data[88];
@@ -270,19 +283,60 @@ impl Pool {
             policy,
             domain,
             bump: data[89],
-            market_slab: Pubkey::new_from_array(data[96..128].try_into().unwrap()),
-            percolator_program: Pubkey::new_from_array(data[128..160].try_into().unwrap()),
-            vote_authority: Pubkey::new_from_array(data[160..192].try_into().unwrap()),
-            total_shares: u128::from_le_bytes(data[192..208].try_into().unwrap()),
-            coin_mint: Pubkey::new_from_array(data[208..240].try_into().unwrap()),
-            deposit_deadline_slot: u64::from_le_bytes(data[240..248].try_into().unwrap()),
-            deposit_window_slots: u64::from_le_bytes(data[248..256].try_into().unwrap()),
-            deposit_start_slot: u64::from_le_bytes(data[256..264].try_into().unwrap()),
-            bootstrap_delay_slots: u64::from_le_bytes(data[264..272].try_into().unwrap()),
+            market_slab: if data.len() >= POOL_SIZE_MARKET {
+                Pubkey::new_from_array(data[96..128].try_into().unwrap())
+            } else {
+                Pubkey::default()
+            },
+            percolator_program: if data.len() >= POOL_SIZE_MARKET {
+                Pubkey::new_from_array(data[128..160].try_into().unwrap())
+            } else {
+                Pubkey::default()
+            },
+            vote_authority: if data.len() >= POOL_SIZE_VOTE {
+                Pubkey::new_from_array(data[160..192].try_into().unwrap())
+            } else {
+                Pubkey::default()
+            },
+            total_shares: if data.len() >= POOL_SIZE_SHARES {
+                u128::from_le_bytes(data[192..208].try_into().unwrap())
+            } else {
+                0
+            },
+            coin_mint: if data.len() >= POOL_SIZE_COIN {
+                Pubkey::new_from_array(data[208..240].try_into().unwrap())
+            } else {
+                Pubkey::default()
+            },
+            deposit_deadline_slot: if data.len() == POOL_SIZE_DEADLINE_ONLY {
+                u64::from_le_bytes(data[208..216].try_into().unwrap())
+            } else if data.len() >= POOL_SIZE_WINDOW {
+                u64::from_le_bytes(data[240..248].try_into().unwrap())
+            } else {
+                u64::MAX
+            },
+            deposit_window_slots: if data.len() >= POOL_SIZE_WINDOW {
+                u64::from_le_bytes(data[248..256].try_into().unwrap())
+            } else {
+                OWN_VAULT_DEPOSIT_WINDOW_SLOTS
+            },
+            deposit_start_slot: if data.len() >= POOL_SIZE_START {
+                u64::from_le_bytes(data[256..264].try_into().unwrap())
+            } else {
+                OWN_VAULT_DEPOSIT_START_SLOT
+            },
+            bootstrap_delay_slots: if data.len() >= POOL_SIZE {
+                u64::from_le_bytes(data[264..272].try_into().unwrap())
+            } else {
+                OWN_VAULT_BOOTSTRAP_DELAY_SLOTS
+            },
         })
     }
 
-    fn serialize(&self, data: &mut [u8]) {
+    fn serialize(&self, data: &mut [u8]) -> ProgramResult {
+        if !supported_pool_size(data.len()) {
+            return Err(ProgramError::InvalidAccountData);
+        }
         data[..8].copy_from_slice(&POOL_DISC);
         data[8..40].copy_from_slice(self.mint.as_ref());
         data[40..48].copy_from_slice(&self.asset_id.to_le_bytes());
@@ -292,20 +346,193 @@ impl Pool {
         data[89] = self.bump;
         data[90] = self.domain;
         data[91..96].fill(0);
-        data[96..128].copy_from_slice(self.market_slab.as_ref());
-        data[128..160].copy_from_slice(self.percolator_program.as_ref());
-        data[160..192].copy_from_slice(self.vote_authority.as_ref());
-        data[192..208].copy_from_slice(&self.total_shares.to_le_bytes());
-        data[208..240].copy_from_slice(self.coin_mint.as_ref());
-        data[240..248].copy_from_slice(&self.deposit_deadline_slot.to_le_bytes());
-        data[248..256].copy_from_slice(&self.deposit_window_slots.to_le_bytes());
-        data[256..264].copy_from_slice(&self.deposit_start_slot.to_le_bytes());
-        data[264..272].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        if data.len() >= POOL_SIZE_MARKET {
+            data[96..128].copy_from_slice(self.market_slab.as_ref());
+            data[128..160].copy_from_slice(self.percolator_program.as_ref());
+        }
+        if data.len() >= POOL_SIZE_VOTE {
+            data[160..192].copy_from_slice(self.vote_authority.as_ref());
+        }
+        if data.len() >= POOL_SIZE_SHARES {
+            data[192..208].copy_from_slice(&self.total_shares.to_le_bytes());
+        }
+        if data.len() == POOL_SIZE_DEADLINE_ONLY {
+            data[208..216].copy_from_slice(&self.deposit_deadline_slot.to_le_bytes());
+        } else if data.len() >= POOL_SIZE_COIN {
+            data[208..240].copy_from_slice(self.coin_mint.as_ref());
+        }
+        if data.len() >= POOL_SIZE_WINDOW {
+            data[240..248].copy_from_slice(&self.deposit_deadline_slot.to_le_bytes());
+            data[248..256].copy_from_slice(&self.deposit_window_slots.to_le_bytes());
+        }
+        if data.len() >= POOL_SIZE_START {
+            data[256..264].copy_from_slice(&self.deposit_start_slot.to_le_bytes());
+        }
+        if data.len() >= POOL_SIZE {
+            data[264..272].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        }
+        Ok(())
     }
 
     fn is_insurance(&self) -> bool {
         self.percolator_program != Pubkey::default()
     }
+}
+
+fn supported_pool_size(size: usize) -> bool {
+    matches!(
+        size,
+        POOL_SIZE_BASE
+            | POOL_SIZE_MARKET
+            | POOL_SIZE_VOTE
+            | POOL_SIZE_SHARES
+            | POOL_SIZE_DEADLINE_ONLY
+            | POOL_SIZE_COIN
+            | POOL_SIZE_WINDOW
+            | POOL_SIZE_START
+    ) || size >= POOL_SIZE
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PoolSeedVersion {
+    Base,
+    Market,
+    Coin,
+    PolicyDomain,
+    Window,
+    Start,
+    Bootstrap,
+}
+
+struct PoolSeedBytes {
+    asset_id: [u8; 8],
+    policy: [u8; 1],
+    domain: [u8; 1],
+    deposit_window_slots: [u8; 8],
+    deposit_start_slot: [u8; 8],
+    bootstrap_delay_slots: [u8; 8],
+    bump: [u8; 1],
+}
+
+impl PoolSeedBytes {
+    fn new(pool: &Pool) -> Self {
+        Self {
+            asset_id: pool.asset_id.to_le_bytes(),
+            policy: [pool.policy],
+            domain: [pool.domain],
+            deposit_window_slots: pool.deposit_window_slots.to_le_bytes(),
+            deposit_start_slot: pool.deposit_start_slot.to_le_bytes(),
+            bootstrap_delay_slots: pool.bootstrap_delay_slots.to_le_bytes(),
+            bump: [pool.bump],
+        }
+    }
+
+    fn signer_seeds<'a>(&'a self, pool: &'a Pool, version: PoolSeedVersion) -> Vec<&'a [u8]> {
+        let mut seeds: Vec<&[u8]> = Vec::with_capacity(12);
+        seeds.extend_from_slice(&[b"subledger_pool", pool.mint.as_ref(), &self.asset_id]);
+        match version {
+            PoolSeedVersion::Base => {}
+            PoolSeedVersion::Market => seeds
+                .extend_from_slice(&[pool.market_slab.as_ref(), pool.percolator_program.as_ref()]),
+            PoolSeedVersion::Coin => seeds.extend_from_slice(&[
+                pool.market_slab.as_ref(),
+                pool.percolator_program.as_ref(),
+                pool.coin_mint.as_ref(),
+            ]),
+            PoolSeedVersion::PolicyDomain => seeds.extend_from_slice(&[
+                pool.market_slab.as_ref(),
+                pool.percolator_program.as_ref(),
+                pool.coin_mint.as_ref(),
+                &self.policy,
+                &self.domain,
+            ]),
+            PoolSeedVersion::Window => seeds.extend_from_slice(&[
+                pool.market_slab.as_ref(),
+                pool.percolator_program.as_ref(),
+                pool.coin_mint.as_ref(),
+                &self.policy,
+                &self.domain,
+                &self.deposit_window_slots,
+            ]),
+            PoolSeedVersion::Start => seeds.extend_from_slice(&[
+                pool.market_slab.as_ref(),
+                pool.percolator_program.as_ref(),
+                pool.coin_mint.as_ref(),
+                &self.policy,
+                &self.domain,
+                &self.deposit_window_slots,
+                &self.deposit_start_slot,
+            ]),
+            PoolSeedVersion::Bootstrap => seeds.extend_from_slice(&[
+                pool.market_slab.as_ref(),
+                pool.percolator_program.as_ref(),
+                pool.coin_mint.as_ref(),
+                &self.policy,
+                &self.domain,
+                &self.deposit_window_slots,
+                &self.deposit_start_slot,
+                &self.bootstrap_delay_slots,
+            ]),
+        }
+        seeds.push(&self.bump);
+        seeds
+    }
+}
+
+fn pool_seed_version(
+    program_id: &Pubkey,
+    pool_key: &Pubkey,
+    pool_data_len: usize,
+    pool: &Pool,
+) -> Result<PoolSeedVersion, ProgramError> {
+    const BASE: &[PoolSeedVersion] = &[PoolSeedVersion::Base];
+    const BASE_OR_MARKET: &[PoolSeedVersion] = &[PoolSeedVersion::Base, PoolSeedVersion::Market];
+    const MARKET: &[PoolSeedVersion] = &[PoolSeedVersion::Market];
+    const COIN_OR_POLICY: &[PoolSeedVersion] =
+        &[PoolSeedVersion::Coin, PoolSeedVersion::PolicyDomain];
+    const WINDOW: &[PoolSeedVersion] = &[PoolSeedVersion::Window];
+    const START: &[PoolSeedVersion] = &[PoolSeedVersion::Start];
+    const BOOTSTRAP: &[PoolSeedVersion] = &[PoolSeedVersion::Bootstrap];
+
+    let candidates = match pool_data_len {
+        POOL_SIZE_BASE | POOL_SIZE_MARKET => BASE,
+        POOL_SIZE_VOTE => BASE_OR_MARKET,
+        POOL_SIZE_SHARES | POOL_SIZE_DEADLINE_ONLY => MARKET,
+        POOL_SIZE_COIN => COIN_OR_POLICY,
+        POOL_SIZE_WINDOW => WINDOW,
+        POOL_SIZE_START => START,
+        size if size >= POOL_SIZE => BOOTSTRAP,
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
+    let seed_bytes = PoolSeedBytes::new(pool);
+    for version in candidates {
+        let signer_seeds = seed_bytes.signer_seeds(pool, *version);
+        let base_seeds = &signer_seeds[..signer_seeds.len() - 1];
+        let (expected, bump) = Pubkey::find_program_address(base_seeds, program_id);
+        if expected == *pool_key && bump == pool.bump {
+            return Ok(*version);
+        }
+    }
+    Err(ProgramError::InvalidSeeds)
+}
+
+fn validate_pool_pda(
+    program_id: &Pubkey,
+    pool_account: &AccountInfo,
+    pool: &Pool,
+) -> Result<PoolSeedVersion, ProgramError> {
+    pool_seed_version(program_id, pool_account.key, pool_account.data_len(), pool)
+}
+
+fn invoke_signed_for_pool<'a>(
+    pool: &Pool,
+    version: PoolSeedVersion,
+    instruction: &Instruction,
+    account_infos: &[AccountInfo<'a>],
+) -> ProgramResult {
+    let seed_bytes = PoolSeedBytes::new(pool);
+    let signer_seeds = seed_bytes.signer_seeds(pool, version);
+    invoke_signed(instruction, account_infos, &[signer_seeds.as_slice()])
 }
 
 struct Position {
@@ -330,11 +557,15 @@ struct Position {
 
 impl Position {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < POSITION_SIZE || data[..8] != POSITION_DISC {
+        if !supported_position_size(data.len()) || data[..8] != POSITION_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
         let withdrawn = data[88];
-        let vote_locked = data[97];
+        let vote_locked = if data.len() >= POSITION_SIZE_TENURE {
+            data[97]
+        } else {
+            0
+        };
         if withdrawn > 1 || vote_locked > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -344,24 +575,46 @@ impl Position {
             principal: u64::from_le_bytes(data[72..80].try_into().unwrap()),
             withdrawn_amount: u64::from_le_bytes(data[80..88].try_into().unwrap()),
             withdrawn: withdrawn == 1,
-            start_slot: u64::from_le_bytes(data[89..97].try_into().unwrap()),
+            start_slot: if data.len() >= POSITION_SIZE_TENURE {
+                u64::from_le_bytes(data[89..97].try_into().unwrap())
+            } else {
+                0
+            },
             vote_locked: vote_locked == 1,
-            shares: u128::from_le_bytes(data[104..120].try_into().unwrap()),
+            shares: if data.len() >= POSITION_SIZE {
+                u128::from_le_bytes(data[104..120].try_into().unwrap())
+            } else {
+                0
+            },
         })
     }
 
-    fn serialize(&self, data: &mut [u8]) {
+    fn serialize(&self, data: &mut [u8]) -> ProgramResult {
+        if !supported_position_size(data.len()) {
+            return Err(ProgramError::InvalidAccountData);
+        }
         data[..8].copy_from_slice(&POSITION_DISC);
         data[8..40].copy_from_slice(self.pool.as_ref());
         data[40..72].copy_from_slice(self.owner.as_ref());
         data[72..80].copy_from_slice(&self.principal.to_le_bytes());
         data[80..88].copy_from_slice(&self.withdrawn_amount.to_le_bytes());
         data[88] = self.withdrawn as u8;
-        data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
-        data[97] = self.vote_locked as u8;
-        data[98..104].fill(0);
-        data[104..120].copy_from_slice(&self.shares.to_le_bytes());
+        if data.len() == POSITION_SIZE_BASE {
+            data[89..POSITION_SIZE_BASE].fill(0);
+        } else {
+            data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
+            data[97] = self.vote_locked as u8;
+            data[98..104].fill(0);
+            if data.len() >= POSITION_SIZE {
+                data[104..120].copy_from_slice(&self.shares.to_le_bytes());
+            }
+        }
+        Ok(())
     }
+}
+
+fn supported_position_size(size: usize) -> bool {
+    matches!(size, POSITION_SIZE_BASE | POSITION_SIZE_TENURE) || size >= POSITION_SIZE
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +928,7 @@ fn process_init_pool(
         deposit_start_slot: OWN_VAULT_DEPOSIT_START_SLOT,
         bootstrap_delay_slots: OWN_VAULT_BOOTSTRAP_DELAY_SLOTS,
     };
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?);
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -719,6 +972,12 @@ fn process_deposit(
     if pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Pre-share pools used pro-rata accounting and cannot persist the current
+    // share fields. Keep their existing owners withdrawable, but do not accept a
+    // deposit that would be serialized without its ownership attribution.
+    if pool_account.data_len() < POOL_SIZE_SHARES {
+        return Err(ProgramError::InvalidAccountData);
+    }
     if *vault.key != pool.vault {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -760,6 +1019,9 @@ fn process_deposit(
             return Err(ProgramError::IllegalOwner);
         }
         let p = Position::deserialize(&position_account.try_borrow_data()?)?;
+        if position_account.data_len() < POSITION_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
         if p.owner != *owner.key || p.pool != *pool_account.key {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -821,8 +1083,8 @@ fn process_deposit(
     // earn early-join weight.
     position.start_slot = Clock::get()?.slot;
 
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?);
-    position.serialize(&mut position_account.try_borrow_mut_data()?);
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    position.serialize(&mut position_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -863,32 +1125,8 @@ fn process_withdraw(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // Re-derive the pool PDA so the recorded vault and signing seeds are trusted.
-    // (own-vault: market_slab/percolator_program are the default key it stored.)
-    let asset_id_bytes = pool.asset_id.to_le_bytes();
-    let policy_seed = [pool.policy];
-    let domain_seed = [pool.domain];
-    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
-    let deposit_start_seed = pool.deposit_start_slot.to_le_bytes();
-    let bootstrap_delay_seed = pool.bootstrap_delay_slots.to_le_bytes();
-    let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds_full(
-            &pool.mint,
-            &asset_id_bytes,
-            &pool.market_slab,
-            &pool.percolator_program,
-            &pool.coin_mint,
-            &policy_seed,
-            &domain_seed,
-            &deposit_window_seed,
-            &deposit_start_seed,
-            &bootstrap_delay_seed,
-        ),
-        program_id,
-    );
-    if *pool_account.key != expected_pool || bump != pool.bump {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    // Match the exact historical PDA schema implied by this deployed account.
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
     if *vault.key != pool.vault {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -908,7 +1146,11 @@ fn process_withdraw(
     // shares were priced at deposit, so a late depositor only redeems its own-tenure surplus. A
     // full own-vault exit burns all of the position's shares. POLICY_PRINCIPAL keeps the pro-rata/
     // principal payout.
-    let (paid, shares_to_burn) = if pool.policy == POLICY_WITH_SURPLUS {
+    let share_accounting = pool_account.data_len() >= POOL_SIZE_SHARES;
+    if share_accounting && position_account.data_len() < POSITION_SIZE {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (paid, shares_to_burn) = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
         let stb = position.shares;
         (redeem_shares(stb, balance, pool.total_shares)?, stb)
     } else {
@@ -924,22 +1166,9 @@ fn process_withdraw(
     };
 
     if paid > 0 {
-        let bump_arr = [pool.bump];
-        let seeds: [&[u8]; 12] = [
-            b"subledger_pool",
-            pool.mint.as_ref(),
-            &asset_id_bytes,
-            pool.market_slab.as_ref(),
-            pool.percolator_program.as_ref(),
-            pool.coin_mint.as_ref(),
-            &policy_seed,
-            &domain_seed,
-            &deposit_window_seed,
-            &deposit_start_seed,
-            &bootstrap_delay_seed,
-            &bump_arr,
-        ];
-        invoke_signed(
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
             &spl_token::instruction::transfer(
                 token_program.key,
                 vault.key,
@@ -954,7 +1183,6 @@ fn process_withdraw(
                 pool_account.clone(),
                 token_program.clone(),
             ],
-            &[&seeds],
         )?;
     }
 
@@ -966,8 +1194,8 @@ fn process_withdraw(
     position.withdrawn = true;
     position.withdrawn_amount = paid;
 
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?);
-    position.serialize(&mut position_account.try_borrow_mut_data()?);
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    position.serialize(&mut position_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -1206,7 +1434,7 @@ fn process_init_insurance_pool(
         deposit_start_slot,
         bootstrap_delay_slots,
     };
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?);
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -1252,6 +1480,12 @@ fn process_insurance_deposit(
     if !pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Historical genesis layouts either had no deposit deadline or did not bind
+    // the complete bootstrap schedule into their PDA. Upgrades preserve exits,
+    // never reopen those pools to late capital.
+    if pool_account.data_len() < POOL_SIZE {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // Genesis deposits are only accepted during the configured window. Binding
     // the start slot into the pool PDA prevents a permissionless first writer
     // from opening deposits early or starting the clock before launch.
@@ -1259,31 +1493,7 @@ fn process_insurance_deposit(
     if now < pool.deposit_start_slot || now >= pool.deposit_deadline_slot {
         return Err(ProgramError::InvalidInstructionData);
     }
-    // Re-derive the pool PDA so the signing seeds are trusted.
-    let asset_id_bytes = pool.asset_id.to_le_bytes();
-    let policy_seed = [pool.policy];
-    let domain_seed = [pool.domain];
-    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
-    let deposit_start_seed = pool.deposit_start_slot.to_le_bytes();
-    let bootstrap_delay_seed = pool.bootstrap_delay_slots.to_le_bytes();
-    let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds_full(
-            &pool.mint,
-            &asset_id_bytes,
-            &pool.market_slab,
-            &pool.percolator_program,
-            &pool.coin_mint,
-            &policy_seed,
-            &domain_seed,
-            &deposit_window_seed,
-            &deposit_start_seed,
-            &bootstrap_delay_seed,
-        ),
-        program_id,
-    );
-    if *pool_account.key != expected_pool || bump != pool.bump {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
     if *market_slab.key != pool.market_slab
         || *percolator_vault.key != pool.vault
         || *percolator_program.key != pool.percolator_program
@@ -1353,6 +1563,9 @@ fn process_insurance_deposit(
             return Err(ProgramError::IllegalOwner);
         }
         let p = Position::deserialize(&position_account.try_borrow_data()?)?;
+        if position_account.data_len() < POSITION_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
         if p.owner != *owner.key || p.pool != *pool_account.key || p.withdrawn {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -1379,23 +1592,11 @@ fn process_insurance_deposit(
 
     // 2) holding -> Percolator insurance vault, signed by the pool PDA as the
     //    asset-0 insurance authority (TopUpInsurance, tag 9).
-    let seeds: [&[u8]; 12] = [
-        b"subledger_pool",
-        pool.mint.as_ref(),
-        &asset_id_bytes,
-        pool.market_slab.as_ref(),
-        pool.percolator_program.as_ref(),
-        pool.coin_mint.as_ref(),
-        &policy_seed,
-        &domain_seed,
-        &deposit_window_seed,
-        &deposit_start_seed,
-        &bootstrap_delay_seed,
-        core::slice::from_ref(&pool.bump),
-    ];
     let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE];
     ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    invoke_signed(
+    invoke_signed_for_pool(
+        &pool,
+        pool_seed_version,
         &Instruction {
             program_id: *percolator_program.key,
             accounts: vec![
@@ -1415,7 +1616,6 @@ fn process_insurance_deposit(
             token_program.clone(),
             percolator_program.clone(),
         ],
-        &[&seeds],
     )?;
 
     pool.outstanding_principal = pool
@@ -1439,8 +1639,8 @@ fn process_insurance_deposit(
     // Last-write-time: topping up resets the vote clock.
     position.start_slot = Clock::get()?.slot;
 
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?);
-    position.serialize(&mut position_account.try_borrow_mut_data()?);
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    position.serialize(&mut position_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -1491,30 +1691,7 @@ fn process_insurance_withdraw(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let asset_id_bytes = pool.asset_id.to_le_bytes();
-    let policy_seed = [pool.policy];
-    let domain_seed = [pool.domain];
-    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
-    let deposit_start_seed = pool.deposit_start_slot.to_le_bytes();
-    let bootstrap_delay_seed = pool.bootstrap_delay_slots.to_le_bytes();
-    let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds_full(
-            &pool.mint,
-            &asset_id_bytes,
-            &pool.market_slab,
-            &pool.percolator_program,
-            &pool.coin_mint,
-            &policy_seed,
-            &domain_seed,
-            &deposit_window_seed,
-            &deposit_start_seed,
-            &bootstrap_delay_seed,
-        ),
-        program_id,
-    );
-    if *pool_account.key != expected_pool || bump != pool.bump {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
     if *market_slab.key != pool.market_slab
         || *percolator_vault.key != pool.vault
         || *percolator_program.key != pool.percolator_program
@@ -1564,13 +1741,17 @@ fn process_insurance_withdraw(
     // policy remains separate: WITH_SURPLUS redeems those shares at the live balance, while PRINCIPAL keeps
     // the principal-only/pro-rata-haircut payout. This keeps RD's live share-value cap aligned with capital
     // still at risk even for a principal-policy partial exit.
-    let shares_to_burn = if position.principal == 0 {
+    let share_accounting = pool_account.data_len() >= POOL_SIZE_SHARES;
+    if share_accounting && position_account.data_len() < POSITION_SIZE {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let shares_to_burn = if !share_accounting || position.principal == 0 {
         0u128
     } else {
         wide_mul_div_floor(position.shares, amount as u128, position.principal as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?
     };
-    let owed = if pool.policy == POLICY_WITH_SURPLUS {
+    let owed = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
         redeem_shares(shares_to_burn, insurance, pool.total_shares)?
     } else {
         payout(pool.policy, insurance, pool.outstanding_principal, amount)?
@@ -1578,27 +1759,15 @@ fn process_insurance_withdraw(
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,
     // moving Percolator insurance -> pool-PDA-owned holding.
-    let seeds: [&[u8]; 12] = [
-        b"subledger_pool",
-        pool.mint.as_ref(),
-        &asset_id_bytes,
-        pool.market_slab.as_ref(),
-        pool.percolator_program.as_ref(),
-        pool.coin_mint.as_ref(),
-        &policy_seed,
-        &domain_seed,
-        &deposit_window_seed,
-        &deposit_start_seed,
-        &bootstrap_delay_seed,
-        core::slice::from_ref(&pool.bump),
-    ];
     // A fully-impaired exit (owed == 0, insurance wiped) still retires the position below; only
     // move tokens when there is something to pay (percolator rejects a zero-amount withdraw).
     if owed > 0 {
         let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
         ix_data.extend_from_slice(&(pool.asset_id as u16).to_le_bytes()); // asset_index (0 for genesis insurance)
         ix_data.extend_from_slice(&(owed as u128).to_le_bytes());
-        invoke_signed(
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
             &Instruction {
                 program_id: *percolator_program.key,
                 accounts: vec![
@@ -1620,12 +1789,13 @@ fn process_insurance_withdraw(
                 token_program.clone(),
                 percolator_program.clone(),
             ],
-            &[&seeds],
         )?;
 
         // holding -> owner's ATA, signed by the pool PDA. The only path out, bounded by the
         // owner's pro-rata share, so the program can never pay more than is owed.
-        invoke_signed(
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
             &spl_token::instruction::transfer(
                 token_program.key,
                 holding.key,
@@ -1640,7 +1810,6 @@ fn process_insurance_withdraw(
                 pool_account.clone(),
                 token_program.clone(),
             ],
-            &[&seeds],
         )?;
     }
 
@@ -1664,8 +1833,8 @@ fn process_insurance_withdraw(
         position.withdrawn = true;
     }
 
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?);
-    position.serialize(&mut position_account.try_borrow_mut_data()?);
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    position.serialize(&mut position_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -1722,7 +1891,7 @@ fn process_set_vote_lock(
         return Err(ProgramError::InvalidAccountData);
     }
     position.vote_locked = locked == 1;
-    position.serialize(&mut position_account.try_borrow_mut_data()?);
+    position.serialize(&mut position_account.try_borrow_mut_data()?)?;
     Ok(())
 }
 
@@ -1761,46 +1930,7 @@ fn process_accept_operator(
     if *market_slab.key != pool.market_slab || *percolator_program.key != pool.percolator_program {
         return Err(ProgramError::InvalidAccountData);
     }
-    // Re-derive the pool PDA so the signing seeds are trusted.
-    let asset_id_bytes = pool.asset_id.to_le_bytes();
-    let policy_seed = [pool.policy];
-    let domain_seed = [pool.domain];
-    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
-    let deposit_start_seed = pool.deposit_start_slot.to_le_bytes();
-    let bootstrap_delay_seed = pool.bootstrap_delay_slots.to_le_bytes();
-    let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds_full(
-            &pool.mint,
-            &asset_id_bytes,
-            &pool.market_slab,
-            &pool.percolator_program,
-            &pool.coin_mint,
-            &policy_seed,
-            &domain_seed,
-            &deposit_window_seed,
-            &deposit_start_seed,
-            &bootstrap_delay_seed,
-        ),
-        program_id,
-    );
-    if *pool_account.key != expected_pool || bump != pool.bump {
-        return Err(ProgramError::InvalidSeeds);
-    }
-
-    let seeds: [&[u8]; 12] = [
-        b"subledger_pool",
-        pool.mint.as_ref(),
-        &asset_id_bytes,
-        pool.market_slab.as_ref(),
-        pool.percolator_program.as_ref(),
-        pool.coin_mint.as_ref(),
-        &policy_seed,
-        &domain_seed,
-        &deposit_window_seed,
-        &deposit_start_seed,
-        &bootstrap_delay_seed,
-        core::slice::from_ref(&pool.bump),
-    ];
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
     // Receive the two insurance roles and then asset_admin. The final rotation removes
     // governance's direct path to reassign either role and withdraw principal.
     for kind in [
@@ -1812,7 +1942,9 @@ fn process_accept_operator(
         ix_data.extend_from_slice(&0u16.to_le_bytes()); // asset_index 0
         ix_data.push(kind);
         ix_data.extend_from_slice(pool_account.key.as_ref()); // new authority = the pool itself
-        invoke_signed(
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
             &Instruction {
                 program_id: *percolator_program.key,
                 accounts: vec![
@@ -1828,7 +1960,6 @@ fn process_accept_operator(
                 market_slab.clone(),
                 percolator_program.clone(),
             ],
-            &[&seeds],
         )?;
     }
     Ok(())
@@ -1878,48 +2009,13 @@ fn process_handoff_to_twap(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let asset_id_bytes = pool.asset_id.to_le_bytes();
-    let policy_seed = [pool.policy];
-    let domain_seed = [pool.domain];
-    let deposit_window_seed = pool.deposit_window_slots.to_le_bytes();
-    let deposit_start_seed = pool.deposit_start_slot.to_le_bytes();
-    let bootstrap_delay_seed = pool.bootstrap_delay_slots.to_le_bytes();
-    let (expected_pool, bump) = Pubkey::find_program_address(
-        &pool_seeds_full(
-            &pool.mint,
-            &asset_id_bytes,
-            &pool.market_slab,
-            &pool.percolator_program,
-            &pool.coin_mint,
-            &policy_seed,
-            &domain_seed,
-            &deposit_window_seed,
-            &deposit_start_seed,
-            &bootstrap_delay_seed,
-        ),
-        program_id,
-    );
-    if *pool_account.key != expected_pool || bump != pool.bump {
-        return Err(ProgramError::InvalidSeeds);
-    }
-    let seeds: [&[u8]; 12] = [
-        b"subledger_pool",
-        pool.mint.as_ref(),
-        &asset_id_bytes,
-        pool.market_slab.as_ref(),
-        pool.percolator_program.as_ref(),
-        pool.coin_mint.as_ref(),
-        &policy_seed,
-        &domain_seed,
-        &deposit_window_seed,
-        &deposit_start_seed,
-        &bootstrap_delay_seed,
-        core::slice::from_ref(&pool.bump),
-    ];
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
 
     let mut handoff_data = vec![TWAP_IX_ACCEPT_FROM_SUBLEDGER];
     handoff_data.extend_from_slice(&(pool.outstanding_principal as u128).to_le_bytes());
-    invoke_signed(
+    invoke_signed_for_pool(
+        &pool,
+        pool_seed_version,
         &Instruction {
             program_id: *twap_program.key,
             accounts: vec![
@@ -1941,7 +2037,6 @@ fn process_handoff_to_twap(
             percolator_program.clone(),
             twap_program.clone(),
         ],
-        &[&seeds],
     )
 }
 
@@ -1971,7 +2066,7 @@ mod tests {
             shares: 0,
         };
         let mut d = vec![0u8; POSITION_SIZE];
-        p.serialize(&mut d);
+        p.serialize(&mut d).unwrap();
         assert_eq!(&d[POS_POOL_OFF..POS_POOL_OFF + 32], pool.as_ref());
         assert_eq!(&d[POS_OWNER_OFF..POS_OWNER_OFF + 32], owner.as_ref());
         assert_eq!(
@@ -2076,7 +2171,7 @@ mod tests {
             bootstrap_delay_slots: 30_000,
         };
         let mut buf = [0u8; POOL_SIZE];
-        pool.serialize(&mut buf);
+        pool.serialize(&mut buf).unwrap();
         // Canary the exported quorum-denominator offset (finding ID) so consumers can cross-pin it.
         assert_eq!(
             u64::from_le_bytes(
@@ -2150,7 +2245,7 @@ mod tests {
             shares: 5_555,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
-        pos.serialize(&mut pbuf);
+        pos.serialize(&mut pbuf).unwrap();
         let dp = Position::deserialize(&pbuf).unwrap();
         assert_eq!(dp.owner, pos.owner);
         assert_eq!(dp.principal, 999);
@@ -2158,6 +2253,169 @@ mod tests {
         assert_eq!(dp.start_slot, 4242);
         assert!(dp.vote_locked);
         assert_eq!(dp.shares, 5_555);
+    }
+
+    fn historical_pool_fixture() -> Pool {
+        Pool {
+            mint: Pubkey::new_unique(),
+            asset_id: 17,
+            vault: Pubkey::new_unique(),
+            outstanding_principal: 91,
+            policy: POLICY_WITH_SURPLUS,
+            domain: DOMAIN_BACKING,
+            bump: 200,
+            market_slab: Pubkey::new_unique(),
+            percolator_program: Pubkey::new_unique(),
+            vote_authority: Pubkey::new_unique(),
+            total_shares: 123_456,
+            coin_mint: Pubkey::new_unique(),
+            deposit_deadline_slot: 700,
+            deposit_window_slots: 600,
+            deposit_start_slot: 100,
+            bootstrap_delay_slots: 1_000,
+        }
+    }
+
+    #[test]
+    fn historical_pool_and_position_layouts_round_trip_without_growth() {
+        let pool = historical_pool_fixture();
+        for size in [
+            POOL_SIZE_BASE,
+            POOL_SIZE_MARKET,
+            POOL_SIZE_VOTE,
+            POOL_SIZE_SHARES,
+            POOL_SIZE_DEADLINE_ONLY,
+            POOL_SIZE_COIN,
+            POOL_SIZE_WINDOW,
+            POOL_SIZE_START,
+            POOL_SIZE,
+        ] {
+            let mut data = vec![0u8; size];
+            pool.serialize(&mut data).unwrap();
+            let decoded = Pool::deserialize(&data).unwrap();
+            assert_eq!(data.len(), size);
+            assert_eq!(decoded.mint, pool.mint);
+            assert_eq!(decoded.asset_id, pool.asset_id);
+            assert_eq!(decoded.outstanding_principal, pool.outstanding_principal);
+            assert_eq!(decoded.policy, pool.policy);
+            assert_eq!(decoded.domain, pool.domain);
+            assert_eq!(decoded.bump, pool.bump);
+            assert_eq!(
+                decoded.market_slab,
+                if size >= POOL_SIZE_MARKET {
+                    pool.market_slab
+                } else {
+                    Pubkey::default()
+                }
+            );
+            assert_eq!(
+                decoded.vote_authority,
+                if size >= POOL_SIZE_VOTE {
+                    pool.vote_authority
+                } else {
+                    Pubkey::default()
+                }
+            );
+            assert_eq!(
+                decoded.total_shares,
+                if size >= POOL_SIZE_SHARES {
+                    pool.total_shares
+                } else {
+                    0
+                }
+            );
+            assert_eq!(
+                decoded.coin_mint,
+                if size >= POOL_SIZE_COIN {
+                    pool.coin_mint
+                } else {
+                    Pubkey::default()
+                }
+            );
+            assert_eq!(
+                decoded.deposit_deadline_slot,
+                if size == POOL_SIZE_DEADLINE_ONLY || size >= POOL_SIZE_WINDOW {
+                    pool.deposit_deadline_slot
+                } else {
+                    u64::MAX
+                }
+            );
+        }
+
+        let position = Position {
+            pool: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            principal: 55,
+            withdrawn_amount: 7,
+            withdrawn: false,
+            start_slot: 99,
+            vote_locked: true,
+            shares: 777,
+        };
+        for size in [POSITION_SIZE_BASE, POSITION_SIZE_TENURE, POSITION_SIZE] {
+            let mut data = vec![0u8; size];
+            position.serialize(&mut data).unwrap();
+            let decoded = Position::deserialize(&data).unwrap();
+            assert_eq!(data.len(), size);
+            assert_eq!(decoded.principal, position.principal);
+            assert_eq!(decoded.withdrawn_amount, position.withdrawn_amount);
+            assert_eq!(
+                decoded.start_slot,
+                if size >= POSITION_SIZE_TENURE { 99 } else { 0 }
+            );
+            assert_eq!(decoded.vote_locked, size >= POSITION_SIZE_TENURE);
+            assert_eq!(decoded.shares, if size >= POSITION_SIZE { 777 } else { 0 });
+        }
+
+        for size in [
+            95, 97, 159, 161, 191, 193, 207, 209, 215, 217, 239, 241, 255, 257, 263, 265, 271,
+        ] {
+            assert!(!supported_pool_size(size), "unsupported pool size {size}");
+        }
+        for size in [95, 97, 103, 105, 119] {
+            assert!(
+                !supported_position_size(size),
+                "unsupported position size {size}"
+            );
+        }
+    }
+
+    fn canonical_pool_key(pool: &mut Pool, version: PoolSeedVersion) -> Pubkey {
+        let seed_bytes = PoolSeedBytes::new(pool);
+        let signer_seeds = seed_bytes.signer_seeds(pool, version);
+        let (key, bump) =
+            Pubkey::find_program_address(&signer_seeds[..signer_seeds.len() - 1], &crate::id());
+        pool.bump = bump;
+        key
+    }
+
+    #[test]
+    fn same_size_historical_seed_versions_are_disambiguated_by_address() {
+        let mut pool = historical_pool_fixture();
+        let base_key = canonical_pool_key(&mut pool, PoolSeedVersion::Base);
+        assert_eq!(
+            pool_seed_version(&crate::id(), &base_key, POOL_SIZE_VOTE, &pool).unwrap(),
+            PoolSeedVersion::Base
+        );
+        let market_key = canonical_pool_key(&mut pool, PoolSeedVersion::Market);
+        assert_eq!(
+            pool_seed_version(&crate::id(), &market_key, POOL_SIZE_VOTE, &pool).unwrap(),
+            PoolSeedVersion::Market
+        );
+
+        let coin_key = canonical_pool_key(&mut pool, PoolSeedVersion::Coin);
+        assert_eq!(
+            pool_seed_version(&crate::id(), &coin_key, POOL_SIZE_COIN, &pool).unwrap(),
+            PoolSeedVersion::Coin
+        );
+        let policy_key = canonical_pool_key(&mut pool, PoolSeedVersion::PolicyDomain);
+        assert_eq!(
+            pool_seed_version(&crate::id(), &policy_key, POOL_SIZE_COIN, &pool).unwrap(),
+            PoolSeedVersion::PolicyDomain
+        );
+        assert!(
+            pool_seed_version(&crate::id(), &Pubkey::new_unique(), POOL_SIZE_COIN, &pool,).is_err()
+        );
     }
 
     // Soft-veto fairness: a depositor who joins AFTER surplus accrued cannot claim it. Property-based

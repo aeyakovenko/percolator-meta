@@ -164,6 +164,138 @@ fn position_pda(pool: &Pubkey, owner: &Pubkey) -> Pubkey {
     .0
 }
 
+fn legacy_master_pool_pda(mint: &Pubkey, asset_id: u64) -> (Pubkey, u8) {
+    let no_market = Pubkey::default();
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            no_market.as_ref(),
+            no_market.as_ref(),
+        ],
+        &program_id(),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoricalPoolSeeds {
+    Base,
+    Market,
+    Coin,
+    PolicyDomain,
+    Window,
+    Start,
+    Bootstrap,
+}
+
+fn historical_pool_pda(
+    mint: &Pubkey,
+    asset_id: u64,
+    policy: u8,
+    version: HistoricalPoolSeeds,
+) -> (Pubkey, u8) {
+    let asset_id = asset_id.to_le_bytes();
+    let no_market = Pubkey::default();
+    let policy = [policy];
+    let domain = [0u8];
+    let window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
+    let delay = OWN_VAULT_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
+    let mut seeds: Vec<&[u8]> = vec![b"subledger_pool", mint.as_ref(), &asset_id];
+    match version {
+        HistoricalPoolSeeds::Base => {}
+        HistoricalPoolSeeds::Market => {
+            seeds.extend_from_slice(&[no_market.as_ref(), no_market.as_ref()]);
+        }
+        HistoricalPoolSeeds::Coin => {
+            seeds.extend_from_slice(&[no_market.as_ref(), no_market.as_ref(), no_market.as_ref()]);
+        }
+        HistoricalPoolSeeds::PolicyDomain => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+            ]);
+        }
+        HistoricalPoolSeeds::Window => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+                &window,
+            ]);
+        }
+        HistoricalPoolSeeds::Start => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+                &window,
+                &start,
+            ]);
+        }
+        HistoricalPoolSeeds::Bootstrap => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+                &window,
+                &start,
+                &delay,
+            ]);
+        }
+    }
+    Pubkey::find_program_address(&seeds, &program_id())
+}
+
+fn historical_pool_data(
+    size: usize,
+    mint: &Pubkey,
+    asset_id: u64,
+    vault: &Pubkey,
+    outstanding: u64,
+    policy: u8,
+    bump: u8,
+) -> Vec<u8> {
+    let mut data = vec![0u8; size];
+    data[..8].copy_from_slice(b"SUBPOOL1");
+    data[8..40].copy_from_slice(mint.as_ref());
+    data[40..48].copy_from_slice(&asset_id.to_le_bytes());
+    data[48..80].copy_from_slice(vault.as_ref());
+    data[80..88].copy_from_slice(&outstanding.to_le_bytes());
+    data[88] = policy;
+    data[89] = bump;
+    data[90] = 0;
+    if size == 216 {
+        data[208..216].copy_from_slice(&u64::MAX.to_le_bytes());
+    } else if size >= 256 {
+        data[240..248].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[248..256].copy_from_slice(&OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes());
+    }
+    data
+}
+
+fn historical_position_data(size: usize, pool: &Pubkey, owner: &Pubkey, principal: u64) -> Vec<u8> {
+    let mut data = vec![0u8; size];
+    data[..8].copy_from_slice(b"SUBPOS01");
+    data[8..40].copy_from_slice(pool.as_ref());
+    data[40..72].copy_from_slice(owner.as_ref());
+    data[72..80].copy_from_slice(&principal.to_le_bytes());
+    if size >= 104 {
+        data[89..97].copy_from_slice(&1u64.to_le_bytes());
+    }
+    data
+}
+
 fn init_pool_ix(env: &Env, pool: &Pubkey, vault: &Pubkey, asset_id: u64, policy: u8) -> Instruction {
     let mut data = vec![0u8]; // IX_INIT_POOL
     data.extend_from_slice(&asset_id.to_le_bytes());
@@ -231,6 +363,227 @@ fn new_depositor(env: &mut Env, amount: u64) -> (Keypair, Pubkey) {
 
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
+}
+
+// UPGRADE LOF PROBE: origin/master created 208-byte pools and derived their PDA
+// without the later COIN/policy/schedule seeds. Growing Pool to 272 bytes must not
+// make an existing owner-bound vault impossible to sign for. This constructs the
+// exact master bytes and exercises a real SPL withdrawal against the current SBF.
+#[test]
+fn legacy_master_pool_owner_can_withdraw_after_layout_and_seed_upgrade() {
+    let mut env = Env::new();
+    let asset_id = 77;
+    let amount = 123_456u64;
+    let (pool, bump) = legacy_master_pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    let (owner, owner_ata) = new_depositor(&mut env, 0);
+    mint_to(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &clone_kp(&env.mint_authority),
+        &vault,
+        amount,
+    );
+
+    let mut pool_data = vec![0u8; 208];
+    pool_data[..8].copy_from_slice(b"SUBPOOL1");
+    pool_data[8..40].copy_from_slice(env.mint.as_ref());
+    pool_data[40..48].copy_from_slice(&asset_id.to_le_bytes());
+    pool_data[48..80].copy_from_slice(vault.as_ref());
+    pool_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    pool_data[88] = 0; // POLICY_PRINCIPAL
+    pool_data[89] = bump;
+    pool_data[90] = 0;
+    env.svm
+        .set_account(
+            pool,
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: pool_data,
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let position = position_pda(&pool, &owner.pubkey());
+    let mut position_data = vec![0u8; 120];
+    position_data[..8].copy_from_slice(b"SUBPOS01");
+    position_data[8..40].copy_from_slice(pool.as_ref());
+    position_data[40..72].copy_from_slice(owner.pubkey().as_ref());
+    position_data[72..80].copy_from_slice(&amount.to_le_bytes());
+    position_data[89..97].copy_from_slice(&1u64.to_le_bytes());
+    env.svm
+        .set_account(
+            position,
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: position_data,
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    env.send(
+        &[withdraw_ix(&pool, &owner.pubkey(), &owner_ata, &vault)],
+        &[&owner],
+    )
+    .expect("legacy owner withdrawal remains live after upgrade");
+    assert_eq!(env.token_amount(&owner_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+    assert_eq!(env.svm.get_account(&pool).unwrap().data.len(), 208);
+}
+
+// Every historical pool layout and both same-size seed transitions must still
+// produce a real PDA signature after upgrade. Each case executes a distinct SPL
+// transfer through the current SBF program; this is a compatibility matrix, not
+// repeated execution of one configuration.
+#[test]
+fn every_historical_pool_seed_schema_preserves_owner_withdrawal() {
+    let cases = [
+        ("base-96", 96, 96, HistoricalPoolSeeds::Base),
+        ("base-160", 160, 104, HistoricalPoolSeeds::Base),
+        ("base-192", 192, 104, HistoricalPoolSeeds::Base),
+        ("market-192", 192, 104, HistoricalPoolSeeds::Market),
+        ("market-208", 208, 120, HistoricalPoolSeeds::Market),
+        ("market-216", 216, 120, HistoricalPoolSeeds::Market),
+        ("coin-240", 240, 120, HistoricalPoolSeeds::Coin),
+        (
+            "policy-domain-240",
+            240,
+            120,
+            HistoricalPoolSeeds::PolicyDomain,
+        ),
+        ("window-256", 256, 120, HistoricalPoolSeeds::Window),
+        ("start-264", 264, 120, HistoricalPoolSeeds::Start),
+        ("bootstrap-272", 272, 120, HistoricalPoolSeeds::Bootstrap),
+    ];
+
+    for (index, (name, pool_size, position_size, seed_version)) in cases.into_iter().enumerate() {
+        let mut env = Env::new();
+        let asset_id = 1_000 + index as u64;
+        let amount = 10_000 + index as u64;
+        let (pool, bump) = historical_pool_pda(&env.mint, asset_id, 0, seed_version);
+        let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+        mint_to(
+            &mut env.svm,
+            &clone_kp(&env.payer),
+            &env.mint,
+            &clone_kp(&env.mint_authority),
+            &vault,
+            amount,
+        );
+        let (owner, owner_ata) = new_depositor(&mut env, 0);
+        env.svm
+            .set_account(
+                pool,
+                solana_sdk::account::Account {
+                    lamports: 10_000_000,
+                    data: historical_pool_data(
+                        pool_size, &env.mint, asset_id, &vault, amount, 0, bump,
+                    ),
+                    owner: program_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        env.svm
+            .set_account(
+                position_pda(&pool, &owner.pubkey()),
+                solana_sdk::account::Account {
+                    lamports: 10_000_000,
+                    data: historical_position_data(position_size, &pool, &owner.pubkey(), amount),
+                    owner: program_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        env.send(
+            &[withdraw_ix(&pool, &owner.pubkey(), &owner_ata, &vault)],
+            &[&owner],
+        )
+        .unwrap_or_else(|error| panic!("{name} owner withdrawal failed: {error}"));
+        assert_eq!(env.token_amount(&owner_ata), amount, "{name}");
+        assert_eq!(env.token_amount(&vault), 0, "{name}");
+        assert_eq!(env.svm.get_account(&pool).unwrap().data.len(), pool_size);
+    }
+}
+
+#[test]
+fn pre_share_surplus_pool_keeps_original_exit_math_and_rejects_new_deposits() {
+    let mut env = Env::new();
+    let asset_id = 9_001;
+    let principal = 100u64;
+    let balance = 150u64;
+    let (pool, bump) = historical_pool_pda(&env.mint, asset_id, 1, HistoricalPoolSeeds::Base);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    mint_to(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &clone_kp(&env.mint_authority),
+        &vault,
+        balance,
+    );
+    let (owner, owner_ata) = new_depositor(&mut env, 0);
+    env.svm
+        .set_account(
+            pool,
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: historical_pool_data(160, &env.mint, asset_id, &vault, principal, 1, bump),
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            position_pda(&pool, &owner.pubkey()),
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: historical_position_data(104, &pool, &owner.pubkey(), principal),
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (late, late_ata) = new_depositor(&mut env, 1);
+    assert!(
+        env.send(
+            &[deposit_ix(
+                &env,
+                &pool,
+                &late.pubkey(),
+                &late_ata,
+                &vault,
+                1,
+            )],
+            &[&late],
+        )
+        .is_err(),
+        "a pre-share pool cannot persist new share attribution"
+    );
+    assert_eq!(env.token_amount(&late_ata), 1);
+    assert_eq!(env.token_amount(&vault), balance);
+
+    env.send(
+        &[withdraw_ix(&pool, &owner.pubkey(), &owner_ata, &vault)],
+        &[&owner],
+    )
+    .expect("the historical with-surplus owner receives the original pro-rata payout");
+    assert_eq!(env.token_amount(&owner_ata), balance);
+    assert_eq!(env.token_amount(&vault), 0);
 }
 
 // DoS PROBE (non-SPL token-shaped vault at init_pool, sweep tick D): init_pool PERSISTS pool.vault
