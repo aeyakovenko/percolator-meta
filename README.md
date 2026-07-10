@@ -17,6 +17,8 @@ recover their owner-bound share of the insurance pool, subject to market losses.
   owner-bound subledger vault. Governance and reward programs custody COIN points/rewards only.
 - **No governance withdrawal key.** Squads authorizes constrained program calls but does not hold
   a funded market's insurance operator, insurance authority, backing authority, or `asset_admin`.
+  TWAP accepts only a real 1-of-1 Squads multisig whose sole all-permissions member and config
+  authority are the named MetaDAO, with at least a one-week timelock.
 - **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
   `marketauth` and can sign only a fixed allow-list of lifecycle, oracle, and fee-policy calls. Its
   generic proxy rejects live deposits, withdrawals, swaps, portfolio operations, and every
@@ -105,7 +107,7 @@ also falls back to burn instead of stalling settlement.
 Governance and custody are deliberately different chains:
 
 ```text
-DAO -> Squads (minimum 1-week timelock) -> market-controller PDA -> Percolator marketauth
+DAO -> Squads (DAO-only member, minimum 1-week timelock) -> market-controller PDA -> Percolator marketauth
 
 market-controller PDA -> owner-bound genesis pool -> config-bound TWAP PDA
                            asset custody             asset custody

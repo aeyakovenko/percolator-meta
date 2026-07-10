@@ -1,9 +1,9 @@
 //! DAO -> Squads -> TWAP wiring, against the REAL Squads v4 binary.
 //!
-//! The TWAP config can only ever name a genuine Squads multisig as its controller,
-//! and that multisig's `config_authority` is the DAO. So the DAO governs the TWAP
-//! (and, through it, percolator insurance) exclusively via the timelocked Squads
-//! path — there is no way to point the TWAP at an attacker-controlled "controller".
+//! The TWAP config can only name a genuine 1-of-1 Squads multisig whose sole
+//! initiate/vote/execute member and config authority are the named MetaDAO. So the
+//! DAO governs the TWAP (and, through it, Percolator insurance) exclusively via the
+//! timelocked Squads path; merely naming MetaDAO as `config_authority` is insufficient.
 
 use litesvm::LiteSVM;
 use solana_sdk::{
@@ -8642,6 +8642,206 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
         perc_vault,
         mint_auth,
     }
+}
+
+// PUBLIC AUTHORITY-HIJACK REGRESSION: Squads does not require `config_authority` to
+// sign multisig creation. Before the fix, an attacker named the real MetaDAO there,
+// installed themselves as the sole voting member, and drove this funded canonical pool
+// through the fixed handoff without one MetaDAO signature. TWAP init must reject the
+// attacker-voted multisig before it can become a selectable custody destination.
+#[test]
+fn e2e_attacker_member_cannot_take_a_funded_pool_by_naming_metadao_config_authority() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    // Put real user principal behind the canonical pool before the attack.
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let principal = 1_000_000u64;
+    let depositor_ata = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &depositor_ata,
+        &env.collateral_mint,
+        &depositor.pubkey(),
+        principal,
+    );
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &depositor.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&principal.to_le_bytes());
+    let deposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: deposit_data,
+    };
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[deposit],
+        Some(&payer.pubkey()),
+        &[&payer, &depositor],
+        svm.latest_blockhash(),
+    ))
+    .expect("fund canonical genesis pool");
+    assert_eq!(token_amount(&svm, &env.perc_vault), principal);
+
+    // Anyone can create this real Squads multisig: the victim MetaDAO is only named
+    // as config_authority while the attacker receives every transaction permission.
+    let squads = squads_id();
+    let program_config = svm.get_account(&program_config_pda(&squads)).unwrap();
+    let treasury = Pubkey::new_from_array(program_config.data[48..80].try_into().unwrap());
+    let attacker = Keypair::new();
+    let create_key = Keypair::new();
+    let attacker_multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create = multisig_create_v2_ix(
+        &squads,
+        &treasury,
+        &attacker_multisig,
+        &create_key.pubkey(),
+        &payer.pubkey(),
+        Some(&env.dao.pubkey()),
+        1,
+        &[(attacker.pubkey(), PERM_ALL)],
+        TIMELOCK_1_WEEK_SECS,
+    );
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create],
+        Some(&payer.pubkey()),
+        &[&payer, &create_key],
+        svm.latest_blockhash(),
+    ))
+    .expect("create attacker-voted multisig naming the victim MetaDAO");
+
+    let twap_cfg = twap_config_pda(
+        &env.slab,
+        &attacker_multisig,
+        &env.coin_mint,
+        &perc_id(),
+    );
+    let twap_init = init_config_ix(
+        &payer.pubkey(),
+        &env.coin_mint,
+        &env.slab,
+        &attacker_multisig,
+        &env.dao.pubkey(),
+        &perc_id(),
+    );
+    svm.expire_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[twap_init],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .is_err(),
+        "config_authority is not transaction control: MetaDAO must be the sole voting member"
+    );
+    assert_eq!(
+        svm.get_account(&twap_cfg).map(|a| a.data.len()).unwrap_or(0),
+        0,
+        "the attacker-voted TWAP custody destination was never created"
+    );
+
+    // Merely including MetaDAO is also insufficient when another voter can meet a
+    // threshold of one. This catches a weaker `members.contains(metadao)` fix.
+    let mixed_key = Keypair::new();
+    let mixed_multisig = multisig_pda(&squads, &mixed_key.pubkey());
+    let mut mixed_members = vec![
+        (env.dao.pubkey(), PERM_ALL),
+        (attacker.pubkey(), PERM_ALL),
+    ];
+    mixed_members.sort_by_key(|member| member.0);
+    let create_mixed = multisig_create_v2_ix(
+        &squads,
+        &treasury,
+        &mixed_multisig,
+        &mixed_key.pubkey(),
+        &payer.pubkey(),
+        Some(&env.dao.pubkey()),
+        1,
+        &mixed_members,
+        TIMELOCK_1_WEEK_SECS,
+    );
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create_mixed],
+        Some(&payer.pubkey()),
+        &[&payer, &mixed_key],
+        svm.latest_blockhash(),
+    ))
+    .expect("create threshold-one multisig containing MetaDAO and attacker");
+    let mixed_cfg = twap_config_pda(&env.slab, &mixed_multisig, &env.coin_mint, &perc_id());
+    let mixed_init = init_config_ix(
+        &payer.pubkey(),
+        &env.coin_mint,
+        &env.slab,
+        &mixed_multisig,
+        &env.dao.pubkey(),
+        &perc_id(),
+    );
+    svm.expire_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[mixed_init],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .is_err(),
+        "MetaDAO membership is insufficient when an attacker can approve alone"
+    );
+    assert_eq!(
+        svm.get_account(&mixed_cfg).map(|a| a.data.len()).unwrap_or(0),
+        0,
+        "the threshold-one mixed-member custody destination was never created"
+    );
+    assert_eq!(
+        token_amount(&svm, &env.perc_vault),
+        principal,
+        "rejected authority wiring leaves every deposited base unit in Percolator"
+    );
+    let pool = svm.get_account(&env.pool).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(pool.data[80..88].try_into().unwrap()),
+        principal,
+        "the canonical owner-bound subledger remains fully outstanding"
+    );
 }
 
 // register a one-entry proposal allocating the whole supply to `dest`; returns (dist, gv) proposals.

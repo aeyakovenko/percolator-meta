@@ -40,6 +40,10 @@ const SQUADS_PROGRAM_ID: Pubkey =
 // Squads v4 `Multisig` account discriminator (anchor account:Multisig). The
 // config_authority is at bytes [40..72] of the account.
 const SQUADS_MULTISIG_DISC: [u8; 8] = [224, 116, 121, 186, 68, 161, 79, 236];
+const SQUADS_PERMISSION_ALL: u8 = 0b111;
+const SQUADS_THRESHOLD_OFFSET: usize = 72;
+const SQUADS_TIME_LOCK_OFFSET: usize = 74;
+const SQUADS_RENT_COLLECTOR_OFFSET: usize = 94;
 // The DAO governs this program ONLY through the timelocked Squads multisig — the 1-week delay is
 // the depositor-protection window (time to react/exit before any insurance-affecting action lands).
 // init_config must REFUSE to bind a multisig whose on-chain `time_lock` is below this, so the
@@ -263,6 +267,52 @@ fn create_pda_robust<'a>(
         &[account.clone(), system_program.clone()],
         &[seeds],
     )?;
+    Ok(())
+}
+
+// Parse the stable Squads v4 Multisig prefix plus its Borsh Option<Pubkey> and member vector.
+// `config_authority` alone does not authenticate transaction control: Squads creation does not
+// require that key to sign, so anyone can name MetaDAO there while installing themselves as the
+// voting member. This program intentionally accepts only the minimal timelock wrapper used by the
+// protocol: 1-of-1, with MetaDAO as the sole initiate/vote/execute member.
+fn validate_metadao_squads_control(data: &[u8], metadao: &Pubkey) -> ProgramResult {
+    if data.len() <= SQUADS_RENT_COLLECTOR_OFFSET
+        || data[..8] != SQUADS_MULTISIG_DISC
+        || u16::from_le_bytes(
+            data[SQUADS_THRESHOLD_OFFSET..SQUADS_THRESHOLD_OFFSET + 2]
+                .try_into()
+                .unwrap(),
+        ) != 1
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut offset = SQUADS_RENT_COLLECTOR_OFFSET;
+    offset = match data[offset] {
+        0 => offset + 1,
+        1 => offset
+            .checked_add(1 + 32)
+            .ok_or(ProgramError::InvalidAccountData)?,
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
+    // bump (u8), then members Vec length (u32), then one Member { key, permissions }.
+    let member_count_offset = offset
+        .checked_add(1)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let member_offset = member_count_offset
+        .checked_add(4)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let member_end = member_offset
+        .checked_add(33)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    if member_end > data.len()
+        || u32::from_le_bytes(data[member_count_offset..member_offset].try_into().unwrap()) != 1
+        || Pubkey::new_from_array(data[member_offset..member_offset + 32].try_into().unwrap())
+            != *metadao
+        || data[member_offset + 32] != SQUADS_PERMISSION_ALL
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     Ok(())
 }
 
@@ -490,22 +540,19 @@ fn process_init_config(
         return Err(ProgramError::IncorrectProgramId);
     }
     // The controller must be a genuine Squads multisig — that is the only account
-    // through which the DAO (its config_authority) can ever reach this program.
+    // through which the DAO can ever reach this program.
     if *squads_multisig.owner != SQUADS_PROGRAM_ID {
         return Err(ProgramError::IllegalOwner);
     }
     if *metadao_futarchy.key == Pubkey::default() || *percolator_program.key == Pubkey::default() {
         return Err(ProgramError::InvalidAccountData);
     }
-    // ...and that multisig must actually be config-controlled by the named DAO. This
-    // is the DAO->Squads link: without it, a TWAP could be wired to a Squads multisig
-    // whose config_authority is an attacker (not the DAO), so the DAO would not in
-    // fact govern this program. Read the multisig's config_authority (bytes [40..72]
-    // of a Squads `Multisig`) and require it to equal metadao_futarchy.
+    // The named DAO must be both config authority and the sole all-permissions member.
+    // Squads does not require config_authority to sign creation, so that field alone
+    // is not proof that the DAO approves vault transactions.
     {
         let ms = squads_multisig.try_borrow_data()?;
-        // Need bytes through the time_lock field (config_authority [40..72], threshold u16 [72..74],
-        // time_lock u32 [74..78]).
+        // Need bytes through the time_lock field before parsing the variable member tail.
         if ms.len() < 78 || ms[..8] != SQUADS_MULTISIG_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -515,10 +562,15 @@ fn process_init_config(
         }
         // Enforce the depositor-protection window on-chain: the bound multisig must impose at least
         // the 1-week timelock the whole DAO->Squads->TWAP->insurance model depends on.
-        let time_lock = u32::from_le_bytes(ms[74..78].try_into().unwrap());
+        let time_lock = u32::from_le_bytes(
+            ms[SQUADS_TIME_LOCK_OFFSET..SQUADS_TIME_LOCK_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
         if time_lock < MIN_TIMELOCK_SECS {
             return Err(ProgramError::InvalidAccountData);
         }
+        validate_metadao_squads_control(&ms, metadao_futarchy.key)?;
     }
 
     let (expected_config, config_bump) = Pubkey::find_program_address(
