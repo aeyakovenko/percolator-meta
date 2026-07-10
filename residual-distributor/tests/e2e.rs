@@ -4291,6 +4291,138 @@ fn funding_payer_claim_does_not_require_portfolio_after_freeze() {
     );
 }
 
+// PUBLIC DOS (terminal residual claim): after Percolator closes a portfolio, anyone can transfer one
+// lamport to its zero-data address. Depending on runtime purge timing the address can retain its old
+// Percolator owner or return to the system program; a PDA-owned portfolio has no signer that can remove
+// that dust. The exact linked key still proves which frozen stake is being claimed, and neither empty
+// account can carry live Percolator counters, so dust must not disable the dematerialized-witness
+// fallback. Exercise both residual cohorts and owner states through the deployed SBF.
+#[test]
+fn lamport_dust_cannot_lock_frozen_lp_or_trader_reward() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let lp = Keypair::new();
+    let trader = Keypair::new();
+    let lp_pf = Pubkey::new_unique();
+    let trader_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        0,
+        0,
+        0,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &trader_pf,
+        &env.stub_perc,
+        &env.market,
+        &trader.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &lp,
+        &lp.pubkey(),
+        &lp_pf,
+        COHORT_LP,
+    )
+    .expect("register LP");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &trader,
+        &trader.pubkey(),
+        &trader_pf,
+        COHORT_TRADER,
+    )
+    .expect("register trader");
+
+    set_slot(&mut svm, 1_124);
+    set_portfolio_full(
+        &mut svm,
+        &lp_pf,
+        &env.stub_perc,
+        &env.market,
+        &lp.pubkey(),
+        10_000,
+        0,
+        0,
+    );
+    set_portfolio_full(
+        &mut svm,
+        &trader_pf,
+        &env.stub_perc,
+        &env.market,
+        &trader.pubkey(),
+        0,
+        20_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &lp, &lp_pf).expect("crystallize LP");
+    crystallize(&mut svm, &payer, &env, &trader, &trader_pf)
+        .expect("crystallize trader");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    for (portfolio, owner) in [
+        (lp_pf, solana_sdk::system_program::ID),
+        (trader_pf, env.stub_perc),
+    ] {
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1,
+                data: Vec::new(),
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    let lp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    let trader_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &trader.pubkey());
+    claim_as(
+        &mut svm,
+        &payer,
+        &env,
+        &payer,
+        &lp.pubkey(),
+        &lp_ata,
+        None,
+    )
+    .expect("public LP claim survives dusted closed witness");
+    claim_as(
+        &mut svm,
+        &payer,
+        &env,
+        &payer,
+        &trader.pubkey(),
+        &trader_ata,
+        None,
+    )
+    .expect("public trader claim survives dusted closed witness");
+
+    assert_eq!(token_amount(&svm, &lp_ata), 400_000);
+    assert_eq!(token_amount(&svm, &trader_ata), 400_000);
+    assert_eq!(token_amount(&svm, &env.vault), 200_000);
+}
+
 // PAY-UP PROBE (funding-payer claim one-sided live cap): if paid funding grows after the last crystallize,
 // claim must not pay the higher live counter against the frozen denominator. Extra funding needs a re-crystallize
 // before freeze; otherwise it stays out of both numerator and denominator.

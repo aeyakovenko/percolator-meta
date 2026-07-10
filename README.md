@@ -40,7 +40,8 @@ capital's own tenure.
   abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
   portfolio and returns its rent only to the slab. Historical reward counters cannot hold insurance
   or backing exits hostage: after any terminal dematerialization, any cranker can pay that LP/trader
-  allocation from the frozen snapshot only to its bound recipient. Donating a creator-owned market
+  allocation from the frozen snapshot only to its bound recipient; lamports donated to the closed,
+  zero-data witness cannot disable that recovery. Donating a creator-owned market
   preserves funded outgoing asset-0 insurance roles and the recorded backing provider; the handoff
   cannot collapse that capital into the controller or select another provider. Donation is accepted only when every
   secondary slot is fully retired because Percolator does not migrate secondary `asset_admin` roles with `marketauth`;
@@ -179,7 +180,8 @@ fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Perco
 nonempty portfolios and sends the closed account's lamports only into the bound market slab.
 Monotonic LP/trader/funding counters are reward telemetry, not a custody gate. If this cleanup or a
 public maintenance sync dematerializes their exact linked portfolio, the residual distributor
-still permits anyone to pay its frozen numerator only to the bound recipient. The wrapper accepts no
+still permits anyone to pay its frozen numerator only to the bound recipient, even if a third party
+donates lamports to the closed address. The wrapper accepts no
 amount, token account, or destination and exposes no generic portfolio authority.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one

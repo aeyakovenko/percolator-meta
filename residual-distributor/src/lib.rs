@@ -1752,17 +1752,19 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             if *portfolio.key != stake.backing_ledger {
                 return Err(ProgramError::InvalidAccountData);
             }
-            let dematerialized = portfolio.lamports() == 0
-                && portfolio.data_len() == 0
-                && (*portfolio.owner == config.percolator_program
-                    || *portfolio.owner == solana_program::system_program::ID);
+            let dematerialized = portfolio.data_len() == 0
+                && (*portfolio.owner == solana_program::system_program::ID
+                    || *portfolio.owner == config.percolator_program);
             if dematerialized {
                 // Percolator can dematerialize an empty portfolio through maintenance-fee or
-                // resolved-market cleanup. The historical counters then no longer exist for the
-                // normal live cap. The recipient remains bound and payout is still bounded by the
-                // frozen cohort denominator, so keeping this path permissionless avoids stranding
-                // PDA-owned portfolios. A close can at worst avoid a later points cap; it cannot
-                // redirect COIN, change the cohort supply, or touch collateral custody.
+                // resolved-market cleanup. Ignore lamports donated to the resulting zero-data
+                // address, whether the runtime still reports its old Percolator owner or has purged
+                // it back to the system program: a PDA-owned witness cannot sign to remove that dust.
+                // The historical counters then no longer exist for the normal live cap. The recipient
+                // remains bound and payout is still bounded by the frozen cohort denominator, so
+                // keeping this path permissionless avoids stranding PDA-owned portfolios. A close
+                // can at worst avoid a later points cap; it cannot redirect COIN, change the cohort
+                // supply, or touch collateral custody.
                 points_to_amount(cohort_supply, stake.points, frozen_denom)
             } else {
                 if *portfolio.owner != config.percolator_program {
