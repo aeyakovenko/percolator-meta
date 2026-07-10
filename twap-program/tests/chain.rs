@@ -24384,6 +24384,112 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         stale_bid_coin as u64,
         "after the reward cutoff, all bought COIN is burned"
     );
+
+    // Finish the continuous-reward lifecycle through custody recovery and both depositor exits.
+    // Reward claims are complete and immutable; returning the insurance operator only restores the
+    // owner-bound principal path and cannot claw back either cohort's already-paid COIN.
+    let return_message = build_return_to_subledger_message(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let return_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        18,
+        &return_message,
+        &return_remaining,
+    )
+    .expect("return continuous-reward market custody to the canonical pool");
+
+    let alice_collateral_before_exit = token_amount(&svm, &alice_ata);
+    let bob_collateral_before_exit = token_amount(&svm, &bob_ata);
+    let alice_coin_after_claim = token_amount(&svm, &alice_coin);
+    let bob_coin_after_claim = token_amount(&svm, &bob_coin);
+    let insurance_before_exit = read_asset0_insurance(&svm, &slab);
+    let backing_before_exit = token_amount(&svm, &backing_vault);
+
+    let mut insurance_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    insurance_withdraw_data.extend_from_slice(&amount.to_le_bytes());
+    let insurance_withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: insurance_withdraw_data,
+    };
+    send(&mut svm, &[&alice], insurance_withdraw)
+        .expect("insurance depositor recovers principal after continuous rewards");
+    assert_eq!(
+        token_amount(&svm, &alice_ata) - alice_collateral_before_exit,
+        amount,
+        "TWAP rounds and reward claims cannot haircut healthy insurance principal"
+    );
+    assert_eq!(
+        insurance_before_exit - read_asset0_insurance(&svm, &slab),
+        amount as u128,
+        "only Alice's protected principal leaves market insurance"
+    );
+
+    let backing_withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new(backing_pool, false),
+            AccountMeta::new(backing_position, false),
+            AccountMeta::new(bob_ata, false),
+            AccountMeta::new(backing_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![2u8], // IX_WITHDRAW
+    };
+    send(&mut svm, &[&bob], backing_withdraw)
+        .expect("backing depositor recovers segregated principal after continuous rewards");
+    assert_eq!(
+        token_amount(&svm, &bob_ata) - bob_collateral_before_exit,
+        backing_before_exit,
+        "Bob alone redeems the backing vault's share value"
+    );
+    assert_eq!(
+        token_amount(&svm, &backing_vault),
+        0,
+        "the sole backing position leaves no depositor value stranded"
+    );
+    assert_eq!(
+        token_amount(&svm, &alice_coin),
+        alice_coin_after_claim,
+        "insurance exit cannot claw back bought-COIN rewards"
+    );
+    assert_eq!(
+        token_amount(&svm, &bob_coin),
+        bob_coin_after_claim,
+        "backing exit cannot claw back bought-COIN rewards"
+    );
 }
 
 // CAPTURED-DAO PRINCIPAL DRAIN via floor-lowering (finding II): README Safety 5 claims the principal

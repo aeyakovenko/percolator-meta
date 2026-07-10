@@ -90,7 +90,9 @@ vault and burns 50%. At day 45 the accumulated reward vault distributes:
 Funding points have no age multiplier and receiver-side funding does not earn points. A portfolio
 can earn from both its long-paid and short-paid totals. Insurance/backing reward points use live
 base-unit principal times `floor(log2(tenure))`. Reward finalization and claims do not modify the
-underlying principal, shares, or Percolator balances.
+underlying principal, shares, or Percolator balances. The same full-chain test then returns TWAP
+custody and proves both the insurance and segregated backing depositors can redeem without losing
+their claimed COIN.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. The DAO may configure future epochs but cannot mutate a live epoch,
