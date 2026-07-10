@@ -106,8 +106,8 @@ a DIFFERENT guard class than the redirect/bind ones — it stops a THIRD PARTY f
 insurance/backing stake at a transient low-share moment (mid partial-withdraw), which freeze would then lock as
 the frozen denominator term, permanently capping the victim's COIN share low. Dropping it makes share_value_
 crystallize_cannot_be_forced_by_a_third_party_at_a_low_share_moment FAIL -> genuinely SHARP (the forced low-share
-crystallize is the sole harm path; LP/trader stay permissionless because their counters are monotonic per-field so
-a forced crystallize can only RAISE the delta, plus my live-cap caps a later recovery). Reverted, git clean, rd
+crystallize is the sole harm path; LP stays permissionless because `received` is monotonic, while the later
+trader owner gate supersedes this tick's incorrect treatment of `crystallized - spent` as monotonic). Reverted, git clean, rd
 e2e 45 green. Cumulative mutation campaign: guard-removal[39] + 9 classes + 2 defense-in-depth; NO uncaught
 mutation. HONEST SATURATION NOTE: the standalone scope's load-bearing guards are now comprehensively mutation-
 verified across redirect/bind, value-bound, owner-gate/forced-timing, anti-wash, and economic-cap classes; recent
@@ -7895,17 +7895,12 @@ TEST: claim_succeeds_through_the_last_window_slot_and_fails_exactly_at_window_en
 existing burn-allowed-at-60 test, the transition is now pinned from both sides: claim valid through 59, burn valid
 from 60, no gap/overlap. VERDICT: BLOCKED/correct. KEEP. distribution 31 green.
 
-### [VERIFIED — LP/trader crystallize is permissionless (monotonic-safe); the KO owner-gating complement] tick (D)
-SURFACE (rd crystallize authorization). share_value_crystallize_cannot_be_forced_by_a_third_party pins that the
-SHARE-VALUE cohorts are OWNER-GATED (finding KO) — a forced crystallize at a transient low-share moment would
-grief (lock the victim's COIN share low). The untested COMPLEMENT: LP/trader crystallize is PERMISSIONLESS (any
-cranker, src:771-775) — the percolator residual counters are MONOTONIC, so a forced crystallize can only RAISE
-the netΔ, never grief; gating it would just add liveness friction.
-TEST: lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points (real rd .so): a THIRD party
-(cranker != stake owner) crystallizes a trader stake -> SUCCEEDS; after freeze the sole trader staker claims its
-full 400_000 cohort, proving the third-party crystallize finalized the points. Pairs with the KO rejection to pin
-both halves of the crystallize-authorization model. VERDICT: BLOCKED/correct (permissionless by design, safe).
-KEEP. rd e2e 37 green.
+### [SUPERSEDED — LP crystallize is permissionless; trader crystallize is owner-gated] tick (D)
+This historical tick correctly identified LP `residual_received` as monotonic but incorrectly extended that
+property to trader `crystallized - spent`, which can fall as spent principal rises. The old trader test has been
+converted into `lp_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points`; the later organic
+two-trader regression and owner gate supersede the trader verdict. Capital and trader crystallization are
+owner-authorized; LP and funding crystallization remain permissionless.
 
 ### [REGRESSION CHECKPOINT — standalone surfaces all GREEN; pre-existing meta-program integration break diagnosed (task #11)] tick
 A full-stack regression pass after the divergence/discipline phase. STANDALONE SWEEP SURFACES (the A/B/C/D scope)
@@ -12277,3 +12272,24 @@ gate while preserving permissionless LP and funding claims.
 FIX: trader claims now require the stake owner, matching insurance and backing claims whose live caps can also
 fall. LP received and cumulative funding-paid counters are monotonic, so those claims remain permissionless. No
 recipient, transfer, collateral, custody, governance, or admin surface changed.
+
+## Tick - a competing trader could lower the denominator and inflate its reward share
+
+Trader points are based on `residual_crystallized_loss - residual_spent_principal`. Unlike LP received and
+funding-paid counters, that net can fall when a normal signed trade spends residual principal. Crystallization
+used subtract-old/add-new accounting but remained permissionless. A competing trader could therefore
+re-crystallize another stake at the lower net, reduce the shared frozen denominator, and redistribute COIN that
+the live-cap design intended to leave forfeited in the immutable vault. This could not move collateral or user
+deposits, but it inflated the attacker's reward payout.
+
+A retained real-Percolator + residual-distributor LiteSVM regression creates two independent trader losses with
+public trades, an authenticated oracle move, and permissionless cranks. Both owners crystallize their points; a
+follow-on signed trade then spends only part of one trader's loss budget. Against the old SBF, the competing
+trader successfully re-crystallized that victim at the lower value. The test proves this would increase the
+competitor's pro-rata payout, then requires the foreign call to reject byte-atomically, freezes, and verifies
+both exact owner claims plus the forfeited vault remainder.
+
+FIX: trader crystallization now requires the stake owner, matching its already owner-gated claim. LP received
+and cumulative funding-paid counters are monotonic, so those crystallizations remain permissionless. The
+100-case lifecycle matrix checks both sides. No recipient, token transfer, collateral, custody, governance, or
+admin surface changed.

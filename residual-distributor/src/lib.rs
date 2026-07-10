@@ -1426,7 +1426,8 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // force-crystallize a victim after a partial withdrawal (withdrawn=false, principal reduced)
             // and `freeze` to lock the victim's COIN share permanently
             // low. A capital-cohort re-crystallize must therefore be authorized by the stake's owner.
-            // (portfolio-flow cohorts stay permissionless).
+            // LP and funding cohorts stay permissionless; trader net is also non-monotonic and is
+            // owner-gated in its branch below.
             if cranker.key != &stake.owner {
                 return Err(ProgramError::MissingRequiredSignature);
             }
@@ -1453,6 +1454,12 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
             // crystallized_loss - spent since register.
+            // A trader's net can fall when spent principal rises. Re-crystallizing that lower value
+            // also lowers the shared denominator and redistributes otherwise-forfeited COIN, so only
+            // the stake owner may choose that slot. LP received is monotonic and remains permissionless.
+            if stake.cohort == COHORT_TRADER && cranker.key != &stake.owner {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
             if *backing_ledger.owner != config.percolator_program {
                 return Err(ProgramError::IllegalOwner);
             }

@@ -58,10 +58,10 @@ redirect, lock, or confiscate insurance/backing principal.
   position and caps by its current principal; a full withdrawal therefore pays zero. Forfeited COIN
   remains in the immutable reward vault and cannot be redirected or redistributed.
 - Symmetric for backing depositors: partial/full exits lower live principal and therefore points.
-- Insurance, backing, and trader claims require the stake owner. Their live principal or
-  `crystallized - spent` caps can fall after freeze, so an unrelated cranker must not choose the
-  irreversible claim slot. LP received and funding-paid counters are monotonic, so those claims
-  remain permissionless.
+- Insurance, backing, and trader crystallizations and claims require the stake owner. Their live
+  principal or `crystallized - spent` bases can fall, so an unrelated cranker must not lower a
+  denominator term or choose the irreversible claim slot. LP received and funding-paid counters
+  are monotonic, so their crystallizations and claims remain permissionless.
 
 ## Trust / determinism
 - `IX_FREEZE` snapshots cohort denominators and the reward supply after the finalize window; `IX_CLAIM` then pays

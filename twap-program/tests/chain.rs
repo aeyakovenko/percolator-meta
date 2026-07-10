@@ -28660,6 +28660,14 @@ fn read_portfolio_residual_spent(svm: &LiteSVM, pf: &Pubkey) -> u128 {
     let d = svm.get_account(pf).unwrap().data;
     u128::from_le_bytes(d[212..228].try_into().unwrap()) // HEADER_LEN(16) + offset_of(spent) 196
 }
+fn read_rd_stake_points(svm: &LiteSVM, stake: &Pubkey) -> u128 {
+    let d = svm.get_account(stake).unwrap().data;
+    u128::from_le_bytes(d[176..192].try_into().unwrap())
+}
+fn read_rd_trader_total_points(svm: &LiteSVM, config: &Pubkey) -> u128 {
+    let d = svm.get_account(config).unwrap().data;
+    u128::from_le_bytes(d[418..434].try_into().unwrap())
+}
 fn read_asset0_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
     let data = svm.get_account(market).unwrap().data;
     let (_, group) = percolator_prog::state::read_market(&data).unwrap();
@@ -28707,7 +28715,7 @@ fn read_portfolio_funding_short_received(svm: &LiteSVM, pf: &Pubkey) -> u128 {
     u128::from_le_bytes(d[292..308].try_into().unwrap()) // HEADER_LEN(16) + offset_of(funding_short_received) 276
 }
 #[test]
-fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
+fn e2e_organic_trader_live_cap_actions_are_owner_gated() {
     use percolator_prog::ix::Instruction as PIx;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -28812,15 +28820,22 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
     };
     auth_mark(&mut svm, initial_price, init_slot).expect("configure auth mark");
 
-    // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
+    // ---- three portfolios: two real long-side losers plus their shared short counterparty ----
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
     let loser = Keypair::new();
     svm.airdrop(&loser.pubkey(), 1_000_000_000).unwrap();
     let winner = Keypair::new();
     svm.airdrop(&winner.pubkey(), 1_000_000_000).unwrap();
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let loser_pf = Pubkey::new_unique();
     let winner_pf = Pubkey::new_unique();
-    for (owner, pf) in [(&loser, &loser_pf), (&winner, &winner_pf)] {
+    let attacker_pf = Pubkey::new_unique();
+    for (owner, pf) in [
+        (&loser, &loser_pf),
+        (&winner, &winner_pf),
+        (&attacker, &attacker_pf),
+    ] {
         svm.set_account(
             *pf,
             Account {
@@ -28974,6 +28989,28 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
         bh,
     ))
     .expect("register loser (trader)");
+    let attacker_stake = rd_stake_pda(&rd_config, &attacker.pubkey(), &attacker_pf, 3);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(rd_config, false),
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new_readonly(attacker.pubkey(), false),
+                AccountMeta::new_readonly(attacker_pf, false),
+                AccountMeta::new(attacker_stake, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: vec![1u8, 3u8],
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &attacker],
+        bh,
+    ))
+    .expect("register attacker (trader)");
     assert_eq!(
         read_portfolio_crystallized(&svm, &loser_pf),
         0,
@@ -29008,6 +29045,29 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
         bh,
     ))
     .expect("loser (owner_b) opens long vs winner short");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(winner.pubkey(), true),
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(winner_pf, false),
+                AccountMeta::new(attacker_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: pos,
+                exec_price: initial_price,
+                fee_bps: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &winner, &attacker],
+        bh,
+    ))
+    .expect("attacker opens the same long against the shared short counterparty");
     svm.set_sysvar(&Clock {
         slot: 110,
         unix_timestamp: 110,
@@ -29060,8 +29120,8 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
             bh,
         ))
     };
-    // Crank the counterparty first (updates the asset's shared b-accumulator), then the loser.
-    for pf in [&winner_pf, &loser_pf] {
+    // Crank the counterparty first (updates the asset's shared b-accumulator), then both losers.
+    for pf in [&winner_pf, &loser_pf, &attacker_pf] {
         crank(&mut svm, pf, 110).expect("auto-crank settlement");
         crank(&mut svm, pf, 110).expect("auto-crank refresh after settlement");
     }
@@ -29069,6 +29129,11 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
     assert!(
         crystallized > 0,
         "the settled loss organically bumped crystallized_loss (got {crystallized})"
+    );
+    let attacker_crystallized = read_portfolio_crystallized(&svm, &attacker_pf);
+    assert!(
+        attacker_crystallized > 0,
+        "the competing trader also has an organic crystallized loss"
     );
 
     // ---- crystallize (Δ = the organic loss), freeze, claim -> the trader cohort earns it ----
@@ -29078,7 +29143,7 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
         &[Instruction {
             program_id: rd_id(),
             accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(loser.pubkey(), true),
                 AccountMeta::new(rd_config, false),
                 AccountMeta::new(t_stake, false),
                 AccountMeta::new_readonly(loser_pf, false),
@@ -29086,10 +29151,28 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
             data: vec![2u8],
         }],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &loser],
         bh,
     ))
-    .expect("crystallize");
+    .expect("owner crystallizes the target trader");
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(rd_config, false),
+                AccountMeta::new(attacker_stake, false),
+                AccountMeta::new_readonly(attacker_pf, false),
+            ],
+            data: vec![2u8],
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &attacker],
+        bh,
+    ))
+    .expect("attacker crystallizes its own competing trader points");
     // Keep the live market and both portfolios current through the short finalize window.
     // These public oracle/crank calls do not spend the trader loss budget; they only make the
     // post-freeze follow-on trade admissible under the market's one-slot accrual bound.
@@ -29118,39 +29201,25 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
             bh,
         ))
         .expect("advance authenticated mark through the finalize window");
-        for pf in [&winner_pf, &loser_pf] {
+        for pf in [&winner_pf, &loser_pf, &attacker_pf] {
             crank(&mut svm, pf, slot).expect("advance portfolio through the finalize window");
             crank(&mut svm, pf, slot).expect("refresh portfolio after shared settlement");
         }
     }
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(
-        &[Instruction {
-            program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(rd_config, false),
-                AccountMeta::new_readonly(coin_mint, false),
-                AccountMeta::new(rd_vault, false),
-            ],
-            data: vec![4u8],
-        }],
-        Some(&payer.pubkey()),
-        &[&payer],
-        bh,
-    ))
-    .expect("freeze");
-
     assert_eq!(
         read_portfolio_residual_spent(&svm, &loser_pf),
         0,
-        "the frozen trader entitlement starts with its full organic loss budget"
+        "the crystallized trader entitlement starts with its full organic loss budget"
     );
 
+    let victim_points = read_rd_stake_points(&svm, &t_stake);
+    let attacker_points = read_rd_stake_points(&svm, &attacker_stake);
+    let original_total = read_rd_trader_total_points(&svm, &rd_config);
+    assert_eq!(original_total, victim_points + attacker_points);
+    assert!(victim_points > 0 && attacker_points > 0);
+
     // A later, ordinary trade can spend part of that loss budget into the counterparty's
-    // residual credit. The trader claim deliberately live-caps against this decrease, so
-    // claim timing is value-relevant and an unrelated cranker must not be able to finalize it.
+    // residual credit. Both re-crystallization and claim timing are now value-relevant.
     let follow_on_pos = -((percolator::POS_SCALE / 10) as i128);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -29174,11 +29243,118 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
         &[&payer, &winner, &loser],
         bh,
     ))
-    .expect("follow-on trade spends part of the frozen trader loss budget");
+    .expect("follow-on trade spends part of the crystallized trader loss budget");
     let spent = read_portfolio_residual_spent(&svm, &loser_pf);
     assert!(
         spent > 0 && spent < crystallized,
         "follow-on trade must lower, but not erase, the live trader cap: spent={spent}, crystallized={crystallized}"
+    );
+
+    let live_net = crystallized - spent;
+    assert_eq!(
+        victim_points % crystallized,
+        0,
+        "organic points retain an exact tenure multiplier"
+    );
+    let victim_low_points = (victim_points / crystallized) * live_net;
+    assert!(victim_low_points < victim_points);
+    let fair_attacker_payout =
+        ((supply as u128) * attacker_points / original_total) as u64;
+    let forced_total = attacker_points + victim_low_points;
+    let inflated_attacker_payout =
+        ((supply as u128) * attacker_points / forced_total) as u64;
+    assert!(
+        inflated_attacker_payout > fair_attacker_payout,
+        "lowering another trader's denominator term would redistribute forfeited COIN to the attacker"
+    );
+
+    // ATTACK 1: the competing trader tries to overwrite the victim's high points with the
+    // lower live net. Before the owner gate this reduced the shared denominator and inflated
+    // the attacker's own payout from `fair_attacker_payout` to `inflated_attacker_payout`.
+    let config_before_forced_crystallize = svm.get_account(&rd_config).unwrap().data;
+    let stake_before_forced_crystallize = svm.get_account(&t_stake).unwrap().data;
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(attacker.pubkey(), true),
+                    AccountMeta::new(rd_config, false),
+                    AccountMeta::new(t_stake, false),
+                    AccountMeta::new_readonly(loser_pf, false),
+                ],
+                data: vec![2u8],
+            }],
+            Some(&payer.pubkey()),
+            &[&payer, &attacker],
+            bh,
+        ))
+        .is_err(),
+        "a competing trader cannot force a lower re-crystallization and inflate its own share"
+    );
+    assert_eq!(
+        svm.get_account(&rd_config).unwrap().data,
+        config_before_forced_crystallize
+    );
+    assert_eq!(
+        svm.get_account(&t_stake).unwrap().data,
+        stake_before_forced_crystallize
+    );
+
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(rd_config, false),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new(rd_vault, false),
+            ],
+            data: vec![4u8],
+        }],
+        Some(&payer.pubkey()),
+        &[&payer],
+        bh,
+    ))
+    .expect("freeze the owner-selected trader denominator");
+
+    let attacker_coin = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_coin,
+        &coin_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new_readonly(rd_config, false),
+                AccountMeta::new(attacker_stake, false),
+                AccountMeta::new(rd_vault, false),
+                AccountMeta::new(attacker_coin, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(attacker_pf, false),
+            ],
+            data: vec![5u8],
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &attacker],
+        bh,
+    ))
+    .expect("competing trader claims only its original denominator share");
+    assert_eq!(
+        token_amount(&svm, &attacker_coin),
+        fair_attacker_payout,
+        "recovered victim points remain forfeited instead of inflating another trader"
     );
 
     let loser_coin = Pubkey::new_unique();
@@ -29241,10 +29417,15 @@ fn e2e_organic_trader_claim_cannot_be_forced_after_live_cap_falls() {
         bh,
     ))
     .expect("stake owner claims at the current live trader cap");
-    let expected = ((supply as u128) * (crystallized - spent) / crystallized) as u64;
+    let expected = ((supply as u128) * victim_low_points / original_total) as u64;
     assert_eq!(
         token_amount(&svm, &loser_coin),
         expected,
         "the owner receives the exact live-capped organic trader allocation"
+    );
+    assert_eq!(
+        token_amount(&svm, &rd_vault),
+        supply - fair_attacker_payout - expected,
+        "the victim's recovered points remain forfeited in the immutable reward vault"
     );
 }

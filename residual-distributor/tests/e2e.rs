@@ -2787,19 +2787,15 @@ fn trader_claim_at_a_100pct_anti_wash_fee_pays_zero_gracefully_and_still_consume
     );
 }
 
-// PERMISSIONLESS CRYSTALLIZE (LP/trader, sweep tick D): share_value_crystallize_cannot_be_forced_by_a_third_party
-// pins that capital (insurance/backing) crystallize is OWNER-GATED (finding KO) — a forced crystallize at a
-// transient low-principal moment would grief. The COMPLEMENT, untested: LP/trader crystallize is PERMISSIONLESS — any
-// cranker may finalize a staker's points, because the percolator residual counters are MONOTONIC, so a forced
-// crystallize can only RAISE the netΔ, never grief. Pin that a third-party cranker successfully crystallizes a
-// trader stake and the points are recorded (the owner then claims its full cohort).
+// PERMISSIONLESS LP CRYSTALLIZE: capital and trader crystallization are owner-gated because their
+// point bases can fall. LP `received` is monotonic, so any cranker may safely finalize its points.
 #[test]
-fn lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points() {
+fn lp_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_points() {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
-    let supply = 1_000_000u64; // trader cohort = 40% = 400_000 ; no anti-wash fee (setup)
+    let supply = 1_000_000u64; // LP cohort = 40% = 400_000; no anti-wash fee (setup)
     let env = setup(&mut svm, &payer, supply);
     set_slot(&mut svm, 100);
 
@@ -2814,32 +2810,32 @@ fn lp_trader_crystallize_is_permissionless_any_cranker_finalizes_a_stakers_point
         0,
         0,
     );
-    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_TRADER).expect("reg trader");
+    register(&mut svm, &payer, &env, &t, &t.pubkey(), &pf, COHORT_LP).expect("register LP");
     set_portfolio(
         &mut svm,
         &pf,
         &env.stub_perc,
         &env.market,
         &t.pubkey(),
-        0,
         9_000,
+        0,
     );
     set_slot(&mut svm, 1_000);
 
-    // A THIRD PARTY (not the stake owner) crystallizes the trader stake — permissionless (monotonic-safe).
+    // A third party (not the stake owner) crystallizes the monotonic LP stake.
     let cranker = Keypair::new();
     crystallize_as(&mut svm, &payer, &env, &cranker, &t.pubkey(), &pf)
-        .expect("LP/trader crystallize is permissionless — any cranker may finalize");
+        .expect("LP crystallize is permissionless - any cranker may finalize");
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
-    // The third-party crystallize recorded the points, so the sole trader staker claims its full cohort.
+    // The third-party crystallize recorded the points, so the sole LP staker claims its full cohort.
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &t.pubkey());
     claim(&mut svm, &payer, &env, &t, &ata, None).expect("owner claim");
     assert_eq!(
         token_amount(&svm, &ata),
         400_000,
-        "the third-party crystallize finalized the points; the sole trader claims its full cohort"
+        "the third-party crystallize finalized the points; the sole LP claims its full cohort"
     );
 }
 
@@ -9814,15 +9810,20 @@ fn cross_cohort_100_case_lifecycle_sweep_no_overdraw_or_free_farm() {
         crystallize(&mut svm, &payer, &env, &back, &back_pos).expect("crystallize active backing");
         crystallize_as(&mut svm, &payer, &env, &attacker, &lp.pubkey(), &lp_pf)
             .expect("permissionless lp crystallize");
-        crystallize_as(
-            &mut svm,
-            &payer,
-            &env,
-            &attacker,
-            &trader.pubkey(),
-            &trader_pf,
-        )
-        .expect("permissionless trader crystallize");
+        assert!(
+            crystallize_as(
+                &mut svm,
+                &payer,
+                &env,
+                &attacker,
+                &trader.pubkey(),
+                &trader_pf,
+            )
+            .is_err(),
+            "case {case_idx}: foreign cranker cannot overwrite trader points"
+        );
+        crystallize(&mut svm, &payer, &env, &trader, &trader_pf)
+            .expect("owner crystallizes trader points");
         crystallize_as(
             &mut svm,
             &payer,
