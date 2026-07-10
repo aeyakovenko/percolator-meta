@@ -1297,6 +1297,57 @@ fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
     assert_eq!(env.pool_outstanding(), 0, "all principal retired");
 }
 
+// LOSS-OF-FUNDS/LIVENESS PROBE: repeated recapitalization after market losses can make a
+// valid position's share count much larger than its principal. The full-exit fraction is still
+// exactly `position.shares`, but computing `shares * amount / principal` must not require the
+// overflowing product to fit in u128.
+#[test]
+fn large_insurance_share_position_can_exit_after_repeated_impairment() {
+    let mut env = Env::new();
+    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS
+
+    let tranche = 1_000_000_000u64;
+    let total_deposit = tranche * 3;
+    let (owner, owner_ata) = new_depositor(&mut env, total_deposit);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    for cycle in 0..3 {
+        env.insurance_deposit(&owner, &owner_ata, &holding, tranche)
+            .expect("recapitalize insurance");
+        if cycle < 2 {
+            // A real venue loss can consume the insurance while the position's principal/share
+            // attribution remains. Mirror that loss in the slab and canonical SPL vault.
+            impair_market(&mut env, 0);
+            env.svm
+                .set_account(
+                    env.perc_vault,
+                    Account {
+                        lamports: 1_000_000,
+                        data: token_account_data(&env.mint, &env.vault_authority, 0),
+                        owner: spl_token::ID,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    let shares = env.position_shares(&owner.pubkey());
+    assert!(
+        shares.checked_mul(total_deposit as u128).is_none(),
+        "fixture must cross the old u128 intermediate-overflow boundary"
+    );
+    assert_eq!(env.read_position(&owner.pubkey()).0, total_deposit);
+
+    env.insurance_withdraw(&owner, &owner_ata, &holding, &owner, total_deposit)
+        .expect("a bounded full exit must not depend on an overflowing intermediate");
+    assert!(env.token_amount(&owner_ata) > 0, "the remaining live insurance is returned");
+    assert_eq!(env.pool_outstanding(), 0, "the owner's full principal attribution retires");
+    assert_eq!(env.pool_total_shares(), 0, "the full exit burns every real share");
+}
+
 // SHARE-INFLATION FIRST-DEPOSITOR THEFT (finding HB, surface B). The classic ERC4626 attack: a dust first
 // depositor DONATES into the fund to inflate the live share PRICE (balance >> total_shares) so a later
 // depositor's shares round toward ZERO; that principal then lands in the fund for 0 shares and the attacker's
