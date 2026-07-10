@@ -1652,7 +1652,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData);
     }
     let family_seed = [stake_family(stake.cohort)?];
-    let (expected_stake, _) = Pubkey::find_program_address(
+    let (expected_stake, expected_bump) = Pubkey::find_program_address(
         &stake_seeds(
             config_account.key,
             &stake.owner,
@@ -1661,8 +1661,37 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         ),
         program_id,
     );
-    if *stake_account.key != expected_stake {
-        return Err(ProgramError::InvalidSeeds);
+    if *stake_account.key != expected_stake || stake.bump != expected_bump {
+        // Claim-only compatibility for the two predecessor PDA schemas. They can
+        // exist only with the exact pre-epoch config; register/crystallize retain
+        // the family-scoped check above, so old stakes cannot resume point accrual.
+        if config.config_kind != CONFIG_KIND_LEGACY
+            || config_account.data_len() != PRE_EPOCH_CONFIG_SIZE
+        {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        let (linked_key, linked_bump) = Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                config_account.key.as_ref(),
+                stake.owner.as_ref(),
+                stake.backing_ledger.as_ref(),
+            ],
+            program_id,
+        );
+        let linked_match = *stake_account.key == linked_key && stake.bump == linked_bump;
+        let (owner_key, owner_bump) = Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                config_account.key.as_ref(),
+                stake.owner.as_ref(),
+            ],
+            program_id,
+        );
+        let owner_match = *stake_account.key == owner_key && stake.bump == owner_bump;
+        if !linked_match && !owner_match {
+            return Err(ProgramError::InvalidSeeds);
+        }
     }
     if stake.claimed {
         return Err(ProgramError::InvalidAccountData); // double-claim
