@@ -101,8 +101,8 @@ provenance market is on an orchestrator-vetted allow-list of trusted-Pyth market
 cannot move.**
 
 **Config.** Legacy configs use `market_group` (primary) + up to `MAX_EXTRA_MARKETS` (9) extras.
-Reward epochs atomically bind up to six full market/pool scopes; six is conservative under Solana's
-transaction-size limit with two signatures. All scope fields are fixed at init.
+Reward epochs atomically bind up to six full market/pool scopes; six fits one DAO-member-signed
+Squads transaction under Solana's packet-size limit. All scope fields are fixed at init.
 `register_start` for the portfolio-flow cohorts requires `portfolio.provenance.market_group ∈ allow-list`
 (`Config::market_allowed`). Pinned by allow-list e2e tests;
 the single-market form is finding IL (`register_rejects_portfolio_from_a_foreign_market`).

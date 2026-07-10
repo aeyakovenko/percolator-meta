@@ -121,10 +121,15 @@ base-unit principal times `floor(log2(tenure))`. Reward finalization and claims 
 underlying principal, shares, or Percolator balances.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
-six selected market/pool scopes. The DAO may configure future epochs but cannot mutate a live epoch,
+six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads
+transaction under the network packet limit. The DAO may configure future epochs but cannot mutate a live epoch,
 redirect a user's claim, or sweep principal. After a sink epoch freezes, later rounds burn that stale
 sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
 also falls back to burn instead of stalling settlement.
+
+Auction bids escrow from and settle only to the bidder's canonical initialized COIN and collateral
+ATAs. Closed ATAs are permissionlessly recreatable; a permanently frozen canonical account is rejected
+before any bid fee or escrow transfer can move.
 
 ## Authority Model
 
