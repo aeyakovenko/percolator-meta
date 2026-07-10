@@ -22,7 +22,10 @@ binary fails the post-resolution return with `MissingRequiredSignature`.
 FIX: TWAP tag 16 still requires the bound Squads vault signature while the market is live. Without
 that signature it now additionally requires the config-bound executable Percolator program, a slab
 owned by that program, Percolator's resolved-and-empty predicate, and a read-only subledger
-attestation that the bound principal-only insurance pool still has both owner principal and shares.
+attestation that the bound principal-only insurance pool still has owner principal. Current
+share-bearing layouts must also have shares; deployed pre-share layouts use their nonzero aggregate
+principal, and a dedicated real-Percolator LiteSVM fixture proves that attestation still leads to the
+historical owner's successful exit.
 The instruction still accepts no amount or destination and can rotate custody only through
 subledger's immutable pool derivation. The regression then re-hands off with zero principal and
 proves the same public call rejects byte-exact, preventing a caller from moving terminal protocol
