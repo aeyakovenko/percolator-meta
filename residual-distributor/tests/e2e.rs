@@ -1703,6 +1703,34 @@ fn reward_epoch_rejects_cross_domain_pool_alias_no_double_claim() {
     );
 }
 
+// The original/genesis initializer must enforce the same domain segregation as reusable epochs.
+// Otherwise one position in the aliased pool can derive distinct insurance and backing stake PDAs
+// and consume both COIN allocations for one principal balance.
+#[test]
+fn legacy_genesis_rejects_cross_domain_pool_alias_no_double_claim() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let aliased_pool = Pubkey::new_unique();
+    assert!(
+        try_init(
+            &mut svm,
+            &payer,
+            1_000_000,
+            5_000,
+            5_000,
+            0,
+            aliased_pool,
+            aliased_pool,
+            Pubkey::default(),
+        )
+        .is_err(),
+        "one genesis pool cannot source both capital reward families"
+    );
+}
+
 #[test]
 fn reward_epoch_rejects_funding_points_created_after_emission_end() {
     let mut svm = LiteSVM::new();

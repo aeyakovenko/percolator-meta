@@ -1033,6 +1033,12 @@ fn init(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Progr
     if backing_bps > 0 && backing_pool == Pubkey::default() {
         return Err(ProgramError::InvalidInstructionData);
     }
+    // Capital reward scopes are segregated even though both witnesses are Subledger positions.
+    // Reusing one non-default pool would let the same position derive distinct insurance and
+    // backing stake families and consume both cohort allocations for one principal balance.
+    if subledger_pool != Pubkey::default() && subledger_pool == backing_pool {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     // Portfolio-flow cohorts read Percolator counters that are admin-mark-manipulable on a market whose oracle
     // the registrant controls, so any nonzero portfolio-flow allocation MUST be scoped to an allow-listed market.
     let trader_bps = (BPS_DENOMINATOR as u32).saturating_sub(explicit_bps_sum);
