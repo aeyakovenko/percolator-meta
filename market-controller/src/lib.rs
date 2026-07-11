@@ -497,13 +497,13 @@ fn validate_reclaim_token_accounts(
     .0;
     if transit_state.state != spl_token::state::AccountState::Initialized
         || destination_state.state != spl_token::state::AccountState::Initialized
-        || *transit.key != canonical_transit
         || transit_state.owner != *controller.key
         || destination_state.owner != *governance.key
         || transit_state.mint != destination_state.mint
         || transit_state.delegate.is_some()
         || transit_state.delegated_amount != 0
         || transit_state.close_authority.is_some()
+        || (*transit.key != canonical_transit && transit_state.amount != 0)
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -626,21 +626,13 @@ fn validate_provider_return_token_accounts(
     }
     let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
     let destination_state = spl_token::state::Account::unpack(&destination.try_borrow_data()?)?;
-    let canonical_transit = Pubkey::find_program_address(
-        &[
-            controller.key.as_ref(),
-            spl_token::ID.as_ref(),
-            transit_state.mint.as_ref(),
-        ],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0;
     // The provider identity is immutable in the slab, while the destination
-    // address is intentionally replaceable. This lets a cranker create a clean
-    // provider-owned account when the canonical ATA was permanently frozen.
+    // and temporary controller transit addresses are intentionally replaceable.
+    // This lets a cranker create clean owner-bound accounts when either canonical
+    // ATA was permanently frozen. Exact-amount forwarding below prevents an
+    // alternate transit's unrelated balance from reaching the provider.
     if transit_state.state != spl_token::state::AccountState::Initialized
         || destination_state.state != spl_token::state::AccountState::Initialized
-        || *transit.key != canonical_transit
         || transit_state.owner != *controller.key
         || destination_state.owner != *provider
         || transit_state.mint != destination_state.mint
@@ -783,7 +775,7 @@ fn withdraw_backing_principal<'a>(
 
 // return_shutdown_backing accounts:
 // [governance, controller_pda, market(w), provider_owned_token_account(w),
-//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  controller_owned_transit(w), percolator_vault(w), vault_authority,
 //  controller_backing_ledger(w), percolator_program, token_program]
 // data: domain(u16) | principal(u128) | earnings(u128)
 //
@@ -907,7 +899,7 @@ fn process_return_shutdown_backing<'a>(
 
 // return_shutdown_insurance accounts:
 // [governance, controller_pda, market(w), authority_owned_token_account(w),
-//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  controller_owned_transit(w), percolator_vault(w), vault_authority,
 //  controller_insurance_ledger(w), percolator_program, token_program]
 // data: asset_index(u16)
 //
@@ -1080,7 +1072,7 @@ fn rotate_asset_role_to_controller<'a>(
 
 // return_resolved_asset_insurance accounts:
 // [governance, controller_pda, market(w), authority_owned_token_account(w),
-//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  controller_owned_transit(w), percolator_vault(w), vault_authority,
 //  controller_insurance_ledger(w), percolator_program, token_program]
 // data: asset_index(u16)
 //
@@ -1243,7 +1235,7 @@ fn process_return_resolved_asset_insurance<'a>(
 
 // return_resolved_asset_backing accounts:
 // [governance, controller_pda, market(w), provider_owned_token_account(w),
-//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+//  controller_owned_transit(w), percolator_vault(w), vault_authority,
 //  long_backing_ledger(w), short_backing_ledger(w), percolator_program,
 //  token_program]
 // data: asset_index(u16)
@@ -1410,7 +1402,7 @@ fn process_return_resolved_asset_backing<'a>(
 
 // return_resolved_asset0_backing accounts:
 // [governance, controller_pda, current_asset_admin(signer unless controller), market(w),
-//  provider_owned_token_account(w), controller_canonical_ata(w), percolator_vault(w),
+//  provider_owned_token_account(w), controller_owned_transit(w), percolator_vault(w),
 //  vault_authority, long_backing_ledger(w), short_backing_ledger(w),
 //  percolator_program, token_program]
 //
@@ -1649,10 +1641,12 @@ fn process_close_resolved_portfolio<'a>(
 // vault rent, and any raw vault dust. Here marketauth is the stateless controller
 // PDA, so exposing CloseSlab through the generic proxy would strand that value.
 // This fixed instruction closes only a fully wound-down market (enforced by
-// Percolator), forwards each controller canonical ATA's complete balance to a
-// governance-owned token account, closes the temporary accounts, and forwards
-// every recovered lamport. Forwarding the complete canonical balance makes public
-// pre-execution token dust harmless without exposing an arbitrary token sweep.
+// Percolator), forwards each clean controller-owned transit's complete balance to
+// a governance-owned token account, closes the temporary accounts, and forwards
+// every recovered lamport. Governance must sign this terminal operation; user
+// attribution is already zero, and an alternate transit must be token-empty
+// before CloseSlab. That prevents an arbitrary sweep while letting a permanently
+// frozen empty canonical ATA be replaced for market closure.
 fn process_close_market_and_reclaim<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
