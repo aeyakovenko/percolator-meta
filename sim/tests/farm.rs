@@ -104,6 +104,7 @@ fn modeled_subledger_position(
     start_slot: u64,
 ) -> Vec<u8> {
     let mut data = vec![0u8; subledger_program::POS_SHARES_OFF + 16];
+    data[..8].copy_from_slice(b"SUBPOS01");
     data[subledger_program::POS_POOL_OFF..subledger_program::POS_POOL_OFF + 32]
         .copy_from_slice(pool.as_ref());
     data[subledger_program::POS_OWNER_OFF..subledger_program::POS_OWNER_OFF + 32]
