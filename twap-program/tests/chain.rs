@@ -26466,6 +26466,109 @@ fn e2e_full_book_equal_to_worst_case_reserve_cannot_dos_execute() {
     );
 }
 
+// PUBLIC CU-DOS (reduced-lot fallback): exact-lot preflight uses binary GCD only after a rounded
+// own-rate pair fails. Fibonacci ratios stress Euclidean division but are not the worst shape for
+// shift/subtract GCD. Fill every public slot with a high-iteration pair whose reduced USD lot is
+// larger than the round budget, forcing all 32 bids through the fallback without a purchase.
+#[test]
+fn e2e_full_book_of_high_iteration_reduced_lots_cannot_dos_execute() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // This pair takes 53 iterations in the program's Stein loop, versus 43 for F(86)/F(87).
+    // The aggregate COIN escrow still fits the SPL Token u64 supply/balance domain.
+    let coin = 444_596_540_824_280_279u128;
+    let usd = 446_956_046_239_206_538u128;
+    assert!(coin * 32 <= u64::MAX as u128);
+    let reserve = build_set_reserve_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        coin,
+        usd,
+    );
+    let reserve_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &reserve,
+        &reserve_accounts,
+    )
+    .expect("set high-iteration reserve");
+
+    for _ in 0..32 {
+        let (bidder, source, destination) = new_bidder(&mut svm, &payer, &env, coin as u64);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &source,
+                &destination,
+                &env.coin_mint,
+                &env.collateral_mint,
+                coin,
+                usd,
+                None,
+            ),
+        )
+        .expect("fill high-iteration reduced-lot bid");
+    }
+
+    warp_to(&mut svm, 111);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let execute = execute_ix(
+        &payer.pubkey(),
+        &env,
+        &bk.book,
+        &bk.holding,
+        &bk.settlement_usd,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        None,
+    );
+    let meta = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[execute],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .expect("all reduced-lot fallbacks remain permissionlessly executable");
+    assert!(
+        meta.compute_units_consumed < 500_000,
+        "reduced-lot fallback must retain compute headroom, got {} CU",
+        meta.compute_units_consumed
+    );
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    assert_eq!(token_amount(&svm, &bk.holding), 400_000);
+}
+
 // LIVENESS (multi-round ratchet over fresh surplus): the buy/burn repeats. Each execute pulls the
 // burn-share of the CURRENT surplus and ratchets the retained share into the principal counter; as
 // NEW surplus accrues (market profit / DAO top-up), later rounds must pull it too — the ratchet
