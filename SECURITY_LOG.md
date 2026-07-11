@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - market donation could preserve funded split insurance custody (surface A/C)
+
+Percolator lets asset 0 name separate insurance deposit and withdrawal keys. Secondary activation
+already required those roles to match, but the permissionless creator-market handoff preserved any
+funded asset-0 roles independently. A creator could assign an external provider as authority, assign
+an unrelated key as operator, accept `700,000` insurance units from the provider, and donate
+`marketauth` to the controller. The previous real SBF accepted the handoff with both split roles
+intact, after which the surviving operator withdrew the provider's complete balance. The same drain
+worked when the split external roles were donated while empty and the authority funded only after
+handoff. Controller governance therefore appeared constrained while onboarding an external deposit
+with a separate withdrawal key.
+
+The retained pinned-Percolator + controller LiteSVM regressions construct both role rotations and
+the deposit through public instructions, prove the old post-handoff drains for funding both before
+and after donation, and now require the handoff to reject before changing the slab, canonical vault,
+or unfunded provider source. The existing same-provider creator insurance, external backing,
+controller donation, terminal provider-return, and full-chain handoff tests remain live.
+
+FIX: before accepting market authority, a nonzero asset-0 insurance balance now requires its
+recorded insurance authority and operator to be identical. An empty asset with an external authority
+that can fund after handoff has the same requirement. Empty creator-owned custody remains freely
+donatable, and an external provider remains supported when it owns both roles. No role is rewritten
+to governance, no withdrawal or repair instruction is added, and no signer, destination, custody,
+or admin surface changes.
+
 ## Tick - endpoint-only reconciliation could skip a safe interior price lot (surface C)
 
 Final-price reconciliation considered the largest rounded pair and exact reduced lots at the
