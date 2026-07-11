@@ -186,6 +186,11 @@ Permissionless portfolio-flow claims pay only
 to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
 cannot force rewards into an account it can spend.
 
+Ordinary point growth closes at the reward epoch's inclusive end slot. During the finalize window,
+any cranker may only reduce a trader stake whose previously crystallized loss has since been spent;
+the shared claim cap makes this refresh monotonic, so post-epoch flow cannot mint points or dilute
+the frozen denominator.
+
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads
 transaction under the network packet limit. The DAO may configure future epochs but cannot mutate a live epoch,

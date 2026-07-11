@@ -194,6 +194,16 @@ fn cap_residual_points(
         .ok_or(ProgramError::ArithmeticOverflow)
 }
 
+fn trader_live_cap(
+    prior_net: u128,
+    spent_at_snapshot: u128,
+    current_net: u128,
+    current_spent: u128,
+) -> u128 {
+    let spent_since_snapshot = current_spent.saturating_sub(spent_at_snapshot);
+    core::cmp::min(prior_net.saturating_sub(spent_since_snapshot), current_net)
+}
+
 // percolator account header length (KIND/version/etc.) — all percolator account reads below are at
 // PERC_HEADER_LEN + within-struct offset, PINNED against the real structs by tests/offsets.rs
 // (offset_of! + HEADER_LEN), finding-T discipline.
@@ -1468,15 +1478,25 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if config.sealed != 0 || config.freeze_slot != 0 {
         return Err(ProgramError::InvalidAccountData); // sealed or frozen -> denominators are final
     }
-    if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
-        let now = Clock::get()?.slot;
-        if now < config.emission_start_slot || now > config.emission_end_slot {
+    let now = Clock::get()?.slot;
+    let post_emission_finalize = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
+        if now < config.emission_start_slot {
             return Err(ProgramError::InvalidInstructionData);
         }
-    }
+        now > config.emission_end_slot
+    } else {
+        false
+    };
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidAccountData);
+    }
+    // Reward counters stop accruing at emission_end. During the delayed freeze window, permit only
+    // a reduce-only trader refresh: residual spent can consume a previously crystallized loss and
+    // otherwise leave stale points in the frozen denominator. Capital forfeiture remains owner-timed,
+    // and monotonic LP/funding counters need no post-period mutation.
+    if post_emission_finalize && stake.cohort != COHORT_TRADER {
+        return Err(ProgramError::InvalidInstructionData);
     }
     if stake.config != *config_account.key || stake.backing_ledger != *backing_ledger.key {
         return Err(ProgramError::InvalidAccountData);
@@ -1553,17 +1573,29 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let (received, crystallized, spent) = read_portfolio_residual(&data)?;
             let counter = residual_counter(stake.cohort, received, crystallized, spent);
             let net_delta = counter.saturating_sub(stake.residual_snap);
-            let tenure = Clock::get()?.slot.saturating_sub(stake.start_slot);
-            let new_pts = floor_log2(tenure)
-                .checked_mul(net_delta)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
+            let (new_pts, new_net) = if post_emission_finalize {
+                let cap_net =
+                    trader_live_cap(stake.earnings_snap, stake.eligible_accum, net_delta, spent);
+                (
+                    cap_residual_points(stake.points, stake.earnings_snap, cap_net)?,
+                    cap_net,
+                )
+            } else {
+                let tenure = now.saturating_sub(stake.start_slot);
+                (
+                    floor_log2(tenure)
+                        .checked_mul(net_delta)
+                        .ok_or(ProgramError::ArithmeticOverflow)?,
+                    net_delta,
+                )
+            };
             replace_cohort_points(
                 config.cohort_points_mut(stake.cohort),
                 stake.points,
                 new_pts,
             )?;
             stake.points = new_pts;
-            stake.earnings_snap = net_delta;
+            stake.earnings_snap = new_net;
             stake.eligible_accum = if stake.cohort == COHORT_TRADER {
                 spent
             } else {
@@ -1889,8 +1921,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                     .saturating_sub(stake.residual_snap);
                 let frozen_net = stake.earnings_snap; // net_delta captured at the last crystallize
                 let cap_net = if stake.cohort == COHORT_TRADER {
-                    let spent_since_crystallize = spent.saturating_sub(stake.eligible_accum);
-                    core::cmp::min(frozen_net.saturating_sub(spent_since_crystallize), live_net)
+                    trader_live_cap(frozen_net, stake.eligible_accum, live_net, spent)
                 } else {
                     live_net
                 };

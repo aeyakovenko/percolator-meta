@@ -23,9 +23,11 @@ The regular `register -> crystallize -> freeze -> claim` instructions are shared
 - TWAP books that target an epoch vault bind an inclusive sink cutoff to the epoch end. A later
   permissionless round burns the would-be reward share, so no COIN can arrive outside the frozen
   snapshot and become permanently unclaimable.
-- Registration is half-open `[start, end)` and crystallization closes at the inclusive `end` slot.
-  The later finalize window delays permissionless freeze but cannot admit counter growth created
-  after the reward period.
+- Registration is half-open `[start, end)` and ordinary crystallization closes at the inclusive
+  `end` slot. Before freeze, a permissionless reduce-only trader refresh may remove points whose
+  crystallized loss was subsequently spent; it uses the same monotonic live cap as claim and cannot
+  admit counter growth created after the reward period. The finalize window gives crankers time to
+  remove that stale denominator before permissionless freeze.
 - A scope may omit insurance/backing pools and contribute only portfolio-flow points. This lets a
   handed-off genesis market provide capital cohorts while other DAO-vetted live markets provide OI.
 

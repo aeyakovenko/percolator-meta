@@ -576,6 +576,73 @@ fn setup(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
     }
 }
 
+fn setup_trader_reward_epoch(svm: &mut LiteSVM, payer: &Keypair, supply: u64) -> Env {
+    let authority = Keypair::new();
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(svm, payer, &mint_auth.pubkey());
+    let epoch_id = 9_001u64;
+    let rd_config = reward_epoch_pda(&authority.pubkey(), &coin_mint, epoch_id);
+    let vault = create_token_account(svm, payer, &coin_mint, &rd_config);
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let emission_start = 100u64;
+    let emission_end = 2_000u64;
+    let finalize_window = 500u64;
+    set_slot(svm, 50);
+    send(
+        svm,
+        payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                authority.pubkey(),
+                coin_mint,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                emission_start,
+                emission_end,
+                0,
+                0,
+                0,
+                0,
+                0,
+                finalize_window,
+                0,
+                &[RewardEpochMarket {
+                    market,
+                    insurance_pool: Pubkey::default(),
+                    backing_pool: Pubkey::default(),
+                }],
+            ),
+        }],
+        &[&authority],
+    )
+    .expect("initialize trader-only reward epoch");
+    mint_to(svm, payer, &coin_mint, &mint_auth, &vault, supply);
+    revoke_mint(svm, payer, &coin_mint, &mint_auth);
+    Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth,
+        stub_sub,
+        stub_perc,
+        ins_pool: Pubkey::default(),
+        back_pool: Pubkey::default(),
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    }
+}
+
 fn setup_funding_payer_only_with_fee_and_extras(
     svm: &mut LiteSVM,
     payer: &Keypair,
@@ -7494,19 +7561,17 @@ fn trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero
     assert_eq!(token_amount(&svm, &t_ata), 0, "a trader whose post-register loss was recovered claims nothing — no free farm from a loss-loaded portfolio");
 }
 
-// FREE-FARM PROBE (stale frozen points bypass net-by-spent, sweep weird-state): the net-by-spent defense assumes
-// a stake's frozen points reflect the FINAL net (crystallized - spent). But the trader net is NOT monotonic
-// (spent rises -> net drops), and the LP/trader CLAIM uses the FROZEN stake.points with NO live re-read (unlike
-// the capital cohorts' live-cap). So: crystallize at PEAK net -> raise spent to recover the loss (net -> 0)
-// -> do NOT re-crystallize -> freeze -> claim the STALE-HIGH points. An honest co-trader is diluted by the
-// attacker's recovered-but-still-counted loss. This probes whether that bypass pays out.
+// REWARD DOS PROBE: a trader can crystallize at peak loss, consume that loss after emission ends, and leave
+// stale points in the frozen denominator. Claim's live cap correctly pays that stake zero, but without a
+// reduce-only finalize path the stale denominator permanently dilutes every honest trader. A permissionless
+// finalize-window crystallize must remove only lost eligibility and must not admit fresh post-epoch loss.
 #[test]
-fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit() {
+fn finalize_window_removes_recovered_trader_loss_without_admitting_fresh_loss() {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
-    let env = setup(&mut svm, &payer, 1_000_000); // trader cohort = 40% = 400_000, fee = 0
+    let env = setup_trader_reward_epoch(&mut svm, &payer, 1_000_000);
     set_slot(&mut svm, 100);
 
     // Honest trader H: a real, UNRECOVERED 6_000 loss, crystallized at tenure 1024 (floor_log2 = 10).
@@ -7580,8 +7645,8 @@ fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit(
     crystallize(&mut svm, &payer, &env, &h, &h_pf).expect("cry H (net 6_000)");
     crystallize(&mut svm, &payer, &env, &a, &a_pf).expect("cry A (net 6_000)");
 
-    // THE ATTACK: A's loss is RECOVERED (spent 0 -> 6_000, net -> 0), but A does NOT re-crystallize. H's loss
-    // stays real (unrecovered). If the frozen points are used as-is, A still counts a phantom 6_000.
+    // A's loss is recovered during the finalize window. The reward period is over, so this can only lower
+    // existing eligibility; a third-party cranker must be able to remove A's stale denominator contribution.
     set_slot(&mut svm, 100 + 2048);
     set_portfolio_full(
         &mut svm,
@@ -7593,6 +7658,40 @@ fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit(
         6_000,
         6_000,
     ); // A net -> 0
+    crystallize_as(&mut svm, &payer, &env, &payer, &a.pubkey(), &a_pf)
+        .expect("permissionless reduce-only finalize removes recovered loss");
+    let a_stake = stake_pda_for_cohort(&env, &a.pubkey(), &a_pf, COHORT_TRADER);
+    let stake_points = |svm: &LiteSVM| {
+        u128::from_le_bytes(
+            svm.get_account(&a_stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        stake_points(&svm),
+        0,
+        "recovered loss leaves no denominator points"
+    );
+
+    // Fresh loss created after emission_end cannot restore the removed points.
+    set_portfolio_full(
+        &mut svm,
+        &a_pf,
+        &env.stub_perc,
+        &env.market,
+        &a.pubkey(),
+        0,
+        12_000,
+        6_000,
+    );
+    crystallize_as(&mut svm, &payer, &env, &payer, &a.pubkey(), &a_pf)
+        .expect("post-epoch finalize remains callable but reduce-only");
+    assert_eq!(
+        stake_points(&svm),
+        0,
+        "fresh post-epoch loss cannot mint reward points"
+    );
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze");
@@ -7603,20 +7702,10 @@ fn trader_recovered_loss_without_recrystallize_stale_points_vs_honest_codeposit(
     let _ = claim(&mut svm, &payer, &env, &a, &a_ata, None); // may or may not pay
     let h_got = token_amount(&svm, &h_ata);
     let a_got = token_amount(&svm, &a_ata);
-    let _ = h_got;
-    // THE FIX (claim live-cap): A's claim re-reads A's portfolio, sees net 0 (loss recovered), and caps the
-    // payout at min(frozen, live) = 0. So the recovered-loss FREE-FARM is closed — A captures NOTHING even
-    // without a defensive re-crystallize. (Before the fix A claimed 200_000, half the cohort.)
-    assert_eq!(a_got, 0, "FREE-FARM CLOSED: a trader whose loss was recovered (net 0) claims 0 — the claim live-cap defeats the stale-points bypass");
-    // Residual (acceptable) effect: A's STALE frozen points still sit in the cohort DENOMINATOR (freeze
-    // snapshotted them), so H is diluted to half and the other half is LOCKED (A claimed 0, its denom share is
-    // unclaimable). This is a COSTLY GRIEF, not a farm: A burned real capital (loss + recovery) for zero gain.
-    // It is fully defended PRE-freeze by the permissionless, incentive-compatible re-crystallize (an honest
-    // claimant re-crystallizes A during the finalize window -> A's points -> 0 -> H takes the full 400k), exactly
-    // as pinned by trader_snap_captures_pre_existing_loss_and_spent_netting_holds_atop_a_nonzero_baseline.
+    assert_eq!(a_got, 0, "a recovered loss earns no trader reward");
     assert_eq!(
-        h_got, 200_000,
-        "H is diluted by A's frozen-denominator share (the locked half is a grief, not A's profit)"
+        h_got, 1_000_000,
+        "stale recovered-loss points cannot lock an honest trader's cohort share"
     );
 }
 
@@ -9658,9 +9747,8 @@ fn self_service_lifecycle_guards_freeze_window_and_post_freeze_closure() {
     );
     crystallize(&mut svm, &payer, &env, &lp, &pf).expect("crystallize");
 
-    // (1) freeze at the LAST in-window slot (emission_end + finalize_window - 1) is rejected — the check is
-    // `now < emission_end + finalize_window -> reject`, so backers get the FULL finalize window to crystallize
-    // their points (an off-by-one here would forfeit slow backers' final-slot points).
+    // (1) freeze at the LAST in-window slot (emission_end + finalize_window - 1) is rejected. This
+    // preserves the full reduce-only trader cleanup window before denominators become immutable.
     set_slot(&mut svm, env.emission_end + env.finalize_window - 1);
     assert!(
         freeze(&mut svm, &payer, &env).is_err(),
