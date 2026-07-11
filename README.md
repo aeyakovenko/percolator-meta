@@ -189,7 +189,9 @@ preserves only the remaining capital through its authenticated return slot, whet
 before or after cleanup; ordinary owner exits still forfeit rewards.
 Permissionless portfolio-flow claims pay only
 to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
-cannot force rewards into an account it can spend.
+cannot force rewards into an account it can spend. The same full-chain test then returns TWAP
+custody and proves both the insurance and segregated backing depositors can redeem without losing
+their claimed COIN.
 
 Ordinary point growth closes at the reward epoch's inclusive end slot. During the finalize window,
 any cranker may only reduce a trader stake whose previously crystallized loss has since been spent;
