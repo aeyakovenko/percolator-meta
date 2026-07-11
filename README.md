@@ -225,10 +225,15 @@ cleanup. A failed domain CPI rolls back every earlier transfer and the authority
 Permissionless market donation transfers lifecycle control, not funded creator capital. If the
 outgoing market authority still owns nonzero asset-0 insurance, the controller atomically restores
 that exact insurance authority/operator after accepting `marketauth`, just as it preserves the
-recorded backing provider. Genesis custody cannot move to a pool until those external insurance
-roles hold no balance. The creator can withdraw through Percolator, then the unchanged grant path
-installs the canonical owner-bound pool; governance cannot convert the external balance into its own
-or pool-controlled insurance. Percolator's market-authority update does not migrate secondary
+recorded backing provider. A funded handoff that restores either outgoing insurance role is rejected
+unless it also leaves `asset_admin` on the controller, so public stale resolution cannot make terminal
+recovery depend on a delegated signer.
+If the provider disappears after a valid handoff, the controller's amountless resolved return rotates
+only that value role and pays the complete asset-0 balance to the provider's canonical token account.
+Genesis custody cannot move to a pool until those external insurance roles hold no balance. The
+creator can also withdraw directly through Percolator, then the unchanged grant path installs the
+canonical owner-bound pool; governance cannot convert the external balance into its own or
+pool-controlled insurance. Percolator's market-authority update does not migrate secondary
 `asset_admin` roles, so the controller rejects donation while any secondary slot is active,
 drain-only, or recovering. Once those slots are empty and retired, the same permissionless handoff
 succeeds only if direct permissionless asset append is disabled. The controller proxy cannot enable

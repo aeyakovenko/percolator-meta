@@ -894,10 +894,11 @@ fn rotate_asset_role_to_controller<'a>(
 // data: asset_index(u16)
 //
 // Global permissionless resolution may race the live shutdown return above. For an
-// external secondary provider, this fixed path rotates only insurance_authority to
-// the controller, withdraws the exact asset-local remainder read from the pinned
-// slab, and forwards it to the outgoing authority's canonical ATA. Controller-owned
-// protocol insurance, including asset 0, stays in the canonical controller ATA for
+// external provider, this fixed path rotates only insurance_authority to the
+// controller, withdraws the exact asset-local remainder read from the pinned
+// slab, and forwards it to the outgoing authority's canonical ATA. This includes
+// asset 0 only when the controller still holds its asset-admin rotation key.
+// Controller-owned protocol insurance stays in the canonical controller ATA for
 // the existing terminal governance reclaim. Any failed operation rolls back.
 fn process_return_resolved_asset_insurance<'a>(
     program_id: &Pubkey,
@@ -960,7 +961,13 @@ fn process_return_resolved_asset_insurance<'a>(
         )
         .map_err(|_| ProgramError::InvalidAccountData)?;
         let controller_owned = authority == controller.key.to_bytes();
-        if authority == [0u8; 32] || amount == 0 || (asset_index == 0 && !controller_owned) {
+        let asset_admin =
+            percolator_accounting::read_asset_admin(&market_data, usize::from(asset_index))
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        if authority == [0u8; 32]
+            || amount == 0
+            || (!controller_owned && asset_admin != controller.key.to_bytes())
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         (Pubkey::new_from_array(authority), amount, controller_owned)
@@ -1795,15 +1802,28 @@ fn process_accept_market_authority<'a>(
         let has_insurance = percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?
             != 0;
+        let insurance_authority =
+            percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let insurance_operator =
+            percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let restore_insurance_authority = has_insurance && insurance_authority == current_bytes;
+        let restore_insurance_operator = has_insurance && insurance_operator == current_bytes;
+        let asset_admin = percolator_accounting::read_asset_admin(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        // UpdateAuthority migrates asset_admin only while it still equals the outgoing
+        // market authority. Restoring an outgoing funded value role while leaving a
+        // separately delegated admin would make terminal recovery depend on that signer.
+        if (restore_insurance_authority || restore_insurance_operator)
+            && asset_admin != current_bytes
+            && asset_admin != controller.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
         (
-            has_insurance
-                && percolator_accounting::read_asset_insurance_authority(&market_data, 0)
-                    .map_err(|_| ProgramError::InvalidAccountData)?
-                    == current_bytes,
-            has_insurance
-                && percolator_accounting::read_asset_insurance_operator(&market_data, 0)
-                    .map_err(|_| ProgramError::InvalidAccountData)?
-                    == current_bytes,
+            restore_insurance_authority,
+            restore_insurance_operator,
             percolator_accounting::read_asset_backing_authority(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?
                 == current_bytes,

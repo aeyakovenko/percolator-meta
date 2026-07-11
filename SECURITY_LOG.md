@@ -2,6 +2,36 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - preserved external asset-0 insurance could block terminal cleanup (surface A/C)
+
+Market donation correctly preserved creator-funded asset-0 insurance instead of giving it to the
+controller, but the fixed resolved-insurance return accepted external providers only for secondary
+assets. After governance enabled public stale resolution, an unaffiliated cranker could resolve the
+donated market before the creator withdrew. Percolator then required the recorded insurance authority
+to withdraw, while `CloseSlab` required the balance to be zero. If that provider disappeared, its
+segregated balance and the whole market remained permanently stuck.
+
+A fresh pinned-Percolator + controller LiteSVM regression funds asset-0 insurance through the real
+public API, donates lifecycle control while preserving the provider, enables and triggers public stale
+resolution, and invokes the provider-bound resolved return. The old controller rejects tag 9 with
+`InvalidAccountData`. The retained chain requires every atom to reach the provider's canonical ATA and
+then completes real `CloseSlab` cleanup.
+
+A companion probe delegates asset-0 `asset_admin` before funding. The old controller accepts the market
+donation even though its PDA cannot later rotate the external insurance role without that delegated
+signer. The retained regression requires the unsafe handoff to reject byte-atomically and proves the
+original provider's direct withdrawal remains live.
+
+FIX: market donation now rejects restoring either outgoing funded insurance role when Percolator's
+handoff would leave a separately delegated `asset_admin`. Existing Subledger/TWAP custody, where the
+outgoing market authority is not being restored as provider, remains composable. The resolved-insurance
+instruction may then handle asset 0 exactly like a secondary external provider: it requires the
+controller to remain the live asset admin, derives the complete amount and outgoing authority from the
+pinned slab, rotates only insurance authority, and forwards exactly that amount to the provider's
+canonical ATA. Controller-owned protocol insurance keeps its separate canonical-controller path. No
+caller-selected amount, recipient, signer, generic authority setter, or governance withdrawal surface
+was added.
+
 ## Tick - pool-less TWAP custody could strand asset-0 backing (surface A/C)
 
 The controller's resolved asset-0 cleanup derives both backing-domain balances and the recorded
