@@ -2170,6 +2170,23 @@ fn cmp_rate(an: u128, ad: u128, bn: u128, bd: u128) -> core::cmp::Ordering {
     wide_product(an, bd).cmp(&wide_product(bn, ad))
 }
 
+// Bid legs are constrained to positive u64 token amounts. Keeping Stein's algorithm in that native
+// width avoids both attacker-priced integer division and costly emulated u128 shift/subtract work.
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    let common_shift = (a | b).trailing_zeros();
+    a >>= a.trailing_zeros();
+    loop {
+        b >>= b.trailing_zeros();
+        if a > b {
+            core::mem::swap(&mut a, &mut b);
+        }
+        b -= a;
+        if b == 0 {
+            return a << common_shift;
+        }
+    }
+}
+
 fn mul_div_floor(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
     a.checked_mul(b)
         .ok_or(ProgramError::ArithmeticOverflow)?
@@ -3079,6 +3096,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         let mut d = book_account.try_borrow_mut_data()?;
         // a) eligible bids: occupied, positive, rate >= reserve.
         let mut idx = [0usize; MAX_BIDS];
+        let mut bid_gcd = [0u64; MAX_BIDS];
         let mut n = 0usize;
         for i in 0..MAX_BIDS {
             let o = slot_off(i);
@@ -3147,11 +3165,27 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 let c = book_rd_u128(&d, o + SL_COIN);
                 let u = book_rd_u128(&d, o + SL_USDC);
                 let nominal_usd = core::cmp::min(remaining, u);
-                if executable_integer_pair(nominal_usd, c, u, c, u)?.is_none() {
-                    continue;
+                // At the bid's own rate, the floored COIN leg is bidder-safe exactly when it is a
+                // multiple of the reduced COIN lot. Preserve that maximum nominal allocation. If
+                // it is not exact, use the largest smaller reduced-ratio lot that fits. Cache the
+                // GCD so bounded repricing retries cannot repeat attacker-controlled work.
+                if bid_gcd[i] == 0 {
+                    bid_gcd[i] = gcd_u64(c as u64, u as u64);
                 }
-                nominal_allocations[i] = nominal_usd;
-                remaining -= nominal_usd;
+                let lot_coin = c as u64 / bid_gcd[i];
+                let lot_usd = u / bid_gcd[i] as u128;
+                let floored_coin = mul_div_floor(nominal_usd, c, u)? as u64;
+                let allocation = if floored_coin != 0 && floored_coin % lot_coin == 0 {
+                    nominal_usd
+                } else {
+                    let exact_usd = (nominal_usd / lot_usd) * lot_usd;
+                    if exact_usd == 0 {
+                        continue;
+                    }
+                    exact_usd
+                };
+                nominal_allocations[i] = allocation;
+                remaining -= allocation;
                 marginal = Some(i);
             }
 
