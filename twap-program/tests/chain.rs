@@ -10421,6 +10421,15 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
         data: vec![5],
     };
 
+    let arbitrary_controller_account = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &arbitrary_controller_account,
+        &primary_mint,
+        &controller,
+        9,
+    );
+
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     assert!(
@@ -10433,6 +10442,24 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
         .is_err(),
         "terminal cleanup cannot close a live market"
     );
+    assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
+    assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
+
+    let mut substituted_transit = close(true);
+    substituted_transit.accounts[5] = AccountMeta::new(arbitrary_controller_account, false);
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[substituted_transit],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            bh,
+        ))
+        .is_err(),
+        "governance cannot sweep a funded controller account while user attribution is live"
+    );
+    assert_eq!(token_amount(&svm, &arbitrary_controller_account), 9);
     assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
     assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
 
@@ -10455,32 +10482,6 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
         bh,
     ))
     .expect("controller resolves the empty two-collateral market");
-
-    let arbitrary_controller_account = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &arbitrary_controller_account,
-        &primary_mint,
-        &controller,
-        9,
-    );
-    let mut substituted_transit = close(true);
-    substituted_transit.accounts[5] = AccountMeta::new(arbitrary_controller_account, false);
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    assert!(
-        svm.send_transaction(Transaction::new_signed_with_payer(
-            &[substituted_transit],
-            Some(&payer.pubkey()),
-            &[&payer, &governance],
-            bh,
-        ))
-        .is_err(),
-        "terminal cleanup cannot sweep an arbitrary controller-owned token account"
-    );
-    assert_eq!(token_amount(&svm, &arbitrary_controller_account), 9);
-    assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
-    assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
 
     let controller_before = svm.get_account(&controller).unwrap().lamports;
     let market_before = svm.get_account(&slab).unwrap().lamports;
@@ -32825,7 +32826,7 @@ fn e2e_public_maintenance_close_cannot_lock_frozen_trader_reward() {
 // principal in its monotonic floor. After resolution and every owner exit, a zero-principal
 // re-handoff intentionally preserves that floor, so the auction cannot pull it while CloseSlab
 // cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
-// exact residual only through the canonical controller account.
+// exact residual only through clean PDA-owned transits into controller custody.
 #[test]
 fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
     let mut svm =
@@ -33734,6 +33735,139 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         "the retained floor currently blocks CloseSlab after every user exits"
     );
 
+    // TERMINAL TRANSIT DOS: the collateral issuer can freeze only the two empty
+    // canonical return accounts and then revoke its freeze authority. Principal
+    // has already reached its owner, but hard-coding either account would strand
+    // protocol insurance and prevent the resolved slab from ever closing.
+    let freeze_authority = Keypair::new();
+    let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply: retained_protocol_insurance,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::Some(freeze_authority.pubkey()),
+        },
+        &mut mint_data,
+    )
+    .unwrap();
+    svm.set_account(
+        env.collateral_mint,
+        Account {
+            lamports: 1_000_000_000,
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let freeze_twap = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &twap_transit,
+        &env.collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let freeze_controller = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &controller_transit,
+        &env.collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke_freeze = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &env.collateral_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[freeze_twap, freeze_controller, revoke_freeze],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    ))
+    .expect("issuer permanently freezes both canonical terminal transits");
+
+    let clean_twap_transit = Pubkey::new_unique();
+    let clean_controller_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_twap_transit,
+        &env.collateral_mint,
+        &twap_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &clean_controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    let market_before_frozen_return = svm.get_account(&env.slab).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_resolved_protocol_insurance_ix(
+                &twap_cfg,
+                &twap_authority,
+                &env.pool,
+                &env.slab,
+                &twap_transit,
+                &controller_transit,
+                &env.perc_vault,
+                &perc_vault_authority(&env.slab, &perc_id()),
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "permanently frozen canonical transits cannot receive protocol insurance"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_frozen_return);
+
+    // A replacement TWAP account must start empty. Otherwise a public caller
+    // could use terminal recovery to sweep an unrelated TWAP-owned balance into
+    // controller custody.
+    let funded_twap_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &funded_twap_transit,
+        &env.collateral_mint,
+        &twap_authority,
+        1,
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_resolved_protocol_insurance_ix(
+                &twap_cfg,
+                &twap_authority,
+                &env.pool,
+                &env.slab,
+                &funded_twap_transit,
+                &clean_controller_transit,
+                &env.perc_vault,
+                &perc_vault_authority(&env.slab, &perc_id()),
+                &perc_id(),
+            ),
+        )
+        .is_err(),
+        "a fallback cannot sweep a pre-existing TWAP-owned balance"
+    );
+    assert_eq!(token_amount(&svm, &funded_twap_transit), 1);
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_frozen_return);
+
     let attacker = Keypair::new();
     let attacker_destination = Pubkey::new_unique();
     set_token(
@@ -33753,7 +33887,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 &twap_authority,
                 &env.pool,
                 &env.slab,
-                &twap_transit,
+                &clean_twap_transit,
                 &attacker_destination,
                 &env.perc_vault,
                 &perc_vault_authority(&env.slab, &perc_id()),
@@ -33774,16 +33908,19 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             &twap_authority,
             &env.pool,
             &env.slab,
-            &twap_transit,
-            &controller_transit,
+            &clean_twap_transit,
+            &clean_controller_transit,
             &env.perc_vault,
             &perc_vault_authority(&env.slab, &perc_id()),
             &perc_id(),
         ),
     )
-    .expect("permissionless terminal recovery moves only protocol insurance to the controller");
+    .expect("permissionless terminal recovery uses clean owner-bound fallback transits");
     assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
-    assert_eq!(token_amount(&svm, &controller_transit), retained_protocol_insurance);
+    assert_eq!(
+        token_amount(&svm, &clean_controller_transit),
+        retained_protocol_insurance
+    );
 
     send(
         &mut svm,
@@ -33824,7 +33961,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             &controller,
             &env.slab,
             &asset0_provider_destination,
-            &controller_transit,
+            &clean_controller_transit,
             &env.perc_vault,
             &perc_vault_authority(&env.slab, &perc_id()),
             &long_backing_ledger,
@@ -33839,7 +33976,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         "asset-0 backing reaches only its recorded provider"
     );
     assert_eq!(
-        token_amount(&svm, &controller_transit),
+        token_amount(&svm, &clean_controller_transit),
         retained_protocol_insurance,
         "asset-0 backing cleanup cannot sweep retained protocol insurance"
     );
@@ -33851,7 +33988,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             &controller,
             &env.slab,
             &provider_destination,
-            &controller_transit,
+            &clean_controller_transit,
             &env.perc_vault,
             &perc_vault_authority(&env.slab, &perc_id()),
             &long_backing_ledger,
@@ -33867,11 +34004,33 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         "provider receives backing only, never retained protocol insurance"
     );
     assert_eq!(
-        token_amount(&svm, &controller_transit),
+        token_amount(&svm, &clean_controller_transit),
         retained_protocol_insurance,
         "terminal protocol insurance remains in controller custody"
     );
 
+    let fallback_close = build_controller_close_and_reclaim_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &env.perc_vault,
+        &perc_vault_authority(&env.slab, &perc_id()),
+        &clean_controller_transit,
+        &governance_destination,
+    );
+    let fallback_close_remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new(clean_controller_transit, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
     squads_execute(
         &mut svm,
         &env.squads,
@@ -33879,8 +34038,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &env.dao,
         &payer,
         10,
-        &close,
-        &close_remaining,
+        &fallback_close,
+        &fallback_close_remaining,
     )
     .expect("terminal protocol recovery unblocks whole-market close");
     assert_eq!(token_amount(&svm, &governance_destination), retained_protocol_insurance);

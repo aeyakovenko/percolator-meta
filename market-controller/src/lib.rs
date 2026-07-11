@@ -486,15 +486,6 @@ fn validate_reclaim_token_accounts(
     }
     let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
     let destination_state = spl_token::state::Account::unpack(&destination.try_borrow_data()?)?;
-    let canonical_transit = Pubkey::find_program_address(
-        &[
-            controller.key.as_ref(),
-            spl_token::ID.as_ref(),
-            transit_state.mint.as_ref(),
-        ],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0;
     if transit_state.state != spl_token::state::AccountState::Initialized
         || destination_state.state != spl_token::state::AccountState::Initialized
         || transit_state.owner != *controller.key
@@ -503,7 +494,6 @@ fn validate_reclaim_token_accounts(
         || transit_state.delegate.is_some()
         || transit_state.delegated_amount != 0
         || transit_state.close_authority.is_some()
-        || (*transit.key != canonical_transit && transit_state.amount != 0)
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -1643,10 +1633,11 @@ fn process_close_resolved_portfolio<'a>(
 // This fixed instruction closes only a fully wound-down market (enforced by
 // Percolator), forwards each clean controller-owned transit's complete balance to
 // a governance-owned token account, closes the temporary accounts, and forwards
-// every recovered lamport. Governance must sign this terminal operation; user
-// attribution is already zero, and an alternate transit must be token-empty
-// before CloseSlab. That prevents an arbitrary sweep while letting a permanently
-// frozen empty canonical ATA be replaced for market closure.
+// every recovered lamport. Governance must sign this terminal operation and
+// Percolator must atomically prove user attribution is already zero. A clean
+// controller-owned transit may therefore already hold protocol insurance from a
+// fixed terminal return; this lets a permanently frozen canonical ATA be replaced
+// without exposing any live provider or depositor balance.
 fn process_close_market_and_reclaim<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
