@@ -783,10 +783,10 @@ fn redeem_shares(shares: u128, balance: u64, total_shares: u128) -> Result<u64, 
     u64::try_from(owed).map_err(|_| ProgramError::ArithmeticOverflow)
 }
 
-/// Reject a deposit before transfer when its positive share count still has no redeemable value at
+/// Reject a deposit before transfer when its shares lose more than one atom to entry rounding at
 /// the post-deposit price. The virtual offset intentionally absorbs bounded rounding dust, but it
-/// must never turn an accepted position's complete principal into a zero-payout exit.
-fn require_nonzero_share_value(
+/// must not make an accepted position materially under-valued before it takes any market risk.
+fn require_bounded_share_rounding(
     amount: u64,
     shares_minted: u128,
     total_shares: u128,
@@ -801,7 +801,8 @@ fn require_nonzero_share_value(
     let post_total_shares = total_shares
         .checked_add(shares_minted)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    if redeem_shares(shares_minted, post_balance, post_total_shares)? == 0 {
+    let immediate_value = redeem_shares(shares_minted, post_balance, post_total_shares)?;
+    if immediate_value == 0 || amount.saturating_sub(immediate_value) > 1 {
         return Err(ProgramError::InvalidArgument);
     }
     Ok(())
@@ -1154,7 +1155,7 @@ fn process_deposit(
     let shares_minted = if pool.policy == POLICY_WITH_SURPLUS {
         let balance_before = token_balance(vault)?;
         let s = mint_shares(amount, pool.total_shares, balance_before)?;
-        require_nonzero_share_value(amount, s, pool.total_shares, balance_before)?;
+        require_bounded_share_rounding(amount, s, pool.total_shares, balance_before)?;
         s
     } else {
         0
@@ -1637,10 +1638,10 @@ fn process_insurance_deposit(
         insurance_before
     };
     let shares_minted = mint_shares(amount, pool.total_shares, priced_balance_before)?;
-    // Inflation/rounding guard (finding HB): never accept principal for zero shares or for positive
-    // dust shares whose complete post-deposit redemption is still zero. A large surplus can inflate
-    // the share price enough for either case; both must reject before the depositor transfers value.
-    require_nonzero_share_value(
+    // Inflation/rounding guard (finding HB): a large surplus can make deposits mint zero or very
+    // few shares. Reject before transfer unless their immediate value is within one atom of the
+    // deposit, so public donations cannot turn entry rounding into material principal loss.
+    require_bounded_share_rounding(
         amount,
         shares_minted,
         pool.total_shares,
