@@ -24211,6 +24211,109 @@ fn e2e_preflight_uses_a_smaller_exact_lot_instead_of_skipping_the_bid() {
     assert_eq!(token_amount(&svm, &honest_usd), 400_000);
 }
 
+// PUBLIC DOS: executable repriced bids can still reserve more nominal budget than their
+// integer USD payouts consume. Those per-bid remainders must be reallocated: together they
+// can fund additional whole lots from the marginal bid even though no individual bid is
+// fully refunded. Otherwise a small set of better-rate Sybils can strand a material share
+// of every round while all bids remain nominally executable.
+#[test]
+fn e2e_uniform_repricing_reallocates_partial_integer_remainders() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // At the eventual 1 COIN / 100 USD marginal rate, each 2/199 bid spends only
+    // 100 of its 199 nominal USD allocation. The three 99-USD remainders plus the
+    // marginal bid's 3-USD remainder fund three additional exact marginal lots.
+    let mut bidders = Vec::new();
+    for _ in 0..3 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 2);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                2,
+                199,
+                None,
+            ),
+        )
+        .expect("place a better repricing bid");
+        bidders.push((bidder, coin, usd));
+    }
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 4_000);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            4_000,
+            400_000,
+            None,
+        ),
+    )
+    .expect("place the exact marginal bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute reallocated uniform clearing");
+
+    assert_eq!(
+        token_amount(&svm, &bk.settlement_usd),
+        400_000,
+        "all executable integer lots consume the round budget"
+    );
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        4_000,
+        "three better lots plus 3,997 marginal lots are bought"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+    let _ = (bidders, marginal, marginal_coin, marginal_usd);
+}
+
 // PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
 // when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
 // reconciliation, but a lower-ranked executable bid never receives an allocation; because a
@@ -24662,8 +24765,8 @@ fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
     let burned = initial_coin - mint_supply(&svm, &env.coin_mint);
     let spent = token_amount(&svm, &bk.settlement_usd);
     assert_eq!(
-        burned, 16,
-        "the 16/6 bid clears as an exact 8/3 lot instead of being skipped"
+        burned, 18,
+        "the stable 16/6 marginal buys 8/3 there and safely enlarges the 11/3 winner to 10/3"
     );
     assert_eq!(spent, 6);
     assert_eq!(token_amount(&svm, &bk.holding), 1);
@@ -24685,6 +24788,22 @@ fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
             ),
         )
         .expect("permissionless cascade claim");
+        let (bid_coin, bid_usd) = bid_legs[slot];
+        let sold_coin = bid_coin - token_amount(&svm, coin);
+        let paid_usd = token_amount(&svm, usd);
+        if sold_coin == 0 {
+            assert_eq!(paid_usd, 0);
+        } else {
+            assert!(
+                (sold_coin as u128) * (bid_usd as u128)
+                    <= (bid_coin as u128) * (paid_usd as u128),
+                "slot {slot} cannot sell below its submitted limit"
+            );
+            assert!(
+                (sold_coin as u128) * 6 >= 16 * (paid_usd as u128),
+                "slot {slot} cannot clear below the stable 16/6 marginal"
+            );
+        }
     }
     let returned_coin: u64 = bidders
         .iter()

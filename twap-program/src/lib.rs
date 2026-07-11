@@ -2222,6 +2222,61 @@ fn executable_integer_pair(
     Ok(Some((coin, usd)))
 }
 
+// Maximum practical integer pair for one bid under an already-selected marginal price and
+// an actual remaining USD budget. The first candidate is the largest COIN amount whose floored
+// marginal-price USD leg fits. If flooring crosses the bidder's limit, fall back to the largest
+// multiple of the bid's reduced COIN lot; that multiple is always bidder-safe because the bid rate
+// is at least the selected marginal rate. All public bid legs are u64-bounded, so the products fit
+// in u128, and the caller supplies the GCD already cached by nominal preflight.
+fn max_executable_integer_pair(
+    remaining_usd: u128,
+    marginal_coin: u128,
+    marginal_usd: u128,
+    bid_coin: u128,
+    bid_usd: u128,
+    bid_gcd: u64,
+) -> Result<Option<(u128, u128)>, ProgramError> {
+    let max_usd = core::cmp::min(remaining_usd, bid_usd);
+    if max_usd == 0 || marginal_coin == 0 || marginal_usd == 0 {
+        return Ok(None);
+    }
+
+    // floor(coin * marginal_usd / marginal_coin) <= max_usd iff
+    // coin * marginal_usd < (max_usd + 1) * marginal_coin.
+    let max_coin_for_budget = max_usd
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(marginal_coin))
+        .and_then(|v| v.checked_sub(1))
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        / marginal_usd;
+    let candidate_coin = core::cmp::min(bid_coin, max_coin_for_budget);
+
+    let try_coin = |coin: u128| -> Result<Option<(u128, u128)>, ProgramError> {
+        if coin == 0 {
+            return Ok(None);
+        }
+        let usd = mul_div_floor(coin, marginal_usd, marginal_coin)?;
+        if usd == 0
+            || usd > max_usd
+            || cmp_bid(coin, usd, bid_coin, bid_usd) == core::cmp::Ordering::Greater
+        {
+            return Ok(None);
+        }
+        Ok(Some((coin, usd)))
+    };
+
+    if let Some(pair) = try_coin(candidate_coin)? {
+        return Ok(Some(pair));
+    }
+
+    if bid_gcd == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let reduced_coin_lot = bid_coin / bid_gcd as u128;
+    let exact_coin = (candidate_coin / reduced_coin_lot) * reduced_coin_lot;
+    try_coin(exact_coin)
+}
+
 fn as_u64(v: u128) -> Result<u64, ProgramError> {
     u64::try_from(v).map_err(|_| ProgramError::InvalidInstructionData)
 }
@@ -3142,13 +3197,14 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         //    the uniform marginal price. A bid can pass its own-rate preflight but become wholly
         //    infeasible only after a lower bid sets that price. Exclude every such fully refunded
         //    bid and recompute so it cannot keep budget away from lower executable bids. Integer
-        //    payout rounding that still produces a trade is deliberately not reallocated: it stays
-        //    in holding for a later round and cannot be recycled into a zero-COIN price setter.
-        //    Every retry excludes at least one of the fixed 32 slots.
+        //    payout rounding that still produces a trade cannot change the marginal price. Once the
+        //    marginal is stable, its aggregate remainder may only enlarge allocations which already
+        //    executed at that same price. Every retry excludes at least one of the fixed 32 slots.
         let mut excluded = vec![false; MAX_BIDS];
         let mut nominal_allocations = vec![0u128; MAX_BIDS];
         let mut stable_allocations = vec![None; MAX_BIDS];
         let mut has_stable = false;
+        let mut stable_marginal_rank = None;
         for _ in 0..=MAX_BIDS {
             nominal_allocations.fill(0);
             let mut remaining = budget;
@@ -3186,10 +3242,10 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 };
                 nominal_allocations[i] = allocation;
                 remaining -= allocation;
-                marginal = Some(i);
+                marginal = Some((i, k));
             }
 
-            let Some(marginal_slot) = marginal else {
+            let Some((marginal_slot, marginal_rank)) = marginal else {
                 break;
             };
             let mo = slot_off(marginal_slot);
@@ -3226,7 +3282,65 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 total_coin = candidate_coin;
                 total_usd = candidate_usd;
                 has_stable = true;
+                stable_marginal_rank = Some(marginal_rank);
                 break;
+            }
+        }
+
+        // Integer reconciliation can leave each executable bid consuming less actual USD than its
+        // nominal allocation. Combine those remainders into additional whole lots without changing
+        // the stable marginal or making an unfilled bid executable. Mutating the existing fixed-size
+        // allocation vector avoids attacker-amplified heap use; cached GCDs bound each fallback.
+        if has_stable && total_usd < budget {
+            let marginal_rank = stable_marginal_rank.ok_or(ProgramError::InvalidAccountData)?;
+            let marginal_slot = idx[marginal_rank];
+            let mo = slot_off(marginal_slot);
+            let cm = book_rd_u128(&d, mo + SL_COIN);
+            let um = book_rd_u128(&d, mo + SL_USDC);
+            let mut remaining = budget - total_usd;
+
+            for &i in &idx[..=marginal_rank] {
+                let Some((old_coin, old_usd)) = stable_allocations[i] else {
+                    continue;
+                };
+                let o = slot_off(i);
+                let c = book_rd_u128(&d, o + SL_COIN);
+                if old_coin == c {
+                    continue;
+                }
+                let u = book_rd_u128(&d, o + SL_USDC);
+                let allocation_budget = old_usd
+                    .checked_add(remaining)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                let Some((new_coin, new_usd)) = max_executable_integer_pair(
+                    allocation_budget,
+                    cm,
+                    um,
+                    c,
+                    u,
+                    bid_gcd[i],
+                )?
+                else {
+                    continue;
+                };
+                if new_coin <= old_coin || new_usd < old_usd {
+                    continue;
+                }
+                let added_usd = new_usd - old_usd;
+                if added_usd > remaining {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                stable_allocations[i] = Some((new_coin, new_usd));
+                total_coin = total_coin
+                    .checked_add(new_coin - old_coin)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                total_usd = total_usd
+                    .checked_add(added_usd)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                remaining -= added_usd;
+                if remaining == 0 {
+                    break;
+                }
             }
         }
 
