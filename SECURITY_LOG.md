@@ -2,6 +2,28 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - equal-price bids could be starved after uniform integer repricing (surface C)
+
+TWAP nominal allocation could consume the complete round budget before uniform integer repricing
+exposed the aggregate whole-lot remainder. Reconciliation enlarged only bids that already had a
+nominal allocation, even when an unallocated bid had exactly the stable marginal price. Thirty
+public `2 COIN / 3,669 USD` bids, followed by `158 / 289,930` and `29 / 53,215` bids, made the old
+binary settle only 344,980 of a 400,000-USD budget. The attacker could therefore strand 55,020 USD
+(13.755% of the round) with 60 COIN while a same-price whole-lot fill was already committed on-book.
+This suppressed reward-point buyback and burn; it could not cross custody floors, redirect escrow,
+or debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the full 32-slot configuration settles 398,195 USD,
+burns 217 COIN, leaves only the unavoidable 1,805-USD sub-lot remainder, and stays below its
+500,000-CU gate. It permissionlessly claims every bid and requires both shared auction escrows to
+end at exactly zero.
+
+FIX: the bounded reconciliation scan now considers every non-excluded bid ranked above the stable
+marginal and every later bid exactly equal to it. Previously unallocated bids start at zero, cache
+their reduced ratio on first use, and receive only executable whole lots under the unchanged stable
+price and original bidder limit. Lower-price bids remain ineligible. No signer, authority, recipient,
+budget, reserve, custody, principal, withdrawal, or admin surface was added.
+
 ## Tick - a historical reward stake could be registered again after an upgrade (surface D)
 
 Pre-epoch configs preserve claims for owner-only V0 and owner+linked V1 stake PDAs, while current

@@ -24314,6 +24314,201 @@ fn e2e_uniform_repricing_reallocates_partial_integer_remainders() {
     let _ = (bidders, marginal, marginal_coin, marginal_usd);
 }
 
+// PUBLIC DOS PROBE: full nominal allocations can consume the complete budget before
+// integer repricing exposes a large aggregate remainder. An unallocated bid at the
+// exact same marginal price must receive that remainder; admitting it does not change
+// the clearing price or weaken any bidder limit. Otherwise 30 two-atom Sybils can
+// strand more than 13% of a round while an exact same-price bid is already on-book.
+#[test]
+fn e2e_uniform_repricing_allocates_remainders_to_unfilled_same_price_bids() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let mut sybils = Vec::with_capacity(30);
+    for _ in 0..30 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 2);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                2,
+                3_669,
+                None,
+            ),
+        )
+        .expect("place coarse better-rate Sybil");
+        sybils.push((bidder, coin, usd));
+    }
+
+    // The Sybils nominally reserve 110,070 USD. This bid consumes the remaining
+    // 289,930 exactly and establishes the reduced marginal price 1 COIN / 1,835 USD.
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 158);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            158,
+            289_930,
+            None,
+        ),
+    )
+    .expect("place full marginal bid");
+
+    // This exact same-price order is nominally unallocated. Repricing each Sybil
+    // from 3,669 to 1,835 USD leaves 55,020 USD, enough to fill all 29 of its lots.
+    let (honest, honest_coin, honest_usd) = new_bidder(&mut svm, &payer, &env, 29);
+    send(
+        &mut svm,
+        &[&honest],
+        place_bid_ix(
+            &honest.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &honest_coin,
+            &honest_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            29,
+            53_215,
+            None,
+        ),
+    )
+    .expect("place unallocated same-price bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    let execute = execute_ix(
+        &cranker.pubkey(),
+        &env,
+        &bk.book,
+        &bk.holding,
+        &bk.settlement_usd,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        None,
+    );
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let meta = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[execute],
+            Some(&cranker.pubkey()),
+            &[&cranker],
+            bh,
+        ))
+        .expect("execute full-book same-price reallocation");
+    assert!(
+        meta.compute_units_consumed < 500_000,
+        "same-price remainder reconciliation must retain compute headroom, got {} CU",
+        meta.compute_units_consumed
+    );
+
+    assert_eq!(
+        token_amount(&svm, &bk.settlement_usd),
+        398_195,
+        "all available whole lots at the stable marginal price consume the budget"
+    );
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        217,
+        "the unfilled same-price bid sells all 29 COIN"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 1_805);
+
+    for (slot, (_, coin, usd)) in sybils.iter().enumerate() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                usd,
+                coin,
+                slot as u8,
+            ),
+        )
+        .expect("claim repriced Sybil");
+        assert_eq!(token_amount(&svm, coin), 1);
+        assert_eq!(token_amount(&svm, usd), 1_835);
+    }
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            30,
+        ),
+    )
+    .expect("claim full marginal bid");
+    assert_eq!(token_amount(&svm, &marginal_coin), 0);
+    assert_eq!(token_amount(&svm, &marginal_usd), 289_930);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &honest_usd,
+            &honest_coin,
+            31,
+        ),
+    )
+    .expect("claim newly allocated same-price bid");
+    assert_eq!(token_amount(&svm, &honest_coin), 0);
+    assert_eq!(token_amount(&svm, &honest_usd), 53_215);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (marginal, honest);
+}
+
 // PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
 // when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
 // reconciliation, but a lower-ranked executable bid never receives an allocation; because a
