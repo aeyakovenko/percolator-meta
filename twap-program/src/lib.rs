@@ -3303,9 +3303,6 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             let mut remaining = budget - total_usd;
 
             for (rank, &i) in idx[..n].iter().enumerate() {
-                if excluded[i] {
-                    continue;
-                }
                 let o = slot_off(i);
                 let c = book_rd_u128(&d, o + SL_COIN);
                 let u = book_rd_u128(&d, o + SL_USDC);

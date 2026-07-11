@@ -24509,6 +24509,183 @@ fn e2e_uniform_repricing_allocates_remainders_to_unfilled_same_price_bids() {
     let _ = (marginal, honest);
 }
 
+// PUBLIC DOS PROBE: the first integer reconstruction can reject a nominal winner even though a
+// larger bidder-safe pair fits the same USD allocation at the final marginal price. A provisional
+// exclusion must therefore be reconsidered during final-price remainder allocation; otherwise one
+// public rounding-edge bid can strand one third of a round.
+#[test]
+fn e2e_uniform_repricing_reconsiders_a_bid_excluded_at_a_provisional_marginal() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Protect all live insurance and use a three-unit prior-round balance so the arithmetic edge
+    // is exercised without fabricating Percolator accounting.
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        3,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            3,
+        )
+        .unwrap(),
+    )
+    .expect("fund exact three-unit budget");
+
+    // At a provisional 21/14 marginal, reconstructing this bid's nominal one-USD allocation
+    // yields one COIN and zero USD, so the first pass excludes it. At that same final price its
+    // maximum safe pair is instead 2 COIN / 1 USD.
+    let (top, top_coin, top_usd) = new_bidder(&mut svm, &payer, &env, 31);
+    send(
+        &mut svm,
+        &[&top],
+        place_bid_ix(
+            &top.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &top_coin,
+            &top_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            31,
+            1,
+            None,
+        ),
+    )
+    .expect("place provisional exclusion edge");
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 21);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            21,
+            14,
+            None,
+        ),
+    )
+    .expect("place final marginal bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute with provisional exclusion");
+
+    assert_eq!(
+        token_amount(&svm, &bk.settlement_usd),
+        3,
+        "the final stable marginal makes both bids executable"
+    );
+    assert_eq!(supply_before - mint_supply(&svm, &env.coin_mint), 5);
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &top_usd,
+            &top_coin,
+            0,
+        ),
+    )
+    .expect("claim reconsidered top bid");
+    assert_eq!(token_amount(&svm, &top_coin), 29);
+    assert_eq!(token_amount(&svm, &top_usd), 1);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            1,
+        ),
+    )
+    .expect("claim final marginal bid");
+    assert_eq!(token_amount(&svm, &marginal_coin), 18);
+    assert_eq!(token_amount(&svm, &marginal_usd), 2);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (top, marginal);
+}
+
 // PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
 // when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
 // reconciliation, but a lower-ranked executable bid never receives an allocation; because a
@@ -24960,11 +25137,11 @@ fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
     let burned = initial_coin - mint_supply(&svm, &env.coin_mint);
     let spent = token_amount(&svm, &bk.settlement_usd);
     assert_eq!(
-        burned, 18,
-        "the stable 16/6 marginal buys 8/3 there and safely enlarges the 11/3 winner to 10/3"
+        burned, 21,
+        "final-price reconciliation revives safe whole-lot fills from provisional exclusions"
     );
-    assert_eq!(spent, 6);
-    assert_eq!(token_amount(&svm, &bk.holding), 1);
+    assert_eq!(spent, 7);
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
 
     for (slot, (_, coin, usd)) in bidders.iter().enumerate() {
         send(
@@ -26674,8 +26851,8 @@ fn e2e_full_book_of_worst_case_rates_cannot_dos_execute() {
         ))
         .expect("execute must clear a full worst-case book without exhausting compute");
     assert!(
-        m.compute_units_consumed < 500_000,
-        "execute compute must stay bounded (constant-time ranking), got {}",
+        m.compute_units_consumed < 550_000,
+        "execute plus final-price reconciliation must retain 60% network headroom, got {}",
         m.compute_units_consumed
     );
 }
