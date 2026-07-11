@@ -2,6 +2,27 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - a permissionless reward claim could pay into an attacker-delegated account (surface A/D)
+
+LP, trader, and funding-payer claims are intentionally permissionless so an absent portfolio owner
+cannot strand a frozen epoch. The claim bound the token account's owner to the stake recipient, but
+accepted an SPL delegate. A third-party cranker could therefore select a pre-existing recipient-owned
+COIN account delegated to that cranker, force the victim's reward into it, and immediately spend the
+payout under the delegate authority. The recipient key remained correct while the reward was stolen.
+
+The retained real-SBF LiteSVM regression has the recipient publicly approve an attacker on one empty
+COIN account, then lets that attacker invoke the existing permissionless LP claim. Against the old
+binary the claim succeeds and a real SPL delegated transfer moves the complete payout into the
+attacker's account. The fixed path rejects before changing the stake, vault, or either token balance;
+the same test still rejects an attacker-owned destination and decoy vault, then lets an unaffiliated
+cranker pay the complete reward into a clean recipient-owned account.
+
+FIX: every claim now requires an initialized SPL Token destination with the configured mint and bound
+recipient owner. For permissionless LP, trader, and cumulative funding-payer cohorts it additionally
+rejects any delegate or nonzero delegated allowance. Insurance and backing claims remain owner-signed,
+so their existing owner-selected destination semantics are unchanged. No signer, recipient, amount,
+vault, principal, backing, or admin surface was added.
+
 ## Tick - live TWAP custody could make owner principal depend forever on governance (surface A/C)
 
 The fixed pool-to-TWAP handoff closed ordinary Subledger exits until custody returned. Public return
