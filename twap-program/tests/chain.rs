@@ -12774,7 +12774,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
     .0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     let create = Instruction {
         program_id: dist_id_e2e(),
         accounts: vec![
@@ -14536,7 +14536,7 @@ fn register_proposal(
     .0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     let create = Instruction {
         program_id: dist_id_e2e(),
         accounts: vec![
@@ -18156,7 +18156,7 @@ fn e2e_non_creator_cannot_append_to_a_proposal() {
     .0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     let create = Instruction {
         program_id: dist_id_e2e(),
         accounts: vec![
@@ -21540,7 +21540,7 @@ fn e2e_full_genesis_to_buy_burn() {
     .0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     let create = Instruction {
         program_id: dist_id_e2e(),
         accounts: vec![
@@ -24281,13 +24281,13 @@ fn e2e_execute_rejects_foreign_market_vault_authority() {
     let _ = (alice, a_usd);
 }
 
-// BAIT-AND-SWITCH (distribution redirect after approval, LOF): a proposal CREATOR registers a
-// distribution, lets voters approve it, then APPENDS a new entry redirecting COIN to themselves
-// before trigger. The gv proposal snapshots (entry_count,total_amount) at registration, and trigger
-// refuses to seal if the live distribution proposal no longer matches — so the sealed distribution
-// is exactly what voters approved, and the redirect can never be sealed/claimed.
+// PUBLIC GENESIS DOS: snapshot rejection prevents a changed proposal from stealing
+// COIN, but a creator could register a partially filled proposal, collect votes,
+// append once, and leave those voters locked behind a permanently unsealable winner.
+// Registration must wait until declared entry capacity is full, making the proposal
+// structurally immutable before any voter can bind capital to it.
 #[test]
-fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
+fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -24305,9 +24305,91 @@ fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let env = setup_genesis(&mut svm, &payer);
 
-    // The creator registers a community distribution (1 entry, total 100); voters snapshot it.
+    // Build only one of two declared entries. The creator is authorized, but the
+    // proposal still has append capacity and is therefore not safe to vote on.
     let community = Pubkey::new_unique();
-    let (dist_proposal, gv_proposal) = register_proposal(&mut svm, &payer, &env, 1, &community, 50); // 50 of 100 supply — leaves room
+    let attacker_dest = Pubkey::new_unique();
+    let id = 1u64;
+    let dist_proposal = Pubkey::find_program_address(
+        &[
+            b"dist_proposal",
+            env.dist_config.as_ref(),
+            &id.to_le_bytes(),
+        ],
+        &dist_id_e2e(),
+    )
+    .0;
+    let mut create_data = vec![1u8];
+    create_data.extend_from_slice(&id.to_le_bytes());
+    create_data.extend_from_slice(&2u32.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: dist_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(env.dist_config, false),
+                AccountMeta::new(dist_proposal, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: create_data,
+        },
+    )
+    .expect("create two-entry proposal");
+    let append_entry = |recipient: Pubkey, amount: u64| {
+        let mut data = vec![2u8];
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(recipient.as_ref());
+        data.extend_from_slice(&amount.to_le_bytes());
+        Instruction {
+            program_id: dist_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(env.dist_config, false),
+                AccountMeta::new(dist_proposal, false),
+            ],
+            data,
+        }
+    };
+    send(&mut svm, &[&payer], append_entry(community, 50)).expect("append first entry");
+
+    let gv_proposal = Pubkey::find_program_address(
+        &[
+            b"gv_proposal",
+            env.gv_config.as_ref(),
+            dist_proposal.as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    let register = Instruction {
+        program_id: gv_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(env.gv_config, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![2u8],
+    };
+    let partial_proposal = svm.get_account(&dist_proposal).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], register.clone()).is_err(),
+        "a proposal with live append capacity must not become votable"
+    );
+    assert_eq!(svm.get_account(&dist_proposal).unwrap(), partial_proposal);
+    assert!(
+        svm.get_account(&gv_proposal)
+            .map_or(true, |account| account.data.is_empty()),
+        "failed registration cannot leave a stale vote target"
+    );
+
+    // Fill the declared shape before registration. The remaining 25 COIN atoms
+    // are intentionally unallocated and follow the existing terminal burn rule.
+    send(&mut svm, &[&payer], append_entry(attacker_dest, 25)).expect("fill proposal capacity");
+    send(&mut svm, &[&payer], register).expect("full proposal becomes votable");
 
     // alice deposits + holds for weight + backs the proposal (meets quorum + majority alone).
     let alice = Keypair::new();
@@ -24387,36 +24469,21 @@ fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
     ))
     .expect("vote");
 
-    // ATTACK: the creator appends a redirect entry to the SAME proposal AFTER voters approved.
-    let attacker_dest = Pubkey::new_unique();
-    let mut ad = vec![2u8];
-    ad.extend_from_slice(&1u32.to_le_bytes());
-    ad.extend_from_slice(attacker_dest.as_ref());
-    ad.extend_from_slice(&50u64.to_le_bytes()); // within supply, so only the snapshot guard blocks it
-    let append = Instruction {
-        program_id: dist_id_e2e(),
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(env.dist_config, false),
-            AccountMeta::new(dist_proposal, false),
-        ],
-        data: ad,
-    };
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(
-        &[append],
-        Some(&payer.pubkey()),
-        &[&payer],
-        bh,
-    ))
-    .expect("append is allowed pre-seal");
+    // Another 25-atom entry would remain inside the supply cap, but the full
+    // declared shape makes mutation impossible after voters approve it.
+    assert!(
+        send(&mut svm, &[&payer], append_entry(Pubkey::new_unique(), 25)).is_err(),
+        "a registered proposal has no append capacity left"
+    );
 
-    // trigger now REJECTS — the live proposal no longer matches the approved snapshot.
+    // No proposal-creator action is needed after the vote. Any cranker can seal
+    // the exact allocation the voter saw once bootstrap ends.
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
     let trigger = Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(cranker.pubkey(), true),
             AccountMeta::new(env.gv_config, false),
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_id_e2e(), false),
@@ -24427,24 +24494,12 @@ fn e2e_bait_and_switch_appended_entries_cannot_be_sealed() {
         data: vec![4u8],
     };
     advance_to_test_bootstrap_end(&mut svm);
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    assert!(
-        svm.send_transaction(Transaction::new_signed_with_payer(
-            &[trigger],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh
-        ))
-        .is_err(),
-        "trigger must refuse a distribution proposal changed after voters approved it"
-    );
-    // The distribution is NOT sealed — the redirect never takes effect.
+    send(&mut svm, &[&cranker], trigger).expect("permissionless trigger seals immutable winner");
     let dc = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(
         Pubkey::new_from_array(dc.data[120..152].try_into().unwrap()),
-        Pubkey::default(),
-        "no winner sealed — bait-and-switch blocked"
+        dist_proposal,
+        "the exact full-shape proposal is sealed"
     );
     let _ = (community, attacker_dest, alice);
 }

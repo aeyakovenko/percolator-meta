@@ -11,7 +11,8 @@ contract that changes to the programs must preserve.
 - One base unit is one unit of live principal. Vote support additionally uses the configured
   log-time multiplier. Withdrawn principal no longer contributes to quorum.
 - A winning proposal allocates at most the complete fixed supply. Claims are recipient-bound and
-  expired/unallocated COIN is burned.
+  expired/unallocated COIN is burned. Registration requires every declared proposal entry to be
+  filled, making its allocation immutable before any voter can lock principal behind it.
 - Genesis insurance is share accounted and owner bound. No governance instruction can redirect an
   owner's exit.
 

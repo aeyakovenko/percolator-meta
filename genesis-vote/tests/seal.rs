@@ -272,7 +272,8 @@ impl Env {
         let proposal = self.dist_proposal(id);
         let mut data = vec![1u8];
         data.extend_from_slice(&id.to_le_bytes());
-        data.extend_from_slice(&4u32.to_le_bytes()); // capacity
+        let capacity = core::cmp::max(1, entries.len() as u32);
+        data.extend_from_slice(&capacity.to_le_bytes());
         let create = Instruction {
             program_id: dist_id(),
             accounts: vec![
@@ -863,16 +864,9 @@ fn register_rejects_an_empty_proposal() {
     env.register(&full);
 }
 
-// BAIT-AND-SWITCH (post-registration distribution tampering, LOF on voters): voters back a gv
-// proposal whose distribution they have read. `register` freezes a (entry_count, total_amount)
-// SNAPSHOT, and `trigger` (lib.rs ~724) refuses to seal unless the live distribution still matches it.
-// The danger this blocks: the distribution-side append-freeze only kicks in at SEAL — but the seal
-// happens INSIDE trigger, so between register and trigger the distribution proposal is NOT yet sealed
-// and its creator CAN still append. A creator could thus register an honest "60 to alice, 40 burned",
-// collect a quorum+majority on it, then append a self-dealing "40 to mallory" into the burn-bound
-// headroom (60+40 == total_supply, so the distribution's own supply cap never fires) and trigger to
-// privatize the 40 voters expected destroyed. The gv snapshot check is the ONLY guard over this exact
-// window; if it were absent the inflated distribution would seal. Confirm trigger refuses the tamper.
+// Defense in depth: current registrations require a full declared shape, so no
+// public append can change the proposal afterward. The trigger snapshot still
+// rejects a corrupted or historical proposal whose header changes after registration.
 #[test]
 fn trigger_refuses_a_distribution_inflated_after_registration() {
     let mut env = Env::new();
@@ -883,24 +877,10 @@ fn trigger_refuses_a_distribution_inflated_after_registration() {
     env.set_pool_outstanding(10);
     env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10); // quorum + majority on the HONEST proposal
 
-    // ATTACK: after voters backed it, the creator appends a self-dealing 40 into the headroom. This
-    // append SUCCEEDS at the distribution layer (not sealed yet; 60+40 == supply, so the cap passes)
-    // — only the gv snapshot stands between it and a sealed rug.
-    let mallory = Pubkey::new_unique();
-    let mut ad = vec![2u8]; // IX_APPEND_ENTRIES
-    ad.extend_from_slice(&1u32.to_le_bytes());
-    ad.extend_from_slice(mallory.as_ref());
-    ad.extend_from_slice(&40u64.to_le_bytes());
-    let append = Instruction {
-        program_id: dist_id(),
-        accounts: vec![
-            AccountMeta::new(env.payer.pubkey(), true),
-            AccountMeta::new_readonly(env.dist_config, false),
-            AccountMeta::new(dist_proposal, false),
-        ],
-        data: ad,
-    };
-    env.send(&[append], &[]).expect("the append itself is accepted pre-seal (only the snapshot guards the trigger)");
+    let mut changed = env.svm.get_account(&dist_proposal).unwrap();
+    changed.data[84..88].copy_from_slice(&2u32.to_le_bytes());
+    changed.data[88..96].copy_from_slice(&100u64.to_le_bytes());
+    env.svm.set_account(dist_proposal, changed).unwrap();
 
     // The trigger must now REFUSE: the live (entry_count=2, total=100) no longer matches the frozen
     // snapshot (1, 60). The voters' approved distribution can never be silently inflated.
@@ -911,14 +891,8 @@ fn trigger_refuses_a_distribution_inflated_after_registration() {
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "nothing sealed — the rug was blocked, not paid out");
 }
 
-// OFFSET CANARY (anti-bait-and-switch snapshot, sweep): the trigger reads the distribution proposal's
-// entry_count + total_amount at HARDCODED byte offsets (src: pd[84..88], pd[88..96]) and compares them to the
-// snapshot taken at registration — the guard the test above relies on. Those offsets were NOT canaried against
-// the distribution's real ProposalHeader layout (gv offsets.rs pins only the subledger offsets + program id). A
-// distribution ProposalHeader reorder would silently drift them: the snapshot would read a non-changing field
-// and ALWAYS match, so an inflated distribution would slip past voters' approval (LOF/governance hijack) with the
-// behavioral test passing unpredictably. Pin the offsets E2E against the REAL distribution binary: build a
-// proposal with known entries and assert the bytes at 84/88 decode to the real entry_count/total_amount.
+// OFFSET CANARY: registration reads capacity and trigger reads entry_count plus
+// total_amount from the real distribution proposal layout.
 #[test]
 fn gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout() {
     let mut env = Env::new();
@@ -929,10 +903,27 @@ fn gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout(
     ];
     let proposal = env.create_dist_proposal(7, &entries); // 3 entries, total 60, via the real distribution .so
     let data = env.svm.get_account(&proposal).unwrap().data;
-    let entry_count = u32::from_le_bytes(data[84..88].try_into().unwrap());
-    let total_amount = u64::from_le_bytes(data[88..96].try_into().unwrap());
-    assert_eq!(entry_count, 3, "gv's hardcoded entry_count offset (84) must read the real distribution entry_count");
-    assert_eq!(total_amount, 60, "gv's hardcoded total_amount offset (88) must read the real distribution total_amount");
+    let capacity = u32::from_le_bytes(
+        data[genesis_vote_program::DIST_PROPOSAL_CAPACITY_OFF
+            ..genesis_vote_program::DIST_PROPOSAL_ENTRY_COUNT_OFF]
+            .try_into()
+            .unwrap(),
+    );
+    let entry_count = u32::from_le_bytes(
+        data[genesis_vote_program::DIST_PROPOSAL_ENTRY_COUNT_OFF
+            ..genesis_vote_program::DIST_PROPOSAL_TOTAL_AMOUNT_OFF]
+            .try_into()
+            .unwrap(),
+    );
+    let total_amount = u64::from_le_bytes(
+        data[genesis_vote_program::DIST_PROPOSAL_TOTAL_AMOUNT_OFF
+            ..genesis_vote_program::DIST_PROPOSAL_TOTAL_AMOUNT_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(capacity, 3);
+    assert_eq!(entry_count, 3);
+    assert_eq!(total_amount, 60);
 }
 
 // COIN-SUPPLY REDIRECT (trigger substitutes a sibling distribution proposal): trigger is permissionless
@@ -988,13 +979,13 @@ fn register_rejects_a_proposal_from_a_foreign_distribution_config() {
     let bad_proposal = Pubkey::new_unique();
 
     // A distribution-program-owned proposal header: disc DISTPRP1, config = FOREIGN, creator = payer
-    // (so the creator-binding passes), capacity 4, entry_count 1, total 100 — fully registerable but
+    // (so the creator-binding passes), capacity 1, entry_count 1, total 100 — fully registerable but
     // for the config.
     let mut data = vec![0u8; 257];
     data[..8].copy_from_slice(b"DISTPRP1");
     data[8..40].copy_from_slice(foreign_config.as_ref());
     data[48..80].copy_from_slice(env.payer.pubkey().as_ref()); // creator
-    data[80..84].copy_from_slice(&4u32.to_le_bytes()); // capacity
+    data[80..84].copy_from_slice(&1u32.to_le_bytes()); // capacity
     data[84..88].copy_from_slice(&1u32.to_le_bytes()); // entry_count (non-empty)
     data[88..96].copy_from_slice(&100u64.to_le_bytes()); // total_amount
     env.svm
