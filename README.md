@@ -183,8 +183,9 @@ also falls back to burn instead of stalling settlement.
 Auction placement requires the bidder's canonical initialized COIN and collateral ATAs. Closed ATAs
 are permissionlessly recreatable, and an already-frozen destination is rejected before any bid fee or
 escrow transfer can move. If a freezable collateral issuer freezes the canonical ATA only after
-placement, a permissionless claim may instead use a clean account for the same mint owned solely by
-the recorded bidder. The cranker still cannot change the beneficiary; COIN refunds remain canonical.
+placement, claims, eviction refunds, and owner cancellations may instead use a clean account for the
+same mint owned solely by the recorded bidder. Delegates and close authorities are rejected at payout,
+so a cranker can recover liveness but cannot change the beneficiary or expose the refund to a spender.
 
 ## Authority Model
 

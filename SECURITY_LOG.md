@@ -12823,3 +12823,23 @@ and requires zero before the first role mutation. Funded genesis continues to us
 atomically binds the sole recovery pool and live principal floor. Legacy auction fixtures now hand off while
 empty and fund afterward through TWAP's existing inbound-only donation. No recovery signer, destination, role,
 or admin surface was added.
+
+## Tick - post-placement SPL delegates could steal forced TWAP COIN refunds (surface A/C)
+
+TWAP recorded a bidder's canonical COIN account at placement but did not revalidate its mutable SPL
+authority state when paying a settled refund or evicting the weakest bid. A bidder could approve a delegate
+after its COIN entered escrow. Any cranker or better bidder could then force the complete principal refund
+into that account, after which the delegate could transfer it. Merely rejecting the canonical account would
+also let an absent bidder permanently block permissionless claims or full-book eviction.
+
+Two retained real-SBF LiteSVM regressions reproduce the independent public paths. The first settles a losing
+`100,000`-unit bid, adds the cranker as delegate, permissionlessly claims, and proves the old binary lets the
+delegate drain all `100,000`. The second fills all 32 slots, delegates the weakest empty refund account, evicts
+it with a better bid, and proves the old binary lets the evictor steal the returned unit. The fixed tests also
+prove a clean alternate account owned solely by the recorded bidder keeps claims, full-book eviction, and
+owner cancellation live.
+
+FIX: every COIN return now requires an initialized correct-mint account owned solely by the slot's recorded
+bidder, with no delegate, delegated amount, or close authority. The stable slot ABI and canonical recovery hint
+remain unchanged, but address equality is no longer the security boundary. No admin, repair signer, arbitrary
+beneficiary, amount selector, withdrawal authority, or principal-moving program surface was added.

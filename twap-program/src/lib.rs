@@ -1982,7 +1982,7 @@ const SL_OCCUPIED: usize = 0;
 const SL_SETTLED: usize = 1;
 const SL_BIDDER: usize = 2;
 const SL_USD_DEST: usize = 34; // collateral token acct that receives the bidder's won USD
-const SL_COIN_ATA: usize = 66; // COIN token acct that receives refunded/unsold COIN
+const SL_COIN_ATA: usize = 66; // canonical COIN recovery hint retained in the stable slot ABI
 const SL_COIN: usize = 98; // coin_atoms escrowed
 const SL_USDC: usize = 114; // usdc_atoms wanted (the limit: rate = coin_atoms / usdc_atoms)
 const SL_USD_OWED: usize = 130; // set at execute: USD this bid won
@@ -2601,7 +2601,7 @@ fn process_set_bid_fee(
 }
 
 // place_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
-//   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_ata(w)?]
+//   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_dest(w)?]
 // data: coin_atoms (u128) || usdc_atoms (u128)
 //
 // PERMISSIONLESS. The bidder escrows `coin_atoms` COIN, offering it for `usdc_atoms` USD (limit
@@ -2742,19 +2742,19 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
                 }
                 evicted = Some((
                     book_rd_u128(&d, ow + SL_COIN),
-                    book_rd_key(&d, ow + SL_COIN_ATA),
+                    book_rd_key(&d, ow + SL_BIDDER),
                 ));
                 weakest
             }
         }
     };
 
-    // Refund the evicted bidder's full escrow to its recorded COIN account (passed last).
-    if let Some((evicted_coin, evicted_ata)) = evicted {
+    // Refund only to a clean account solely owned by the recorded evictee. The canonical ATA's
+    // authority state can change after placement, so pinning its key would either expose the refund
+    // to a newly-added delegate or let a poisoned ATA block every better bid permanently.
+    if let Some((evicted_coin, evicted_bidder)) = evicted {
         let evict_acct = next_account_info(iter)?;
-        if *evict_acct.key != evicted_ata {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        validate_clean_owner_token_account(evict_acct, &evicted_bidder, coin_mint.key)?;
         spl_transfer(
             token_program,
             coin_escrow,
@@ -2804,10 +2804,9 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     d[o + SL_OCCUPIED] = 1;
     d[o + SL_SETTLED] = 0;
     d[o + SL_BIDDER..o + SL_BIDDER + 32].copy_from_slice(bidder.key.as_ref());
-    // Both payout destinations are the bidder's CANONICAL ATAs (USD = collateral ATA, refund = COIN
-    // ATA), NOT the arbitrary accounts passed in — so a bidder (winner OR loser) cannot brick the
-    // book by closing a payout account after bidding: a closed ATA is permissionlessly recreatable,
-    // making any stuck claim recoverable (finding V + AB).
+    // Record both canonical ATAs as deterministic recovery hints. Payout paths still revalidate
+    // current SPL authority state and may use another clean bidder-owned account, because delegates,
+    // close authorities, freezes, and account closure can change after placement.
     d[o + SL_USD_DEST..o + SL_USD_DEST + 32]
         .copy_from_slice(canonical_usd_dest.as_ref());
     d[o + SL_COIN_ATA..o + SL_COIN_ATA + 32]
@@ -3233,9 +3232,8 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 // data: slot_index (u8)
 //
 // PERMISSIONLESS (no bidder signature), so anyone may crank every claim and reopen the book. USD
-// may go to any clean token account owned by the recorded bidder, allowing recovery if a freezable
-// collateral issuer freezes the canonical ATA after placement. Unsold COIN remains pinned to the
-// recorded canonical refund account.
+// may go to any clean token account owned by the recorded bidder, allowing recovery if a canonical
+// ATA is frozen, closed, or delegated after placement. The same rule protects unsold COIN principal.
 fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -3280,7 +3278,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let (usd_owed, coin_refund, bidder_key, coin_key) = {
+    let (usd_owed, coin_refund, bidder_key) = {
         let d = book_account.try_borrow_data()?;
         let o = book_layout.slot_off(slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 1 {
@@ -3290,13 +3288,10 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
             book_rd_u128(&d, o + SL_USD_OWED),
             book_rd_u128(&d, o + SL_COIN_REFUND),
             book_rd_key(&d, o + SL_BIDDER),
-            book_rd_key(&d, o + SL_COIN_ATA),
         )
     };
-    if *coin_ata.key != coin_key {
-        return Err(ProgramError::InvalidAccountData);
-    }
     validate_clean_owner_token_account(usd_dest, &bidder_key, &book.collateral_mint)?;
+    validate_clean_owner_token_account(coin_ata, &bidder_key, &book.coin_mint)?;
     if usd_owed > 0 {
         spl_transfer(
             token_program,
@@ -3397,7 +3392,7 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let (coin_atoms, coin_key) = {
+    let coin_atoms = {
         let d = book_account.try_borrow_data()?;
         let o = book_layout.slot_off(slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 0 {
@@ -3425,14 +3420,9 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
                 return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
             }
         }
-        (
-            book_rd_u128(&d, o + SL_COIN),
-            book_rd_key(&d, o + SL_COIN_ATA),
-        )
+        book_rd_u128(&d, o + SL_COIN)
     };
-    if *coin_ata.key != coin_key {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    validate_clean_owner_token_account(coin_ata, bidder.key, &book.coin_mint)?;
 
     if coin_atoms > 0 {
         spl_transfer(
