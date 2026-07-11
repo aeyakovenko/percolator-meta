@@ -2,6 +2,27 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - a permanently frozen provider ATA could block terminal market close (surface A/C)
+
+All fixed insurance and backing returns preserved the slab-recorded provider and amount, but required
+that provider's canonical token account. A collateral issuer could freeze the healthy ATA after the
+provider deposited, then revoke its freeze authority. The provider principal remained segregated, yet
+neither the provider nor a public cranker could receive it, so one atom could permanently block asset
+retirement or whole-market `CloseSlab` cleanup.
+
+A clean-room real-Percolator LiteSVM regression deposits asset-0 backing, donates lifecycle authority
+to the controller, resolves the empty market, permanently freezes the provider ATA, and proves the old
+SBF rejects a fresh provider-owned destination. The retained chain also rejects the frozen ATA, an
+attacker-owned account, and a provider account delegated to the cranker with byte-atomic failures. It
+then returns the exact slab-derived atom to a clean provider-owned account and completes real `CloseSlab`.
+
+FIX: the shared provider-return validator keeps the provider identity immutable but makes the token
+account replaceable. It accepts only an initialized same-mint SPL account owned solely by the recorded
+provider, with no delegate or close authority; a cranker can create such an account without the provider
+signing. Amounts, role rotations, controller transit, and every Percolator withdrawal remain unchanged.
+This adds no DAO recipient, provider impersonation, arbitrary amount, or withdrawal authority and applies
+uniformly to shutdown and resolved insurance/backing returns.
+
 ## Tick - post-placement collateral freeze could permanently settle-lock the auction (surface C)
 
 Placement required a healthy canonical bidder collateral ATA, but collateral mints such as stablecoins
@@ -445,6 +466,10 @@ longer treats the destination token owner as immutable. Only the provider can au
 the controller still cannot select or accept another address, so the change restores liveness without creating
 a redirect or governance withdrawal surface. The regression returns the atom to the same canonical address and
 closes the controller transit account; the existing noncanonical-recipient and atomic-return tests stay green.
+
+SUPERSEDED: the later permanent-freeze probe showed that address pinning itself was the liveness defect and
+that paying a reassigned account did not preserve provider control. Current code instead requires a clean
+replaceable account whose token owner is the immutable slab-recorded provider.
 
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 302 standalone tests GREEN (subledger 75, genesis-vote 22, distribution 36, residual-distributor 52,

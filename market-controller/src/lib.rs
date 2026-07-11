@@ -635,27 +635,21 @@ fn validate_provider_return_token_accounts(
         &ASSOCIATED_TOKEN_PROGRAM_ID,
     )
     .0;
-    let canonical_destination = Pubkey::find_program_address(
-        &[
-            provider.as_ref(),
-            spl_token::ID.as_ref(),
-            transit_state.mint.as_ref(),
-        ],
-        &ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    .0;
-    // The address, mint, and initialized state are the immutable routing boundary.
-    // Requiring the mutable token owner to remain `provider` lets that provider
-    // reassign the account to a dead key and permanently block terminal cleanup.
+    // The provider identity is immutable in the slab, while the destination
+    // address is intentionally replaceable. This lets a cranker create a clean
+    // provider-owned account when the canonical ATA was permanently frozen.
     if transit_state.state != spl_token::state::AccountState::Initialized
         || destination_state.state != spl_token::state::AccountState::Initialized
         || *transit.key != canonical_transit
-        || *destination.key != canonical_destination
         || transit_state.owner != *controller.key
+        || destination_state.owner != *provider
         || transit_state.mint != destination_state.mint
         || transit_state.delegate.is_some()
         || transit_state.delegated_amount != 0
         || transit_state.close_authority.is_some()
+        || destination_state.delegate.is_some()
+        || destination_state.delegated_amount != 0
+        || destination_state.close_authority.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -788,7 +782,7 @@ fn withdraw_backing_principal<'a>(
 }
 
 // return_shutdown_backing accounts:
-// [governance, controller_pda, market(w), provider_canonical_ata(w),
+// [governance, controller_pda, market(w), provider_owned_token_account(w),
 //  controller_canonical_ata(w), percolator_vault(w), vault_authority,
 //  controller_backing_ledger(w), percolator_program, token_program]
 // data: domain(u16) | principal(u128) | earnings(u128)
@@ -796,7 +790,7 @@ fn withdraw_backing_principal<'a>(
 // Permissionless after Percolator's own asset-shutdown delay and empty-state checks.
 // The controller can exercise marketauth's shutdown override, but neither governance
 // nor the caller chooses the recipient: the attributed withdrawal and, when the
-// transit account is empty, its rent go to the canonical ATA of the backing authority
+// transit account is empty, its rent go to a clean account owned by the backing authority
 // recorded in the asset profile. Earnings are returned first because Percolator
 // refuses a final-principal exit while earnings remain.
 fn process_return_shutdown_backing<'a>(
@@ -912,14 +906,14 @@ fn process_return_shutdown_backing<'a>(
 }
 
 // return_shutdown_insurance accounts:
-// [governance, controller_pda, market(w), authority_canonical_ata(w),
+// [governance, controller_pda, market(w), authority_owned_token_account(w),
 //  controller_canonical_ata(w), percolator_vault(w), vault_authority,
 //  controller_insurance_ledger(w), percolator_program, token_program]
 // data: asset_index(u16)
 //
 // Permissionless only through Percolator's secondary-asset marketauth shutdown
 // override. The amount is the complete asset-local balance read from the pinned
-// slab, and both tokens and transit rent go only to the canonical ATA of the
+// slab, and both tokens and transit rent go only to a clean account owned by the
 // recorded insurance authority. Rejecting a controller-owned live operator keeps
 // this path unavailable before Percolator's shutdown delay has matured.
 fn process_return_shutdown_insurance<'a>(
@@ -1085,7 +1079,7 @@ fn rotate_asset_role_to_controller<'a>(
 }
 
 // return_resolved_asset_insurance accounts:
-// [governance, controller_pda, market(w), authority_canonical_ata(w),
+// [governance, controller_pda, market(w), authority_owned_token_account(w),
 //  controller_canonical_ata(w), percolator_vault(w), vault_authority,
 //  controller_insurance_ledger(w), percolator_program, token_program]
 // data: asset_index(u16)
@@ -1093,7 +1087,7 @@ fn rotate_asset_role_to_controller<'a>(
 // Global permissionless resolution may race the live shutdown return above. For an
 // external provider, this fixed path rotates only insurance_authority to the
 // controller, withdraws the exact asset-local remainder read from the pinned
-// slab, and forwards it to the outgoing authority's canonical ATA. This includes
+// slab, and forwards it to a clean account owned by the outgoing authority. This includes
 // asset 0 only when the controller still holds its asset-admin rotation key.
 // Controller-owned protocol insurance stays in the canonical controller ATA for
 // the existing terminal governance reclaim. Any failed operation rolls back.
@@ -1248,7 +1242,7 @@ fn process_return_resolved_asset_insurance<'a>(
 }
 
 // return_resolved_asset_backing accounts:
-// [governance, controller_pda, market(w), provider_canonical_ata(w),
+// [governance, controller_pda, market(w), provider_owned_token_account(w),
 //  controller_canonical_ata(w), percolator_vault(w), vault_authority,
 //  long_backing_ledger(w), short_backing_ledger(w), percolator_program,
 //  token_program]
@@ -1416,7 +1410,7 @@ fn process_return_resolved_asset_backing<'a>(
 
 // return_resolved_asset0_backing accounts:
 // [governance, controller_pda, current_asset_admin(signer unless controller), market(w),
-//  provider_canonical_ata(w), controller_canonical_ata(w), percolator_vault(w),
+//  provider_owned_token_account(w), controller_canonical_ata(w), percolator_vault(w),
 //  vault_authority, long_backing_ledger(w), short_backing_ledger(w),
 //  percolator_program, token_program]
 //
