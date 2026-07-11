@@ -923,6 +923,73 @@ fn a_deposit_with_zero_immediate_share_value_is_rejected_without_moving_principa
     );
 }
 
+// PUBLIC LOF: a donation can make a positive share mint materially under-value the new deposit.
+// The attacker cannot recover the donation, but can grief a victim into losing half of a deposit
+// to virtual-share rounding unless the program rejects before moving the victim's principal.
+#[test]
+fn a_deposit_with_material_immediate_rounding_loss_is_rejected_before_transfer() {
+    let mut env = Env::new();
+    let asset_id = 12;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let donation = 100_000_000;
+    let (attacker, attacker_ata) = new_depositor(&mut env, donation + 1);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &attacker.pubkey(),
+            &attacker_ata,
+            &vault,
+            1,
+        )],
+        &[&attacker],
+    )
+    .expect("attacker seeds one atom");
+    let donate = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &attacker_ata,
+        &vault,
+        &attacker.pubkey(),
+        &[],
+        donation,
+    )
+    .unwrap();
+    env.send(&[donate], &[&attacker])
+        .expect("attacker donates through SPL Token");
+    assert_eq!(env.token_amount(&vault), donation + 1);
+
+    // This buys one share whose immediate redemption is only 50 atoms. Positive shares alone do
+    // not keep the accepted deposit within the documented one-atom rounding bound.
+    let (victim, victim_ata) = new_depositor(&mut env, 100);
+    let deposit = env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            100,
+        )],
+        &[&victim],
+    );
+    assert!(
+        deposit.is_err(),
+        "a deposit with material immediate rounding loss must reject"
+    );
+    assert_eq!(env.token_amount(&victim_ata), 100);
+    assert_eq!(env.token_amount(&vault), donation + 1);
+    assert!(
+        env.svm
+            .get_account(&position_pda(&pool, &victim.pubkey()))
+            .is_none(),
+        "rejected deposit creates no dead position"
+    );
+}
+
 // LOF PROBE (finding HB zero-share guard, sweep tick B): the test above pins the SKIM bound (value not
 // stolen); the distinct, UNTESTED safety property is the zero-share REJECT. With a balance >> total_shares
 // (an attacker first-deposits 1 atom then donates to inflate the price), a small victim deposit rounds to 0
@@ -950,11 +1017,27 @@ fn a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silen
     // CRITICAL LOF pin: the reject is atomic — the victim's 100 atoms never left its ATA.
     assert_eq!(env.token_amount(&victim_ata), 10_000_100, "rejected deposit transfers NOTHING — no principal lost to a 0-share mint");
 
-    // Recoverable + fair: a 1e7-atom deposit clears the threshold (-> ~20_000 shares) and redeems ~principal.
-    env.send(&[deposit_ix(&env, &pool, &victim.pubkey(), &victim_ata, &vault, 10_000_000)], &[&victim]).expect("above-threshold deposit mints shares");
-    assert_eq!(env.token_amount(&victim_ata), 100, "1e7 deposited, 100 dust left");
+    // Recoverable + fair: an amount aligned to the live share price mints 2,000 shares and has an
+    // immediate value of 1,000,000, exactly one atom below the 1,000,001-atom deposit.
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            1_000_001,
+        )],
+        &[&victim],
+    )
+    .expect("bounded-rounding deposit mints shares");
+    assert_eq!(env.token_amount(&victim_ata), 9_000_099);
     env.send(&[withdraw_ix(&pool, &victim.pubkey(), &victim_ata, &vault)], &[&victim]).unwrap();
-    assert!(env.token_amount(&victim_ata) >= 9_900_000, "victim redeems ~its principal (>99%) — bought in at the inflated price, not skimmed");
+    assert_eq!(
+        env.token_amount(&victim_ata),
+        10_000_099,
+        "accepted deposit loses only the documented one atom of entry-rounding dust"
+    );
 }
 
 fn set_token_amount(svm: &mut LiteSVM, account: &Pubkey, amount: u64) {

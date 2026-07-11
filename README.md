@@ -99,9 +99,10 @@ capital's own tenure.
   approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
   Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
   capital does not recapitalize an older position's historical loss and protocol-surplus pulls do
-  not look like depositor losses. A deposit whose newly minted shares would have zero value at the
-  post-deposit price rejects before transfer, so virtual-share rounding cannot silently consume a
-  complete base-unit deposit; governance still cannot redirect a depositor's withdrawal.
+  not look like depositor losses. A deposit whose newly minted shares would be worth more than one
+  base unit less than the deposit at the post-deposit price rejects before transfer, so virtual-share
+  rounding cannot silently consume material principal; governance still cannot redirect a depositor's
+  withdrawal.
 
 ## Programs
 
