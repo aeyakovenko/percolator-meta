@@ -2,6 +2,33 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - endpoint-only reconciliation could skip a safe interior price lot (surface C)
+
+Final-price reconciliation considered the largest rounded pair and exact reduced lots at the
+marginal and bid prices. The bidder-safe rational interval between those endpoints can contain a
+smaller whole-atom pair even when all three candidates fail. Ten public `11 COIN / 23 USD` bids,
+followed by `227 / 480` and `11 / 24`, made the previous binary settle only 234 units of an exact
+254-unit reward budget. Uniform repricing released 20 units, and `8 COIN / 17 USD` was safe at both
+the final marginal and original bidder limit, but neither endpoint lot could represent it. The
+public book therefore suppressed 20/254 of the round even though only three units were unavoidable.
+This affected point buyback and burn only; it could not cross custody floors, redirect escrow, or
+debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the fixed path settles 251 units, burns 119 COIN,
+pays all twelve owner-bound bidder accounts exactly, leaves only three units of sub-lot dust, and
+drains both shared auction escrows to zero. A second retained 32-slot probe funds the complete
+u64-scale high-Fibonacci book, requires execution below 1.2M CU, and conserves every USD atom. The
+smaller full-book Fibonacci canary consumes 596,278 CU under its 650,000-CU gate, retaining more
+than 53% of the network limit as headroom.
+
+FIX: when both exact endpoint fallbacks are insufficient, reconciliation finds the simplest
+fraction in the closed marginal-to-bid interval with a bounded 128-step u64 continued-fraction
+procedure, then checks its scaled form and both Stern-Brocot parent rays through the unchanged
+bidder-limit validator. A determinant-derived lower bound rejects impossible interior denominators
+before Euclidean work, and ordered endpoints require only one public division per step. No
+budget-sized scan, signer, authority, recipient, reserve, custody, principal, withdrawal, or admin
+surface was added.
+
 ## Tick - final-price reconciliation could skip a safe exact marginal lot (surface C)
 
 TWAP reconciliation retried the largest final-price rounded pair and then a whole lot at the bid's

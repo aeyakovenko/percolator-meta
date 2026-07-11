@@ -2222,12 +2222,144 @@ fn executable_integer_pair(
     Ok(Some((coin, usd)))
 }
 
+struct IntervalFraction {
+    num: u128,
+    den: u128,
+    left_parent: Option<(u128, u128)>,
+    right_parent: Option<(u128, u128)>,
+}
+
+// Find the lowest-denominator fraction in the closed positive interval, together with its
+// Stern-Brocot parents. Continued-fraction inversion is Euclidean: u64 inputs terminate in at most
+// 128 iterations, independent of the auction budget. The parents let the caller spend additional
+// denominator capacity without scanning attacker-selected token amounts one atom at a time.
+fn simplest_interval_fraction(
+    lower_num: u64,
+    lower_den: u64,
+    upper_num: u64,
+    upper_den: u64,
+) -> Result<IntervalFraction, ProgramError> {
+    if lower_num == 0
+        || lower_den == 0
+        || upper_num == 0
+        || upper_den == 0
+        || (lower_num as u128) * upper_den as u128
+            > (upper_num as u128) * lower_den as u128
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut ln = lower_num;
+    let mut ld = lower_den;
+    let mut un = upper_num;
+    let mut ud = upper_den;
+    let mut terms = [0u64; 128];
+    let mut terms_len = 0usize;
+    let terminal = loop {
+        let lower_term = ln / ld;
+        let lower_rem = ln - lower_term * ld;
+        if lower_rem == 0 {
+            break lower_term;
+        }
+        // The transformed endpoints remain ordered, so the upper quotient cannot be smaller.
+        // Compare it to lower_term + 1 with a wide product instead of paying a second public
+        // integer division on every continued-fraction step.
+        if un as u128
+            >= (lower_term as u128 + 1)
+                .checked_mul(ud as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+        {
+            break lower_term
+                .checked_add(1)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+        if terms_len == terms.len() {
+            return Err(ProgramError::ArithmeticOverflow);
+        }
+        let upper_rem = un - lower_term * ud;
+        if upper_rem == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        terms[terms_len] = lower_term;
+        terms_len += 1;
+        (ln, ld, un, ud) = (ud, upper_rem, ld, lower_rem);
+    };
+
+    // Standard convergent recurrence. The penultimate convergent is one Stern-Brocot parent; the
+    // component-wise difference from the result is the other because adjacent determinants are 1.
+    let mut prev2_num = 0u128;
+    let mut prev_num = 1u128;
+    let mut prev2_den = 1u128;
+    let mut prev_den = 0u128;
+    for i in 0..=terms_len {
+        let term = if i == terms_len {
+            terminal
+        } else {
+            terms[i]
+        } as u128;
+        let next_num = term
+            .checked_mul(prev_num)
+            .and_then(|value| value.checked_add(prev2_num))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let next_den = term
+            .checked_mul(prev_den)
+            .and_then(|value| value.checked_add(prev2_den))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        (prev2_num, prev_num) = (prev_num, next_num);
+        (prev2_den, prev_den) = (prev_den, next_den);
+    }
+    if prev_num == 0 || prev_den == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let other_num = prev_num
+        .checked_sub(prev2_num)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let other_den = prev_den
+        .checked_sub(prev2_den)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let previous_is_left = prev2_den != 0
+        && prev2_num
+            .checked_mul(prev_den)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            < prev_num
+                .checked_mul(prev2_den)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+    let previous = (prev2_num, prev2_den);
+    let other = (other_num, other_den);
+    let (left_parent, right_parent) = if previous_is_left {
+        (previous, other)
+    } else {
+        (other, previous)
+    };
+
+    Ok(IntervalFraction {
+        num: prev_num,
+        den: prev_den,
+        left_parent: (left_parent.1 != 0).then_some(left_parent),
+        right_parent: (right_parent.1 != 0).then_some(right_parent),
+    })
+}
+
+fn consider_larger_pair(
+    best: &mut Option<(u128, u128)>,
+    pair: Option<(u128, u128)>,
+) {
+    if let Some(candidate) = pair {
+        if best.map_or(true, |current| {
+            candidate.1 > current.1 || (candidate.1 == current.1 && candidate.0 > current.0)
+        }) {
+            *best = Some(candidate);
+        }
+    }
+}
+
 // Maximum practical integer pair for one bid under an already-selected marginal price and
 // an actual remaining USD budget. The first candidate is the largest COIN amount whose floored
 // marginal-price USD leg fits. If flooring crosses the bidder's limit, fall back to exact reduced
-// lots at both the marginal and bid prices; either ratio is bidder-safe because the bid rate is at
-// least the selected marginal rate. All public bid legs are u64-bounded, so the products fit in
-// u128, and the caller supplies GCDs already computed for the two ratios.
+// lots at both endpoints and bounded interior continued-fraction candidates. Every candidate is
+// bidder-safe because it stays between the selected marginal and bid rates. All public bid legs are
+// u64-bounded, so the products fit in u128, and the caller supplies GCDs for the endpoint ratios.
 fn max_executable_integer_pair(
     remaining_usd: u128,
     marginal_coin: u128,
@@ -2285,13 +2417,110 @@ fn max_executable_integer_pair(
     let marginal_pair = try_coin(marginal_lots * marginal_coin_lot)?;
 
     let reduced_coin_lot = bid_coin / bid_gcd as u128;
+    let reduced_usd_lot = bid_usd / bid_gcd as u128;
     let exact_coin = (candidate_coin / reduced_coin_lot) * reduced_coin_lot;
     let bid_pair = try_coin(exact_coin)?;
-    Ok(match (marginal_pair, bid_pair) {
-        (Some(a), Some(b)) if b.1 > a.1 || (b.1 == a.1 && b.0 > a.0) => Some(b),
-        (Some(a), _) => Some(a),
-        (None, b) => b,
-    })
+    let mut best = marginal_pair;
+    consider_larger_pair(&mut best, bid_pair);
+    if best.is_some_and(|pair| pair.1 == max_usd) {
+        return Ok(best);
+    }
+
+    // For reduced endpoints a/b < c/d, every strict interior p/q satisfies
+    // determinant*q = b*(c*q - p*d) + d*(p*b - a*q) >= b + d. This constant-work
+    // lower bound bypasses continued fractions when no interior denominator can fit.
+    let interval_determinant = reduced_coin_lot
+        .checked_mul(marginal_usd_lot)
+        .and_then(|value| value.checked_sub(marginal_coin_lot * reduced_usd_lot))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if interval_determinant == 0 {
+        return Ok(best);
+    }
+    let endpoint_den_sum = marginal_usd_lot
+        .checked_add(reduced_usd_lot)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let min_interior_den = endpoint_den_sum / interval_determinant
+        + u128::from(endpoint_den_sum % interval_determinant != 0);
+    if min_interior_den > max_usd {
+        return Ok(best);
+    }
+
+    let interior = simplest_interval_fraction(
+        marginal_coin_lot as u64,
+        marginal_usd_lot as u64,
+        reduced_coin_lot as u64,
+        reduced_usd_lot as u64,
+    )?;
+    if interior.den <= max_usd && interior.num <= bid_coin {
+        let lots = core::cmp::min(max_usd / interior.den, bid_coin / interior.num);
+        consider_larger_pair(&mut best, try_coin(lots * interior.num)?);
+
+        for parent in [interior.left_parent, interior.right_parent]
+            .into_iter()
+            .flatten()
+        {
+            let (parent_num, parent_den) = parent;
+            let mut steps = (max_usd - interior.den) / parent_den;
+
+            // A parent outside the lower edge can be approached only until the resulting mediant
+            // reaches that edge. The initial fraction itself is already inside the interval.
+            let parent_below = parent_num
+                .checked_mul(marginal_usd_lot)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+                < marginal_coin_lot
+                    .checked_mul(parent_den)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+            if parent_below {
+                let headroom = interior
+                    .num
+                    .checked_mul(marginal_usd_lot)
+                    .and_then(|value| {
+                        value.checked_sub(marginal_coin_lot * interior.den)
+                    })
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                let loss_per_step = marginal_coin_lot
+                    .checked_mul(parent_den)
+                    .and_then(|value| {
+                        value.checked_sub(parent_num * marginal_usd_lot)
+                    })
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                steps = core::cmp::min(steps, headroom / loss_per_step);
+            }
+
+            let parent_above = parent_num
+                .checked_mul(reduced_usd_lot)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+                > reduced_coin_lot
+                    .checked_mul(parent_den)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+            if parent_above {
+                let headroom = reduced_coin_lot
+                    .checked_mul(interior.den)
+                    .and_then(|value| {
+                        value.checked_sub(interior.num * reduced_usd_lot)
+                    })
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                let loss_per_step = parent_num
+                    .checked_mul(reduced_usd_lot)
+                    .and_then(|value| {
+                        value.checked_sub(reduced_coin_lot * parent_den)
+                    })
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                steps = core::cmp::min(steps, headroom / loss_per_step);
+            }
+
+            let ray_coin = interior
+                .num
+                .checked_add(
+                    steps
+                        .checked_mul(parent_num)
+                        .ok_or(ProgramError::ArithmeticOverflow)?,
+                )
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            consider_larger_pair(&mut best, try_coin(ray_coin)?);
+        }
+    }
+    Ok(best)
 }
 
 fn as_u64(v: u128) -> Result<u64, ProgramError> {
@@ -3788,6 +4017,34 @@ mod tests {
             Ordering::Greater
         );
         assert_eq!(cmp_rate(u128::MAX, 3, u128::MAX, 4), Ordering::Greater);
+    }
+
+    #[test]
+    fn simplest_interval_fraction_exposes_bounded_interior_parent_rays() {
+        let fraction = simplest_interval_fraction(11, 24, 227, 480).unwrap();
+        assert_eq!((fraction.num, fraction.den), (6, 13));
+        assert_eq!(fraction.left_parent, Some((5, 11)));
+        assert_eq!(fraction.right_parent, Some((1, 2)));
+
+        // Two right-parent steps produce the largest candidate used by the real-SBF regression.
+        let right = fraction.right_parent.unwrap();
+        assert_eq!(
+            (fraction.num + 2 * right.0, fraction.den + 2 * right.1),
+            (8, 17)
+        );
+    }
+
+    #[test]
+    fn simplest_interval_fraction_handles_equal_and_integer_edges() {
+        let equal = simplest_interval_fraction(2, 3, 2, 3).unwrap();
+        assert_eq!((equal.num, equal.den), (2, 3));
+
+        let integer = simplest_interval_fraction(5, 3, 2, 1).unwrap();
+        assert_eq!((integer.num, integer.den), (2, 1));
+        assert!(integer.right_parent.is_none());
+
+        assert!(simplest_interval_fraction(3, 2, 4, 3).is_err());
+        assert!(simplest_interval_fraction(1, 0, 2, 1).is_err());
     }
 
     #[test]
