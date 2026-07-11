@@ -2,6 +2,27 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - final-price reconciliation could skip a safe exact marginal lot (surface C)
+
+TWAP reconciliation retried the largest final-price rounded pair and then a whole lot at the bid's
+own reduced ratio. It did not retry a whole lot at the final marginal's reduced ratio. Three public
+`2 COIN / 2 USD` bids followed by `5 / 7` and `2 / 3` bids made the old binary settle only six units
+of an exact ten-unit reward budget. Uniform repricing released three units from the better bids; the
+skipped `5 / 7` bid could safely take an exact `2 COIN / 3 USD` marginal lot, but neither of the old
+candidate forms found it. A five-bid public book could therefore strand 40% of that round's budget.
+This suppressed reward-point buyback and burn; it could not cross custody floors, redirect escrow,
+or debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the fixed path settles nine units, burns seven COIN,
+leaves only the unavoidable one-unit sub-lot remainder, pays all five owner-bound bidder accounts
+exactly, and drains both shared auction escrows to zero.
+
+FIX: final-price reconciliation now also considers the largest exact reduced marginal-price lot
+capped by the remaining USD and the bid's deposited COIN, then chooses the larger safe result between
+that and the existing exact bid-price fallback. The marginal GCD is computed once per execution and
+the per-bid work remains bounded. No signer, authority, recipient, budget, reserve, custody,
+principal, withdrawal, or admin surface was added.
+
 ## Tick - provisional integer exclusion could suppress a final-price whole-lot fill (surface C)
 
 TWAP recomputation permanently excluded a bid when its first integer reconstruction was infeasible,

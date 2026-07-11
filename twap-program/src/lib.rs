@@ -2224,10 +2224,10 @@ fn executable_integer_pair(
 
 // Maximum practical integer pair for one bid under an already-selected marginal price and
 // an actual remaining USD budget. The first candidate is the largest COIN amount whose floored
-// marginal-price USD leg fits. If flooring crosses the bidder's limit, fall back to the largest
-// multiple of the bid's reduced COIN lot; that multiple is always bidder-safe because the bid rate
-// is at least the selected marginal rate. All public bid legs are u64-bounded, so the products fit
-// in u128, and the caller supplies the GCD already cached by nominal preflight.
+// marginal-price USD leg fits. If flooring crosses the bidder's limit, fall back to exact reduced
+// lots at both the marginal and bid prices; either ratio is bidder-safe because the bid rate is at
+// least the selected marginal rate. All public bid legs are u64-bounded, so the products fit in
+// u128, and the caller supplies GCDs already computed for the two ratios.
 fn max_executable_integer_pair(
     remaining_usd: u128,
     marginal_coin: u128,
@@ -2235,6 +2235,7 @@ fn max_executable_integer_pair(
     bid_coin: u128,
     bid_usd: u128,
     bid_gcd: u64,
+    marginal_gcd: u64,
 ) -> Result<Option<(u128, u128)>, ProgramError> {
     let max_usd = core::cmp::min(remaining_usd, bid_usd);
     if max_usd == 0 || marginal_coin == 0 || marginal_usd == 0 {
@@ -2269,12 +2270,28 @@ fn max_executable_integer_pair(
         return Ok(Some(pair));
     }
 
-    if bid_gcd == 0 {
+    if bid_gcd == 0 || marginal_gcd == 0 {
         return Err(ProgramError::InvalidAccountData);
     }
+    // The largest rounded candidate can cross the bidder's limit even though a smaller exact
+    // marginal-price lot fits. That lot is always safe for a bid ranked at or above the marginal;
+    // cap its scale by both the available USD and the bid's deposited COIN.
+    let marginal_coin_lot = marginal_coin / marginal_gcd as u128;
+    let marginal_usd_lot = marginal_usd / marginal_gcd as u128;
+    let marginal_lots = core::cmp::min(
+        max_usd / marginal_usd_lot,
+        bid_coin / marginal_coin_lot,
+    );
+    let marginal_pair = try_coin(marginal_lots * marginal_coin_lot)?;
+
     let reduced_coin_lot = bid_coin / bid_gcd as u128;
     let exact_coin = (candidate_coin / reduced_coin_lot) * reduced_coin_lot;
-    try_coin(exact_coin)
+    let bid_pair = try_coin(exact_coin)?;
+    Ok(match (marginal_pair, bid_pair) {
+        (Some(a), Some(b)) if b.1 > a.1 || (b.1 == a.1 && b.0 > a.0) => Some(b),
+        (Some(a), _) => Some(a),
+        (None, b) => b,
+    })
 }
 
 fn as_u64(v: u128) -> Result<u64, ProgramError> {
@@ -3300,6 +3317,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             let mo = slot_off(marginal_slot);
             let cm = book_rd_u128(&d, mo + SL_COIN);
             let um = book_rd_u128(&d, mo + SL_USDC);
+            let marginal_gcd = gcd_u64(cm as u64, um as u64);
             let mut remaining = budget - total_usd;
 
             for (rank, &i) in idx[..n].iter().enumerate() {
@@ -3328,6 +3346,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                     c,
                     u,
                     bid_gcd[i],
+                    marginal_gcd,
                 )?
                 else {
                     continue;
