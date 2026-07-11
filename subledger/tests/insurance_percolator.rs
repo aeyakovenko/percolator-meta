@@ -1147,7 +1147,7 @@ fn create_and_register_proposal(env: &mut Env, ve: &VoteEnv, id: u64, dest: &Pub
     // create
     let mut data = vec![1u8];
     data.extend_from_slice(&id.to_le_bytes());
-    data.extend_from_slice(&4u32.to_le_bytes());
+    data.extend_from_slice(&1u32.to_le_bytes());
     let create = Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -2506,29 +2506,22 @@ fn full_lifecycle_deposit_vote_seal_then_recipient_claims_coin() {
     assert!(env.send(&[reclaim], &[&recipient]).is_err(), "cannot double-claim");
 }
 
-// Anti bait-and-switch: a creator must not be able to change the distribution after
-// voters have backed it. Build a PARTIAL proposal (room to append), register + vote
-// it, then append a self-allocation — the trigger must REFUSE to seal the changed
-// proposal (its entry_count/total_amount snapshot no longer matches).
+// Registration accepts only a proposal whose declared entry shape is complete.
+// This removes creator action before voters can lock capital: a partial proposal
+// cannot become votable, while a registered full proposal has no room to append.
 #[test]
-fn proposal_changed_after_registration_cannot_be_sealed() {
+fn partial_proposal_cannot_be_registered_or_mutated_after_registration() {
     let mut env = Env::new();
     env.init_insurance_pool();
     let ve = setup_vote(&mut env);
     let dist_config = ve.dist_config;
-
-    let amount = 1_000_000u64;
-    let (alice, alice_ata) = new_depositor(&mut env, amount);
-    let pool = env.pool;
-    let holding = create_holding(&mut env, &pool);
-    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
 
     let id = 1u64;
     let dist_proposal =
         Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&2u32.to_le_bytes());
     env.send(&[Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -2559,10 +2552,9 @@ fn proposal_changed_after_registration_cannot_be_sealed() {
     let fair = Pubkey::new_unique();
     append(&mut env, &fair, 40).expect("append fair entry");
 
-    // Register the gv proposal — snapshots (entry_count=1, total_amount=40).
     let gv_proposal =
         Pubkey::find_program_address(&[b"gv_proposal", ve.gv_config.as_ref(), dist_proposal.as_ref()], &gv_id()).0;
-    env.send(&[Instruction {
+    let register = Instruction {
         program_id: gv_id(),
         accounts: vec![
             AccountMeta::new(env.payer.pubkey(), true),
@@ -2572,20 +2564,35 @@ fn proposal_changed_after_registration_cannot_be_sealed() {
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: vec![2u8],
-    }], &[]).expect("register");
-
-    // Voters back it to quorum + majority.
-    env.warp_slot(1124);
-    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote");
-
-    // ATTACK: the creator appends a self-allocation AFTER voters committed.
-    let attacker = Pubkey::new_unique();
-    append(&mut env, &attacker, 60).expect("creator can still append (no dist-level lock)");
-
-    // The trigger must refuse to seal the changed proposal.
+    };
     assert!(
-        gv_trigger(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
-        "trigger must reject a proposal changed after registration"
+        env.send(&[register.clone()], &[]).is_err(),
+        "a partial declared shape cannot become votable"
+    );
+    assert!(
+        env.svm
+            .get_account(&gv_proposal)
+            .is_none_or(|account| account.data.is_empty()),
+        "failed registration is atomic"
+    );
+
+    let second = Pubkey::new_unique();
+    append(&mut env, &second, 60).expect("creator completes the declared shape");
+    env.send(&[register], &[])
+        .expect("the complete proposal can be registered");
+    let proposal_after_registration = env.svm.get_account(&dist_proposal).unwrap();
+    let vote_after_registration = env.svm.get_account(&gv_proposal).unwrap();
+    assert!(
+        append(&mut env, &Pubkey::new_unique(), 1).is_err(),
+        "a registered full-capacity proposal has no mutable entry slot"
+    );
+    assert_eq!(
+        env.svm.get_account(&dist_proposal).unwrap(),
+        proposal_after_registration
+    );
+    assert_eq!(
+        env.svm.get_account(&gv_proposal).unwrap(),
+        vote_after_registration
     );
 }
 
@@ -3684,7 +3691,7 @@ fn register_rejects_foreign_distribution_proposal() {
         Pubkey::find_program_address(&[b"dist_proposal", foreign_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     env.send(&[Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -4323,7 +4330,7 @@ fn only_the_proposal_creator_can_register_it() {
         Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     env.send(&[Instruction {
         program_id: dist_id(),
         accounts: vec![
