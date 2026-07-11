@@ -363,6 +363,7 @@ fn set_position(
     withdrawn: bool,
 ) {
     let mut data = vec![0u8; 160];
+    data[..8].copy_from_slice(b"SUBPOS01");
     data[8..40].copy_from_slice(pool.as_ref());
     data[40..72].copy_from_slice(owner.as_ref());
     data[72..80].copy_from_slice(
@@ -408,6 +409,9 @@ fn set_portfolio(
     crystallized: u128,
 ) {
     let mut data = vec![0u8; 512];
+    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+    data[8..10].copy_from_slice(&16u16.to_le_bytes());
+    data[10] = 2;
     data[16..48].copy_from_slice(market.as_ref());
     data[116..148].copy_from_slice(owner.as_ref());
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
@@ -437,6 +441,9 @@ fn set_portfolio_full(
     spent: u128,
 ) {
     let mut data = vec![0u8; 512];
+    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+    data[8..10].copy_from_slice(&16u16.to_le_bytes());
+    data[10] = 2;
     data[16..48].copy_from_slice(market.as_ref());
     data[116..148].copy_from_slice(owner.as_ref());
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
@@ -467,6 +474,9 @@ fn set_portfolio_funding(
     short_received: u128,
 ) {
     let mut data = vec![0u8; 512];
+    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+    data[8..10].copy_from_slice(&16u16.to_le_bytes());
+    data[10] = 2;
     data[16..48].copy_from_slice(market.as_ref());
     data[116..148].copy_from_slice(owner.as_ref());
     data[244..260].copy_from_slice(&long_paid.to_le_bytes());
@@ -8909,6 +8919,247 @@ fn claim_rejects_a_stake_from_a_different_rd_config_no_cross_genesis_claim() {
 // type confusion (a capital cohort pointed at a percolator account, or an LP/trader cohort at a subledger
 // position — the owner-PROGRAM check blocks reading the wrong struct at the bound offsets), and a
 // double-register (the per-owner stake PDA already exists). Real .so.
+#[test]
+fn register_rejects_a_non_portfolio_percolator_witness() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let witness = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &witness,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        10_000,
+        0,
+    );
+    let mut account = svm.get_account(&witness).unwrap();
+    account.data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+    account.data[8..10].copy_from_slice(&16u16.to_le_bytes());
+    account.data[10] = 1; // Percolator market, not portfolio.
+    svm.set_account(witness, account).unwrap();
+
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &owner.pubkey(),
+            &witness,
+            COHORT_LP,
+        )
+        .is_err(),
+        "a Percolator-owned non-portfolio account must not mint portfolio-flow points"
+    );
+}
+
+#[test]
+fn register_rejects_a_non_position_subledger_witness() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let witness = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &witness,
+        &env.stub_sub,
+        &env.ins_pool,
+        &owner.pubkey(),
+        500,
+        false,
+    );
+    let mut account = svm.get_account(&witness).unwrap();
+    account.data[..8].copy_from_slice(b"SUBPOOL1");
+    svm.set_account(witness, account).unwrap();
+
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &owner,
+            &owner.pubkey(),
+            &witness,
+            COHORT_INSURANCE,
+        )
+        .is_err(),
+        "a Subledger-owned non-position account must not mint capital points"
+    );
+}
+
+#[test]
+fn portfolio_witness_kind_is_rechecked_at_crystallize_and_claim() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    )
+    .expect("register a real portfolio");
+    set_slot(&mut svm, 1_000);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        10_000,
+        0,
+    );
+    let mut wrong_kind = svm.get_account(&portfolio).unwrap();
+    wrong_kind.data[10] = 1;
+    svm.set_account(portfolio, wrong_kind).unwrap();
+    assert!(
+        crystallize(&mut svm, &payer, &env, &owner, &portfolio).is_err(),
+        "a same-key non-portfolio account cannot enter the frozen denominator"
+    );
+
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        10_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+        .expect("the restored portfolio crystallizes");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    let mut wrong_kind = svm.get_account(&portfolio).unwrap();
+    wrong_kind.data[10] = 1;
+    svm.set_account(portfolio, wrong_kind).unwrap();
+    assert!(
+        claim(&mut svm, &payer, &env, &owner, &recipient, None).is_err(),
+        "a same-key non-portfolio account cannot satisfy the live claim cap"
+    );
+    assert_eq!(token_amount(&svm, &recipient), 0);
+
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        10_000,
+        0,
+    );
+    claim(&mut svm, &payer, &env, &owner, &recipient, None)
+        .expect("the restored portfolio claims its frozen share");
+    assert!(token_amount(&svm, &recipient) > 0);
+}
+
+#[test]
+fn capital_witness_kind_is_rechecked_at_crystallize_and_claim() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let position = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &position,
+        &env.stub_sub,
+        &env.ins_pool,
+        &owner.pubkey(),
+        500,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &position,
+        COHORT_INSURANCE,
+    )
+    .expect("register a real position");
+    set_slot(&mut svm, 1_000);
+    let mut wrong_kind = svm.get_account(&position).unwrap();
+    wrong_kind.data[..8].copy_from_slice(b"SUBPOOL1");
+    svm.set_account(position, wrong_kind).unwrap();
+    assert!(
+        crystallize(&mut svm, &payer, &env, &owner, &position).is_err(),
+        "a same-key non-position account cannot enter the frozen denominator"
+    );
+
+    set_position(
+        &mut svm,
+        &position,
+        &env.stub_sub,
+        &env.ins_pool,
+        &owner.pubkey(),
+        500,
+        false,
+    );
+    crystallize(&mut svm, &payer, &env, &owner, &position)
+        .expect("the restored position crystallizes");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    let mut wrong_kind = svm.get_account(&position).unwrap();
+    wrong_kind.data[..8].copy_from_slice(b"SUBPOOL1");
+    svm.set_account(position, wrong_kind).unwrap();
+    assert!(
+        claim(&mut svm, &payer, &env, &owner, &recipient, Some(&position)).is_err(),
+        "a same-key non-position account cannot satisfy the live claim cap"
+    );
+    assert_eq!(token_amount(&svm, &recipient), 0);
+
+    set_position(
+        &mut svm,
+        &position,
+        &env.stub_sub,
+        &env.ins_pool,
+        &owner.pubkey(),
+        500,
+        false,
+    );
+    claim(&mut svm, &payer, &env, &owner, &recipient, Some(&position))
+        .expect("the restored position claims its frozen share");
+    assert!(token_amount(&svm, &recipient) > 0);
+}
+
 #[test]
 fn register_rejects_out_of_range_cohort_cross_program_and_double_register() {
     let mut svm = LiteSVM::new();

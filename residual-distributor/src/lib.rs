@@ -101,6 +101,11 @@ const COHORT_LP: u8 = 2;
 const COHORT_TRADER: u8 = 3;
 const COHORT_FUNDING_PAYER: u8 = 4;
 
+const SUB_POSITION_DISC: [u8; 8] = *b"SUBPOS01";
+const PERC_MAGIC: u64 = 0x5045_5243_5631_3600;
+const PERC_VERSION: u16 = 16;
+const PERC_KIND_PORTFOLIO: u8 = 2;
+
 const IX_INIT: u8 = 0;
 const IX_REGISTER_START: u8 = 1;
 const IX_CRYSTALLIZE: u8 = 2;
@@ -222,9 +227,19 @@ pub const SUB_POS_PRINCIPAL: usize = 72;
 pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
 
+fn validate_subledger_position(data: &[u8]) -> ProgramResult {
+    if data.get(..8) != Some(SUB_POSITION_DISC.as_slice())
+        || data.get(SUB_POS_WITHDRAWN).copied().unwrap_or(2) > 1
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 /// Comparable base-unit principal from a live subledger Position. Raw shares cannot be summed across
 /// pools because each pool has an independent loss/surplus-dependent share price.
 pub fn read_subledger_principal(data: &[u8]) -> Result<(u128, bool), ProgramError> {
+    validate_subledger_position(data)?;
     let bytes = data
         .get(SUB_POS_PRINCIPAL..SUB_POS_PRINCIPAL + 8)
         .ok_or(ProgramError::AccountDataTooSmall)?;
@@ -317,6 +332,25 @@ fn funding_payer_counter(long_paid: u128, short_paid: u128) -> u128 {
 }
 
 fn validate_portfolio_identity(config: &Config, data: &[u8], owner: &Pubkey) -> ProgramResult {
+    if data.len() < OFF_PORTFOLIO_OWNER + 32 {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if u64::from_le_bytes(
+        data.get(..8)
+            .ok_or(ProgramError::AccountDataTooSmall)?
+            .try_into()
+            .unwrap(),
+    ) != PERC_MAGIC
+        || u16::from_le_bytes(
+            data.get(8..10)
+                .ok_or(ProgramError::AccountDataTooSmall)?
+                .try_into()
+                .unwrap(),
+        ) != PERC_VERSION
+        || data.get(10).copied() != Some(PERC_KIND_PORTFOLIO)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     if read_pubkey(data, OFF_PORTFOLIO_OWNER)? != *owner {
         return Err(ProgramError::IllegalOwner);
     }
@@ -1301,6 +1335,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 return Err(ProgramError::IllegalOwner);
             }
             let data = linked.try_borrow_data()?;
+            validate_subledger_position(&data)?;
             // Bind the position to its depositor (finding GY): only the rightful owner may register it.
             if pk(&data, SUB_POS_OWNER) != *owner.key {
                 return Err(ProgramError::IllegalOwner);
@@ -1905,6 +1940,7 @@ mod tests {
     #[test]
     fn reads_live_subledger_capital_offsets() {
         let mut d = [0u8; 120];
+        d[..8].copy_from_slice(&SUB_POSITION_DISC);
         d[72..80].copy_from_slice(&555u64.to_le_bytes()); // principal
         d[88] = 1; // withdrawn
         d[89..97].copy_from_slice(&4242u64.to_le_bytes()); // resettable deposit clock
