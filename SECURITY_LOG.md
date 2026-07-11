@@ -2,6 +2,24 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - a historical reward stake could be registered again after an upgrade (surface D)
+
+Pre-epoch configs preserve claims for owner-only V0 and owner+linked V1 stake PDAs, while current
+registration creates a family-scoped V2 PDA. An unfrozen config could therefore retain nonzero
+points from a predecessor stake and accept a second registration for the same owner, witness, and
+reward family. Both terms entered the frozen denominator and both stakes remained claimable,
+diluting other COIN recipients. No collateral account is writable in this path.
+
+The real-SBF LiteSVM regression migrates an already-crystallized stake into each predecessor schema
+and proves the previous binary creates the parallel V2 stake. The retained tests require both
+duplicates to reject without creating state. They also prove a zero-point predecessor can still
+migrate and one-lamport prefunding of either predecessor PDA cannot block a legitimate registration.
+
+FIX: pre-epoch registration now receives both canonically derived predecessor addresses and rejects
+only a program-owned predecessor carrying nonzero points for the same linked witness and current
+reward family. Current configs keep their existing account list. This adds no authority, recipient,
+withdrawal, principal, or custody surface.
+
 ## Tick - legacy reward init could count one capital pool in both cohorts (surface D)
 
 Reusable reward epochs rejected a Subledger pool reused across insurance and backing scopes, but

@@ -1345,7 +1345,8 @@ fn init_reward_epoch(
     Ok(())
 }
 
-// register_start accounts: [payer(s,w), config, owner, recipient, linked, stake(pda,w), system]
+// register_start accounts: [payer(s,w), config, owner, recipient, linked, stake(pda,w), system,
+//   legacy_owner_stake?, legacy_linked_stake?]
 //   residual:  linked = percolator backing ledger; insurance: linked = subledger position.
 // data: cohort(u8)
 fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -1382,6 +1383,65 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     if config.freeze_slot != 0 {
         return Err(ProgramError::InvalidAccountData); // denominators frozen — no new registrations
+    }
+    let family_seed = [stake_family(cohort)?];
+    // Pre-epoch configs may already have an owner-only V0 or owner+linked V1 stake whose points
+    // remain in a live denominator. A new family-scoped stake for the same economics would count
+    // those points twice and both schemas would remain claimable. Require both canonical predecessor
+    // addresses and reject an already-counted same-family witness before creating a current stake.
+    // A zero-point predecessor may migrate, and merely donated lamports remain harmless.
+    if config_account.data_len() == PRE_EPOCH_CONFIG_SIZE {
+        let legacy_owner_stake = next_account_info(iter)?;
+        let legacy_linked_stake = next_account_info(iter)?;
+        if iter.next().is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let expected_owner_stake = Pubkey::find_program_address(
+            &[b"rd_stake", config_account.key.as_ref(), owner.key.as_ref()],
+            program_id,
+        )
+        .0;
+        let expected_linked_stake = Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                config_account.key.as_ref(),
+                owner.key.as_ref(),
+                linked.key.as_ref(),
+            ],
+            program_id,
+        )
+        .0;
+        if *legacy_owner_stake.key != expected_owner_stake
+            || *legacy_linked_stake.key != expected_linked_stake
+        {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        for (legacy_stake, linked_seed) in [
+            (legacy_owner_stake, false),
+            (legacy_linked_stake, true),
+        ] {
+            if legacy_stake.data_len() == 0 {
+                continue;
+            }
+            if legacy_stake.owner != program_id {
+                return Err(ProgramError::IllegalOwner);
+            }
+            let predecessor = Stake::deserialize(&legacy_stake.try_borrow_data()?)?;
+            if predecessor.config != *config_account.key
+                || predecessor.owner != *owner.key
+                || (linked_seed && predecessor.backing_ledger != *linked.key)
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            if predecessor.backing_ledger == *linked.key
+                && stake_family(predecessor.cohort)? == family_seed[0]
+                && predecessor.points != 0
+            {
+                return Err(ProgramError::AccountAlreadyInitialized);
+            }
+        }
+    } else if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
     }
     let now = Clock::get()?.slot;
     if config.config_kind == CONFIG_KIND_REWARD_EPOCH
@@ -1432,7 +1492,6 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         }
     };
     let start_slot = now;
-    let family_seed = [stake_family(cohort)?];
     let (expected, bump) = Pubkey::find_program_address(
         &stake_seeds(config_account.key, owner.key, linked.key, &family_seed),
         program_id,
