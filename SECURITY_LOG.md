@@ -2,6 +2,26 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - preserved asset-0 backing could retain an unusable rotation key (surface A/C)
+
+The asset-0 backing return already handled an absent provider after resolution, but it requires the
+current `asset_admin` to authorize the fixed backing-role rotation. A creator could delegate that admin,
+fund backing as the still-recorded provider, and then donate market lifecycle to the controller. The
+handoff preserved the creator's backing as intended while leaving the external admin unchanged. If both
+keys disappeared before public stale resolution, the backing balance permanently blocked `CloseSlab`.
+
+A clean-room real-Percolator + controller LiteSVM regression shares the delegated-admin fixture with
+the insurance prevention test, funds asset-0 backing through the public API, and attempts market
+donation. The PR125 controller accepts the unsafe handoff. The retained probe requires byte-atomic
+rejection and then proves the original provider can still withdraw every backing atom directly.
+
+FIX: donation reads both backing domains from the pinned slab. When the outgoing market authority is
+the recorded provider and either domain has principal or earnings, the handoff is rejected unless
+Percolator will also move `asset_admin` to the controller. Empty-role donations and existing
+Subledger/TWAP custodians remain unchanged. This adds no instruction, signer, destination, amount, or
+authority mutation; it prevents entry into a state the existing provider-bound terminal return cannot
+safely unwind.
+
 ## Tick - preserved external asset-0 insurance could block terminal cleanup (surface A/C)
 
 Market donation correctly preserved creator-funded asset-0 insurance instead of giving it to the

@@ -1810,12 +1810,23 @@ fn process_accept_market_authority<'a>(
                 .map_err(|_| ProgramError::InvalidAccountData)?;
         let restore_insurance_authority = has_insurance && insurance_authority == current_bytes;
         let restore_insurance_operator = has_insurance && insurance_operator == current_bytes;
+        let backing_authority =
+            percolator_accounting::read_asset_backing_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let restore_outgoing_backing = backing_authority == current_bytes;
+        let has_backing = percolator_accounting::read_asset_backing_balances(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            .iter()
+            .any(|balance| balance.principal_atoms != 0 || balance.earnings_atoms != 0);
         let asset_admin = percolator_accounting::read_asset_admin(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?;
         // UpdateAuthority migrates asset_admin only while it still equals the outgoing
-        // market authority. Restoring an outgoing funded value role while leaving a
-        // separately delegated admin would make terminal recovery depend on that signer.
-        if (restore_insurance_authority || restore_insurance_operator)
+        // market authority. Restoring an outgoing funded insurance or backing role
+        // while leaving a separately delegated admin would make terminal recovery
+        // depend on that signer.
+        if (restore_insurance_authority
+            || restore_insurance_operator
+            || (restore_outgoing_backing && has_backing))
             && asset_admin != current_bytes
             && asset_admin != controller.key.to_bytes()
         {
@@ -1824,9 +1835,7 @@ fn process_accept_market_authority<'a>(
         (
             restore_insurance_authority,
             restore_insurance_operator,
-            percolator_accounting::read_asset_backing_authority(&market_data, 0)
-                .map_err(|_| ProgramError::InvalidAccountData)?
-                == current_bytes,
+            restore_outgoing_backing,
         )
     };
     let mut ix_data = vec![PERC_IX_UPDATE_AUTHORITY];

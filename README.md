@@ -225,9 +225,9 @@ cleanup. A failed domain CPI rolls back every earlier transfer and the authority
 Permissionless market donation transfers lifecycle control, not funded creator capital. If the
 outgoing market authority still owns nonzero asset-0 insurance, the controller atomically restores
 that exact insurance authority/operator after accepting `marketauth`, just as it preserves the
-recorded backing provider. A funded handoff that restores either outgoing insurance role is rejected
-unless it also leaves `asset_admin` on the controller, so public stale resolution cannot make terminal
-recovery depend on a delegated signer.
+recorded backing provider. A funded handoff that restores an outgoing insurance role or nonzero
+backing bucket is rejected unless it also leaves `asset_admin` on the controller, so public stale
+resolution cannot make terminal recovery depend on a delegated signer.
 If the provider disappears after a valid handoff, the controller's amountless resolved return rotates
 only that value role and pays the complete asset-0 balance to the provider's canonical token account.
 Genesis custody cannot move to a pool until those external insurance roles hold no balance. The
