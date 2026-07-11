@@ -206,9 +206,10 @@ An absent insurance authority or backing provider cannot block secondary-asset r
 remaining atom. After Squads shuts the asset down and Percolator's delay and empty-state checks pass,
 anyone can return its complete asset-local insurance and each backing domain through the controller.
 The controller derives the insurance amount from the pinned slab and accepts no caller-selected
-amount. Each destination is the recorded provider's canonical token account, not a DAO-selected
-account; backing earnings are paid first and the controller forwards exactly the value attributed
-to that provider. It closes the temporary controller account only when no unrelated balance
+amount. Each destination must be a clean token account owned solely by the recorded provider, not a
+DAO-selected beneficiary; this lets a cranker bypass a permanently frozen ATA without redirecting
+funds. Backing earnings are paid first and the controller forwards exactly the value attributed to
+that provider. It closes the temporary controller account only when no unrelated balance
 remains. Protocol insurance or token dust already held there stays in controller custody for the
 fixed terminal reclaim. While live, Percolator authorizes these returns only through its delayed
 secondary-asset shutdown override.
@@ -216,8 +217,8 @@ secondary-asset shutdown override.
 Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
 run. The resolved companions require the whole market to be resolved and empty, derive every amount
 from the slab, and use the controller's existing secondary `asset_admin` role to rotate only the
-relevant insurance or backing role. They then return all value to the outgoing recorded provider's
-canonical account, but only up to the exact amount attributed by that cleanup. The caller and DAO
+relevant insurance or backing role. They then return all value to a clean account owned solely by
+the outgoing recorded provider, but only up to the exact amount attributed by that cleanup. The caller and DAO
 still choose neither an amount nor a recipient, and any failed rotation, withdrawal, forwarding, or
 close rolls the entire operation back.
 
@@ -235,8 +236,8 @@ existing fixed wrapper complete asset-0 backing cleanup without a surviving DAO.
 
 Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
 reads both domains' complete principal and earnings from the pinned slab, atomically transfers the
-backing role to the controller, and returns the full value to the outgoing provider's canonical
-account. Before genesis custody moves, the controller is the constrained asset admin; after TWAP,
+backing role to the controller, and returns the full value to a clean account owned solely by the
+outgoing provider. Before genesis custody moves, the controller is the constrained asset admin; after TWAP,
 custody first returns to the canonical pool, whose only backing action is invoking this same fixed
 cleanup. A failed domain CPI rolls back every earlier transfer and the authority change.
 
@@ -250,7 +251,7 @@ bound to this exact market and Percolator program; both insurance roles must nam
 PDA. An arbitrary delegated admin is rejected even while empty because it could fund after handoff.
 Thus public stale resolution cannot make terminal recovery depend on a delegated signer.
 If the provider disappears after a valid handoff, the controller's amountless resolved return rotates
-only that value role and pays the complete asset-0 balance to the provider's canonical token account.
+only that value role and pays the complete asset-0 balance to a clean token account owned solely by the provider.
 Genesis custody cannot move to a pool until those external insurance roles hold no balance. The
 creator can also withdraw directly through Percolator, then the unchanged grant path installs the
 canonical owner-bound pool; governance cannot convert the external balance into its own or
