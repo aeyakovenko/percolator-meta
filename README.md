@@ -58,7 +58,9 @@ capital's own tenure.
   exits first, after which the same grant can proceed.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
-  pool's live `outstanding_principal` as a minimum floor. The floor can only rise. Recovery can
+  pool's live `outstanding_principal` as a minimum floor. TWAP also re-reads `marketauth` and accepts
+  custody only before lifecycle donation, while its own Squads vault still controls the market, or
+  after donation to the controller derived from that same vault. The floor can only rise. Recovery can
   return custody only to that same pool. Squads must authorize that return while the market is live;
   after the bound Percolator market is resolved and empty, anyone can crank the same fixed return
   while the pool attests that owner principal remains, so owner exits do not depend on a surviving
