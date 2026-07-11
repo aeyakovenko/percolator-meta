@@ -783,6 +783,30 @@ fn redeem_shares(shares: u128, balance: u64, total_shares: u128) -> Result<u64, 
     u64::try_from(owed).map_err(|_| ProgramError::ArithmeticOverflow)
 }
 
+/// Reject a deposit before transfer when its positive share count still has no redeemable value at
+/// the post-deposit price. The virtual offset intentionally absorbs bounded rounding dust, but it
+/// must never turn an accepted position's complete principal into a zero-payout exit.
+fn require_nonzero_share_value(
+    amount: u64,
+    shares_minted: u128,
+    total_shares: u128,
+    balance_before: u64,
+) -> ProgramResult {
+    if shares_minted == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let post_balance = balance_before
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let post_total_shares = total_shares
+        .checked_add(shares_minted)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if redeem_shares(shares_minted, post_balance, post_total_shares)? == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
 /// Payout for a full position exit. `balance` is the pool's live token balance.
 fn payout(policy: u8, balance: u64, outstanding: u64, principal: u64) -> Result<u64, ProgramError> {
     if outstanding == 0 || principal == 0 || principal > outstanding {
@@ -1130,9 +1154,7 @@ fn process_deposit(
     let shares_minted = if pool.policy == POLICY_WITH_SURPLUS {
         let balance_before = token_balance(vault)?;
         let s = mint_shares(amount, pool.total_shares, balance_before)?;
-        if s == 0 {
-            return Err(ProgramError::InvalidArgument); // never accept principal for 0 shares (cf. HB)
-        }
+        require_nonzero_share_value(amount, s, pool.total_shares, balance_before)?;
         s
     } else {
         0
@@ -1615,15 +1637,15 @@ fn process_insurance_deposit(
         insurance_before
     };
     let shares_minted = mint_shares(amount, pool.total_shares, priced_balance_before)?;
-    // Inflation/rounding guard (finding HB): never accept principal for ZERO shares. If a large
-    // surplus has inflated the share price (balance >> total_shares) so this deposit would round to
-    // 0 shares, the depositor would hand over principal that the existing shareholders' shares then
-    // redeem — the classic share-vault first-depositor/inflation theft. Reject instead. (Not
-    // reachable in the genesis flow, where deposits close at kickstart before PnL diverges balance;
-    // this hardens the reusable pool for any with-surplus reuse with deposits open during live PnL.)
-    if shares_minted == 0 {
-        return Err(ProgramError::InvalidArgument);
-    }
+    // Inflation/rounding guard (finding HB): never accept principal for zero shares or for positive
+    // dust shares whose complete post-deposit redemption is still zero. A large surplus can inflate
+    // the share price enough for either case; both must reject before the depositor transfers value.
+    require_nonzero_share_value(
+        amount,
+        shares_minted,
+        pool.total_shares,
+        priced_balance_before,
+    )?;
 
     // Position PDA (one per owner per pool).
     let pos_seeds = position_seeds(pool_account.key, owner.key);

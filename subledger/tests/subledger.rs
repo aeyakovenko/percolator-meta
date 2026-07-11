@@ -850,6 +850,79 @@ fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
     assert!(victim_out >= victim_deposit - 10, "victim recovers ~its principal, not skimmed: {victim_out}");
 }
 
+// PUBLIC LOF: nonzero shares are not sufficient if their immediate redemption value is zero. A first
+// depositor can donate directly to an own-vault pool, making a later one-atom deposit mint positive dust
+// shares that the program accepts but retires for a zero payout even though no market loss occurred.
+#[test]
+fn a_deposit_with_zero_immediate_share_value_is_rejected_without_moving_principal() {
+    let mut env = Env::new();
+    let asset_id = 10;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let (attacker, attacker_ata) = new_depositor(&mut env, 5);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &attacker.pubkey(),
+            &attacker_ata,
+            &vault,
+            1,
+        )],
+        &[&attacker],
+    )
+    .expect("attacker seeds one atom");
+    let donate = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &attacker_ata,
+        &vault,
+        &attacker.pubkey(),
+        &[],
+        4,
+    )
+    .unwrap();
+    env.send(&[donate], &[&attacker])
+        .expect("attacker donates four atoms through SPL Token");
+    assert_eq!(env.token_amount(&vault), 5);
+
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let deposit = env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            1,
+        )],
+        &[&victim],
+    );
+    assert!(
+        deposit.is_err(),
+        "a share purchase with zero immediate value must reject before transfer"
+    );
+
+    assert_eq!(
+        env.token_amount(&victim_ata),
+        1,
+        "rejected deposit leaves the victim's principal untouched"
+    );
+    assert_eq!(
+        env.token_amount(&vault),
+        5,
+        "rejected deposit does not donate principal into the pool"
+    );
+    assert!(
+        env.svm
+            .get_account(&position_pda(&pool, &victim.pubkey()))
+            .is_none(),
+        "rejected first deposit creates no dead position"
+    );
+}
+
 // LOF PROBE (finding HB zero-share guard, sweep tick B): the test above pins the SKIM bound (value not
 // stolen); the distinct, UNTESTED safety property is the zero-share REJECT. With a balance >> total_shares
 // (an attacker first-deposits 1 atom then donates to inflate the price), a small victim deposit rounds to 0
