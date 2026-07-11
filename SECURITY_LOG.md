@@ -12935,3 +12935,23 @@ candidate cannot consume nominal budget or set the uniform price. If positive bu
 exist but every candidate is infeasible, execute enters a refund-only settled state instead of preserving an
 un-evictable full book. No admin escape, recipient, amount selector, custody authority, principal counter, or
 new signer was added.
+
+## Tick - partial integer repricing remainders could starve marginal TWAP lots (surface C)
+
+Uniform clearing assigned each winner a nominal USD allocation before integer reconciliation. A better-rate
+winner could consume less actual USD than that nominal allocation while remaining partially filled, but only a
+fully refunded winner caused the budget walk to retry. Public bidders could therefore split a bid so the small
+per-slot remainders combined into additional executable marginal lots while execute stranded them every round.
+
+A retained real-SBF LiteSVM regression submits three `2 COIN / 199 USD` better-rate bids followed by an exact
+`4,000 / 400,000` marginal bid. At the `1 / 100` marginal, each better bid spends only 100 of its nominal 199;
+those three 99-unit remainders plus the marginal allocation's 3-unit remainder buy three more marginal COIN.
+The old binary spent only 399,700 of the 400,000-unit budget and bought 3,997 COIN. The fixed binary spends the
+complete budget and buys 4,000, while the existing 32-bid cascade and worst-rate book remain below 500k CU.
+
+FIX: after marginal selection and exclusion converge, execute may use aggregate integer remainder only to
+enlarge allocations that already executed at that same marginal price. It cannot admit an unfilled bid or move
+the marginal rate. The bounded pass mutates the existing 32-slot allocation vector and reuses GCDs cached by
+nominal preflight, preserving heap and compute bounds. Every enlarged pair is capped by escrow, remaining
+budget, and the bidder's submitted limit. No authority, destination, signer, custody path, principal counter,
+or admin surface was added.
