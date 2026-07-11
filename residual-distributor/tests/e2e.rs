@@ -8593,10 +8593,10 @@ fn rd_config_cannot_be_reinitialized_to_un_freeze_or_reset_denominators() {
 }
 
 // claim anti-theft (GY at the claim layer): LP/trader claim is PERMISSIONLESS (any cranker may finalize a
-// backer's claim), so the cranker must NOT be able to (a) redirect the COIN to an account it controls, nor
-// (b) pay from a decoy vault. The bound recipient + the config.vault are the only acceptable endpoints. Real .so.
+// backer's claim), so the cranker must NOT be able to redirect the COIN to an account it owns or can spend
+// as delegate, nor pay from a decoy vault. The bound recipient + config vault are the only endpoints. Real .so.
 #[test]
-fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
+fn claim_cannot_be_redirected_delegated_or_paid_from_a_decoy_vault() {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
@@ -8660,8 +8660,48 @@ fn claim_cannot_be_redirected_or_paid_from_a_decoy_vault() {
         )
     };
 
-    // (a) a third-party cranker redirecting to its OWN ata -> rejected (ra.owner != stake.recipient).
     let attacker_ata = create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
+    // A permissionless cranker must not force the payout into a recipient-owned
+    // account that delegates token spending to the cranker. Owner equality alone
+    // does not prevent the delegate from taking the reward immediately afterward.
+    let delegated_lp_ata = create_token_account(&mut svm, &payer, &coin_mint, &lp.pubkey());
+    send(
+        &mut svm,
+        &payer,
+        &[spl_token::instruction::approve(
+            &spl_token::ID,
+            &delegated_lp_ata,
+            &attacker.pubkey(),
+            &lp.pubkey(),
+            &[],
+            u64::MAX,
+        )
+        .unwrap()],
+        &[&lp],
+    )
+    .expect("recipient legitimately delegates an existing COIN account");
+    if raw_claim(&mut svm, &attacker, real_vault, delegated_lp_ata).is_ok() {
+        let stolen = token_amount(&svm, &delegated_lp_ata);
+        send(
+            &mut svm,
+            &payer,
+            &[spl_token::instruction::transfer(
+                &spl_token::ID,
+                &delegated_lp_ata,
+                &attacker_ata,
+                &attacker.pubkey(),
+                &[],
+                stolen,
+            )
+            .unwrap()],
+            &[&attacker],
+        )
+        .expect("the cranker spends the forced payout through its delegate authority");
+        assert_eq!(token_amount(&svm, &attacker_ata), stolen);
+        panic!("permissionless claim exposed the bound recipient's reward to a token delegate");
+    }
+
+    // (a) a third-party cranker redirecting to its OWN ata -> rejected (ra.owner != stake.recipient).
     assert!(
         raw_claim(&mut svm, &attacker, real_vault, attacker_ata).is_err(),
         "claim cannot be redirected to a non-recipient ata"

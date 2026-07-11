@@ -1710,8 +1710,21 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::MissingRequiredSignature);
     }
     // The COIN must land in the bound recipient's own account (finding GY: no cranker redirect).
+    // Portfolio-flow claims are permissionless, so owner equality is not sufficient: a cranker
+    // could select a pre-existing recipient-owned account delegated to itself, force the payout
+    // there, and spend it immediately. Require sole recipient control on those public claims.
+    if recipient_ata.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
     let ra = spl_token::state::Account::unpack(&recipient_ata.try_borrow_data()?)?;
-    if ra.owner != stake.recipient || ra.mint != config.coin_mint {
+    if ra.state != spl_token::state::AccountState::Initialized
+        || ra.owner != stake.recipient
+        || ra.mint != config.coin_mint
+        || (matches!(
+            stake.cohort,
+            COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER
+        ) && (ra.delegate.is_some() || ra.delegated_amount != 0))
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     let cohort_supply = config.cohort_supply(stake.cohort);
