@@ -24231,6 +24231,339 @@ fn e2e_unexecutable_top_bid_cannot_starve_lower_executable_bid() {
     assert_eq!(token_amount(&svm, &honest_usd), 400_000);
 }
 
+// PUBLIC DOS: a bid can be executable at its own rate during nominal allocation, then become
+// integer-infeasible only after a lower bid establishes the uniform clearing rate. Such a bid
+// must not retain its nominal budget allocation: otherwise Sybils can reserve almost the entire
+// round, receive complete COIN refunds, and leave only the tiny marginal allocation executable.
+#[test]
+fn e2e_uniform_repricing_cannot_leave_refunded_bids_reserving_budget() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Each Sybil is executable in full at its own 299,999/199,999 rate. Together they consume
+    // 399,998 of the 400k nominal budget. The honest bid receives the final 2 USD and establishes
+    // a 3/2 uniform rate. Repricing either Sybil at 3/2 yields 299,998 COIN for 199,998 USD, whose
+    // realized rate exceeds that Sybil's limit, so both must be refunded and removed from the
+    // allocation. The released budget must then be reassigned to the honest bid.
+    let mut sybils = Vec::new();
+    for _ in 0..2 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 299_999);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                299_999,
+                199_999,
+                None,
+            ),
+        )
+        .expect("place nominally executable Sybil bid");
+        sybils.push((bidder, coin, usd));
+    }
+    let (honest, honest_coin, honest_usd) = new_bidder(&mut svm, &payer, &env, 600_000);
+    send(
+        &mut svm,
+        &[&honest],
+        place_bid_ix(
+            &honest.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &honest_coin,
+            &honest_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            600_000,
+            400_000,
+            None,
+        ),
+    )
+    .expect("place executable honest bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute must reallocate budget released by uniform repricing");
+
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        600_000,
+        "the honest bid receives the complete 400k budget at the 3/2 rate"
+    );
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000);
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    for (slot, (_, coin, usd)) in sybils.iter().enumerate() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                usd,
+                coin,
+                slot as u8,
+            ),
+        )
+        .expect("refunded Sybil claim");
+        assert_eq!(token_amount(&svm, coin), 299_999);
+        assert_eq!(token_amount(&svm, usd), 0);
+    }
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &honest_usd,
+            &honest_coin,
+            2,
+        ),
+    )
+    .expect("honest claim");
+    assert_eq!(token_amount(&svm, &honest_coin), 0);
+    assert_eq!(token_amount(&svm, &honest_usd), 400_000);
+}
+
+// PUBLIC CU/LOF PROBE: uniform repricing can invalidate a different nominal winner after each
+// recomputation. This exact 32-bid book requires eight bounded passes. Execute must stay below the
+// network compute ceiling, settle the stable result, and preserve every escrowed atom through
+// permissionless claims.
+#[test]
+fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Protect all live insurance through the real Squads path, then permissionlessly transfer a
+    // seven-unit prior-round balance into the canonical holding. Execute therefore exercises the
+    // exact seven-unit auction budget without fabricating Percolator accounting.
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message = build_set_reserved_floor_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        live_insurance,
+    );
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        7,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            7,
+        )
+        .unwrap(),
+    )
+    .expect("donor funds canonical holding");
+
+    let bid_legs = [
+        (3u64, 13u64),
+        (21, 4),
+        (16, 9),
+        (7, 13),
+        (9, 6),
+        (10, 4),
+        (2, 10),
+        (17, 4),
+        (8, 10),
+        (19, 4),
+        (10, 6),
+        (9, 10),
+        (7, 8),
+        (16, 6),
+        (5, 3),
+        (15, 1),
+        (20, 11),
+        (3, 5),
+        (18, 3),
+        (4, 12),
+        (10, 12),
+        (5, 13),
+        (11, 12),
+        (8, 11),
+        (21, 12),
+        (15, 4),
+        (16, 11),
+        (9, 14),
+        (13, 3),
+        (11, 3),
+        (3, 4),
+        (12, 7),
+    ];
+    let mut bidders = Vec::new();
+    for (coin_atoms, usd_atoms) in bid_legs {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, coin_atoms);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                coin_atoms as u128,
+                usd_atoms as u128,
+                None,
+            ),
+        )
+        .expect("fill cascade bid");
+        bidders.push((bidder, coin, usd));
+    }
+
+    let initial_coin = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    let ix = execute_ix(
+        &cranker.pubkey(),
+        &env,
+        &bk.book,
+        &bk.holding,
+        &bk.settlement_usd,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        None,
+    );
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    let meta = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&cranker.pubkey()),
+            &[&cranker],
+            bh,
+        ))
+        .expect("eight-pass public repricing cascade stays executable");
+    assert!(
+        meta.compute_units_consumed < 500_000,
+        "repricing cascade must retain compute headroom, got {} CU",
+        meta.compute_units_consumed
+    );
+
+    let burned = initial_coin - mint_supply(&svm, &env.coin_mint);
+    let spent = token_amount(&svm, &bk.settlement_usd);
+    assert_eq!(burned, 17);
+    assert_eq!(spent, 6);
+    assert_eq!(token_amount(&svm, &bk.holding), 1);
+
+    for (slot, (_, coin, usd)) in bidders.iter().enumerate() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                usd,
+                coin,
+                slot as u8,
+            ),
+        )
+        .expect("permissionless cascade claim");
+    }
+    let returned_coin: u64 = bidders
+        .iter()
+        .map(|(_, coin, _)| token_amount(&svm, coin))
+        .sum();
+    let paid_usd: u64 = bidders
+        .iter()
+        .map(|(_, _, usd)| token_amount(&svm, usd))
+        .sum();
+    assert_eq!(returned_coin + burned, initial_coin);
+    assert_eq!(paid_usd, spent);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+}
+
 // PUBLIC DOS: skipping an integer-infeasible marginal candidate is insufficient when Sybils fill
 // every slot with that rate. A lower executable bid cannot evict any of them, and a no-purchase
 // roll would preserve all 32 commitments forever. Once the round has aged, execute must make every
