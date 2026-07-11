@@ -5759,11 +5759,12 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
-// PUBLIC LOF: donating marketauth must not silently donate creator-funded insurance.
-// The controller may grant empty asset-0 custody to the canonical genesis pool, but it
-// cannot rotate a nonzero external insurance balance away from its recorded authority.
+// PUBLIC DOS: donating marketauth must neither absorb creator-funded insurance nor leave it
+// dependent on the creator after a public stale resolution. The controller may grant empty
+// asset-0 custody to the canonical genesis pool, but it cannot rotate a nonzero external balance
+// into pool custody; terminal cleanup must instead return it to the recorded provider.
 #[test]
-fn e2e_market_donation_preserves_creator_insurance_until_owner_exit() {
+fn e2e_market_donation_preserves_and_terminally_returns_creator_insurance() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -5780,6 +5781,7 @@ fn e2e_market_donation_preserves_creator_insurance_until_owner_exit() {
     let creator = Keypair::new();
     svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
     let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
     let slab = Pubkey::new_unique();
@@ -5907,38 +5909,300 @@ fn e2e_market_donation_preserves_creator_insurance_until_owner_exit() {
     assert_eq!(svm.get_account(&slab).unwrap(), market_before_grant);
     assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
 
-    let withdraw = Instruction {
-        program_id: perc_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(creator.pubkey(), true),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(creator_token, false),
-            AccountMeta::new(percolator_vault, false),
-            AccountMeta::new_readonly(vault_authority, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
-            asset_index: 0,
-            amount: insurance_amount as u128,
+    let mut stale_config_data = vec![0u8]; // IX_PROXY_ADMIN
+    stale_config_data.extend_from_slice(
+        &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 1,
+            force_close_delay_slots: 1,
         }
         .encode(),
-    };
-    send(&mut svm, &[&payer, &creator], withdraw)
-        .expect("recorded creator recovers insurance after donating lifecycle control");
-    assert_eq!(token_amount(&svm, &creator_token), insurance_amount);
-    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: stale_config_data,
+        },
+    )
+    .expect("governance enables the public stale resolver");
+    svm.set_sysvar(&Clock {
+        slot: 102,
+        unix_timestamp: 102,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(slab, false)],
+            data: percolator_prog::ix::Instruction::ResolveStalePermissionless { now_slot: 102 }
+                .encode(),
+        },
+    )
+    .expect("an unaffiliated cranker resolves the donated market");
 
-    send(&mut svm, &[&payer, &governance], grant)
-        .expect("empty insurance custody can progress to the canonical genesis pool");
-    let granted_market = svm.get_account(&slab).unwrap();
-    assert_eq!(
-        percolator_accounting::read_asset_insurance_authority(&granted_market.data, 0).unwrap(),
-        pool.to_bytes()
+    let creator_destination = canonical_insurance_vault(&creator.pubkey(), &collateral_mint);
+    set_token(
+        &mut svm,
+        &creator_destination,
+        &collateral_mint,
+        &creator.pubkey(),
+        0,
     );
-    assert_eq!(
-        percolator_accounting::read_asset_insurance_operator(&granted_market.data, 0).unwrap(),
-        pool.to_bytes()
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
     );
+    let insurance_ledger = Pubkey::new_unique();
+    svm.set_account(
+        insurance_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::insurance_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    send(
+        &mut svm,
+        &[&payer],
+        controller_return_resolved_asset_insurance_ix(
+            &governance.pubkey(),
+            &controller,
+            &slab,
+            &creator_destination,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &insurance_ledger,
+            &perc_id(),
+            0,
+        ),
+    )
+    .expect("public terminal cleanup returns external asset-0 insurance to its provider");
+    assert_eq!(token_amount(&svm, &creator_destination), insurance_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        controller.to_bytes(),
+        "the value role moves only after its complete provider-bound return"
+    );
+
+    // The provider return closes an empty transit account. Recreating that canonical ATA is
+    // permissionless and lets CloseSlab receive any raw terminal vault dust before reclaim.
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    svm.set_account(
+        controller,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new(governance.pubkey(), true),
+                AccountMeta::new(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new(controller_transit, false),
+                AccountMeta::new(governance_destination, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
+        },
+    )
+    .expect("external provider return unblocks terminal market cleanup");
+    assert!(
+        svm.get_account(&slab)
+            .map_or(true, |account| account.lamports == 0),
+        "the resolved slab closes after its provider is paid"
+    );
+}
+
+// A funded donation is recoverable only if the handoff also leaves the controller as asset_admin.
+// Otherwise an absent delegated admin can prevent the controller from rotating the external value
+// role after stale resolution, making one provider balance a permanent CloseSlab gate.
+#[test]
+fn e2e_funded_market_donation_rejects_a_delegated_asset0_admin() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let delegated_admin = Keypair::new();
+    svm.airdrop(&delegated_admin.pubkey(), 1_000_000_000)
+        .unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    send(
+        &mut svm,
+        &[&payer, &creator, &delegated_admin],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(delegated_admin.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            data: percolator_prog::ix::Instruction::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 0,
+                new_pubkey: delegated_admin.pubkey().to_bytes(),
+            }
+            .encode(),
+        },
+    )
+    .expect("creator delegates the asset admin before funding");
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let insurance_amount = 17u64;
+    let creator_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &creator_token,
+        &collateral_mint,
+        &creator.pubkey(),
+        insurance_amount,
+    );
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(creator_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+                domain: 0,
+                amount: insurance_amount as u128,
+            }
+            .encode(),
+        },
+    )
+    .expect("creator funds insurance while retaining its value roles");
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let market_before = svm.get_account(&slab).unwrap();
+    let vault_before = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance, false),
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+            },
+        )
+        .is_err(),
+        "funded custody cannot be handed off without its terminal rotation key"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), vault_before);
+
+    let creator_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &creator_destination,
+        &collateral_mint,
+        &creator.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(creator_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: insurance_amount as u128,
+            }
+            .encode(),
+        },
+    )
+    .expect("rejected handoff leaves the original provider withdrawal live");
+    assert_eq!(token_amount(&svm, &creator_destination), insurance_amount);
 }
 
 // PUBLIC LOF: secondary-asset activation names the deposit authority and withdrawal operator
