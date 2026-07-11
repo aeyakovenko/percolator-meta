@@ -34564,8 +34564,9 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     assert_eq!(token_amount(&svm, &deposit_source), 0);
     assert_eq!(token_amount(&svm, &owner_destination), 0);
 
-    // Freeze a one-staker capital reward before terminal cleanup. Permissionless
-    // principal return must not erase this already-earned reward for an absent owner.
+    // Register a one-staker capital reward before terminal cleanup, but leave it
+    // uncrystallized. Permissionless principal return must preserve the reward
+    // earned through the return slot without aging capital after it has exited.
     let reward_supply = 10_000u64;
     let reward_authority = Keypair::new();
     let reward_mint = create_real_mint(&mut svm, &payer, &reward_authority.pubkey());
@@ -34598,7 +34599,7 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     )
     .expect("fund terminal-return reward epoch");
     let reward_start = svm.get_sysvar::<Clock>().slot;
-    let reward_end = reward_start + 8;
+    let reward_end = TEST_BOOTSTRAP_START_SLOT + TEST_BOOTSTRAP_DELAY_SLOTS + 8;
     send(
         &mut svm,
         &[&payer, &reward_authority],
@@ -34691,18 +34692,6 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
         },
     )
     .expect("sole depositor votes and locks the atom");
-    send(
-        &mut svm,
-        &[&payer, &absent_voter],
-        rd_crystallize_ix(
-            &absent_voter.pubkey(),
-            &reward_config,
-            &absent_voter.pubkey(),
-            &position,
-            0,
-        ),
-    )
-    .expect("owner crystallizes the one-unit capital reward at epoch end");
     advance_to_test_bootstrap_end(&mut svm);
     send(
         &mut svm,
@@ -34722,17 +34711,6 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
         },
     )
     .expect("permissionless trigger seals the complete supply");
-    send(
-        &mut svm,
-        &[&payer],
-        rd_freeze_ix(
-            &payer.pubkey(),
-            &reward_config,
-            &reward_mint,
-            &reward_vault,
-        ),
-    )
-    .expect("freeze the capital reward before terminal cleanup");
     assert_eq!(svm.get_account(&winner).unwrap().data[96], 1);
     assert_eq!(svm.get_account(&position).unwrap().data[97], 1);
 
@@ -34893,6 +34871,73 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     assert_eq!(retired.data[97], 0);
     assert_eq!(retired.data[98], 1);
     assert_eq!(u128::from_le_bytes(retired.data[104..120].try_into().unwrap()), 0);
+    let terminal_return_slot = svm.get_sysvar::<Clock>().slot;
+    assert_eq!(terminal_return_slot, TEST_BOOTSTRAP_DELAY_SLOTS);
+    let mut encoded_return_slot = [0u8; 8];
+    encoded_return_slot[..5].copy_from_slice(&retired.data[99..104]);
+    assert_eq!(
+        u64::from_le_bytes(encoded_return_slot).checked_sub(1),
+        Some(terminal_return_slot),
+        "the subledger authenticates when permissionless cleanup removed capital"
+    );
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = reward_end;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        rd_crystallize_ix(
+            &absent_voter.pubkey(),
+            &reward_config,
+            &absent_voter.pubkey(),
+            &position,
+            0,
+        ),
+    )
+    .expect("owner crystallizes after permissionless terminal cleanup");
+    let reward_stake = svm
+        .get_account(&rd_stake_pda(
+            &reward_config,
+            &absent_voter.pubkey(),
+            &position,
+            0,
+        ))
+        .unwrap();
+    let position_start_slot =
+        u64::from_le_bytes(retired.data[89..97].try_into().unwrap());
+    let reward_tenure = terminal_return_slot
+        .saturating_sub(core::cmp::max(reward_start, position_start_slot));
+    let expected_points = if reward_tenure < 2 {
+        0
+    } else {
+        (63 - reward_tenure.leading_zeros()) as u128
+    };
+    assert!(expected_points > 0, "the probe must exercise an earned reward");
+    assert_eq!(
+        u128::from_le_bytes(reward_stake.data[176..192].try_into().unwrap()),
+        expected_points,
+        "one unit earns only through the terminal return slot"
+    );
+    assert_eq!(
+        u128::from_le_bytes(reward_stake.data[194..210].try_into().unwrap()),
+        terminal_return_slot as u128,
+        "delayed crystallization cannot age capital after terminal return"
+    );
+
+    clock.slot = reward_end + 1;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        rd_freeze_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &reward_mint,
+            &reward_vault,
+        ),
+    )
+    .expect("freeze the capital reward after delayed crystallization");
     send(
         &mut svm,
         &[&payer, &absent_voter],
@@ -34910,7 +34955,7 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     assert_eq!(
         token_amount(&svm, &reward_destination),
         reward_supply,
-        "terminal cleanup cannot erase the absent depositor's frozen capital reward"
+        "terminal cleanup cannot erase the depositor's uncrystallized capital reward"
     );
 
     let governance_destination = Pubkey::new_unique();

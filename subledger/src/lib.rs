@@ -95,6 +95,7 @@ pub const POS_WITHDRAWN_AMOUNT_OFF: usize = 80;
 pub const POS_WITHDRAWN_OFF: usize = 88;
 pub const POS_START_SLOT_OFF: usize = 89;
 pub const POS_TERMINAL_RETURNED_OFF: usize = 98;
+pub const POS_TERMINAL_RETURN_SLOT_OFF: usize = 99;
 pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) — the share-value points source.
                                        // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
                                        // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
@@ -111,6 +112,9 @@ const POLICY_WITH_SURPLUS: u8 = 1;
 // vote bond; backing (asset 0) and assets 1..N run with-surplus.
 const DOMAIN_INSURANCE: u8 = 0;
 const DOMAIN_BACKING: u8 = 1;
+
+const U40_MAX: u64 = (1u64 << 40) - 1;
+const MAX_TERMINAL_RETURN_SLOT: u64 = U40_MAX - 1;
 
 // The SPL Associated Token Account program. Percolator pins each market vault to
 // the single CANONICAL ATA of (vault_authority, mint) — its finding F-VAULT-FRAG.
@@ -575,8 +579,12 @@ struct Position {
     vote_locked: bool,
     /// A permissionless finalized-genesis return consumed the position. In this
     /// state `withdrawn_amount` stores the principal still at risk immediately
-    /// before that return, so a cranker cannot erase an already-frozen reward.
+    /// before that return, so a cranker cannot erase its capital reward.
     terminal_returned: bool,
+    /// Slot when the permissionless terminal return removed the principal. The
+    /// current layout stores `slot + 1` as a five-byte little-endian integer;
+    /// zero remains the legacy/no-snapshot sentinel.
+    terminal_return_slot: Option<u64>,
     /// Shares held for share-value accounting. Insurance deposits mint priced
     /// shares for both payout policies so residual-distributor live caps track
     /// remaining capital; own-vault POLICY_PRINCIPAL deposits keep this at 0.
@@ -599,9 +607,19 @@ impl Position {
         } else {
             0
         };
+        let terminal_return_slot = if data.len() >= POSITION_SIZE {
+            let mut encoded = [0u8; 8];
+            encoded[..5].copy_from_slice(
+                &data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5],
+            );
+            u64::from_le_bytes(encoded).checked_sub(1)
+        } else {
+            None
+        };
         if withdrawn > 1
             || vote_locked > 1
             || terminal_returned > 1
+            || (terminal_returned == 0 && terminal_return_slot.is_some())
             || (terminal_returned == 1
                 && (withdrawn != 1 || u64::from_le_bytes(data[72..80].try_into().unwrap()) != 0))
         {
@@ -620,6 +638,7 @@ impl Position {
             },
             vote_locked: vote_locked == 1,
             terminal_returned: terminal_returned == 1,
+            terminal_return_slot,
             shares: if data.len() >= POSITION_SIZE {
                 u128::from_le_bytes(data[104..120].try_into().unwrap())
             } else {
@@ -645,7 +664,18 @@ impl Position {
             data[97] = self.vote_locked as u8;
             if data.len() >= POSITION_SIZE {
                 data[POS_TERMINAL_RETURNED_OFF] = self.terminal_returned as u8;
-                data[99..104].fill(0);
+                if !self.terminal_returned && self.terminal_return_slot.is_some() {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                let encoded_slot = match self.terminal_return_slot {
+                    Some(slot) => slot
+                        .checked_add(1)
+                        .filter(|encoded| *encoded <= U40_MAX)
+                        .ok_or(ProgramError::InvalidAccountData)?,
+                    None => 0,
+                };
+                data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5]
+                    .copy_from_slice(&encoded_slot.to_le_bytes()[..5]);
                 data[104..120].copy_from_slice(&self.shares.to_le_bytes());
             } else {
                 data[98..104].fill(0);
@@ -1074,6 +1104,7 @@ fn process_deposit(
             start_slot: 0,
             vote_locked: false,
             terminal_returned: false,
+            terminal_return_slot: None,
             shares: 0,
         }
     } else {
@@ -1625,6 +1656,7 @@ fn process_insurance_deposit(
             start_slot: 0,
             vote_locked: false,
             terminal_returned: false,
+            terminal_return_slot: None,
             shares: 0,
         }
     } else {
@@ -2054,6 +2086,10 @@ fn process_insurance_withdraw_impl(
             // governance effect; do not leave a stale lock on retired capital.
             position.vote_locked = false;
             position.terminal_returned = true;
+            position.terminal_return_slot = Some(core::cmp::min(
+                Clock::get()?.slot,
+                MAX_TERMINAL_RETURN_SLOT,
+            ));
         }
     }
 
@@ -2455,6 +2491,7 @@ mod tests {
             start_slot: 0x0102_0304_0506_0708,
             vote_locked: false,
             terminal_returned: false,
+            terminal_return_slot: None,
             shares: 0,
         };
         let mut d = vec![0u8; POSITION_SIZE];
@@ -2488,10 +2525,16 @@ mod tests {
             start_slot: 55,
             vote_locked: false,
             terminal_returned: true,
+            terminal_return_slot: Some(66),
             shares: 0,
         };
         terminal.serialize(&mut d).unwrap();
         assert_eq!(d[POS_TERMINAL_RETURNED_OFF], 1);
+        let mut encoded_slot = [0u8; 8];
+        encoded_slot[..5].copy_from_slice(
+            &d[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5],
+        );
+        assert_eq!(u64::from_le_bytes(encoded_slot), 67);
         assert_eq!(
             u64::from_le_bytes(
                 d[POS_WITHDRAWN_AMOUNT_OFF..POS_WITHDRAWN_AMOUNT_OFF + 8]
@@ -2500,7 +2543,9 @@ mod tests {
             ),
             77
         );
-        assert!(Position::deserialize(&d).unwrap().terminal_returned);
+        let decoded = Position::deserialize(&d).unwrap();
+        assert!(decoded.terminal_returned);
+        assert_eq!(decoded.terminal_return_slot, Some(66));
         d[POS_PRINCIPAL_OFF..POS_PRINCIPAL_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
         assert!(Position::deserialize(&d).is_err());
     }
@@ -2660,6 +2705,7 @@ mod tests {
             start_slot: 4242,
             vote_locked: true,
             terminal_returned: false,
+            terminal_return_slot: None,
             shares: 5_555,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
@@ -2770,6 +2816,7 @@ mod tests {
             start_slot: 99,
             vote_locked: true,
             terminal_returned: false,
+            terminal_return_slot: None,
             shares: 777,
         };
         for size in [POSITION_SIZE_BASE, POSITION_SIZE_TENURE, POSITION_SIZE] {

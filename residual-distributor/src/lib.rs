@@ -230,10 +230,19 @@ pub const SUB_POS_WITHDRAWN_AMOUNT: usize = 80;
 pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
 pub const SUB_POS_TERMINAL_RETURNED: usize = 98;
+pub const SUB_POS_TERMINAL_RETURN_SLOT: usize = 99;
 
 fn validate_subledger_position(data: &[u8]) -> ProgramResult {
     let withdrawn = data.get(SUB_POS_WITHDRAWN).copied().unwrap_or(2);
     let terminal_returned = data.get(SUB_POS_TERMINAL_RETURNED).copied().unwrap_or(0);
+    let terminal_return_slot_encoded = data
+        .get(SUB_POS_TERMINAL_RETURN_SLOT..SUB_POS_TERMINAL_RETURN_SLOT + 5)
+        .map(|bytes| {
+            let mut encoded = [0u8; 8];
+            encoded[..5].copy_from_slice(bytes);
+            u64::from_le_bytes(encoded)
+        })
+        .unwrap_or(0);
     let principal = data
         .get(SUB_POS_PRINCIPAL..SUB_POS_PRINCIPAL + 8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
@@ -241,6 +250,7 @@ fn validate_subledger_position(data: &[u8]) -> ProgramResult {
     if data.get(..8) != Some(SUB_POSITION_DISC.as_slice())
         || withdrawn > 1
         || terminal_returned > 1
+        || (terminal_returned == 0 && terminal_return_slot_encoded != 0)
         || (terminal_returned == 1 && (withdrawn != 1 || principal != 0))
     {
         return Err(ProgramError::InvalidAccountData);
@@ -263,7 +273,9 @@ pub fn read_subledger_principal(data: &[u8]) -> Result<(u128, bool), ProgramErro
     Ok((principal, withdrawn))
 }
 
-fn read_terminal_return_principal(data: &[u8]) -> Result<Option<u128>, ProgramError> {
+fn read_terminal_return_snapshot(
+    data: &[u8],
+) -> Result<Option<(u128, Option<u64>)>, ProgramError> {
     validate_subledger_position(data)?;
     if data.get(SUB_POS_TERMINAL_RETURNED).copied() != Some(1) {
         return Ok(None);
@@ -277,7 +289,13 @@ fn read_terminal_return_principal(data: &[u8]) -> Result<Option<u128>, ProgramEr
     if principal == 0 {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(Some(principal as u128))
+    let mut encoded = [0u8; 8];
+    encoded[..5].copy_from_slice(
+        data.get(SUB_POS_TERMINAL_RETURN_SLOT..SUB_POS_TERMINAL_RETURN_SLOT + 5)
+            .ok_or(ProgramError::AccountDataTooSmall)?,
+    );
+    let return_slot = u64::from_le_bytes(encoded).checked_sub(1);
+    Ok(Some((principal as u128, return_slot)))
 }
 
 /// The subledger resets this clock whenever capital is added to the position. Reward tenure must
@@ -1499,11 +1517,21 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             }
             let data = backing_ledger.try_borrow_data()?;
             let (principal, withdrawn) = read_subledger_principal(&data)?;
-            let live_principal = capital_points(principal, withdrawn);
             let position_start_slot = read_subledger_start_slot(&data)?;
             let now = Clock::get()?.slot;
+            let (live_principal, crystallized_slot) =
+                match read_terminal_return_snapshot(&data)? {
+                    Some((terminal_principal, Some(return_slot))) => {
+                        (terminal_principal, core::cmp::min(now, return_slot))
+                    }
+                    // Historical terminal snapshots predate the return-slot field.
+                    // Preserve their already-crystallized claim cap, but do not
+                    // guess a tenure and inflate a newly crystallized reward.
+                    Some((_terminal_principal, None)) => (0, now),
+                    None => (capital_points(principal, withdrawn), now),
+                };
             let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
-            let multiplier = floor_log2(now.saturating_sub(effective_start));
+            let multiplier = floor_log2(crystallized_slot.saturating_sub(effective_start));
             let new_pts = multiplier.saturating_mul(live_principal);
             replace_cohort_points(
                 config.cohort_points_mut(stake.cohort),
@@ -1512,7 +1540,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             )?;
             stake.points = new_pts;
             stake.earnings_snap = live_principal;
-            stake.eligible_accum = now as u128;
+            stake.eligible_accum = crystallized_slot as u128;
         }
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
@@ -1813,7 +1841,8 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // principal remaining immediately before that fixed full return. This is
             // still capped by the crystallized principal below, and any earlier
             // voluntary partial withdrawal remains excluded.
-            let live_principal = read_terminal_return_principal(&data)?
+            let live_principal = read_terminal_return_snapshot(&data)?
+                .map(|(principal, _return_slot)| principal)
                 .unwrap_or_else(|| capital_points(principal, withdrawn));
             let position_start_slot = read_subledger_start_slot(&data)?;
             let crystallized_slot = u64::try_from(stake.eligible_accum)
