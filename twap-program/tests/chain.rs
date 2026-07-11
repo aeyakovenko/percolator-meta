@@ -25303,6 +25303,229 @@ fn e2e_uniform_repricing_uses_a_safe_interior_price_lot() {
     let _ = (target, marginal);
 }
 
+// PUBLIC DOS PROBE: the simplest interior fraction and its two parent rays do not span every
+// denominator-bounded safe pair. Ten better bids release ten USD at the final 3/4 price. The
+// skipped 11/14 bid can safely sell 7 COIN for 9 USD, but endpoint/ray-only reconciliation stops
+// at 6/8 and strands an additional spendable unit in the holding account.
+#[test]
+fn e2e_uniform_repricing_finds_a_safe_off_ray_interior_lot() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        34,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            34,
+        )
+        .unwrap(),
+    )
+    .expect("fund exact 34-unit budget");
+
+    // Each 3/3 bid consumes three nominal USD, then sells 2 COIN for 2 USD at the final
+    // 3/4 marginal. Their ten released units are the target's reconciliation budget.
+    let mut better = Vec::new();
+    for _ in 0..10 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 3);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                3,
+                3,
+                None,
+            ),
+        )
+        .expect("place better-rate remainder bid");
+        better.push((bidder, coin, usd));
+    }
+
+    // Four nominal USD remain, so this 11/14 bid has no safe whole pair during preflight.
+    // Once the better bids release ten USD, 7/9 is inside [3/4, 11/14] and is the largest
+    // spend by USD. It is not on a ray from the interval's simplest 3/4 fraction.
+    let (target, target_coin, target_usd) = new_bidder(&mut svm, &payer, &env, 11);
+    send(
+        &mut svm,
+        &[&target],
+        place_bid_ix(
+            &target.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &target_coin,
+            &target_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            11,
+            14,
+            None,
+        ),
+    )
+    .expect("place skipped off-ray target");
+
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 3);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            3,
+            4,
+            None,
+        ),
+    )
+    .expect("place final marginal bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute off-ray interior probe");
+
+    assert_eq!(
+        token_amount(&svm, &bk.settlement_usd),
+        33,
+        "the safe 7/9 target lot must consume its ninth USD"
+    );
+    assert_eq!(supply_before - mint_supply(&svm, &env.coin_mint), 30);
+    assert_eq!(token_amount(&svm, &bk.holding), 1);
+
+    for (slot, (_, coin, usd)) in better.iter().enumerate() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                usd,
+                coin,
+                slot as u8,
+            ),
+        )
+        .expect("claim better-rate bid");
+        assert_eq!(token_amount(&svm, coin), 1);
+        assert_eq!(token_amount(&svm, usd), 2);
+    }
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &target_usd,
+            &target_coin,
+            10,
+        ),
+    )
+    .expect("claim off-ray target");
+    assert_eq!(token_amount(&svm, &target_coin), 4);
+    assert_eq!(token_amount(&svm, &target_usd), 9);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            11,
+        ),
+    )
+    .expect("claim marginal bid");
+    assert_eq!(token_amount(&svm, &marginal_coin), 0);
+    assert_eq!(token_amount(&svm, &marginal_usd), 4);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (target, marginal);
+}
+
 // PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
 // when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
 // reconciliation, but a lower-ranked executable bid never receives an allocation; because a

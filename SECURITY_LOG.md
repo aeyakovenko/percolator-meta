@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - parent-ray reconciliation could miss a safe off-ray integer lot (surface C)
+
+The bounded continued-fraction fallback checked the simplest marginal-to-bid fraction and its two
+Stern-Brocot parent rays, but those rays do not span every denominator class in the interval. Ten
+public `3 COIN / 3 USD` bids followed by `11 / 14` and final-marginal `3 / 4` bids made the previous
+binary settle only 32 units of an exact 34-unit reward budget and burn 29 COIN. Uniform repricing
+released ten USD, and the skipped `11 / 14` bid could safely sell `7 COIN / 9 USD`; the old `6 / 8`
+ray candidate stranded one additional spendable unit. This suppressed point buyback and burn only;
+it could not cross custody floors, redirect escrow, or debit insurance, backing, or bidder principal.
+
+The retained pinned-Percolator + TWAP LiteSVM regression proves the fixed path settles 33 units,
+burns 30 COIN, leaves only one unit after every eligible deposited COIN atom has been considered,
+pays all twelve owner-bound bidder accounts exactly, and drains both shared auction escrows to zero.
+An exhaustive unit regression compares the maximum spend for every valid narrow-excess
+configuration with rate legs up to 12 and budgets up to 16 against brute force. The existing
+32-slot Fibonacci probes continue to pass their 650,000-CU and 1.2M-CU liveness gates.
+
+FIX: for reduced interval `a/b <= x/q <= c/d`, reconciliation bounds the lattice excess
+`r = b*x - a*q` by `(b*c - a*d)*max_usd/d`. Small bounds are solved exactly by enumerating at most
+eight excess classes; the upper Stern-Brocot parent of `a/b` maps each class directly to its largest
+budget-safe denominator. Larger bounds retain a descending 128-step projection with the established
+safe endpoint/continued-fraction result as fallback. The globally maximal rounded candidate remains
+the common constant-work path. No signer, authority, recipient, reserve, custody, principal,
+withdrawal, or admin surface was added.
+
 ## Tick - market donation could preserve funded split insurance custody (surface A/C)
 
 Percolator lets asset 0 name separate insurance deposit and withdrawal keys. Secondary activation

@@ -2357,9 +2357,11 @@ fn consider_larger_pair(
 // Maximum practical integer pair for one bid under an already-selected marginal price and
 // an actual remaining USD budget. The first candidate is the largest COIN amount whose floored
 // marginal-price USD leg fits. If flooring crosses the bidder's limit, fall back to exact reduced
-// lots at both endpoints and bounded interior continued-fraction candidates. Every candidate is
-// bidder-safe because it stays between the selected marginal and bid rates. All public bid legs are
-// u64-bounded, so the products fit in u128, and the caller supplies GCDs for the endpoint ratios.
+// lots at both endpoints and bounded interior lattice candidates. Every candidate is bidder-safe
+// because it stays between the selected marginal and bid rates. All public bid legs are u64-bounded,
+// so the products fit in u128, and the caller supplies GCDs for the endpoint ratios.
+const MAX_EXCESS_RESIDUES: u128 = 8;
+
 fn max_executable_integer_pair(
     remaining_usd: u128,
     marginal_coin: u128,
@@ -2398,10 +2400,28 @@ fn max_executable_integer_pair(
         Ok(Some((coin, usd)))
     };
 
+    // Preserve the common constant-work path: candidate_coin is already the largest numerator
+    // whose marginal-price floor fits the budget, so a bidder-safe result cannot be improved.
     if let Some(pair) = try_coin(candidate_coin)? {
         return Ok(Some(pair));
     }
 
+    // Project through denominators produced by flooring at the marginal rate. At a fixed USD
+    // denominator, cap the numerator by both the bidder's limit and the largest COIN amount whose
+    // marginal-price floor does not exceed that denominator. If this maximum misses the marginal
+    // floor, no smaller numerator can work there; floor(coin*marginal_usd/marginal_coin) is then the
+    // largest denominator that numerator can support. Each step therefore skips only impossible
+    // denominators, while the caller's hard cap bounds the number of steps.
+    let projected_coin_for_usd = |usd: u128| -> Result<u128, ProgramError> {
+        let bidder_cap = mul_div_floor(bid_coin, usd, bid_usd)?;
+        let marginal_cap = usd
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(marginal_coin))
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / marginal_usd;
+        Ok(core::cmp::min(bidder_cap, marginal_cap))
+    };
     if bid_gcd == 0 || marginal_gcd == 0 {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -2435,6 +2455,87 @@ fn max_executable_integer_pair(
         .ok_or(ProgramError::ArithmeticOverflow)?;
     if interval_determinant == 0 {
         return Ok(best);
+    }
+    // For a reduced candidate x/q above marginal a/b, let r = b*x - a*q. Bidder safety against
+    // c/d requires d*r <= (b*c - a*d)*q, so every feasible r is bounded by determinant*max_usd/d.
+    // When that bound is small, enumerate residue classes instead of descending one denominator at
+    // a time. The upper Stern-Brocot parent p/s of a/b has b*p-a*s=1, hence every denominator for
+    // excess r is congruent to r*s mod b. The largest budget-safe member of each class dominates
+    // every smaller member, making this branch exact and cheap for narrow public intervals.
+    if let Some(determinant_budget) = interval_determinant.checked_mul(max_usd) {
+        let max_excess = determinant_budget / reduced_usd_lot;
+        if max_excess <= MAX_EXCESS_RESIDUES {
+            if max_excess > 0 {
+                // For an integer marginal a/1, 1/0 is the omitted upper Stern-Brocot parent and
+                // correctly places every excess in the sole denominator congruence class.
+                let (parent_coin, parent_usd) = if marginal_usd_lot == 1 {
+                    (1, 0)
+                } else {
+                    let marginal_basis = simplest_interval_fraction(
+                        marginal_coin_lot as u64,
+                        marginal_usd_lot as u64,
+                        marginal_coin_lot as u64,
+                        marginal_usd_lot as u64,
+                    )?;
+                    marginal_basis
+                        .right_parent
+                        .ok_or(ProgramError::InvalidAccountData)?
+                };
+                if marginal_usd_lot
+                    .checked_mul(parent_coin)
+                    .and_then(|value| {
+                        value.checked_sub(marginal_coin_lot * parent_usd)
+                    })
+                    != Some(1)
+                {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                for excess in 1..=max_excess {
+                    let coin_capacity = marginal_usd_lot
+                        .checked_mul(candidate_coin)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    if coin_capacity < excess {
+                        continue;
+                    }
+                    let denominator_limit = core::cmp::min(
+                        max_usd,
+                        (coin_capacity - excess) / marginal_coin_lot,
+                    );
+                    let class = excess
+                        .checked_mul(parent_usd)
+                        .ok_or(ProgramError::ArithmeticOverflow)?
+                        % marginal_usd_lot;
+                    let denominator = if class == 0 {
+                        (denominator_limit / marginal_usd_lot) * marginal_usd_lot
+                    } else if class <= denominator_limit {
+                        class
+                            + ((denominator_limit - class) / marginal_usd_lot)
+                                * marginal_usd_lot
+                    } else {
+                        0
+                    };
+                    if denominator == 0
+                        || best.is_some_and(|pair| denominator <= pair.1)
+                        || reduced_usd_lot
+                            .checked_mul(excess)
+                            .ok_or(ProgramError::ArithmeticOverflow)?
+                            > interval_determinant
+                                .checked_mul(denominator)
+                                .ok_or(ProgramError::ArithmeticOverflow)?
+                    {
+                        continue;
+                    }
+                    let coin = marginal_coin_lot
+                        .checked_mul(denominator)
+                        .and_then(|value| value.checked_add(excess))
+                        .ok_or(ProgramError::ArithmeticOverflow)?
+                        / marginal_usd_lot;
+                    consider_larger_pair(&mut best, try_coin(coin)?);
+                }
+            }
+            return Ok(best);
+        }
     }
     let endpoint_den_sum = marginal_usd_lot
         .checked_add(reduced_usd_lot)
@@ -2519,6 +2620,36 @@ fn max_executable_integer_pair(
                 .ok_or(ProgramError::ArithmeticOverflow)?;
             consider_larger_pair(&mut best, try_coin(ray_coin)?);
         }
+    }
+
+    // The endpoint and continued-fraction candidates above seed a close lower bound before the
+    // denominator projection. Once the descending projection reaches that denominator it
+    // cannot improve the result, which keeps a full public book compute-bounded. The hard cap is a
+    // final liveness guard; reaching it retains the established safe fallback instead of failing
+    // otherwise executable auctions.
+    let mut projected_usd = max_usd;
+    for _ in 0..128 {
+        if projected_usd == 0 || best.is_some_and(|pair| projected_usd <= pair.1) {
+            break;
+        }
+        let coin = projected_coin_for_usd(projected_usd)?;
+        if coin == 0 {
+            break;
+        }
+        if coin
+            .checked_mul(marginal_usd)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            >= marginal_coin
+                .checked_mul(projected_usd)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+        {
+            return Ok(Some((coin, projected_usd)));
+        }
+        let next_usd = mul_div_floor(coin, marginal_usd, marginal_coin)?;
+        if next_usd >= projected_usd {
+            break;
+        }
+        projected_usd = next_usd;
     }
     Ok(best)
 }
@@ -4045,6 +4176,71 @@ mod tests {
 
         assert!(simplest_interval_fraction(3, 2, 4, 3).is_err());
         assert!(simplest_interval_fraction(1, 0, 2, 1).is_err());
+    }
+
+    #[test]
+    fn narrow_excess_solver_matches_exhaustive_maximum_spend() {
+        for marginal_coin in 1u128..=12 {
+            for marginal_usd in 1u128..=12 {
+                let marginal_gcd = gcd_u64(marginal_coin as u64, marginal_usd as u64);
+                let marginal_coin_lot = marginal_coin / marginal_gcd as u128;
+                let marginal_usd_lot = marginal_usd / marginal_gcd as u128;
+
+                for bid_coin in 1u128..=12 {
+                    for bid_usd in 1u128..=12 {
+                        if cmp_bid(
+                            marginal_coin,
+                            marginal_usd,
+                            bid_coin,
+                            bid_usd,
+                        ) == core::cmp::Ordering::Greater
+                        {
+                            continue;
+                        }
+                        let bid_gcd = gcd_u64(bid_coin as u64, bid_usd as u64);
+                        let bid_coin_lot = bid_coin / bid_gcd as u128;
+                        let bid_usd_lot = bid_usd / bid_gcd as u128;
+                        let determinant = bid_coin_lot * marginal_usd_lot
+                            - marginal_coin_lot * bid_usd_lot;
+
+                        for remaining_usd in 1u128..=16 {
+                            let max_usd = core::cmp::min(remaining_usd, bid_usd);
+                            if determinant * max_usd / bid_usd_lot > MAX_EXCESS_RESIDUES {
+                                continue;
+                            }
+
+                            let actual = max_executable_integer_pair(
+                                remaining_usd,
+                                marginal_coin,
+                                marginal_usd,
+                                bid_coin,
+                                bid_usd,
+                                bid_gcd,
+                                marginal_gcd,
+                            )
+                            .unwrap();
+                            let mut expected = None;
+                            for coin in 1..=bid_coin {
+                                let usd = coin * marginal_usd / marginal_coin;
+                                if usd == 0
+                                    || usd > max_usd
+                                    || cmp_bid(coin, usd, bid_coin, bid_usd)
+                                        == core::cmp::Ordering::Greater
+                                {
+                                    continue;
+                                }
+                                consider_larger_pair(&mut expected, Some((coin, usd)));
+                            }
+                            assert_eq!(
+                                actual.map(|pair| pair.1),
+                                expected.map(|pair| pair.1),
+                                "marginal={marginal_coin}/{marginal_usd}, bid={bid_coin}/{bid_usd}, remaining={remaining_usd}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
