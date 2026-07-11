@@ -1352,14 +1352,17 @@ fn process_return_to_subledger(
 }
 
 // return_resolved_protocol_insurance accounts:
-// [config, twap_authority, custody_pool_or_system, market(w), twap_canonical_ata(w),
-//  controller_canonical_ata(w), percolator_vault(w), vault_authority,
+// [config, twap_authority, custody_pool_or_system, market(w), twap_transit(w),
+//  controller_transit(w), percolator_vault(w), vault_authority,
 //  percolator_program, subledger_program, token_program]
 //
 // Once the market is resolved and the bound principal pool attests that every
 // owner claim is gone, the monotonic retained floor is protocol insurance rather
-// than user principal. Anyone may move the exact remaining asset-0 balance into
-// the controller's canonical ATA, where the existing terminal close forwards it.
+// than user principal. Anyone may move the exact remaining asset-0 balance through
+// clean accounts owned by the TWAP and controller PDAs, where terminal close
+// forwards it. Requiring an empty TWAP transit prevents this public path from
+// sweeping an unrelated TWAP balance, while replaceable accounts prevent a
+// permanently frozen canonical ATA from blocking terminal cleanup.
 fn process_return_resolved_protocol_insurance(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1488,11 +1491,10 @@ fn process_return_resolved_protocol_insurance(
         spl_token::state::Account::unpack(&controller_transit.try_borrow_data()?)?;
     if twap_state.state != spl_token::state::AccountState::Initialized
         || controller_state.state != spl_token::state::AccountState::Initialized
-        || *twap_transit.key != canonical_token_account(twap_authority.key, &twap_state.mint)
-        || *controller_transit.key != canonical_token_account(&controller, &twap_state.mint)
         || twap_state.owner != *twap_authority.key
         || controller_state.owner != controller
         || twap_state.mint != controller_state.mint
+        || twap_state.amount != 0
         || twap_state.delegate.is_some()
         || twap_state.delegated_amount != 0
         || twap_state.close_authority.is_some()
@@ -1531,9 +1533,9 @@ fn process_return_resolved_protocol_insurance(
         &[&auth_seeds],
     )?;
 
-    let complete_transit_amount =
+    let returned_amount =
         spl_token::state::Account::unpack(&twap_transit.try_borrow_data()?)?.amount;
-    if complete_transit_amount < amount_u64 {
+    if returned_amount != amount_u64 {
         return Err(ProgramError::InvalidAccountData);
     }
     spl_transfer(
@@ -1541,7 +1543,7 @@ fn process_return_resolved_protocol_insurance(
         twap_transit,
         controller_transit,
         twap_authority,
-        complete_transit_amount,
+        amount_u64,
         Some(&auth_seeds),
     )?;
     invoke_signed(
