@@ -3782,12 +3782,14 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
         &controller,
         &env.slab,
         &perc_id(),
+        &env.twap_cfg,
     );
     let donate_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.slab, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -3927,6 +3929,7 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
         &provider_destination,
         &env.perc_vault,
         &perc_id(),
+        &env.twap_cfg,
         backing_amount as u128,
     );
     let donate_remaining = vec![
@@ -3937,6 +3940,7 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -4620,13 +4624,14 @@ fn build_controller_accept_and_top_up_asset0_backing_message(
     provider_source: &Pubkey,
     percolator_vault: &Pubkey,
     percolator_program: &Pubkey,
+    custody_state: &Pubkey,
     amount: u128,
 ) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // governance is the signer for both instructions
     m.push(0);
     m.push(3); // market, provider source, and vault are writable
-    m.push(8);
+    m.push(9);
     for key in [
         governance,
         market,
@@ -4635,15 +4640,16 @@ fn build_controller_accept_and_top_up_asset0_backing_message(
         controller,
         &spl_token::ID,
         percolator_program,
+        custody_state,
         &controller_id(),
     ] {
         m.extend_from_slice(key.as_ref());
     }
     m.push(2);
 
-    m.push(7); // market-controller program
-    m.push(5);
-    for index in [0u8, 0, 4, 1, 6] {
+    m.push(8); // market-controller program
+    m.push(6);
+    for index in [0u8, 0, 4, 1, 6, 7] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -4671,25 +4677,27 @@ fn build_controller_accept_market_authority_message(
     controller: &Pubkey,
     market: &Pubkey,
     percolator_program: &Pubkey,
+    custody_state: &Pubkey,
 ) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // governance is also the current market authority signer
     m.push(0);
     m.push(1); // market writable
-    m.push(5);
+    m.push(6);
     for key in [
         governance,
         market,
         controller,
         percolator_program,
+        custody_state,
         &controller_id(),
     ] {
         m.extend_from_slice(key.as_ref());
     }
     m.push(1);
-    m.push(4); // market-controller program
-    m.push(5);
-    for index in [0u8, 0, 2, 1, 3] {
+    m.push(5); // market-controller program
+    m.push(6);
+    for index in [0u8, 0, 2, 1, 3, 4] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -6062,10 +6070,13 @@ fn e2e_market_donation_preserves_and_terminally_returns_creator_insurance() {
     );
 }
 
-// A funded donation is recoverable only if the handoff also leaves the controller as asset_admin.
-// Otherwise an absent delegated admin can prevent the controller from rotating the external value
-// role after stale resolution, making one provider balance a permanent CloseSlab gate.
-fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool) {
+// A funded donation is recoverable only if asset_admin migrates to the controller or remains on a
+// canonical constrained custodian. This fixture delegates an arbitrary cold admin: after stale
+// resolution it could prevent role rotation and make one provider balance a permanent CloseSlab gate.
+fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(
+    backing: bool,
+    distinct_provider: bool,
+) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -6082,11 +6093,43 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool)
     let delegated_admin = Keypair::new();
     svm.airdrop(&delegated_admin.pubkey(), 1_000_000_000)
         .unwrap();
+    let provider = Keypair::new();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    let provider_signer = if distinct_provider {
+        &provider
+    } else {
+        &creator
+    };
     let governance = Pubkey::new_unique();
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
     let slab = Pubkey::new_unique();
     init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    if distinct_provider {
+        let kinds: &[u8] = if backing { &[3] } else { &[1, 2] };
+        for kind in kinds {
+            send(
+                &mut svm,
+                &[&payer, &creator, &provider],
+                Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(creator.pubkey(), true),
+                        AccountMeta::new_readonly(provider.pubkey(), true),
+                        AccountMeta::new(slab, false),
+                    ],
+                    data: percolator_prog::ix::Instruction::UpdateAssetAuthority {
+                        asset_index: 0,
+                        kind: *kind,
+                        new_pubkey: provider.pubkey().to_bytes(),
+                    }
+                    .encode(),
+                },
+            )
+            .expect("creator assigns the asset-0 value role to an external provider");
+        }
+    }
 
     send(
         &mut svm,
@@ -6123,7 +6166,7 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool)
         &mut svm,
         &creator_token,
         &collateral_mint,
-        &creator.pubkey(),
+        &provider_signer.pubkey(),
         amount,
     );
     let top_up_data = if backing {
@@ -6142,11 +6185,11 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool)
     };
     send(
         &mut svm,
-        &[&payer, &creator],
+        &[&payer, provider_signer],
         Instruction {
             program_id: perc_id(),
             accounts: vec![
-                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(provider_signer.pubkey(), true),
                 AccountMeta::new(slab, false),
                 AccountMeta::new(creator_token, false),
                 AccountMeta::new(percolator_vault, false),
@@ -6187,7 +6230,7 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool)
         &mut svm,
         &creator_destination,
         &collateral_mint,
-        &creator.pubkey(),
+        &provider_signer.pubkey(),
         0,
     );
     let withdraw_data = if backing {
@@ -6205,11 +6248,11 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool)
     };
     send(
         &mut svm,
-        &[&payer, &creator],
+        &[&payer, provider_signer],
         Instruction {
             program_id: perc_id(),
             accounts: vec![
-                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(provider_signer.pubkey(), true),
                 AccountMeta::new(slab, false),
                 AccountMeta::new(creator_destination, false),
                 AccountMeta::new(percolator_vault, false),
@@ -6225,12 +6268,105 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool)
 
 #[test]
 fn e2e_funded_insurance_donation_rejects_a_delegated_asset0_admin() {
-    assert_funded_market_donation_rejects_a_delegated_asset0_admin(false);
+    assert_funded_market_donation_rejects_a_delegated_asset0_admin(false, false);
 }
 
 #[test]
 fn e2e_funded_backing_donation_rejects_a_delegated_asset0_admin() {
-    assert_funded_market_donation_rejects_a_delegated_asset0_admin(true);
+    assert_funded_market_donation_rejects_a_delegated_asset0_admin(true, false);
+}
+
+#[test]
+fn e2e_distinct_insurance_provider_donation_rejects_a_delegated_asset0_admin() {
+    assert_funded_market_donation_rejects_a_delegated_asset0_admin(false, true);
+}
+
+#[test]
+fn e2e_distinct_backing_provider_donation_rejects_a_delegated_asset0_admin() {
+    assert_funded_market_donation_rejects_a_delegated_asset0_admin(true, true);
+}
+
+// PUBLIC DOS: a TWAP-owned account is not enough to attest a non-migrating asset_admin. A caller
+// can permissionlessly initialize another canonical config, so the controller must rederive both
+// config PDAs and bind the supplied state to this exact market, Percolator program, and Squads vault.
+#[test]
+fn e2e_foreign_canonical_twap_config_cannot_bless_a_market_handoff() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let foreign_creator = Keypair::new();
+    svm.airdrop(&foreign_creator.pubkey(), 1_000_000_000)
+        .unwrap();
+    let foreign_mint_authority = Keypair::new();
+    let foreign_collateral = create_real_mint(&mut svm, &payer, &foreign_mint_authority.pubkey());
+    let foreign_market = Pubkey::new_unique();
+    init_creator_owned_market(
+        &mut svm,
+        &payer,
+        &foreign_creator,
+        &foreign_collateral,
+        &foreign_market,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &foreign_market,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("permissionless caller initializes a canonical config for another real market");
+    let foreign_config =
+        twap_config_pda(&foreign_market, &env.multisig, &env.coin_mint, &perc_id());
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &foreign_config,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(foreign_config, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let market_before = svm.get_account(&env.slab).unwrap();
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &donate_market,
+            &remaining,
+        )
+        .is_err(),
+        "a canonical config for another market cannot attest this TWAP admin"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before);
 }
 
 // PUBLIC LOF: secondary-asset activation names the deposit authority and withdrawal operator
@@ -6468,9 +6604,10 @@ fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
-// PUBLIC LOF: market donation migrates only asset-0 roles still equal to the outgoing market
-// authority. A delegated asset admin must not survive the handoff and retain a post-donation path
-// to rotate the insurance operator after an honest caller uses the controller's inbound-only top-up.
+// PUBLIC LOF/DOS: market donation migrates only asset-0 roles still equal to the outgoing market
+// authority. A delegated asset admin must not survive even an empty handoff: afterward it could
+// rotate both insurance roles to itself, fund one atom through Percolator, and disappear. A separately
+// delegated operator is inert while empty, but must still keep the controller's inbound donation shut.
 fn assert_controller_donation_rejects_delegated_role(delegated_kind: u8) {
     assert_eq!(
         percolator_accounting::ASSET_ADMIN_PROFILE_OFFSET,
@@ -6533,8 +6670,17 @@ fn assert_controller_donation_rejects_delegated_role(delegated_kind: u8) {
         ],
         data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
     };
-    send(&mut svm, &[&payer, &creator], donate_market)
-        .expect("creator donates market lifecycle control");
+    let market_before_handoff = svm.get_account(&slab).unwrap();
+    let handoff = send(&mut svm, &[&payer, &creator], donate_market.clone());
+    if delegated_kind == 0 {
+        assert!(
+            handoff.is_err(),
+            "an arbitrary delegated asset admin must not survive even an empty handoff"
+        );
+        assert_eq!(svm.get_account(&slab).unwrap(), market_before_handoff);
+        return;
+    }
+    handoff.expect("creator donates market lifecycle control with an inert external operator");
     let profile = percolator_prog::state::read_asset_oracle_profile(
         &svm.get_account(&slab).unwrap().data,
         0,
@@ -12795,12 +12941,14 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &controller,
         &env.slab,
         &perc_id(),
+        &env.twap_cfg,
     );
-    let controller_remaining = vec![
+    let accept_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.slab, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -12811,9 +12959,17 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &payer,
         5,
         &donate_market,
-        &controller_remaining,
+        &accept_remaining,
     )
     .expect("Squads donates post-genesis lifecycle to the constrained controller");
+
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
 
     let shutdown_slot = svm.get_sysvar::<Clock>().slot;
     let active_before = svm.get_account(&env.slab).unwrap();
@@ -31695,6 +31851,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &asset0_provider_destination,
         &env.perc_vault,
         &perc_id(),
+        &env.pool,
         asset0_backing_amount as u128,
     );
     let accept_and_back_remaining = vec![
@@ -31705,6 +31862,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(

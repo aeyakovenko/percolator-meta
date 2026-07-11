@@ -34,6 +34,19 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const SUBLEDGER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Sub1edger1111111111111111111111111111111111");
+const TWAP_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("TwapBuyBurn11111111111111111111111111111111");
+const SQUADS_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
+const TWAP_CONFIG_SEED: &[u8] = b"twap_config";
+const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
+const TWAP_CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
+const TWAP_CONFIG_SIZE: usize = 272;
+const TWAP_CUSTODY_MODE_POOL_BOUND: u8 = 1;
+const TWAP_CUSTODY_MODE_POOLLESS_EMPTY: u8 = 2;
+const SUBLEDGER_POOL_SEED: &[u8] = b"subledger_pool";
+const SUBLEDGER_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
+const SUBLEDGER_POOL_SIZE: usize = 272;
 
 const IX_PROXY_ADMIN: u8 = 0;
 const IX_INIT_MARKET: u8 = 1;
@@ -125,6 +138,190 @@ fn signer_seeds<'a>(
         percolator_program.as_ref(),
         bump,
     ]
+}
+
+// A funded market can already be under the constrained TWAP PDA when lifecycle
+// authority moves to the controller. Validate that exception from canonical TWAP
+// state; accepting an arbitrary delegated asset_admin would make terminal role
+// rotation depend on a signer that may disappear.
+fn validate_twap_custody_admin(
+    governance: &AccountInfo,
+    market: &AccountInfo,
+    percolator_program: &AccountInfo,
+    twap_config: &AccountInfo,
+    asset_admin: [u8; 32],
+    insurance_authority: [u8; 32],
+    insurance_operator: [u8; 32],
+) -> ProgramResult {
+    if twap_config.owner != &TWAP_PROGRAM_ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = twap_config.try_borrow_data()?;
+    if data.len() < TWAP_CONFIG_SIZE
+        || data[..8] != TWAP_CONFIG_DISC
+        || data[40..72] != market.key.to_bytes()
+        || data[72..104] != percolator_program.key.to_bytes()
+        || data[170] != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let coin_mint = Pubkey::new_from_array(data[8..40].try_into().unwrap());
+    let squads_multisig = Pubkey::new_from_array(data[104..136].try_into().unwrap());
+    let expected_governance = Pubkey::find_program_address(
+        &[b"multisig", squads_multisig.as_ref(), b"vault", &[0u8]],
+        &SQUADS_PROGRAM_ID,
+    )
+    .0;
+    if *governance.key != expected_governance {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let config_bump = [data[171]];
+    let expected_config = Pubkey::create_program_address(
+        &[
+            TWAP_CONFIG_SEED,
+            market.key.as_ref(),
+            squads_multisig.as_ref(),
+            coin_mint.as_ref(),
+            percolator_program.key.as_ref(),
+            &config_bump,
+        ],
+        &TWAP_PROGRAM_ID,
+    )
+    .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_config.key != expected_config {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let authority_bump = [data[172]];
+    let expected_admin = Pubkey::create_program_address(
+        &[
+            TWAP_AUTHORITY_SEED,
+            twap_config.key.as_ref(),
+            &authority_bump,
+        ],
+        &TWAP_PROGRAM_ID,
+    )
+    .map_err(|_| ProgramError::InvalidSeeds)?;
+    if asset_admin != expected_admin.to_bytes()
+        || insurance_authority != asset_admin
+        || insurance_operator != asset_admin
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let custody_pool = Pubkey::new_from_array(data[225..257].try_into().unwrap());
+    let custody_principal = u64::from_le_bytes(data[257..265].try_into().unwrap());
+    match data[265] {
+        TWAP_CUSTODY_MODE_POOL_BOUND if custody_pool != Pubkey::default() => Ok(()),
+        TWAP_CUSTODY_MODE_POOLLESS_EMPTY
+            if custody_pool == Pubkey::default() && custody_principal == 0 =>
+        {
+            Ok(())
+        }
+        _ => Err(ProgramError::InvalidAccountData),
+    }
+}
+
+fn validate_subledger_custody_admin(
+    market: &AccountInfo,
+    percolator_program: &AccountInfo,
+    pool: &AccountInfo,
+    asset_admin: [u8; 32],
+    insurance_authority: [u8; 32],
+    insurance_operator: [u8; 32],
+) -> ProgramResult {
+    if pool.owner != &SUBLEDGER_PROGRAM_ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = pool.try_borrow_data()?;
+    if data.len() < SUBLEDGER_POOL_SIZE
+        || data[..8] != SUBLEDGER_POOL_DISC
+        || data[40..48] != 0u64.to_le_bytes()
+        || data[88] != 0
+        || data[90] != 0
+        || data[96..128] != market.key.to_bytes()
+        || data[128..160] != percolator_program.key.to_bytes()
+        || asset_admin != pool.key.to_bytes()
+        || insurance_authority != asset_admin
+        || insurance_operator != asset_admin
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let collateral_mint = Pubkey::new_from_array(data[8..40].try_into().unwrap());
+    let vault_authority =
+        Pubkey::find_program_address(&[b"vault", market.key.as_ref()], percolator_program.key).0;
+    let expected_vault = Pubkey::find_program_address(
+        &[
+            vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            collateral_mint.as_ref(),
+        ],
+        &ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    .0;
+    if data[48..80] != expected_vault.to_bytes() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let bump = [data[89]];
+    let expected_pool = Pubkey::create_program_address(
+        &[
+            SUBLEDGER_POOL_SEED,
+            &data[8..40],
+            &data[40..48],
+            market.key.as_ref(),
+            percolator_program.key.as_ref(),
+            &data[208..240],
+            &data[88..89],
+            &data[90..91],
+            &data[248..256],
+            &data[256..264],
+            &data[264..272],
+            &bump,
+        ],
+        &SUBLEDGER_PROGRAM_ID,
+    )
+    .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *pool.key != expected_pool {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(())
+}
+
+fn validate_constrained_custody_admin(
+    governance: &AccountInfo,
+    market: &AccountInfo,
+    percolator_program: &AccountInfo,
+    custody_state: &AccountInfo,
+    asset_admin: [u8; 32],
+    insurance_authority: [u8; 32],
+    insurance_operator: [u8; 32],
+) -> ProgramResult {
+    if custody_state.owner == &TWAP_PROGRAM_ID {
+        validate_twap_custody_admin(
+            governance,
+            market,
+            percolator_program,
+            custody_state,
+            asset_admin,
+            insurance_authority,
+            insurance_operator,
+        )
+    } else if custody_state.owner == &SUBLEDGER_PROGRAM_ID {
+        validate_subledger_custody_admin(
+            market,
+            percolator_program,
+            custody_state,
+            asset_admin,
+            insurance_authority,
+            insurance_operator,
+        )
+    } else {
+        Err(ProgramError::IllegalOwner)
+    }
 }
 
 /// Exact pinned-v16 generic governance surface. Every value mover, authority
@@ -1753,7 +1950,8 @@ fn process_grant_genesis_pool<'a>(
 }
 
 // accept_market_authority accounts:
-// [governance, current_authority(signer), controller_pda, market(w), percolator_program]
+// [governance, current_authority(signer), controller_pda, market(w), percolator_program,
+//  custody_state(optional when a canonical Subledger/TWAP PDA already owns asset_admin)]
 // A permissionless creator can hand a market to the governance-bound controller;
 // governance does not need to participate in or approve the donation. Percolator's
 // market-authority update also rotates asset-0 roles that equal the outgoing key, but
@@ -1762,8 +1960,10 @@ fn process_grant_genesis_pool<'a>(
 // append disabled; controller-governed secondary assets can then be activated after
 // the handoff. If the outgoing key owns funded
 // asset-0 insurance or is the recorded backing provider, restore only those same roles
-// so donating lifecycle control cannot donate segregated capital too. A later
-// genesis-pool grant requires the external insurance balance to exit first.
+// so donating lifecycle control cannot donate segregated capital too. asset_admin must
+// migrate to this controller unless canonical current-layout Subledger/TWAP state proves
+// that its constrained PDA already owns admin and both insurance roles.
+// A later genesis-pool grant requires the external insurance balance to exit first.
 fn process_accept_market_authority<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1778,6 +1978,7 @@ fn process_accept_market_authority<'a>(
     let controller = next_account_info(iter)?;
     let market = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    let custody_state = iter.next();
     if !current.is_signer || iter.next().is_some() {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -1814,22 +2015,22 @@ fn process_accept_market_authority<'a>(
             percolator_accounting::read_asset_backing_authority(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
         let restore_outgoing_backing = backing_authority == current_bytes;
-        let has_backing = percolator_accounting::read_asset_backing_balances(&market_data, 0)
-            .map_err(|_| ProgramError::InvalidAccountData)?
-            .iter()
-            .any(|balance| balance.principal_atoms != 0 || balance.earnings_atoms != 0);
         let asset_admin = percolator_accounting::read_asset_admin(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?;
         // UpdateAuthority migrates asset_admin only while it still equals the outgoing
-        // market authority. Restoring an outgoing funded insurance or backing role
-        // while leaving a separately delegated admin would make terminal recovery
-        // depend on that signer.
-        if (restore_insurance_authority
-            || restore_insurance_operator
-            || (restore_outgoing_backing && has_backing))
-            && asset_admin != current_bytes
-            && asset_admin != controller.key.to_bytes()
-        {
+        // market authority. The only safe non-migrating admins are this repository's
+        // canonical Subledger/TWAP PDAs, whose fixed terminal wrappers can sign cleanup.
+        if asset_admin != current_bytes && asset_admin != controller.key.to_bytes() {
+            validate_constrained_custody_admin(
+                governance,
+                market,
+                percolator_program,
+                custody_state.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                asset_admin,
+                insurance_authority,
+                insurance_operator,
+            )?;
+        } else if custody_state.is_some() {
             return Err(ProgramError::InvalidAccountData);
         }
         (

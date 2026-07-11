@@ -43,8 +43,12 @@ capital's own tenure.
   allocation from the frozen snapshot only to its bound recipient; lamports donated to the closed,
   zero-data witness cannot disable that recovery. Donating a creator-owned market
   preserves funded outgoing asset-0 insurance roles and the recorded backing provider; the handoff
-  cannot collapse that capital into the controller or select another provider. Donation is accepted only when every
-  secondary slot is fully retired because Percolator does not migrate secondary `asset_admin` roles with `marketauth`;
+  cannot collapse that capital into the controller or select another provider. `asset_admin` must
+  migrate to the controller even on an empty market, unless read-only canonical Subledger or TWAP
+  state proves that its fixed-cleanup PDA already owns admin and both insurance roles. This prevents
+  a cold delegated admin from funding one atom after handoff and blocking terminal close. Donation
+  is accepted only when every secondary slot is fully retired because Percolator does not migrate
+  secondary `asset_admin` roles with `marketauth`;
   multi-asset markets are
   instead initialized under the controller before governance-approved activation. The handoff also
   requires direct permissionless asset append to be disabled, and the controller cannot enable it.
@@ -228,8 +232,11 @@ Permissionless market donation transfers lifecycle control, not funded creator c
 outgoing market authority still owns nonzero asset-0 insurance, the controller atomically restores
 that exact insurance authority/operator after accepting `marketauth`, just as it preserves the
 recorded backing provider. A funded handoff that restores an outgoing insurance role or nonzero
-backing bucket is rejected unless it also leaves `asset_admin` on the controller, so public stale
-resolution cannot make terminal recovery depend on a delegated signer.
+backing bucket is rejected unless `asset_admin` migrates to the controller. The only non-migrating
+exception requires the existing handoff to include canonical current-layout Subledger or TWAP state
+bound to this exact market and Percolator program; both insurance roles must name the same constrained
+PDA. An arbitrary delegated admin is rejected even while empty because it could fund after handoff.
+Thus public stale resolution cannot make terminal recovery depend on a delegated signer.
 If the provider disappears after a valid handoff, the controller's amountless resolved return rotates
 only that value role and pays the complete asset-0 balance to the provider's canonical token account.
 Genesis custody cannot move to a pool until those external insurance roles hold no balance. The
