@@ -106,6 +106,7 @@ const SUBLEDGER_PROGRAM_ID: Pubkey =
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
 const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 const SUBLEDGER_IX_ASSERT_PRINCIPAL: u8 = 11;
+const SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
@@ -403,6 +404,9 @@ struct Config {
     /// Current-layout custody provenance. Historical zero means no safe inference.
     /// Pool-less terminal recovery requires the explicit empty-at-handoff marker.
     custody_mode: u8,
+    /// Set only after an atomic live owner exit returns roles to `custody_pool`.
+    /// It authorizes one permissionless re-handoff to this exact config.
+    rehandoff_pending: bool,
 }
 
 impl Config {
@@ -419,7 +423,12 @@ impl Config {
         } else {
             0
         };
-        if custody_mode > CUSTODY_MODE_POOLLESS_EMPTY {
+        let rehandoff_pending = if data.len() >= CONFIG_SIZE {
+            data[266]
+        } else {
+            0
+        };
+        if custody_mode > CUSTODY_MODE_POOLLESS_EMPTY || rehandoff_pending > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -447,6 +456,7 @@ impl Config {
                 0
             },
             custody_mode,
+            rehandoff_pending: rehandoff_pending == 1,
         })
     }
 
@@ -476,7 +486,8 @@ impl Config {
             if data.len() >= CONFIG_SIZE {
                 data[257..265].copy_from_slice(&self.custody_principal.to_le_bytes());
                 data[265] = self.custody_mode;
-                data[266..CONFIG_SIZE].fill(0);
+                data[266] = self.rehandoff_pending as u8;
+                data[267..CONFIG_SIZE].fill(0);
             } else {
                 data[257..CUSTODY_CONFIG_SIZE].fill(0);
             }
@@ -663,6 +674,7 @@ fn process_init_config(
         custody_pool: Pubkey::default(),
         custody_principal: 0,
         custody_mode: CUSTODY_MODE_UNATTESTED,
+        rehandoff_pending: false,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -889,12 +901,13 @@ fn process_accept_operator(
     )
 }
 
-// accept_from_subledger accounts: [squads_vault(signer), pool(current_admin signer),
+// accept_from_subledger accounts: [squads_vault(signer on first handoff), pool(current_admin signer),
 //   config, twap_authority, market_slab(w), percolator_program]
 // data: pool_outstanding_principal(u128), supplied by the fixed subledger CPI.
 //
-// The call is reachable through subledger::handoff_to_twap only: Squads chooses when
-// the handoff occurs, the owner-bound pool supplies the current-admin signature, and
+// The call is reachable through subledger::handoff_to_twap only: Squads chooses the
+// first handoff, while any caller may resume an established current-layout binding
+// after an owner exit. The owner-bound pool supplies the current-admin signature, and
 // this program supplies only its canonical config-bound incoming PDA signature.
 fn process_accept_from_subledger(
     program_id: &Pubkey,
@@ -912,6 +925,9 @@ fn process_accept_from_subledger(
     let twap_authority = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if current_admin.owner != &SUBLEDGER_PROGRAM_ID {
         return Err(ProgramError::IllegalOwner);
     }
@@ -939,13 +955,24 @@ fn process_accept_custody<'a>(
     percolator_program: &AccountInfo<'a>,
     source_pool: Option<(&AccountInfo<'a>, u128)>,
 ) -> ProgramResult {
-    if !squads_vault.is_signer || !current_admin.is_signer {
+    if !current_admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let established_rehandoff = if let Some((pool, _)) = source_pool {
+        config_account.data_len() >= CONFIG_SIZE
+            && config.custody_mode == CUSTODY_MODE_POOL_BOUND
+            && config.custody_pool == *pool.key
+            && config.rehandoff_pending
+    } else {
+        false
+    };
+    if !squads_vault.is_signer && !established_rehandoff {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     let mut persist_config = false;
     if let Some((pool, protected_floor)) = source_pool {
         if !config_account.is_writable || config_account.data_len() < CUSTODY_CONFIG_SIZE {
@@ -981,6 +1008,7 @@ fn process_accept_custody<'a>(
         if config_account.data_len() >= CONFIG_SIZE {
             config.custody_principal = new_pool_principal;
             config.custody_mode = CUSTODY_MODE_POOL_BOUND;
+            config.rehandoff_pending = false;
         }
         persist_config = true;
     }
@@ -1085,13 +1113,19 @@ fn process_accept_custody<'a>(
     Ok(())
 }
 
-// return_to_subledger accounts: [squads_vault(signer unless resolved + empty + safe return), config,
+// return_to_subledger accounts: [squads_vault(signer unless fixed public return), config,
 //   twap_authority(current_admin), pool, market_slab(w), percolator_program,
-//   subledger_program]
+//   subledger_program, owner(signer, optional), position(w, optional),
+//   owner_destination(w, optional), pool_holding(w, optional),
+//   percolator_vault(w, optional), vault_authority(optional), token_program(optional)]
 //
 // This is the only recovery key transition exposed by the TWAP. It cannot select an
 // arbitrary replacement: the fixed subledger program re-derives the market-bound pool
-// and hardcodes all incoming authorities to that pool PDA.
+// and hardcodes all incoming authorities to that pool PDA. Before terminal resolution,
+// a non-governance call must atomically complete the signing owner's full subledger
+// withdrawal. A failed exit rolls back the role return, and a successful exit consumes
+// the claim that authorized it. Any caller may subsequently re-handoff the established
+// pool, so an owner exit cannot permanently interrupt the auction.
 fn process_return_to_subledger(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1108,6 +1142,46 @@ fn process_return_to_subledger(
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let subledger_program = next_account_info(iter)?;
+    let owner = iter.next();
+    let position = iter.next();
+    let owner_destination = iter.next();
+    let pool_holding = iter.next();
+    let percolator_vault = iter.next();
+    let vault_authority = iter.next();
+    let token_program = iter.next();
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let owner_exit = match (
+        owner,
+        position,
+        owner_destination,
+        pool_holding,
+        percolator_vault,
+        vault_authority,
+        token_program,
+    ) {
+        (None, None, None, None, None, None, None) => None,
+        (
+            Some(owner),
+            Some(position),
+            Some(owner_destination),
+            Some(pool_holding),
+            Some(percolator_vault),
+            Some(vault_authority),
+            Some(token_program),
+        ) => Some((
+            owner,
+            position,
+            owner_destination,
+            pool_holding,
+            percolator_vault,
+            vault_authority,
+            token_program,
+        )),
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+    let owner_exit_requested = owner_exit.is_some();
 
     if *subledger_program.key != SUBLEDGER_PROGRAM_ID || !subledger_program.executable {
         return Err(ProgramError::IncorrectProgramId);
@@ -1115,7 +1189,7 @@ fn process_return_to_subledger(
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
         return Err(ProgramError::IllegalOwner);
     }
@@ -1133,35 +1207,78 @@ fn process_return_to_subledger(
     if *twap_authority.key != expected_authority {
         return Err(ProgramError::InvalidSeeds);
     }
-    if !squads_vault.is_signer {
+    if squads_vault.is_signer {
+        if owner_exit.is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+    } else {
         if !percolator_program.executable || market_slab.owner != percolator_program.key {
             return Err(ProgramError::MissingRequiredSignature);
         }
         let market_data = market_slab.try_borrow_data()?;
-        if !percolator_accounting::market_is_resolved_and_empty(&market_data)
-            .map_err(|_| ProgramError::InvalidAccountData)?
-        {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-        let insurance = read_asset_insurance(&market_data, config.market_0_domain as usize)?;
+        let resolved_empty = percolator_accounting::market_is_resolved_and_empty(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let insurance = if resolved_empty {
+            Some(read_asset_insurance(
+                &market_data,
+                config.market_0_domain as usize,
+            )?)
+        } else {
+            None
+        };
         drop(market_data);
-        if insurance != 0 {
-            // The subledger owns both current and historical pool layouts. Its
-            // read-only attestation prevents a public caller from rotating terminal
-            // protocol insurance into a pool after every owner claim has exited.
-            invoke(
-                &Instruction {
-                    program_id: *subledger_program.key,
-                    accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
-                    data: vec![SUBLEDGER_IX_ASSERT_PRINCIPAL],
-                },
-                &[pool.clone(), subledger_program.clone()],
-            )?;
+
+        if let Some(insurance) = insurance {
+            if owner_exit.is_some() {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            if insurance != 0 {
+                // The subledger owns both current and historical pool layouts. Its
+                // read-only attestation prevents a public caller from rotating terminal
+                // protocol insurance into a pool after every owner claim has exited.
+                invoke(
+                    &Instruction {
+                        program_id: *subledger_program.key,
+                        accounts: vec![AccountMeta::new_readonly(*pool.key, false)],
+                        data: vec![SUBLEDGER_IX_ASSERT_PRINCIPAL],
+                    },
+                    &[pool.clone(), subledger_program.clone()],
+                )?;
+            }
+            // Once asset-local insurance is zero, returning asset_admin and the two
+            // insurance roles moves no value. The exact pool is still config-bound and
+            // its accept CPI revalidates the canonical Subledger PDA. This lets that
+            // pool invoke the fixed asset-0 backing cleanup when its provider is absent.
+        } else {
+            if config_account.data_len() < CONFIG_SIZE
+                || config.custody_mode != CUSTODY_MODE_POOL_BOUND
+                || config.rehandoff_pending
+            {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+            let (
+                owner,
+                position,
+                owner_destination,
+                pool_holding,
+                percolator_vault,
+                _,
+                token_program,
+            ) = owner_exit.ok_or(ProgramError::MissingRequiredSignature)?;
+            if !owner.is_signer
+                || !pool.is_writable
+                || !position.is_writable
+                || !owner_destination.is_writable
+                || !pool_holding.is_writable
+                || !percolator_vault.is_writable
+                || !config_account.is_writable
+            {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
+            if *token_program.key != spl_token::ID {
+                return Err(ProgramError::IncorrectProgramId);
+            }
         }
-        // Once asset-local insurance is zero, returning asset_admin and the two
-        // insurance roles moves no value. The exact pool is still config-bound and
-        // its accept CPI revalidates the canonical Subledger PDA. This lets that
-        // pool invoke the fixed asset-0 backing cleanup when its provider is absent.
     }
 
     invoke_signed(
@@ -1183,7 +1300,55 @@ fn process_return_to_subledger(
             subledger_program.clone(),
         ],
         &[&auth_seeds],
-    )
+    )?;
+
+    if let Some((
+        owner,
+        position,
+        owner_destination,
+        pool_holding,
+        percolator_vault,
+        vault_authority,
+        token_program,
+    )) = owner_exit
+    {
+        invoke(
+            &Instruction {
+                program_id: *subledger_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*owner.key, true),
+                    AccountMeta::new(*pool.key, false),
+                    AccountMeta::new(*position.key, false),
+                    AccountMeta::new(*owner_destination.key, false),
+                    AccountMeta::new(*pool_holding.key, false),
+                    AccountMeta::new(*market_slab.key, false),
+                    AccountMeta::new(*percolator_vault.key, false),
+                    AccountMeta::new_readonly(*vault_authority.key, false),
+                    AccountMeta::new_readonly(*percolator_program.key, false),
+                    AccountMeta::new_readonly(*token_program.key, false),
+                ],
+                data: vec![SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL],
+            },
+            &[
+                owner.clone(),
+                pool.clone(),
+                position.clone(),
+                owner_destination.clone(),
+                pool_holding.clone(),
+                market_slab.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                percolator_program.clone(),
+                token_program.clone(),
+                subledger_program.clone(),
+            ],
+        )?;
+    }
+    if owner_exit_requested {
+        config.rehandoff_pending = true;
+        config.serialize(&mut config_account.try_borrow_mut_data()?)?;
+    }
+    Ok(())
 }
 
 // return_resolved_protocol_insurance accounts:
@@ -3507,6 +3672,7 @@ mod tests {
             custody_pool: Pubkey::new_unique(),
             custody_principal: 987_654_321,
             custody_mode: CUSTODY_MODE_POOL_BOUND,
+            rehandoff_pending: true,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf).unwrap();
@@ -3525,6 +3691,7 @@ mod tests {
         assert_eq!(d.custody_pool, c.custody_pool);
         assert_eq!(d.custody_principal, c.custody_principal);
         assert_eq!(d.custody_mode, c.custody_mode);
+        assert!(d.rehandoff_pending);
 
         let mut predecessor = [0u8; CUSTODY_CONFIG_SIZE];
         c.serialize(&mut predecessor).unwrap();
@@ -3532,8 +3699,15 @@ mod tests {
         assert_eq!(old.custody_pool, c.custody_pool);
         assert_eq!(old.custody_principal, 0);
         assert_eq!(old.custody_mode, CUSTODY_MODE_UNATTESTED);
+        assert!(!old.rehandoff_pending);
 
         buf[265] = CUSTODY_MODE_POOLLESS_EMPTY + 1;
+        assert!(matches!(
+            Config::deserialize(&buf),
+            Err(ProgramError::InvalidAccountData)
+        ));
+        buf[265] = CUSTODY_MODE_POOL_BOUND;
+        buf[266] = 2;
         assert!(matches!(
             Config::deserialize(&buf),
             Err(ProgramError::InvalidAccountData)

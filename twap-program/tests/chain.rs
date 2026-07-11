@@ -32781,6 +32781,44 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     )
     .expect("owner deposits protected base units");
 
+    let exiting_depositor = Keypair::new();
+    svm.airdrop(&exiting_depositor.pubkey(), 1_000_000_000)
+        .unwrap();
+    let exiting_principal = 1u64;
+    let exiting_ata = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &exiting_ata,
+        &env.collateral_mint,
+        &exiting_depositor.pubkey(),
+        exiting_principal,
+    );
+    let exiting_position = sub_position_pda(&env.pool, &exiting_depositor.pubkey());
+    let mut exiting_deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    exiting_deposit_data.extend_from_slice(&exiting_principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &exiting_depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(exiting_depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(exiting_position, false),
+                AccountMeta::new(exiting_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: exiting_deposit_data,
+        },
+    )
+    .expect("second owner deposits the one-unit live-exit probe");
+    let total_principal = principal + exiting_principal;
+
     send(
         &mut svm,
         &[&payer],
@@ -32815,6 +32853,37 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
+    let market_before_unsigned_first_handoff = svm.get_account(&env.slab).unwrap();
+    let config_before_unsigned_first_handoff = svm.get_account(&twap_cfg).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(env.squads_vault, false),
+                    AccountMeta::new_readonly(env.pool, false),
+                    AccountMeta::new(twap_cfg, false),
+                    AccountMeta::new_readonly(twap_authority, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(twap_id(), false),
+                ],
+                data: vec![8u8], // IX_HANDOFF_TO_TWAP
+            },
+        )
+        .is_err(),
+        "an unaffiliated caller cannot initiate the first custody handoff"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        market_before_unsigned_first_handoff
+    );
+    assert_eq!(
+        svm.get_account(&twap_cfg).unwrap(),
+        config_before_unsigned_first_handoff
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -32826,7 +32895,10 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &handoff_remaining,
     )
     .expect("pool hands protected principal to TWAP");
-    assert_eq!(read_reserved_floor(&svm, &twap_cfg), principal as u128);
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        total_principal as u128
+    );
 
     let round_surplus = 10u64;
     let retained_protocol_insurance = round_surplus / 2;
@@ -32979,7 +33051,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         },
     )
     .expect("permissionless empty-book round ratchets the retained half into insurance");
-    let retained_floor = principal as u128 + retained_protocol_insurance as u128;
+    let retained_floor = total_principal as u128 + retained_protocol_insurance as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
     assert_eq!(
@@ -33043,6 +33115,133 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     );
     assert_eq!(svm.get_account(&env.slab).unwrap(), live_market_before_public_return);
     assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_public_return);
+
+    // A real depositor must not need the DAO to release live custody. The fixed
+    // path returns the roles and completes that owner's full ordinary withdrawal
+    // in one instruction, so a failed exit rolls back and a successful caller
+    // cannot reuse the position to toggle custody. Any cranker can then resume the
+    // already-bound TWAP with the reduced live-principal floor.
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    let mut attacker_return = public_return_to_pool.clone();
+    attacker_return.accounts[1] = AccountMeta::new(twap_cfg, false);
+    attacker_return.accounts[3] = AccountMeta::new(env.pool, false);
+    attacker_return
+        .accounts
+        .push(AccountMeta::new_readonly(attacker.pubkey(), true));
+    attacker_return
+        .accounts
+        .push(AccountMeta::new(exiting_position, false));
+    attacker_return
+        .accounts
+        .push(AccountMeta::new(attacker_destination, false));
+    attacker_return
+        .accounts
+        .push(AccountMeta::new(pool_holding, false));
+    attacker_return
+        .accounts
+        .push(AccountMeta::new(env.perc_vault, false));
+    attacker_return.accounts.push(AccountMeta::new_readonly(
+        perc_vault_authority(&env.slab, &perc_id()),
+        false,
+    ));
+    attacker_return
+        .accounts
+        .push(AccountMeta::new_readonly(spl_token::ID, false));
+    assert!(
+        send(&mut svm, &[&payer, &attacker], attacker_return).is_err(),
+        "an attacker cannot release custody with another owner's position"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), live_market_before_public_return);
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_public_return);
+
+    let mut owner_return = public_return_to_pool.clone();
+    owner_return.accounts[1] = AccountMeta::new(twap_cfg, false);
+    owner_return.accounts[3] = AccountMeta::new(env.pool, false);
+    owner_return
+        .accounts
+        .push(AccountMeta::new_readonly(exiting_depositor.pubkey(), true));
+    owner_return
+        .accounts
+        .push(AccountMeta::new(exiting_position, false));
+    owner_return
+        .accounts
+        .push(AccountMeta::new(exiting_ata, false));
+    owner_return
+        .accounts
+        .push(AccountMeta::new(pool_holding, false));
+    owner_return
+        .accounts
+        .push(AccountMeta::new(env.perc_vault, false));
+    owner_return.accounts.push(AccountMeta::new_readonly(
+        perc_vault_authority(&env.slab, &perc_id()),
+        false,
+    ));
+    owner_return
+        .accounts
+        .push(AccountMeta::new_readonly(spl_token::ID, false));
+    let mut redirected_owner_return = owner_return.clone();
+    redirected_owner_return.accounts[9] = AccountMeta::new(attacker_destination, false);
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &exiting_depositor],
+            redirected_owner_return,
+        )
+        .is_err(),
+        "a signing owner cannot redirect the full exit to another owner"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), live_market_before_public_return);
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_public_return);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+    send(
+        &mut svm,
+        &[&payer, &exiting_depositor],
+        owner_return.clone(),
+    )
+    .expect("owner atomically releases live custody and fully exits without the DAO");
+    assert_eq!(token_amount(&svm, &exiting_ata), exiting_principal);
+
+    let permissionless_rehandoff = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+        data: vec![8u8], // IX_HANDOFF_TO_TWAP
+    };
+    send(&mut svm, &[&payer], permissionless_rehandoff.clone())
+        .expect("any cranker resumes established TWAP custody after the owner exit");
+    let remaining_principal = principal;
+    let retained_floor = retained_floor - exiting_principal as u128;
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
+    let market_before_replayed_exit = svm.get_account(&env.slab).unwrap();
+    let config_before_replayed_exit = svm.get_account(&twap_cfg).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &exiting_depositor],
+            owner_return,
+        )
+        .is_err(),
+        "a fully exited position cannot repeatedly interrupt TWAP custody"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_replayed_exit);
+    assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_replayed_exit);
 
     let resolve = build_controller_proxy_message(
         &env.squads_vault,
@@ -33131,7 +33330,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         .expect("any cranker returns resolved custody to the canonical owner-bound pool");
 
     let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
-    withdraw_data.extend_from_slice(&principal.to_le_bytes());
+    withdraw_data.extend_from_slice(&remaining_principal.to_le_bytes());
     send(
         &mut svm,
         &[&payer, &depositor],
@@ -33155,6 +33354,21 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     .expect("owner recovers the complete protected principal after resolution");
     assert_eq!(token_amount(&svm, &depositor_ata), principal);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_protocol_insurance as u128);
+
+    let market_before_unpending_rehandoff = svm.get_account(&env.slab).unwrap();
+    let config_before_unpending_rehandoff = svm.get_account(&twap_cfg).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], permissionless_rehandoff).is_err(),
+        "an unsigned re-handoff cannot undo a terminal return without an owner-exit permit"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        market_before_unpending_rehandoff
+    );
+    assert_eq!(
+        svm.get_account(&twap_cfg).unwrap(),
+        config_before_unpending_rehandoff
+    );
 
     squads_execute(
         &mut svm,

@@ -2,6 +2,36 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - live TWAP custody could make owner principal depend forever on governance (surface A/C)
+
+The fixed pool-to-TWAP handoff closed ordinary Subledger exits until custody returned. Public return
+was available only after the market resolved and became empty; every live return still required the
+Squads vault. Governance could therefore hand off a pool containing owner principal and disappear or
+refuse every recovery proposal. The monotonic floor prevented theft, but no depositor could exercise
+their valid withdrawal claim for the rest of the live market.
+
+A retained full-chain LiteSVM regression uses the real pinned Percolator, Subledger, TWAP, controller,
+and Squads binaries with two depositors and retained protocol insurance. The old SBF rejects a signing
+owner's live recovery with `MissingRequiredSignature`. The final probe also rejects an unsigned first
+handoff, another signer using the owner's position, and the real owner redirecting payout to another
+token owner; each failure leaves the slab, pool, config, and token balances byte-exact. The real owner
+then returns custody and redeems their complete one-unit position atomically. A public crank re-hands
+the reduced pool to the same TWAP config, preserves the second owner's ten units plus the retained
+insurance floor, and consumes the permit. Replaying the exited position and trying to undo a later
+terminal return both fail atomically. The second owner ultimately receives all ten units, while only
+protocol insurance reaches terminal controller custody.
+
+FIX: Subledger tag 13 is an amountless full exit that reuses the ordinary owner signature, canonical
+position, destination-owner, share/loss, pool, vault, and Percolator checks. Current-layout TWAP tag 16
+may return live custody without Squads only when it invokes that full exit in the same instruction;
+any failed payout rolls the three role rotations back, and success consumes the authorizing position.
+Success sets a one-use bit in the existing config's reserved bytes. Unsigned Subledger re-handoff is
+accepted only for that exact pool/config binding while the bit is set, replaces only the recorded
+pool-principal floor component, and clears the bit. A read-only proof was deliberately not retained:
+it would have let a one-unit depositor toggle custody repeatedly without withdrawing. No caller-selectable
+amount, DAO recipient, reusable withdrawal authority, first-handoff bypass, or terminal re-handoff was
+added.
+
 ## Tick - a frozen controller transit could block every provider return and terminal close (surface A/C)
 
 Provider cleanup preserved the slab-recorded beneficiary and exact amount, and the prior fix made a
