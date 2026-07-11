@@ -2,6 +2,27 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - a proposal creator could turn anti-tamper rejection into a permanent genesis DoS (surface B/C)
+
+Genesis-vote snapshotting correctly refused to seal a distribution changed after registration, but
+registration accepted a partially filled declared entry capacity. After a majority locked principal
+behind that proposal, its creator could append one valid entry and disappear. The snapshot mismatch
+then made the only winning proposal permanently unsealable; the unique vote-target PDA could not be
+re-registered, absent voters could not move their ballots, and no public cranker could finish genesis.
+
+A clean-room real Percolator + Subledger + genesis-vote + distribution LiteSVM regression creates a
+two-entry proposal with only one entry written. The old SBF makes it votable. The retained chain requires
+that registration to reject atomically, fills the second slot, registers, deposits real insurance
+principal, casts the quorum vote, proves another supply-valid append cannot fit, and permissionlessly
+seals the exact visible proposal after bootstrap.
+
+FIX: registration now requires `entry_count == capacity != 0`. Creators already choose capacity when
+creating a proposal, so this adds no instruction or authority and does not require allocation of the
+whole COIN supply; unallocated supply still burns. It makes public proposal mutation impossible before
+voters can lock capital. The existing `(entry_count, total_amount)` trigger snapshot remains as a
+defense-in-depth check for corrupted or historical state, and the real-distribution offset canary now
+pins the capacity field as well.
+
 ## Tick - a permanently frozen provider ATA could block terminal market close (surface A/C)
 
 All fixed insurance and backing returns preserved the slab-recorded provider and amount, but required

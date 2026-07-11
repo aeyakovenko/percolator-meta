@@ -71,6 +71,9 @@ pub const SUB_POOL_OUTSTANDING_OFF: usize = 80;
 // Distribution proposal: disc[8], config[8..40]. Used to bind a registered vote to
 // the genesis's OWN distribution config (so a winning vote is always sealable).
 const DIST_PROPOSAL_DISC: [u8; 8] = *b"DISTPRP1";
+pub const DIST_PROPOSAL_CAPACITY_OFF: usize = 80;
+pub const DIST_PROPOSAL_ENTRY_COUNT_OFF: usize = 84;
+pub const DIST_PROPOSAL_TOTAL_AMOUNT_OFF: usize = 88;
 // Distribution config: disc[8], coin_mint[8..40], vault[40..72], authority[72..104].
 const DIST_CONFIG_DISC: [u8; 8] = *b"DISTCFG1";
 // Canonical distribution program (finding IC; the gv dual of residual's HK). init_config must pin the
@@ -575,9 +578,9 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     // rejects (header.config mismatch) — bricking finalize forever. Bind it here so
     // every votable proposal is guaranteed sealable.
     // Snapshot the proposal's (entry_count, total_amount) so the trigger can verify
-    // it is UNCHANGED at seal time — a creator must not append self-allocations after
-    // voters back it (bait-and-switch). Require it non-empty: only a fully-built
-    // proposal can be registered for voting.
+    // it is UNCHANGED at seal time. Registration additionally requires every
+    // declared entry slot to be filled: otherwise the creator could append after
+    // collecting votes and turn the snapshot guard into a permanent finalize DoS.
     let (snapshot_entry_count, snapshot_total_amount) = {
         let pd = distribution_proposal.try_borrow_data()?;
         if pd.len() < 96 || pd[..8] != DIST_PROPOSAL_DISC {
@@ -598,9 +601,22 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         if creator != *payer.key {
             return Err(ProgramError::IllegalOwner);
         }
-        let entry_count = u32::from_le_bytes(pd[84..88].try_into().unwrap());
-        let total_amount = u64::from_le_bytes(pd[88..96].try_into().unwrap());
-        if entry_count == 0 {
+        let capacity = u32::from_le_bytes(
+            pd[DIST_PROPOSAL_CAPACITY_OFF..DIST_PROPOSAL_ENTRY_COUNT_OFF]
+                .try_into()
+                .unwrap(),
+        );
+        let entry_count = u32::from_le_bytes(
+            pd[DIST_PROPOSAL_ENTRY_COUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF]
+                .try_into()
+                .unwrap(),
+        );
+        let total_amount = u64::from_le_bytes(
+            pd[DIST_PROPOSAL_TOTAL_AMOUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if entry_count == 0 || entry_count != capacity {
             return Err(ProgramError::InvalidAccountData);
         }
         (entry_count, total_amount)
@@ -1005,8 +1021,16 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     {
         let pd = distribution_proposal.try_borrow_data()?;
         if pd.len() < 96
-            || u32::from_le_bytes(pd[84..88].try_into().unwrap()) != pv.snapshot_entry_count
-            || u64::from_le_bytes(pd[88..96].try_into().unwrap()) != pv.snapshot_total_amount
+            || u32::from_le_bytes(
+                pd[DIST_PROPOSAL_ENTRY_COUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF]
+                    .try_into()
+                    .unwrap(),
+            ) != pv.snapshot_entry_count
+            || u64::from_le_bytes(
+                pd[DIST_PROPOSAL_TOTAL_AMOUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            ) != pv.snapshot_total_amount
         {
             msg!("distribution proposal changed after registration");
             return Err(ProgramError::InvalidAccountData);
