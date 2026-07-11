@@ -2978,6 +2978,25 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         .checked_sub(savings)
         .ok_or(ProgramError::ArithmeticOverflow)?;
 
+    // Validate the optional savings destination before either insurance pull. The book holding is
+    // also a valid twap-authority-owned collateral account, but aliasing it would merge the savings
+    // share into the auction budget and let a permissionless crank spend both allocations.
+    let savings_dest = if savings > 0 {
+        let savings_dest = next_account_info(iter)?;
+        if *savings_dest.key != config.base_unit_savings_account
+            || savings_dest.key == holding.key
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let sd = spl_token::state::Account::unpack(&savings_dest.try_borrow_data()?)?;
+        if sd.mint != book.collateral_mint {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Some(savings_dest)
+    } else {
+        None
+    };
+
     // 2) pull the burn-share into the holding (twap_authority is the percolator insurance operator).
     //    tag-57 WithdrawInsuranceAsset: asset_index (0 = the genesis market_0_domain) + amount. The
     //    percolator caps it to the available insurance; the meta floor (reserved_floor) is the principal
@@ -3015,15 +3034,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     //     OPTIONAL trailing account: only consumed when a savings share is configured, so the (savings=0)
     //     default keeps the existing execute account list unchanged. The destination is pinned to
     //     config.base_unit_savings_account and must hold the market's collateral mint.
-    if savings > 0 {
-        let savings_dest = next_account_info(iter)?;
-        if *savings_dest.key != config.base_unit_savings_account {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        let sd = spl_token::state::Account::unpack(&savings_dest.try_borrow_data()?)?;
-        if sd.mint != book.collateral_mint {
-            return Err(ProgramError::InvalidAccountData);
-        }
+    if let Some(savings_dest) = savings_dest {
         let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
         ix_data.extend_from_slice(&(config.market_0_domain as u16).to_le_bytes());
         ix_data.extend_from_slice(&savings.to_le_bytes());

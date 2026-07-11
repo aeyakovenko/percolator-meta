@@ -166,7 +166,8 @@ stays in the holding for a later round. A bid that cannot transact a whole-atom 
 nominal budget or set the marginal price. If every eligible bid is integer-infeasible, the aged book
 settles for permissionless refunds without spending collateral. Insurance deposited for other assets
 is never counted toward that surplus. Bought COIN can be split between burn and a canonical dynamic
-reward vault.
+reward vault. The collateral savings reserve must be distinct from the auction holding; an aliased
+configuration fails atomically before either surplus pull, so savings cannot enlarge the buy budget.
 
 The full chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
 vault and burns 50%. At day 45 the accumulated reward vault distributes:
