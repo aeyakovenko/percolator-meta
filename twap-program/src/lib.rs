@@ -3289,8 +3289,11 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 
         // Integer reconciliation can leave each executable bid consuming less actual USD than its
         // nominal allocation. Combine those remainders into additional whole lots without changing
-        // the stable marginal or making an unfilled bid executable. Mutating the existing fixed-size
-        // allocation vector avoids attacker-amplified heap use; cached GCDs bound each fallback.
+        // the stable marginal. This may enlarge an existing allocation or admit a previously
+        // unallocated bid that is ranked above the marginal (for example, its lot did not fit the
+        // nominal remainder) or exactly equal to it. Lower-price bids remain ineligible. Mutating the
+        // existing fixed-size allocation vector avoids attacker-amplified heap use; cached GCDs bound
+        // each fallback.
         if has_stable && total_usd < budget {
             let marginal_rank = stable_marginal_rank.ok_or(ProgramError::InvalidAccountData)?;
             let marginal_slot = idx[marginal_rank];
@@ -3299,16 +3302,25 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             let um = book_rd_u128(&d, mo + SL_USDC);
             let mut remaining = budget - total_usd;
 
-            for &i in &idx[..=marginal_rank] {
-                let Some((old_coin, old_usd)) = stable_allocations[i] else {
+            for (rank, &i) in idx[..n].iter().enumerate() {
+                if excluded[i] {
                     continue;
-                };
+                }
                 let o = slot_off(i);
                 let c = book_rd_u128(&d, o + SL_COIN);
+                let u = book_rd_u128(&d, o + SL_USDC);
+                if rank > marginal_rank
+                    && cmp_bid(c, u, cm, um) != core::cmp::Ordering::Equal
+                {
+                    continue;
+                }
+                let (old_coin, old_usd) = stable_allocations[i].unwrap_or((0, 0));
                 if old_coin == c {
                     continue;
                 }
-                let u = book_rd_u128(&d, o + SL_USDC);
+                if bid_gcd[i] == 0 {
+                    bid_gcd[i] = gcd_u64(c as u64, u as u64);
+                }
                 let allocation_budget = old_usd
                     .checked_add(remaining)
                     .ok_or(ProgramError::ArithmeticOverflow)?;
