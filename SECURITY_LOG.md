@@ -2,6 +2,26 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - post-placement collateral freeze could permanently settle-lock the auction (surface C)
+
+Placement required a healthy canonical bidder collateral ATA, but collateral mints such as stablecoins
+can retain an external freeze authority. The issuer could freeze that ATA after the bid committed and
+then revoke its authority. Auction execution still settled into the shared USD account, but every
+permissionless claim was hard-pinned to the now-permanently-frozen address. One occupied slot therefore
+kept the singleton book settled forever and blocked all future buyback rounds.
+
+A clean-room real-SBF LiteSVM regression places a valid full-fill bid, freezes its canonical USD ATA
+only after placement, revokes the freeze key, and executes the round. The old SBF cannot claim either
+to the frozen ATA or to a fresh account owned by the same bidder. The retained test also rejects an
+attacker-owned fallback and a bidder-owned fallback delegated to the cranker, then pays all settled USD
+to a clean bidder-owned account and proves a new bid can enter the reopened book.
+
+FIX: the slot's recorded bidder remains the immutable beneficiary, but claim may pay USD to any
+initialized SPL account for the collateral mint owned solely by that bidder. Frozen, wrong-owner,
+delegated, close-authority, and wrong-mint accounts reject atomically. The COIN refund remains pinned to
+its recorded canonical account. This adds no admin, bidder signature, amount, beneficiary, or collateral
+withdrawal surface; a cranker can create and claim through a fresh owner-bound account atomically.
+
 ## Tick - an absent one-unit genesis voter could block terminal market close (surface B/C)
 
 Every genesis deposit is segregated behind the principal pool, and ordinary withdrawal correctly
