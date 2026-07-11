@@ -2,6 +2,33 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - controller-owned secondary fee insurance could block asset retirement (surface A/C)
+
+Secondary activation may intentionally bind both insurance roles to the constrained controller.
+Ordinary public trades then credit asset-local protocol insurance without any provider top-up. The
+controller's live shutdown return rejected a controller-owned operator to prevent permissionless
+withdrawal before the shutdown delay, while its generic proxy correctly denied raw withdrawals.
+After a fee-bearing round trip, governance therefore could not drain the secondary budget and
+retire that asset without resolving the entire market.
+
+A fresh controller + pinned-Percolator LiteSVM regression activates asset 1 with controller-owned
+insurance, opens and closes a real public position pair, and observes exactly `120` insurance atoms
+from two round-trip 3-bps trades. Direct retirement fails on that balance. The old controller SBF
+also rejects its only fixed return after shutdown and the ten-slot delay mature. The retained test
+first invokes the repaired path before shutdown and requires the market, vault, ledger, operator,
+and transit to remain byte-atomic; after maturity it returns all `120` atoms to canonical controller
+custody and retires asset 1 while the rest of the market stays live.
+Both traders then withdraw every remaining collateral atom; together with the `120` retained fee
+atoms, the test conserves the complete `2,000,000`-atom deposit.
+
+FIX: controller-owned shutdown cleanup atomically rotates only the asset-local insurance operator
+to an asset-scoped instruction-only PDA, then invokes Percolator as market authority. This forces
+the pinned Percolator binary itself to enforce recovery mode, the empty-asset predicate, and its
+configured shutdown delay; any early or unsafe call rolls the role rotation back. The amount remains
+slab-derived and the destination must be the canonical controller token account, so no caller or DAO
+can select a recipient. External provider cleanup is unchanged. No generic authority setter,
+withdrawal amount, governance destination, user-principal path, or reusable admin signer was added.
+
 ## Tick - parent-ray reconciliation could miss a safe off-ray integer lot (surface C)
 
 The bounded continued-fraction fallback checked the simplest marginal-to-bid fraction and its two
