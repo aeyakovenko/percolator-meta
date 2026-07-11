@@ -2437,10 +2437,12 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     // In SEND mode, validate + record the COIN sink (a COIN token account); BURN mode ignores it.
     let coin_sink_key = if sink_mode == SINK_SEND {
         let coin_sink = next_account_info(iter)?;
-        // The sink must be EXTERNAL to the auction — never the shared coin_escrow (which is also a
-        // coin-mint account), or execute's SEND would loop escrow -> escrow and strand the bought
-        // COIN forever. (finding AS)
-        if *coin_sink.key == *coin_escrow.key {
+        // Same-mint markets make every custody account a valid COIN account. Keep the sink outside
+        // all custody so bought COIN cannot be stranded under auction accounting. (finding BT)
+        if *coin_sink.key == *coin_escrow.key
+            || *coin_sink.key == *settlement_usd.key
+            || *coin_sink.key == *holding.key
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         validate_coin_sink_configuration(coin_sink, coin_mint.key)?;
@@ -2574,11 +2576,12 @@ fn process_set_coin_sink(
     }
     let sink_key = if sink_mode == SINK_SEND {
         let coin_sink = next_account_info(iter)?;
-        // The sink must be EXTERNAL to the auction. The shared coin_escrow is also a coin-mint
-        // account, so without this a SEND sink set to it would make execute's transfer a no-op
-        // (escrow -> escrow), silently STRANDING every bought COIN in the escrow forever (fixed
-        // supply) instead of reaching the treasury — the buyback nullified. (finding AS)
-        if *coin_sink.key == book.coin_escrow {
+        // Same-mint markets make every custody account a valid COIN account. Keep the sink outside
+        // all custody so bought COIN cannot be stranded under auction accounting. (finding BT)
+        if *coin_sink.key == book.coin_escrow
+            || *coin_sink.key == book.settlement_usd
+            || *coin_sink.key == book.holding
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         validate_coin_sink_configuration(coin_sink, &book.coin_mint)?;

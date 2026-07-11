@@ -190,7 +190,9 @@ six selected market/pool scopes. A maximal six-scope initialization fits a one-m
 transaction under the network packet limit. The DAO may configure future epochs but cannot mutate a live epoch,
 redirect a user's claim, or sweep principal. After a sink epoch freezes, later rounds burn that stale
 sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
-also falls back to burn instead of stalling settlement.
+also falls back to burn instead of stalling settlement. The configured COIN sink must remain external
+to the book's COIN escrow, collateral settlement escrow, and holding account, including when COIN is
+also the collateral mint.
 
 Auction placement requires the bidder's canonical initialized COIN and collateral ATAs. Closed ATAs
 are permissionlessly recreatable, and an already-frozen destination is rejected before any bid fee or
