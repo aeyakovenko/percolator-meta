@@ -13023,6 +13023,14 @@ struct HandoffEnv {
     surplus: u64,
 }
 fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
+    setup_handoff_with_mint_mode(svm, payer, false)
+}
+
+fn setup_handoff_with_mint_mode(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    shared_coin_and_collateral_mint: bool,
+) -> HandoffEnv {
     let squads = squads_id();
     let treasury = install_squads(svm, &squads, &payer.pubkey());
     let dao = Keypair::new();
@@ -13050,9 +13058,13 @@ fn setup_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
     .expect("multisig");
     let squads_vault = vault_pda(&squads, &multisig, 0);
 
-    let collateral_mint = Pubkey::new_unique();
     let coin_mint_authority = Keypair::new();
     let coin_mint = create_real_mint(svm, payer, &coin_mint_authority.pubkey());
+    let collateral_mint = if shared_coin_and_collateral_mint {
+        coin_mint
+    } else {
+        Pubkey::new_unique()
+    };
     let slab = Pubkey::new_unique();
     let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 100);
     svm.set_account(
@@ -28575,6 +28587,332 @@ fn e2e_send_sink_cannot_be_the_coin_escrow() {
     .expect("external treasury sink accepted");
 }
 
+// INTERNAL SINK ALIAS: when a market uses COIN itself as collateral, the settlement account is
+// also a valid COIN token account. Sending the bought-COIN share there does not satisfy any bidder
+// obligation: claims remove only tracked USD and refunds, leaving the reward share permanently in
+// book escrow. The configured sink must therefore be external to every auction custody account,
+// not only distinct from coin_escrow.
+#[test]
+fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff_with_mint_mode(&mut svm, &payer, true);
+    assert_eq!(env.coin_mint, env.collateral_mint);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let book_before = svm.get_account(&bk.book).unwrap();
+    let bad = build_set_coin_sink_send_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        &bk.settlement_usd,
+    );
+    let bad_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(bk.settlement_usd, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let bad_result = squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &bad,
+        &bad_remaining,
+    );
+    if bad_result.is_ok() {
+        let economics = build_set_economics_message(
+            &env.squads_vault,
+            &env.twap_cfg,
+            &bk.holding,
+            0,
+            10_000,
+        );
+        let economics_remaining = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(bk.holding, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            7,
+            &economics,
+            &economics_remaining,
+        )
+        .expect("arm the vulnerable all-buyback path");
+
+        let bidder = Keypair::new();
+        svm.airdrop(&bidder.pubkey(), 1_000_000_000).unwrap();
+        let bidder_account = coin_ata_of(&bidder.pubkey(), &env.coin_mint);
+        set_token(
+            &mut svm,
+            &bidder_account,
+            &env.coin_mint,
+            &bidder.pubkey(),
+            0,
+        );
+        mint_coin(
+            &mut svm,
+            &payer,
+            &env.coin_mint,
+            &env.coin_mint_authority,
+            &bidder_account,
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &bidder_account,
+                &bidder_account,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1_000_000,
+                1_000_000,
+                None,
+            ),
+        )
+        .expect("same-mint bidder commits COIN");
+        let round_end = u64::from_le_bytes(
+            svm.get_account(&bk.book).unwrap().data[240..248]
+                .try_into()
+                .unwrap(),
+        );
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&payer],
+            execute_ix(
+                &payer.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                Some(bk.settlement_usd),
+            ),
+        )
+        .expect("vulnerable round settles into its own settlement custody");
+        send(
+            &mut svm,
+            &[&payer],
+            claim_ix(
+                &payer.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &bidder_account,
+                &bidder_account,
+                0,
+            ),
+        )
+        .expect("bidder receives every tracked payout and refund");
+        assert_eq!(
+            token_amount(&svm, &bk.settlement_usd),
+            0,
+            "an internal sink strands the bought-COIN share after every bidder obligation is paid"
+        );
+    }
+    assert_eq!(
+        svm.get_account(&bk.book).unwrap(),
+        book_before,
+        "the rejected alias leaves the auction configuration unchanged"
+    );
+
+    let holding_alias = build_set_coin_sink_send_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        &bk.holding,
+    );
+    let holding_alias_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(bk.holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            7,
+            &holding_alias,
+            &holding_alias_remaining,
+        )
+        .is_err(),
+        "holding custody cannot recycle bought COIN as next-round collateral"
+    );
+    assert_eq!(svm.get_account(&bk.book).unwrap(), book_before);
+
+    let external_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &external_sink,
+        &env.coin_mint,
+        &env.squads_vault,
+        0,
+    );
+    let valid = build_set_coin_sink_send_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        &external_sink,
+    );
+    let valid_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(external_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &valid,
+        &valid_remaining,
+    )
+    .expect("a distinct same-mint reward sink remains valid");
+
+    let economics = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.holding,
+        0,
+        10_000,
+    );
+    let economics_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(bk.holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        9,
+        &economics,
+        &economics_remaining,
+    )
+    .expect("arm an all-buyback round with the external sink");
+
+    let bidder = Keypair::new();
+    svm.airdrop(&bidder.pubkey(), 1_000_000_000).unwrap();
+    let bidder_account = coin_ata_of(&bidder.pubkey(), &env.coin_mint);
+    set_token(
+        &mut svm,
+        &bidder_account,
+        &env.coin_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    mint_coin(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.coin_mint_authority,
+        &bidder_account,
+        1_000_000,
+    );
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &bidder_account,
+            &bidder_account,
+            &env.coin_mint,
+            &env.collateral_mint,
+            1_000_000,
+            1_000_000,
+            None,
+        ),
+    )
+    .expect("same-mint bidder commits COIN");
+    let round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            Some(external_sink),
+        ),
+    )
+    .expect("same-mint round settles to the external sink");
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &bidder_account,
+            &bidder_account,
+            0,
+        ),
+    )
+    .expect("same-mint bidder claims settlement and refund");
+    assert_eq!(token_amount(&svm, &external_sink), 400_000);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+    assert_eq!(token_amount(&svm, &bidder_account), 1_000_000);
+}
+
 // FINDING AS AT INIT (self-loop sink set at CREATION, not just by set_coin_sink): a book can be born in
 // SEND mode with a coin_sink already chosen. init_book must reject coin_sink == coin_escrow exactly like
 // set_coin_sink does — otherwise execute's SEND would transfer the shared escrow to itself (escrow ->
@@ -28658,6 +28996,84 @@ fn e2e_init_book_send_sink_cannot_be_the_coin_escrow() {
     assert!(
         svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
         "book never created with the self-loop sink"
+    );
+}
+
+#[test]
+fn e2e_same_mint_init_book_sink_cannot_alias_settlement_custody() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff_with_mint_mode(&mut svm, &payer, true);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(
+        &mut svm,
+        &settlement_usd,
+        &env.collateral_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+
+    let msg = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        0,
+        1,
+        10,
+        1,
+        0,
+        Some(&settlement_usd),
+    );
+    let rem = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
+        "init_book must reject settlement custody as a same-mint bought-COIN sink"
+    );
+    assert!(
+        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
+        "book never binds its settlement custody as the reward sink"
     );
 }
 
