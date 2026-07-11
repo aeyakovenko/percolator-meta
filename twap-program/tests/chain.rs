@@ -24908,6 +24908,228 @@ fn e2e_uniform_repricing_uses_a_safe_exact_marginal_lot() {
     let _ = (target, marginal);
 }
 
+// PUBLIC DOS PROBE: the bidder-safe integer interval can contain a whole-atom pair even when the
+// largest rounded pair crosses the bid limit and neither exact endpoint lot fits. Reconciliation
+// must consider a bounded interior rational candidate or a public book can suppress a safe fill.
+#[test]
+fn e2e_uniform_repricing_uses_a_safe_interior_price_lot() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        254,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            254,
+        )
+        .unwrap(),
+    )
+    .expect("fund exact 254-unit budget");
+
+    // Each better-rate 11/23 bid nominally consumes 23 USD, then reprices to 10 COIN / 21 USD at
+    // the final 11/24 marginal. Its own 23-USD cap prevents it from absorbing the released dust.
+    let mut better = Vec::new();
+    for _ in 0..10 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 11);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                11,
+                23,
+                None,
+            ),
+        )
+        .expect("place better-rate remainder bid");
+        better.push((bidder, coin, usd));
+    }
+
+    // Only 24 nominal USD remain, so this reduced 227/480 lot is skipped by preflight. After the
+    // ten better bids release 20 USD, 8/17 lies safely between 11/24 and 227/480. The largest
+    // rounded 9/19 pair crosses the bidder's limit, while the exact endpoint lots need 24 and 480.
+    let (target, target_coin, target_usd) = new_bidder(&mut svm, &payer, &env, 227);
+    send(
+        &mut svm,
+        &[&target],
+        place_bid_ix(
+            &target.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &target_coin,
+            &target_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            227,
+            480,
+            None,
+        ),
+    )
+    .expect("place skipped interior-ratio target");
+
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 11);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            11,
+            24,
+            None,
+        ),
+    )
+    .expect("place final marginal bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute interior-price probe");
+
+    assert_eq!(
+        token_amount(&svm, &bk.settlement_usd),
+        251,
+        "a safe interior whole-atom lot must not be skipped"
+    );
+    assert_eq!(supply_before - mint_supply(&svm, &env.coin_mint), 119);
+    assert_eq!(token_amount(&svm, &bk.holding), 3);
+
+    for (slot, (_, coin, usd)) in better.iter().enumerate() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                usd,
+                coin,
+                slot as u8,
+            ),
+        )
+        .expect("claim better-rate bid");
+        assert_eq!(token_amount(&svm, coin), 1);
+        assert_eq!(token_amount(&svm, usd), 21);
+    }
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &target_usd,
+            &target_coin,
+            10,
+        ),
+    )
+    .expect("claim interior-price target");
+    assert_eq!(token_amount(&svm, &target_coin), 219);
+    assert_eq!(token_amount(&svm, &target_usd), 17);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            11,
+        ),
+    )
+    .expect("claim marginal bid");
+    assert_eq!(token_amount(&svm, &marginal_coin), 0);
+    assert_eq!(token_amount(&svm, &marginal_usd), 24);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (target, marginal);
+}
+
 // PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
 // when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
 // reconciliation, but a lower-ranked executable bid never receives an allocation; because a
@@ -27073,9 +27295,152 @@ fn e2e_full_book_of_worst_case_rates_cannot_dos_execute() {
         ))
         .expect("execute must clear a full worst-case book without exhausting compute");
     assert!(
-        m.compute_units_consumed < 550_000,
-        "execute plus final-price reconciliation must retain 60% network headroom, got {}",
+        m.compute_units_consumed < 650_000,
+        "execute plus interior reconciliation must retain over 53% network headroom, got {}",
         m.compute_units_consumed
+    );
+}
+
+// PUBLIC CU-DOS PROBE: a small round budget makes high-denominator intervals fail the exact
+// denominator bound before continued-fraction work starts. Fund a reachable u64-scale round and
+// fill all 32 slots with much higher Fibonacci ratios so the interior reconciliation path itself
+// cannot hide an attacker-controlled compute failure behind that cheap rejection.
+#[test]
+fn e2e_full_book_of_max_scale_interior_rates_cannot_dos_execute() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+
+    let mut fib = vec![1u64, 1u64];
+    while fib.len() <= 90 {
+        fib.push(
+            fib[fib.len() - 1]
+                .checked_add(fib[fib.len() - 2])
+                .expect("selected Fibonacci range fits u64"),
+        );
+    }
+    let rates: Vec<(u64, u64)> = (0..32)
+        .map(|i| (fib[58 + i], fib[59 + i]))
+        .collect();
+    let total_coin = rates
+        .iter()
+        .try_fold(0u64, |sum, rate| sum.checked_add(rate.0))
+        .expect("all public bids fit the shared u64 COIN escrow");
+    let budget = rates
+        .iter()
+        .try_fold(0u64, |sum, rate| sum.checked_add(rate.1))
+        .expect("the full public USD book fits one u64 round budget");
+    assert!(total_coin > 1_000_000_000_000_000_000);
+    assert!(budget > total_coin);
+
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        budget,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            budget,
+        )
+        .unwrap(),
+    )
+    .expect("fund max-scale round budget");
+
+    for (coin, usd) in rates {
+        let (bidder, coin_source, usd_destination) = new_bidder(&mut svm, &payer, &env, coin);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_source,
+                &usd_destination,
+                &env.coin_mint,
+                &env.collateral_mint,
+                coin as u128,
+                usd as u128,
+                None,
+            ),
+        )
+        .expect("place max-scale Fibonacci bid");
+    }
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), total_coin);
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    let ix = execute_ix(
+        &cranker.pubkey(),
+        &env,
+        &bk.book,
+        &bk.holding,
+        &bk.settlement_usd,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        None,
+    );
+    svm.expire_blockhash();
+    let m = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&cranker.pubkey()),
+            &[&cranker],
+            svm.latest_blockhash(),
+        ))
+        .expect("max-scale public book must execute within the network limit");
+    assert!(
+        m.compute_units_consumed < 1_200_000,
+        "max-scale interior reconciliation must retain compute headroom, got {}",
+        m.compute_units_consumed
+    );
+    assert_eq!(
+        token_amount(&svm, &bk.holding) + token_amount(&svm, &bk.settlement_usd),
+        budget,
+        "execution conserves every USD atom"
     );
 }
 
