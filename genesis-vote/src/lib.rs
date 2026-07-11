@@ -847,6 +847,20 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if pv.executed && action == VOTE_BACK {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Trigger becomes valid at this exact slot, so new support must already be
+    // closed. Otherwise a depositor can wait for the final result, refresh an
+    // old ballot or retract and switch proposals before a cranker lands trigger.
+    // Retraction remains open indefinitely because it is the owner's escape from
+    // the Subledger vote lock and cannot add support to any proposal.
+    let back_slot = if action == VOTE_BACK {
+        let slot = Clock::get()?.slot;
+        if slot >= config.bootstrap_end_slot {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some(slot)
+    } else {
+        None
+    };
 
     // The subledger position + pool must be owned by the configured subledger
     // program and be the canonical PDAs for (pool, voter) / (pool).
@@ -923,10 +937,14 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         ballot.voted_weight = 0;
         ballot.voted_principal = 0;
     } else {
-        let clock = Clock::get()?;
         // Slot zero is a valid configured bootstrap start and deposit timestamp. Principal zero
         // and age below two already produce zero weight, so no timestamp sentinel is needed.
-        let weight = vote_weight(principal, clock.slot.saturating_sub(start_slot));
+        let weight = vote_weight(
+            principal,
+            back_slot
+                .ok_or(ProgramError::InvalidInstructionData)?
+                .saturating_sub(start_slot),
+        );
         if weight == 0 {
             msg!("position has no vote weight (unfunded or too recent)");
             return Err(ProgramError::InvalidAccountData);
