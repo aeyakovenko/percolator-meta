@@ -165,6 +165,10 @@ const IX_ASSERT_PRINCIPAL: u8 = 11;
 // retires the complete position and can pay only a clean token account owned by
 // that depositor.
 const IX_RETURN_FINALIZED_POSITION: u8 = 12;
+// Owner-signed, amountless full exit. TWAP uses this after returning established
+// custody so a live owner recovery cannot commit without consuming the complete
+// position that authorized it.
+const IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 
 // Percolator CPI tags (verified against the pinned v16 program, percolator-prog 624b13d).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -791,6 +795,9 @@ pub fn process_instruction(
         IX_ASSERT_PRINCIPAL => process_assert_principal(program_id, accounts, &mut data),
         IX_RETURN_FINALIZED_POSITION => {
             process_return_finalized_position(program_id, accounts, &mut data)
+        }
+        IX_INSURANCE_WITHDRAW_FULL => {
+            process_insurance_withdraw_full(program_id, accounts, &mut data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -1703,6 +1710,28 @@ fn process_insurance_withdraw(
     process_insurance_withdraw_impl(program_id, accounts, data, false)
 }
 
+// insurance_withdraw_full has the same accounts as insurance_withdraw and no
+// instruction data. It removes the position's complete remaining principal;
+// all owner, destination, pool, market, and payout checks stay centralized in
+// the ordinary withdrawal implementation.
+fn process_insurance_withdraw_full(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let position_account = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if position_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let principal = Position::deserialize(&position_account.try_borrow_data()?)?.principal;
+    let amount_bytes = principal.to_le_bytes();
+    let mut amount_data: &[u8] = &amount_bytes;
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
+}
+
 // return_finalized_position accounts: [owner, pool(w), position(w), owner_ata(w),
 //   holding(w), market_slab(w), percolator_vault(w), vault_authority,
 //   percolator_program, token_program, genesis_config, executed_proposal,
@@ -2226,18 +2255,20 @@ fn process_return_resolved_asset0_backing(
 }
 
 // handoff_to_twap accounts:
-// [squads_vault(signer), pool(current asset_admin), twap_config,
+// [squads_vault(signer on first handoff), pool(current asset_admin), twap_config,
 //  twap_authority, market_slab(w), percolator_program, twap_program]
 // data: none
 //
-// The governance signer authorizes timing, but never receives a Percolator role. The
-// pool signs a CPI to the fixed TWAP program, which hardcodes the only incoming
-// authority to its config-bound PDA and atomically protects this pool's live
+// Governance authorizes the first handoff but never receives a Percolator role. After
+// an owner-bound recovery, the same current-layout TWAP config may accept the same pool
+// again without governance; TWAP verifies that immutable binding before changing a
+// role. The pool signs a CPI to the fixed TWAP program, which hardcodes the only
+// incoming authority to its config-bound PDA and atomically protects this pool's live
 // outstanding principal. Only POLICY_PRINCIPAL may cross this boundary: TWAP moves
 // protocol surplus, while POLICY_WITH_SURPLUS makes the live balance part of depositor
 // share value, so combining them could socialize a protocol pull into user principal.
 // Percolator verifies that this pool is the current asset_admin, while the TWAP verifies
-// the Squads vault and all market bindings.
+// the Squads identity and all market bindings.
 fn process_handoff_to_twap(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2255,8 +2286,8 @@ fn process_handoff_to_twap(
     let percolator_program = next_account_info(iter)?;
     let twap_program = next_account_info(iter)?;
 
-    if !squads_vault.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
     }
     if *twap_program.key != TWAP_PROGRAM_ID || !twap_program.executable {
         return Err(ProgramError::IncorrectProgramId);
@@ -2283,7 +2314,7 @@ fn process_handoff_to_twap(
         &Instruction {
             program_id: *twap_program.key,
             accounts: vec![
-                AccountMeta::new_readonly(*squads_vault.key, true),
+                AccountMeta::new_readonly(*squads_vault.key, squads_vault.is_signer),
                 AccountMeta::new_readonly(*pool_account.key, true),
                 AccountMeta::new(*twap_config.key, false),
                 AccountMeta::new_readonly(*twap_authority.key, false),
