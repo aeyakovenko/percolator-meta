@@ -2,6 +2,27 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - provisional integer exclusion could suppress a final-price whole-lot fill (surface C)
+
+TWAP recomputation permanently excluded a bid when its first integer reconstruction was infeasible,
+even though a larger bidder-safe pair could fit the same USD allocation during final-price
+reconciliation. With a three-unit budget, public `31 COIN / 1 USD` and `21 COIN / 14 USD` bids made
+the old binary settle only two units. The first bid initially reconstructed to a zero-USD pair and
+was excluded, but the final `21/14` price safely supports its `2 COIN / 1 USD` whole-lot fill. One
+rounding-edge bid could therefore strand one third of a round.
+This suppressed reward-point buyback and burn; it could not cross custody floors, redirect escrow,
+or debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the final price settles all three units, burns five
+COIN, pays the two owner-bound bidder accounts `1 + 2` USD, returns `29 + 18` COIN, and drains both
+shared auction escrows exactly to zero.
+
+FIX: final-price remainder reconciliation no longer inherits provisional exclusion flags. It still
+considers only bids ranked above the final stable marginal or exactly equal to it, caps every fill by
+the remaining budget and original bid, and recomputes a bidder-safe integer pair under the unchanged
+final price. No signer, authority, recipient, budget, reserve, custody, principal, withdrawal, or
+admin surface was added.
+
 ## Tick - equal-price bids could be starved after uniform integer repricing (surface C)
 
 TWAP nominal allocation could consume the complete round budget before uniform integer repricing
