@@ -3107,22 +3107,44 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                     continue;
                 }
                 let c = book_rd_u128(&d, o + SL_COIN);
+                let u = book_rd_u128(&d, o + SL_USDC);
                 let usd_i = book_rd_u128(&d, o + SL_USD_OWED);
                 let coin_i = if usd_i > 0 {
                     mul_div_floor(usd_i, cm, um)?
                 } else {
                     0
                 };
-                if usd_i > 0 && coin_i > 0 {
+                // `usd_i` is only a nominal budget allocation. COIN is indivisible, so paying all
+                // of it after flooring the COIN leg can cross the marginal price and even the DAO
+                // reserve by almost one whole COIN atom per bid. Reconcile the payout to the whole
+                // COIN actually bought, rounding USD down in the protocol's favor. The resulting
+                // pair must still honor this bidder's own limit; if no integer pair does, leave the
+                // bid unfilled and roll that budget forward to a later round.
+                let executable_usd = if coin_i > 0 {
+                    mul_div_floor(coin_i, um, cm)?
+                } else {
+                    0
+                };
+                let executable = executable_usd > 0
+                    && executable_usd <= usd_i
+                    && cmp_rate(coin_i, executable_usd, c, u) != Ordering::Greater
+                    && cmp_rate(
+                        coin_i,
+                        executable_usd,
+                        book.reserve_num,
+                        book.reserve_den,
+                    ) != Ordering::Less;
+                if executable {
                     let refund = c
                         .checked_sub(coin_i)
                         .ok_or(ProgramError::ArithmeticOverflow)?;
+                    book_wr_u128(&mut d, o + SL_USD_OWED, executable_usd);
                     book_wr_u128(&mut d, o + SL_COIN_REFUND, refund);
                     total_coin = total_coin
                         .checked_add(coin_i)
                         .ok_or(ProgramError::ArithmeticOverflow)?;
                     total_usd = total_usd
-                        .checked_add(usd_i)
+                        .checked_add(executable_usd)
                         .ok_or(ProgramError::ArithmeticOverflow)?;
                 } else {
                     book_wr_u128(&mut d, o + SL_USD_OWED, 0);

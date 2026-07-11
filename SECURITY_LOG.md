@@ -12843,3 +12843,22 @@ FIX: every COIN return now requires an initialized correct-mint account owned so
 bidder, with no delegate, delegated amount, or close authority. The stable slot ABI and canonical recovery hint
 remain unchanged, but address equality is no longer the security boundary. No admin, repair signer, arbitrary
 beneficiary, amount selector, withdrawal authority, or principal-moving program surface was added.
+
+## Tick - per-bid flooring could pay above the TWAP reserve (surface A/C)
+
+The uniform-price settlement first allocated a nominal USD amount, then floored the corresponding COIN to a
+whole atom while leaving the full nominal USD payable. A cheap high-rate bid followed by a marginal reserve bid
+could therefore collect almost two marginal-price units for one delivered atom. Every submitted bid passed the
+reserve, but the executed transfer did not, so repeated rounding could leak insurance surplus to colluding
+bidders.
+
+A retained real-SBF LiteSVM regression sets the DAO reserve to `1 COIN / 500 USD`, submits a `10 / 999` bid and
+a marginal `1 / 500` bid, then runs permissionless settlement and both claims. The old binary burned two COIN
+but paid `1,499` USD, including `999` to the bidder that delivered one atom; the reserve permits at most `1,000`
+for the two delivered atoms. A second retained probe covers the opposite safety edge: if rounding USD down would
+take a whole COIN below the marginal bidder's own limit, that bid is fully refunded rather than underpaid.
+
+FIX: after deriving whole COIN at the marginal rate, settlement derives the executable USD amount back from that
+integer COIN, rounds in the insurance fund's favor, and rechecks both the bidder limit and DAO reserve. Any
+non-executable remainder stays in the canonical holding for a later round. No authority, destination, signer,
+bid-cancellation path, principal counter, or admin surface was added.
