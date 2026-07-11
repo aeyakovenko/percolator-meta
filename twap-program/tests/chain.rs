@@ -862,8 +862,8 @@ fn place_bid_rejects_a_frozen_canonical_usd_destination() {
     assert_eq!(token_amount(&svm, &book.coin_escrow), 0);
 }
 
-// PUBLIC DOS PROBE: refunds are pinned to the canonical COIN ATA. A healthy noncanonical source
-// must not mask a canonical refund ATA that was frozen before the mint's freeze key was revoked.
+// PUBLIC DOS PROBE: placement escrows from the canonical COIN ATA. A healthy noncanonical source
+// must not mask that canonical source being frozen before the mint's freeze key was revoked.
 #[test]
 fn place_bid_rejects_a_frozen_canonical_coin_refund_account() {
     let mut svm =
@@ -20165,12 +20165,9 @@ fn e2e_claim_cannot_be_replayed_to_drain_other_winners() {
 
 // LOF PROBE (claim payout redirect, sweep tick A): claim is PERMISSIONLESS — any cranker may settle a bidder's
 // slot (the replay test above cranks alice's claim for her). The bidder's payout destinations (usd_dest /
-// coin_ata) come from the caller, so the ONLY thing stopping a cranker from redirecting a winner's parked USD
-// (and escrowed COIN refund) into the cranker's OWN account is the recorded-key bind at lib.rs:1793
-// (usd_dest.key == SL_USD_DEST && coin_ata.key == SL_COIN_ATA). The existing claim tests only ever pass the
-// CORRECT accounts, so that bind was unexercised. This pins it: a redirect to an attacker account is rejected,
-// and it is rejected unconditionally (the guard runs before the >0 transfer branches, so it holds even when the
-// COIN refund is 0). Parity with the distribution claim-theft guard.
+// coin_ata) come from the caller, so the only thing stopping a cranker from redirecting a winner's parked USD
+// (and escrowed COIN refund) into the cranker's own account is the clean recorded-bidder ownership check. This
+// pins it: a redirect to an attacker account is rejected unconditionally, even when the COIN refund is zero.
 #[test]
 fn e2e_claim_payout_cannot_be_redirected_to_a_cranker_account() {
     let mut svm =
@@ -22283,6 +22280,48 @@ fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
         .is_err(),
         "only the bidder may cancel their own bid"
     );
+
+    // Even an owner-signed return must not pay into an account with a mutable third-party drain
+    // path. The owner can instead name another clean account they solely control.
+    send(
+        &mut svm,
+        &[&alice],
+        spl_token::instruction::approve(
+            &spl_token::ID,
+            &a_src,
+            &mallory.pubkey(),
+            &alice.pubkey(),
+            &[],
+            10_000,
+        )
+        .unwrap(),
+    )
+    .expect("alice delegates the original refund ATA after placement");
+    assert!(
+        send(
+            &mut svm,
+            &[&alice],
+            cancel_ix(
+                &alice.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &a_src,
+                0,
+            )
+        )
+        .is_err(),
+        "cancel must not expose returned principal to a token delegate"
+    );
+    let clean_refund = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_refund,
+        &env.coin_mint,
+        &alice.pubkey(),
+        0,
+    );
     send(
         &mut svm,
         &[&alice],
@@ -22292,13 +22331,18 @@ fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
             &bk.book,
             &bk.book_escrow,
             &bk.coin_escrow,
-            &a_src,
+            &clean_refund,
             0,
         ),
     )
-    .expect("alice cancels after cooldown");
+    .expect("alice cancels to a clean owner-only fallback after cooldown");
 
-    assert_eq!(token_amount(&svm, &a_src), 10_000, "escrowed COIN returned");
+    assert_eq!(
+        token_amount(&svm, &clean_refund),
+        10_000,
+        "escrowed COIN returned"
+    );
+    assert_eq!(token_amount(&svm, &a_src), 0, "delegated ATA was not used");
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0, "escrow drained");
     assert_eq!(
         mint_supply(&svm, &env.coin_mint),
@@ -25427,9 +25471,8 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
     let (better, bt_s, bt_u) = new_bidder(&mut svm, &payer, &env, 50);
 
     // ATTACK (eviction-refund theft): the incoming bidder tries to redirect the evicted bidder's
-    // escrowed COIN to an account THEY control instead of the evictee's RECORDED canonical ATA. The
-    // refund target is pinned to the weakest bid's stored SL_COIN_ATA (set at the evictee's own
-    // place_bid), so a mismatched evict account is rejected and the evictee's COIN is never stolen.
+    // escrowed COIN to an account they control. The destination must instead be clean and owned
+    // solely by the recorded evictee, so the evictee's COIN cannot be stolen.
     let thief = Pubkey::new_unique();
     set_token(&mut svm, &thief, &env.coin_mint, &better.pubkey(), 0);
     assert!(
@@ -25452,7 +25495,7 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
             )
         )
         .is_err(),
-        "eviction must refund the evictee's recorded canonical ATA, not an attacker-chosen account"
+        "eviction must refund an evictee-owned account, not an attacker-owned account"
     );
     assert_eq!(
         token_amount(&svm, &thief),
@@ -27275,12 +27318,9 @@ fn e2e_execute_rejects_a_substituted_holding_no_budget_fragmentation() {
 
 // UNCENSORABILITY survives a closed-ATA poison bid on the EVICTION path (distinct from finding V's
 // CLAIM-path e2e_closing_refund_ata_...). In a FULL 32-slot book, a strictly-better bid evicts the
-// weakest and refunds it to the weakest's CANONICAL coin ATA. If that bidder closed their ATA, the
-// eviction refund (spl transfer) fails and the better bid is temporarily blocked — but anyone can
-// permissionlessly recreate the canonical ATA, after which the eviction succeeds + refunds. Pins that
-// the core uncensorable-bid guarantee is RECOVERABLE (not a permanent brick) on the eviction path
-// too; a regression pointing the eviction refund away from the canonical ATA would not be caught by
-// finding V's claim-path test.
+// weakest and refunds it to a clean account owned solely by that bidder. If the caller supplies a
+// closed canonical ATA, the transfer fails, but anyone can recreate that ATA or supply another clean
+// evictee-owned account. This pins that the core uncensorable-bid guarantee remains recoverable.
 #[test]
 fn e2e_closed_weakest_ata_cannot_permanently_block_eviction() {
     let mut svm =
@@ -27404,6 +27444,141 @@ fn e2e_closed_weakest_ata_cannot_permanently_block_eviction() {
         "the better bid's 50 COIN now escrowed"
     );
     let _ = bidders;
+}
+
+// PUBLIC LOF + DOS PROBE: the weakest bidder can add an SPL delegate after placement. A better
+// bidder must neither force the escrow refund into that delegated account (letting the delegate
+// steal it) nor be permanently blocked by the poisoned canonical ATA. A fresh, clean token account
+// owned solely by the recorded evictee is a safe permissionless recovery destination.
+#[test]
+fn e2e_delegated_weakest_refund_cannot_be_stolen_or_block_eviction() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let mut bidders = Vec::new();
+    for i in 0..32u64 {
+        let coin = i + 1;
+        let (bidder, coin_src, usd_dest) = new_bidder(&mut svm, &payer, &env, coin);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_src,
+                &usd_dest,
+                &env.coin_mint,
+                &env.collateral_mint,
+                coin as u128,
+                1000,
+                None,
+            ),
+        )
+        .expect("fill bid");
+        bidders.push((bidder, coin_src));
+    }
+
+    let (better, better_coin, better_usd) = new_bidder(&mut svm, &payer, &env, 50);
+    let weakest_ata = bidders[0].1;
+    send(
+        &mut svm,
+        &[&bidders[0].0],
+        spl_token::instruction::approve(
+            &spl_token::ID,
+            &weakest_ata,
+            &better.pubkey(),
+            &bidders[0].0.pubkey(),
+            &[],
+            1,
+        )
+        .unwrap(),
+    )
+    .expect("weakest bidder delegates its empty refund ATA after placement");
+
+    let stolen = Pubkey::new_unique();
+    set_token(&mut svm, &stolen, &env.coin_mint, &better.pubkey(), 0);
+    if send(
+        &mut svm,
+        &[&better],
+        place_bid_ix(
+            &better.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &better_coin,
+            &better_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            50,
+            1000,
+            Some(weakest_ata),
+        ),
+    )
+    .is_ok()
+    {
+        send(
+            &mut svm,
+            &[&better],
+            spl_token::instruction::transfer(
+                &spl_token::ID,
+                &weakest_ata,
+                &stolen,
+                &better.pubkey(),
+                &[],
+                1,
+            )
+            .unwrap(),
+        )
+        .expect("delegate drains the forced eviction refund");
+        assert_eq!(token_amount(&svm, &stolen), 1);
+        panic!("eviction exposed the weakest bidder's escrow to an SPL delegate");
+    }
+
+    let clean_fallback = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_fallback,
+        &env.coin_mint,
+        &bidders[0].0.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&better],
+        place_bid_ix(
+            &better.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &better_coin,
+            &better_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            50,
+            1000,
+            Some(clean_fallback),
+        ),
+    )
+    .expect("clean evictee-owned fallback keeps permissionless eviction live");
+    assert_eq!(token_amount(&svm, &clean_fallback), 1);
+    assert_eq!(token_amount(&svm, &weakest_ata), 0);
+    assert_eq!(token_amount(&svm, &better_coin), 0);
 }
 
 // ANTI-SPOOF COMMITMENT (issue #28 fix): a permissionless no-op ROLL advances round_end but must NOT
@@ -28388,10 +28563,9 @@ fn e2e_execute_full_four_way_split_composes_in_one_round() {
 
 // CLAIM COIN-REFUND REDIRECT BY A PERMISSIONLESS CRANKER (external LOF): claim is permissionless and
 // pays a bid's coin_refund (coin_escrow -> coin_ata). For a LOSER (unfilled) bid the refund is the
-// FULL escrowed COIN. If coin_ata weren't pinned, a cranker could claim the loser's slot with THEIR
-// OWN COIN account and steal the refund. claim pins coin_ata == the bid's recorded canonical COIN ATA
-// (findings V/AB). The existing redirect test only covers the USD side (its winner sold all its COIN,
-// so coin_refund was 0) — this exercises a non-zero refund.
+// FULL escrowed COIN. A cranker must not claim the loser's slot into its own or a delegated account;
+// claim requires a clean account owned solely by the recorded bidder. The existing redirect test only
+// covers the USD side (its winner sold all its COIN), so this exercises a non-zero refund.
 #[test]
 fn e2e_claim_cannot_redirect_a_losers_coin_refund() {
     let mut svm =
@@ -28469,6 +28643,77 @@ fn e2e_claim_cannot_redirect_a_losers_coin_refund() {
         ),
     )
     .expect("execute settles");
+
+    // The refund target was clean when Bob placed the bid, but SPL authority state is mutable.
+    // A delegate approved after escrow must not be able to make a permissionless cranker force
+    // Bob's principal into an account the delegate can immediately drain.
+    let delegate_thief = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &delegate_thief,
+        &env.coin_mint,
+        &cranker.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&bob],
+        spl_token::instruction::approve(
+            &spl_token::ID,
+            &b_src,
+            &cranker.pubkey(),
+            &bob.pubkey(),
+            &[],
+            100_000,
+        )
+        .unwrap(),
+    )
+    .expect("bob approves a delegate after bidding");
+    if send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &b_usd,
+            &b_src,
+            1,
+        ),
+    )
+    .is_ok()
+    {
+        send(
+            &mut svm,
+            &[&cranker],
+            spl_token::instruction::transfer(
+                &spl_token::ID,
+                &b_src,
+                &delegate_thief,
+                &cranker.pubkey(),
+                &[],
+                100_000,
+            )
+            .unwrap(),
+        )
+        .expect("delegate drains the forced refund");
+        assert_eq!(token_amount(&svm, &delegate_thief), 100_000);
+        panic!("permissionless claim exposed Bob's COIN principal to an SPL delegate");
+    }
+    assert_eq!(
+        token_amount(&svm, &bk.coin_escrow),
+        100_000,
+        "a rejected delegated refund leaves Bob's principal escrowed"
+    );
+    send(
+        &mut svm,
+        &[&bob],
+        spl_token::instruction::revoke(&spl_token::ID, &b_src, &bob.pubkey(), &[]).unwrap(),
+    )
+    .expect("bob revokes the delegate");
 
     // ATTACK: the cranker claims bob's loser slot (index 1) but substitutes bob's coin_ata with theirs.
     let thief = Pubkey::new_unique();
