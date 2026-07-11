@@ -12862,3 +12862,23 @@ FIX: after deriving whole COIN at the marginal rate, settlement derives the exec
 integer COIN, rounds in the insurance fund's favor, and rechecks both the bidder limit and DAO reserve. Any
 non-executable remainder stays in the canonical holding for a later round. No authority, destination, signer,
 bid-cancellation path, principal counter, or admin surface was added.
+
+## Tick - integer-infeasible bids could indefinitely reserve TWAP budget (surface C)
+
+TWAP selected the marginal rate from nominal USD allocations before checking whether that allocation formed a
+whole-COIN pair within the bidder's own limit. A `801 COIN / 400,001 USD` bid ranks above an exact
+`800 / 400,000` reserve bid, but a 400,000-unit allocation reconciles its 800 COIN to only 399,501 USD and
+therefore violates its own limit. The old binary refunded the top bid after allocation, never considered the
+exact lower bid, bought nothing, and rolled both commitments into every later round.
+
+The first retained real-SBF LiteSVM regression reproduces that two-bid starvation and proves the lower bid now
+sells 800 COIN for exactly 400,000 collateral units while the infeasible bid receives all 801 COIN back. A
+second regression fills all 32 slots with the infeasible rate, proves a lower executable bid cannot evict one,
+permissionlessly refunds every aged slot without spending collateral, reopens the book, and completes the next
+exact settlement from the preserved budget.
+
+FIX: marginal selection now uses the same whole-token reconciliation as final settlement. An infeasible partial
+candidate cannot consume nominal budget or set the uniform price. If positive budget and reserve-eligible bids
+exist but every candidate is infeasible, execute enters a refund-only settled state instead of preserving an
+un-evictable full book. No admin escape, recipient, amount selector, custody authority, principal counter, or
+new signer was added.

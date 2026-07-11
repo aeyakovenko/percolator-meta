@@ -156,8 +156,11 @@ TWAP rounds are externally cranked. Each round pulls only asset-0's live insuran
 the configured insurance share by ratcheting the floor upward, and buys COIN at one marginal
 clearing price. Whole-atom fills reconcile the USD payout to the integer COIN actually bought; every
 executed pair must still satisfy both the bidder's limit and the DAO reserve, and fractional remainder
-stays in the holding for a later round. Insurance deposited for other assets is never counted toward
-that surplus. Bought COIN can be split between burn and a canonical dynamic reward vault.
+stays in the holding for a later round. A bid that cannot transact a whole-atom pair cannot reserve
+nominal budget or set the marginal price. If every eligible bid is integer-infeasible, the aged book
+settles for permissionless refunds without spending collateral. Insurance deposited for other assets
+is never counted toward that surplus. Bought COIN can be split between burn and a canonical dynamic
+reward vault.
 
 The full chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
 vault and burns 50%. At day 45 the accumulated reward vault distributes:

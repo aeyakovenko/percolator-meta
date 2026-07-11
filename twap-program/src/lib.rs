@@ -2175,6 +2175,33 @@ fn mul_div_floor(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
         .ok_or(ProgramError::ArithmeticOverflow)
 }
 
+fn executable_integer_pair(
+    nominal_usd: u128,
+    marginal_coin: u128,
+    marginal_usd: u128,
+    bid_coin: u128,
+    bid_usd: u128,
+    reserve_num: u128,
+    reserve_den: u128,
+) -> Result<Option<(u128, u128)>, ProgramError> {
+    if nominal_usd == 0 {
+        return Ok(None);
+    }
+    let coin = mul_div_floor(nominal_usd, marginal_coin, marginal_usd)?;
+    if coin == 0 || coin > bid_coin {
+        return Ok(None);
+    }
+    let usd = mul_div_floor(coin, marginal_usd, marginal_coin)?;
+    if usd == 0
+        || usd > nominal_usd
+        || cmp_rate(coin, usd, bid_coin, bid_usd) == core::cmp::Ordering::Greater
+        || cmp_rate(coin, usd, reserve_num, reserve_den) == core::cmp::Ordering::Less
+    {
+        return Ok(None);
+    }
+    Ok(Some((coin, usd)))
+}
+
 fn as_u64(v: u128) -> Result<u64, ProgramError> {
     u64::try_from(v).map_err(|_| ProgramError::InvalidInstructionData)
 }
@@ -3076,8 +3103,12 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             }
             idx[b] = key;
         }
-        // c) walk best->worst spending the budget; the last bid filled is the marginal one. Stash
-        //    each filled bid's won USD in its SL_USD_OWED field.
+        // c) walk best->worst spending the budget; the last bid filled is the marginal one. A
+        //    partially allocated bid can fail to form any whole-COIN pair at its own rate. Such a
+        //    bid cannot reserve nominal budget or set the clearing price: doing so would refund it
+        //    during reconciliation while starving every lower-ranked executable bid indefinitely.
+        //    Full allocations are always exact; for the partial edge, preflight the same integer
+        //    pair used below and continue to the next bid when it is not executable.
         let mut remaining = budget;
         let mut marginal: Option<usize> = None;
         for k in 0..n {
@@ -3085,9 +3116,23 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 break;
             }
             let o = slot_off(idx[k]);
+            let c = book_rd_u128(&d, o + SL_COIN);
             let u = book_rd_u128(&d, o + SL_USDC);
             let fill = core::cmp::min(remaining, u);
             if fill == 0 {
+                continue;
+            }
+            if executable_integer_pair(
+                fill,
+                c,
+                u,
+                c,
+                u,
+                book.reserve_num,
+                book.reserve_den,
+            )?
+            .is_none()
+            {
                 continue;
             }
             book_wr_u128(&mut d, o + SL_USD_OWED, fill);
@@ -3109,32 +3154,21 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 let c = book_rd_u128(&d, o + SL_COIN);
                 let u = book_rd_u128(&d, o + SL_USDC);
                 let usd_i = book_rd_u128(&d, o + SL_USD_OWED);
-                let coin_i = if usd_i > 0 {
-                    mul_div_floor(usd_i, cm, um)?
-                } else {
-                    0
-                };
                 // `usd_i` is only a nominal budget allocation. COIN is indivisible, so paying all
                 // of it after flooring the COIN leg can cross the marginal price and even the DAO
                 // reserve by almost one whole COIN atom per bid. Reconcile the payout to the whole
                 // COIN actually bought, rounding USD down in the protocol's favor. The resulting
                 // pair must still honor this bidder's own limit; if no integer pair does, leave the
-                // bid unfilled and roll that budget forward to a later round.
-                let executable_usd = if coin_i > 0 {
-                    mul_div_floor(coin_i, um, cm)?
-                } else {
-                    0
-                };
-                let executable = executable_usd > 0
-                    && executable_usd <= usd_i
-                    && cmp_rate(coin_i, executable_usd, c, u) != Ordering::Greater
-                    && cmp_rate(
-                        coin_i,
-                        executable_usd,
-                        book.reserve_num,
-                        book.reserve_den,
-                    ) != Ordering::Less;
-                if executable {
+                // bid unfilled and preserve that budget for a later round.
+                if let Some((coin_i, executable_usd)) = executable_integer_pair(
+                    usd_i,
+                    cm,
+                    um,
+                    c,
+                    u,
+                    book.reserve_num,
+                    book.reserve_den,
+                )? {
                     let refund = c
                         .checked_sub(coin_i)
                         .ok_or(ProgramError::ArithmeticOverflow)?;
@@ -3153,17 +3187,28 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 d[o + SL_SETTLED] = 1;
             }
         }
-        // Settle only if we actually bought COIN; otherwise this is a roll (bids stay committed).
+        // Settle normally when COIN was bought. If positive budget and reserve-eligible bids exist
+        // but every possible marginal allocation is integer-infeasible, settle the book for
+        // refunds only. Rolling that state would preserve a full higher-rate Sybil book forever:
+        // a lower executable bid cannot enter because eviction requires a strictly better rate.
         if total_coin > 0 && total_usd > 0 {
             d[BK_STATE] = BOOK_STATE_SETTLED;
             settled = true;
+        } else if budget > 0 && n > 0 && marginal.is_none() {
+            for i in 0..MAX_BIDS {
+                let o = slot_off(i);
+                if d[o + SL_OCCUPIED] == 1 {
+                    let c = book_rd_u128(&d, o + SL_COIN);
+                    book_wr_u128(&mut d, o + SL_USD_OWED, 0);
+                    book_wr_u128(&mut d, o + SL_COIN_REFUND, c);
+                    d[o + SL_SETTLED] = 1;
+                }
+            }
+            d[BK_STATE] = BOOK_STATE_SETTLED;
         } else {
-            // A roll (nothing bought) must FULLY restore each bid's pre-execute payout state, not
-            // just the usd_owed/settled marks: when `marginal` was set but every fill rounded to
-            // zero COIN, the settlement loop above already wrote SL_COIN_REFUND (= full escrow) on
-            // each slot. Leaving that stale relies on a later real settlement overwriting it before
-            // any read — fragile. Reset all three fields so a rolled bid is byte-identical to its
-            // pre-execute self for the subsequent cancel/evict/settle paths. (finding AE)
+            // A zero-budget or no-eligible-bid roll keeps commitments live. Fully restore every
+            // provisional payout field so each bid is byte-identical to its pre-execute state for
+            // subsequent cancel, eviction, and settlement paths.
             for i in 0..MAX_BIDS {
                 let o = slot_off(i);
                 if d[o + SL_OCCUPIED] == 1 {
