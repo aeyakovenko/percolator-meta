@@ -1988,6 +1988,14 @@ fn process_accept_market_authority<'a>(
         let insurance_operator =
             percolator_accounting::read_asset_insurance_operator(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
+        // A funded asset, or an empty asset whose external authority can fund later, must have one
+        // provider for both deposit and withdrawal custody. Preserving split external roles would
+        // let the unrelated operator drain insurance immediately after the market handoff.
+        if (has_insurance || insurance_authority != current_bytes)
+            && insurance_authority != insurance_operator
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let restore_insurance_authority = has_insurance && insurance_authority == current_bytes;
         let restore_insurance_operator = has_insurance && insurance_operator == current_bytes;
         let backing_authority =

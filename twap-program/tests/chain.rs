@@ -6106,6 +6106,179 @@ fn e2e_market_donation_preserves_and_terminally_returns_creator_insurance() {
     );
 }
 
+// PUBLIC LOF PROBE: controller-governed markets require one external key to own both insurance
+// deposit and withdrawal custody. A creator must not be able to fund asset 0 under split roles and
+// then donate marketauth while preserving an unrelated operator that can drain the provider.
+fn assert_market_donation_rejects_split_asset0_insurance_custody(
+    fund_before_handoff: bool,
+) {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    let provider = Keypair::new();
+    let operator = Keypair::new();
+    for signer in [&creator, &provider, &operator] {
+        svm.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
+    }
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    for (kind, new_authority) in [(1u8, &provider), (2u8, &operator)] {
+        send(
+            &mut svm,
+            &[&payer, &creator, new_authority],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(new_authority.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                ],
+                data: percolator_prog::ix::Instruction::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: new_authority.pubkey().to_bytes(),
+                }
+                .encode(),
+            },
+        )
+        .expect("creator splits asset-0 insurance custody through the public API");
+    }
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let amount = 700_000u64;
+    let provider_source = Pubkey::new_unique();
+    let operator_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_source,
+        &collateral_mint,
+        &provider.pubkey(),
+        amount,
+    );
+    set_token(
+        &mut svm,
+        &operator_destination,
+        &collateral_mint,
+        &operator.pubkey(),
+        0,
+    );
+    let top_up = || Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(provider_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+                domain: 0,
+                amount: amount as u128,
+            }
+            .encode(),
+        };
+    if fund_before_handoff {
+        send(&mut svm, &[&payer, &provider], top_up())
+            .expect("external authority deposits under the split withdrawal role");
+    }
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8],
+    };
+    let market_before = svm.get_account(&slab).unwrap();
+    let vault_before = svm.get_account(&percolator_vault).unwrap();
+    if send(&mut svm, &[&payer, &creator], donate_market).is_ok() {
+        let donated = svm.get_account(&slab).unwrap();
+        assert_eq!(
+            percolator_accounting::read_market_authority(&donated.data).unwrap(),
+            controller.to_bytes()
+        );
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_authority(&donated.data, 0).unwrap(),
+            provider.pubkey().to_bytes()
+        );
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_operator(&donated.data, 0).unwrap(),
+            operator.pubkey().to_bytes()
+        );
+        if !fund_before_handoff {
+            send(&mut svm, &[&payer, &provider], top_up())
+                .expect("external authority deposits after the unsafe controller handoff");
+        }
+        send(
+            &mut svm,
+            &[&payer, &operator],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(operator.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(operator_destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+                    asset_index: 0,
+                    amount: amount as u128,
+                }
+                .encode(),
+            },
+        )
+        .expect("surviving split operator drains the external provider after handoff");
+        assert_eq!(token_amount(&svm, &operator_destination), amount);
+        panic!("controller accepted split insurance custody");
+    }
+
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), vault_before);
+    assert_eq!(
+        token_amount(&svm, &provider_source),
+        if fund_before_handoff { 0 } else { amount }
+    );
+    assert_eq!(token_amount(&svm, &operator_destination), 0);
+}
+
+#[test]
+fn e2e_market_donation_rejects_split_funded_asset0_insurance_custody() {
+    assert_market_donation_rejects_split_asset0_insurance_custody(true);
+}
+
+#[test]
+fn e2e_market_donation_rejects_split_asset0_roles_before_later_funding() {
+    assert_market_donation_rejects_split_asset0_insurance_custody(false);
+}
+
 // A funded donation is recoverable only if asset_admin migrates to the controller or remains on a
 // canonical constrained custodian. This fixture delegates an arbitrary cold admin: after stale
 // resolution it could prevent role rotation and make one provider balance a permanent CloseSlab gate.
