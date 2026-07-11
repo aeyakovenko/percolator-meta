@@ -2,6 +2,26 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - pool-to-TWAP handoff could cross controller governance seeds (surface A/C)
+
+A canonical Subledger pool binds its market and Percolator program but intentionally has no
+governance key. Squads C could therefore hand that pool to TWAP C after market lifecycle had already
+been donated to a controller derived from governance B. TWAP's terminal insurance recovery derives
+controller C from its config, while Percolator permanently records controller B as `marketauth`.
+Neither constrained controller can donate its PDA-held authority again, so retained protocol
+insurance and terminal `CloseSlab` could be stranded.
+
+A clean-room LiteSVM regression creates the canonical principal pool and real Squads-C/TWAP-C config,
+donates lifecycle to a differently seeded controller B through the real controller and pinned
+Percolator binary, and deposits owner principal. The old TWAP SBF accepts the mismatched handoff. The
+retained test requires byte-atomic rejection across the slab, pool, and config, then proves the owner
+still withdraws every deposited atom through the unchanged Subledger path.
+
+FIX: the shared TWAP custody acceptor now re-reads `marketauth` from the pinned slab. It accepts only
+the two valid lifecycle phases: the config's own Squads vault before controller donation, or the exact
+controller PDA derived from that vault, market, and Percolator program afterward. No account, signer,
+instruction, destination, amount, authority mutation, or value path was added.
+
 ## Tick - distinct asset-0 providers could retain an unusable rotation key (surface A/C)
 
 The delegated-admin donation guard covered funded insurance or backing only when the outgoing

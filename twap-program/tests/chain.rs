@@ -4706,6 +4706,42 @@ fn build_controller_accept_market_authority_message(
     m
 }
 
+fn build_controller_accept_market_authority_with_distinct_governance_message(
+    current_authority: &Pubkey,
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    custody_state: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // current_authority is the Squads vault signer
+    m.push(0);
+    m.push(1); // market writable
+    m.push(7);
+    for key in [
+        current_authority,
+        market,
+        governance,
+        controller,
+        percolator_program,
+        custody_state,
+        &controller_id(),
+    ] {
+        m.extend_from_slice(key.as_ref());
+    }
+    m.push(1);
+    m.push(6); // market-controller program
+    m.push(6);
+    for index in [2u8, 0, 3, 1, 4, 5] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(3); // IX_ACCEPT_MARKET_AUTHORITY
+    m.push(0);
+    m
+}
+
 fn build_controller_raw_close_message(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -6367,6 +6403,191 @@ fn e2e_foreign_canonical_twap_config_cannot_bless_a_market_handoff() {
         "a canonical config for another market cannot attest this TWAP admin"
     );
     assert_eq!(svm.get_account(&env.slab).unwrap(), market_before);
+}
+
+// PUBLIC DOS: a canonical Subledger pool is market-bound but governance-neutral. If marketauth is
+// first donated to controller B, Squads C must not hand that pool to TWAP C: terminal TWAP recovery
+// derives controller C, while Percolator permanently records controller B. Reject before custody
+// moves so the owner-bound pool keeps every depositor withdrawal live.
+#[test]
+fn e2e_twap_handoff_rejects_a_mismatched_market_controller() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    let foreign_governance = Keypair::new();
+    svm.airdrop(&foreign_governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    let foreign_controller = controller_pda(&foreign_governance.pubkey(), &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_with_distinct_governance_message(
+        &env.squads_vault,
+        &foreign_governance.pubkey(),
+        &foreign_controller,
+        &env.slab,
+        &perc_id(),
+        &env.pool,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(foreign_governance.pubkey(), false),
+        AccountMeta::new_readonly(foreign_controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("Squads donates lifecycle to a differently seeded controller");
+    assert_eq!(
+        percolator_accounting::read_market_authority(&svm.get_account(&env.slab).unwrap().data)
+            .unwrap(),
+        foreign_controller.to_bytes()
+    );
+
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let principal = 10u64;
+    let depositor_ata = Pubkey::new_unique();
+    let pool_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &depositor_ata,
+        &env.collateral_mint,
+        &depositor.pubkey(),
+        principal,
+    );
+    set_token(&mut svm, &pool_holding, &env.collateral_mint, &env.pool, 0);
+    let position = sub_position_pda(&env.pool, &depositor.pubkey());
+    let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    deposit_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("owner deposits while the canonical pool still owns custody");
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize the Squads-C TWAP config");
+    let twap_cfg = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+    let handoff = build_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    let market_before = svm.get_account(&env.slab).unwrap();
+    let pool_before = svm.get_account(&env.pool).unwrap();
+    let config_before = svm.get_account(&twap_cfg).unwrap();
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            3,
+            &handoff,
+            &handoff_remaining,
+        )
+        .is_err(),
+        "TWAP custody must reject a market controlled by another governance seed"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before);
+
+    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    withdraw_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: withdraw_data,
+        },
+    )
+    .expect("rejected custody handoff leaves the owner's direct exit live");
+    assert_eq!(token_amount(&svm, &depositor_ata), principal);
+    assert_eq!(token_amount(&svm, &env.perc_vault), 0);
 }
 
 // PUBLIC LOF: secondary-asset activation names the deposit authority and withdrawal operator

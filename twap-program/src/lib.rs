@@ -1024,6 +1024,28 @@ fn process_accept_custody<'a>(
         return Err(ProgramError::InvalidSeeds);
     }
 
+    // Terminal recovery derives one controller from this config's Squads vault.
+    // Custody may move before lifecycle donation (marketauth is still that vault)
+    // or after donation to that exact controller, but never across governance seeds.
+    let expected_controller = Pubkey::find_program_address(
+        &[
+            MARKET_CONTROLLER_SEED,
+            squads_vault.key.as_ref(),
+            market_slab.key.as_ref(),
+            percolator_program.key.as_ref(),
+        ],
+        &MARKET_CONTROLLER_PROGRAM_ID,
+    )
+    .0;
+    let market_authority =
+        percolator_accounting::read_market_authority(&market_slab.try_borrow_data()?)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+    if market_authority != squads_vault.key.to_bytes()
+        && market_authority != expected_controller.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     // Move both insurance roles and finally asset_admin to the constrained PDA.
     // Percolator's insurance authority is also its resolved-mode terminal withdrawal
     // key, so even a nominally top-up-only governance key would be a principal drain
