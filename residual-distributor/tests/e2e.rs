@@ -3420,20 +3420,40 @@ fn register(
     cohort: u8,
 ) -> Result<(), String> {
     let stake = stake_pda_for_cohort(env, &owner.pubkey(), linked, cohort);
+    let mut accounts = vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new_readonly(env.rd_config, false),
+        AccountMeta::new_readonly(owner.pubkey(), true),
+        AccountMeta::new_readonly(*recipient, false),
+        AccountMeta::new_readonly(*linked, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ];
+    if svm.get_account(&env.rd_config).unwrap().data.len() == 823 {
+        let legacy_owner_stake = Pubkey::find_program_address(
+            &[b"rd_stake", env.rd_config.as_ref(), owner.pubkey().as_ref()],
+            &rd_id(),
+        )
+        .0;
+        let legacy_linked_stake = Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                env.rd_config.as_ref(),
+                owner.pubkey().as_ref(),
+                linked.as_ref(),
+            ],
+            &rd_id(),
+        )
+        .0;
+        accounts.push(AccountMeta::new_readonly(legacy_owner_stake, false));
+        accounts.push(AccountMeta::new_readonly(legacy_linked_stake, false));
+    }
     let result = send(
         svm,
         payer,
         &[Instruction {
             program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(env.rd_config, false),
-                AccountMeta::new_readonly(owner.pubkey(), true),
-                AccountMeta::new_readonly(*recipient, false),
-                AccountMeta::new_readonly(*linked, false),
-                AccountMeta::new(stake, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            ],
+            accounts,
             data: vec![1u8, cohort],
         }],
         &[owner],
@@ -7327,6 +7347,25 @@ fn pre_epoch_config_completes_register_crystallize_freeze_and_claim() {
     let mut historical_config = current_config;
     historical_config.data.truncate(PRE_EPOCH_CONFIG_SIZE);
     svm.set_account(env.rd_config, historical_config).unwrap();
+    // The two predecessor addresses are required as absence proofs. A third party can transfer
+    // lamports to either PDA, so data-empty prefunding must not become a new registration DoS.
+    let legacy_owner_stake = Pubkey::find_program_address(
+        &[b"rd_stake", env.rd_config.as_ref(), lp.pubkey().as_ref()],
+        &rd_id(),
+    )
+    .0;
+    let legacy_linked_stake = Pubkey::find_program_address(
+        &[
+            b"rd_stake",
+            env.rd_config.as_ref(),
+            lp.pubkey().as_ref(),
+            portfolio.as_ref(),
+        ],
+        &rd_id(),
+    )
+    .0;
+    svm.airdrop(&legacy_owner_stake, 1).unwrap();
+    svm.airdrop(&legacy_linked_stake, 1).unwrap();
     register(
         &mut svm,
         &payer,
@@ -7499,6 +7538,149 @@ fn exercise_historical_frozen_stake_claim(linked_seed: bool, label: &str) {
 fn frozen_owner_only_and_linked_stakes_preserve_claims_without_reopening_accrual() {
     exercise_historical_frozen_stake_claim(false, "owner-only V0 stake");
     exercise_historical_frozen_stake_claim(true, "owner+linked V1 stake");
+}
+
+fn exercise_pre_epoch_legacy_stake_blocks_parallel_registration(
+    linked_seed: bool,
+    already_counted: bool,
+    label: &str,
+) {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_slot(&mut svm, 100);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        5_000,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    )
+    .expect("register the pre-upgrade stake");
+    if already_counted {
+        set_slot(&mut svm, 1_500);
+        set_portfolio(
+            &mut svm,
+            &portfolio,
+            &env.stub_perc,
+            &env.market,
+            &owner.pubkey(),
+            12_000,
+            0,
+        );
+        crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+            .expect("crystallize the pre-upgrade stake");
+    }
+
+    let current_stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_LP);
+    let mut historical_stake = svm.get_account(&current_stake).unwrap();
+    let (historical_key, historical_bump) = if linked_seed {
+        Pubkey::find_program_address(
+            &[
+                b"rd_stake",
+                env.rd_config.as_ref(),
+                owner.pubkey().as_ref(),
+                portfolio.as_ref(),
+            ],
+            &rd_id(),
+        )
+    } else {
+        Pubkey::find_program_address(
+            &[b"rd_stake", env.rd_config.as_ref(), owner.pubkey().as_ref()],
+            &rd_id(),
+        )
+    };
+    historical_stake.data[192] = historical_bump;
+    svm.set_account(historical_key, historical_stake).unwrap();
+    svm.set_account(
+        current_stake,
+        Account {
+            lamports: 0,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let mut historical_config = svm.get_account(&env.rd_config).unwrap();
+    historical_config.data.truncate(823);
+    svm.set_account(env.rd_config, historical_config).unwrap();
+
+    set_slot(&mut svm, 1_600);
+    let result = register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    );
+    if already_counted {
+        assert!(
+            result.is_err(),
+            "{label}: an already-counted historical stake must block a parallel family stake"
+        );
+        assert!(
+            svm.get_account(&current_stake)
+                .is_none_or(|account| account.data.is_empty()),
+            "{label}: rejected parallel registration creates no current stake"
+        );
+    } else {
+        result.unwrap_or_else(|error| {
+            panic!("{label}: a zero-point predecessor can migrate: {error}")
+        });
+        assert!(
+            svm.get_account(&current_stake)
+                .is_some_and(|account| !account.data.is_empty()),
+            "{label}: migration creates the current family stake"
+        );
+    }
+}
+
+#[test]
+fn pre_epoch_historical_stake_cannot_be_registered_again_under_the_current_family_seed() {
+    exercise_pre_epoch_legacy_stake_blocks_parallel_registration(
+        false,
+        true,
+        "owner-only V0 stake",
+    );
+    exercise_pre_epoch_legacy_stake_blocks_parallel_registration(
+        true,
+        true,
+        "owner+linked V1 stake",
+    );
+}
+
+#[test]
+fn pre_epoch_zero_point_historical_stake_can_migrate_to_the_current_family_seed() {
+    exercise_pre_epoch_legacy_stake_blocks_parallel_registration(
+        false,
+        false,
+        "owner-only V0 stake",
+    );
+    exercise_pre_epoch_legacy_stake_blocks_parallel_registration(
+        true,
+        false,
+        "owner+linked V1 stake",
+    );
 }
 
 // SNAP MANIPULATION (trader cohort, NON-ZERO baseline — sweep tick D free-farm): the LP delta test above and
