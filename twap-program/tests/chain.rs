@@ -6065,8 +6065,7 @@ fn e2e_market_donation_preserves_and_terminally_returns_creator_insurance() {
 // A funded donation is recoverable only if the handoff also leaves the controller as asset_admin.
 // Otherwise an absent delegated admin can prevent the controller from rotating the external value
 // role after stale resolution, making one provider balance a permanent CloseSlab gate.
-#[test]
-fn e2e_funded_market_donation_rejects_a_delegated_asset0_admin() {
+fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(backing: bool) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -6118,15 +6117,29 @@ fn e2e_funded_market_donation_rejects_a_delegated_asset0_admin() {
         &vault_authority,
         0,
     );
-    let insurance_amount = 17u64;
+    let amount = 17u64;
     let creator_token = Pubkey::new_unique();
     set_token(
         &mut svm,
         &creator_token,
         &collateral_mint,
         &creator.pubkey(),
-        insurance_amount,
+        amount,
     );
+    let top_up_data = if backing {
+        percolator_prog::ix::Instruction::TopUpBackingBucket {
+            domain: 0,
+            amount: amount as u128,
+            expiry_slot: 10_000,
+        }
+        .encode()
+    } else {
+        percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+            domain: 0,
+            amount: amount as u128,
+        }
+        .encode()
+    };
     send(
         &mut svm,
         &[&payer, &creator],
@@ -6139,14 +6152,10 @@ fn e2e_funded_market_donation_rejects_a_delegated_asset0_admin() {
                 AccountMeta::new(percolator_vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
-                domain: 0,
-                amount: insurance_amount as u128,
-            }
-            .encode(),
+            data: top_up_data,
         },
     )
-    .expect("creator funds insurance while retaining its value roles");
+    .expect("creator funds one asset-0 value role before handoff");
 
     let controller = controller_pda(&governance, &slab, &perc_id());
     let market_before = svm.get_account(&slab).unwrap();
@@ -6181,6 +6190,19 @@ fn e2e_funded_market_donation_rejects_a_delegated_asset0_admin() {
         &creator.pubkey(),
         0,
     );
+    let withdraw_data = if backing {
+        percolator_prog::ix::Instruction::WithdrawBackingBucket {
+            domain: 0,
+            amount: amount as u128,
+        }
+        .encode()
+    } else {
+        percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+            asset_index: 0,
+            amount: amount as u128,
+        }
+        .encode()
+    };
     send(
         &mut svm,
         &[&payer, &creator],
@@ -6194,15 +6216,21 @@ fn e2e_funded_market_donation_rejects_a_delegated_asset0_admin() {
                 AccountMeta::new_readonly(vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
-                asset_index: 0,
-                amount: insurance_amount as u128,
-            }
-            .encode(),
+            data: withdraw_data,
         },
     )
     .expect("rejected handoff leaves the original provider withdrawal live");
-    assert_eq!(token_amount(&svm, &creator_destination), insurance_amount);
+    assert_eq!(token_amount(&svm, &creator_destination), amount);
+}
+
+#[test]
+fn e2e_funded_insurance_donation_rejects_a_delegated_asset0_admin() {
+    assert_funded_market_donation_rejects_a_delegated_asset0_admin(false);
+}
+
+#[test]
+fn e2e_funded_backing_donation_rejects_a_delegated_asset0_admin() {
+    assert_funded_market_donation_rejects_a_delegated_asset0_admin(true);
 }
 
 // PUBLIC LOF: secondary-asset activation names the deposit authority and withdrawal operator
