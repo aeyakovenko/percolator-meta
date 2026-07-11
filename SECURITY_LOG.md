@@ -2,6 +2,25 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - a feasible reduced bid lot could be skipped and suppress a TWAP reward round (surface C)
+
+TWAP preflight tested only the largest nominal partial allocation at a bid's own rate. Integer
+rounding could make that pair cross the bidder's limit even when a smaller exact reduced-ratio lot
+fit. A one-USD strictly better bid followed by a `399,998 COIN / 400,000 USD` bid therefore made the
+old binary settle only one of 400,000 available collateral units and leave the final reward budget
+unused. This could suppress COIN-point distribution; it could not cross the reserved insurance floor,
+redirect collateral, or take bidder principal.
+
+The retained real-SBF LiteSVM regression proves the old one-unit settlement, then requires the fixed
+path to exclude and fully refund the tiny bid, buy all `399,998` COIN for `400,000` collateral, drain
+the holding, and pay each bidder's owner-bound accounts exactly. The existing 32-slot Fibonacci and
+eight-pass repricing probes also remain below their 500,000-CU gates and conserve every escrowed atom.
+
+FIX: preflight reduces each visited positive u64 bid with cached shift/subtract GCD work. It preserves
+a valid maximum nominal allocation, otherwise reserves the largest exact reduced-ratio lot that fits.
+The final uniform-price bidder-limit checks remain unchanged. No signer, authority, recipient, amount
+selector, principal counter, custody path, or admin surface was added.
+
 ## Tick - a permissionless reward claim could pay into an attacker-delegated account (surface A/D)
 
 LP, trader, and funding-payer claims are intentionally permissionless so an absent portfolio owner

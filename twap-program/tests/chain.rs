@@ -24078,6 +24078,139 @@ fn e2e_integer_reconciliation_never_takes_coin_below_the_bidder_limit() {
     let _ = (alice, alice_coin, alice_usd, bob);
 }
 
+// PUBLIC DOS: an integer-safe partial bid can contain a smaller exact lot even when the largest
+// floored pair crosses the bidder's limit. Skipping the whole bid lets a one-USD better bid consume
+// the round's only executable allocation and leave almost the entire final reward budget unused.
+#[test]
+fn e2e_preflight_uses_a_smaller_exact_lot_instead_of_skipping_the_bid() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // The attacker takes one nominal USD at a strictly better rate. The remaining 399,999 USD
+    // makes the largest rounded pair for the honest 399,998/400,000 bid violate its own limit,
+    // but its reduced 199,999/200,000 lot fits twice once the infeasible attacker is excluded.
+    let (attacker, attacker_coin, attacker_usd) = new_bidder(&mut svm, &payer, &env, 2);
+    send(
+        &mut svm,
+        &[&attacker],
+        place_bid_ix(
+            &attacker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &attacker_coin,
+            &attacker_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            2,
+            1,
+            None,
+        ),
+    )
+    .expect("place one-USD better bid");
+    let (honest, honest_coin, honest_usd) = new_bidder(&mut svm, &payer, &env, 399_998);
+    send(
+        &mut svm,
+        &[&honest],
+        place_bid_ix(
+            &honest.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &honest_coin,
+            &honest_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            399_998,
+            400_000,
+            None,
+        ),
+    )
+    .expect("place divisible honest bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute reduced-lot clearing");
+
+    assert_eq!(
+        token_amount(&svm, &bk.settlement_usd),
+        400_000,
+        "the smaller exact lot keeps the complete round budget executable"
+    );
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        399_998,
+        "the full executable honest escrow is bought"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &attacker_usd,
+            &attacker_coin,
+            0,
+        ),
+    )
+    .expect("attacker claims full refund");
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &honest_usd,
+            &honest_coin,
+            1,
+        ),
+    )
+    .expect("honest bidder claims complete USD");
+    assert_eq!(token_amount(&svm, &attacker_coin), 2);
+    assert_eq!(token_amount(&svm, &attacker_usd), 0);
+    assert_eq!(token_amount(&svm, &honest_coin), 0);
+    assert_eq!(token_amount(&svm, &honest_usd), 400_000);
+}
+
 // PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
 // when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
 // reconciliation, but a lower-ranked executable bid never receives an allocation; because a
@@ -24528,7 +24661,10 @@ fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
 
     let burned = initial_coin - mint_supply(&svm, &env.coin_mint);
     let spent = token_amount(&svm, &bk.settlement_usd);
-    assert_eq!(burned, 17);
+    assert_eq!(
+        burned, 16,
+        "the 16/6 bid clears as an exact 8/3 lot instead of being skipped"
+    );
     assert_eq!(spent, 6);
     assert_eq!(token_amount(&svm, &bk.holding), 1);
 
