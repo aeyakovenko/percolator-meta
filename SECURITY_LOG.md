@@ -2,6 +2,22 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - legacy reward init could count one capital pool in both cohorts (surface D)
+
+Reusable reward epochs rejected a Subledger pool reused across insurance and backing scopes, but
+the original/genesis reward initializer did not. Because those cohorts intentionally use distinct
+stake families, one position in an aliased pool could crystallize the same principal twice and
+consume both COIN allocations. The configuration required the live COIN mint authority, and the
+effect was limited to reward points; no path could debit Subledger principal, Percolator insurance,
+or backing.
+
+The real-SBF LiteSVM regression first proved that the old legacy initializer accepted a 50/50
+aliased configuration. It now requires atomic rejection while the existing distinct-pool legacy
+configuration and reusable-epoch alias regression remain green.
+
+FIX: legacy init now applies the same immutable cross-domain pool segregation rule as reward-epoch
+init. This adds no signer, authority, recipient, withdrawal, custody, or admin surface.
+
 ## Tick - a feasible reduced bid lot could be skipped and suppress a TWAP reward round (surface C)
 
 TWAP preflight tested only the largest nominal partial allocation at a bid's own rate. Integer

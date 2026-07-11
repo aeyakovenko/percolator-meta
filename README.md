@@ -198,7 +198,9 @@ the frozen denominator.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads
-transaction under the network packet limit. The DAO may configure future epochs but cannot mutate a live epoch,
+transaction under the network packet limit. Insurance and backing allocations must name distinct
+Subledger pools in both genesis and continuous epochs, so one position cannot enter both capital cohorts.
+The DAO may configure future epochs but cannot mutate a live epoch,
 redirect a user's claim, or sweep principal. After a sink epoch freezes, later rounds burn that stale
 sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
 also falls back to burn instead of stalling settlement. The configured COIN sink must remain external
