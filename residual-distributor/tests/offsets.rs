@@ -170,6 +170,11 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         "Position.principal (cross-pool base-unit points) offset"
     );
     assert_eq!(
+        rd::SUB_POS_WITHDRAWN_AMOUNT,
+        subledger_program::POS_WITHDRAWN_AMOUNT_OFF,
+        "Position terminal-return principal snapshot offset"
+    );
+    assert_eq!(
         rd::SUB_POS_WITHDRAWN,
         subledger_program::POS_WITHDRAWN_OFF,
         "Position.withdrawn offset"
@@ -178,5 +183,10 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         rd::SUB_POS_START_SLOT,
         subledger_program::POS_START_SLOT_OFF,
         "Position.start_slot (top-up reset clock) offset"
+    );
+    assert_eq!(
+        rd::SUB_POS_TERMINAL_RETURNED,
+        subledger_program::POS_TERMINAL_RETURNED_OFF,
+        "Position permissionless terminal-return marker offset"
     );
 }

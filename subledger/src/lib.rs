@@ -91,8 +91,10 @@ const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
 pub const POS_POOL_OFF: usize = 8;
 pub const POS_OWNER_OFF: usize = 40;
 pub const POS_PRINCIPAL_OFF: usize = 72;
+pub const POS_WITHDRAWN_AMOUNT_OFF: usize = 80;
 pub const POS_WITHDRAWN_OFF: usize = 88;
 pub const POS_START_SLOT_OFF: usize = 89;
+pub const POS_TERMINAL_RETURNED_OFF: usize = 98;
 pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) — the share-value points source.
                                        // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
                                        // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
@@ -571,6 +573,10 @@ struct Position {
     /// Set by the pool's vote_authority while a genesis vote is live on this
     /// position. Blocks insurance-withdraw until the vote is retracted.
     vote_locked: bool,
+    /// A permissionless finalized-genesis return consumed the position. In this
+    /// state `withdrawn_amount` stores the principal still at risk immediately
+    /// before that return, so a cranker cannot erase an already-frozen reward.
+    terminal_returned: bool,
     /// Shares held for share-value accounting. Insurance deposits mint priced
     /// shares for both payout policies so residual-distributor live caps track
     /// remaining capital; own-vault POLICY_PRINCIPAL deposits keep this at 0.
@@ -588,7 +594,17 @@ impl Position {
         } else {
             0
         };
-        if withdrawn > 1 || vote_locked > 1 {
+        let terminal_returned = if data.len() >= POSITION_SIZE {
+            data[POS_TERMINAL_RETURNED_OFF]
+        } else {
+            0
+        };
+        if withdrawn > 1
+            || vote_locked > 1
+            || terminal_returned > 1
+            || (terminal_returned == 1
+                && (withdrawn != 1 || u64::from_le_bytes(data[72..80].try_into().unwrap()) != 0))
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -603,6 +619,7 @@ impl Position {
                 0
             },
             vote_locked: vote_locked == 1,
+            terminal_returned: terminal_returned == 1,
             shares: if data.len() >= POSITION_SIZE {
                 u128::from_le_bytes(data[104..120].try_into().unwrap())
             } else {
@@ -626,9 +643,12 @@ impl Position {
         } else {
             data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
             data[97] = self.vote_locked as u8;
-            data[98..104].fill(0);
             if data.len() >= POSITION_SIZE {
+                data[POS_TERMINAL_RETURNED_OFF] = self.terminal_returned as u8;
+                data[99..104].fill(0);
                 data[104..120].copy_from_slice(&self.shares.to_le_bytes());
+            } else {
+                data[98..104].fill(0);
             }
         }
         Ok(())
@@ -1053,6 +1073,7 @@ fn process_deposit(
             withdrawn: false,
             start_slot: 0,
             vote_locked: false,
+            terminal_returned: false,
             shares: 0,
         }
     } else {
@@ -1603,6 +1624,7 @@ fn process_insurance_deposit(
             withdrawn: false,
             start_slot: 0,
             vote_locked: false,
+            terminal_returned: false,
             shares: 0,
         }
     } else {
@@ -2017,14 +2039,21 @@ fn process_insurance_withdraw_impl(
     }
     // Historical telemetry must not become a custody gate. A position can cycle
     // the finite token supply enough times for cumulative withdrawals to exceed
-    // u64 even though every individual balance and principal remains valid.
-    position.withdrawn_amount = position.withdrawn_amount.saturating_add(owed);
+    // u64 even though every individual balance and principal remains valid. A
+    // permissionless terminal return instead records the remaining principal at
+    // risk, preserving a frozen reward cap without restoring earlier withdrawals.
+    position.withdrawn_amount = if terminal {
+        amount
+    } else {
+        position.withdrawn_amount.saturating_add(owed)
+    };
     if position.principal == 0 {
         position.withdrawn = true;
         if terminal {
             // The executed proposal proves the ballot has no remaining
             // governance effect; do not leave a stale lock on retired capital.
             position.vote_locked = false;
+            position.terminal_returned = true;
         }
     }
 
@@ -2425,6 +2454,7 @@ mod tests {
             withdrawn: true,
             start_slot: 0x0102_0304_0506_0708,
             vote_locked: false,
+            terminal_returned: false,
             shares: 0,
         };
         let mut d = vec![0u8; POSITION_SIZE];
@@ -2448,6 +2478,31 @@ mod tests {
             ),
             p.start_slot
         );
+
+        let terminal = Position {
+            pool,
+            owner,
+            principal: 0,
+            withdrawn_amount: 77,
+            withdrawn: true,
+            start_slot: 55,
+            vote_locked: false,
+            terminal_returned: true,
+            shares: 0,
+        };
+        terminal.serialize(&mut d).unwrap();
+        assert_eq!(d[POS_TERMINAL_RETURNED_OFF], 1);
+        assert_eq!(
+            u64::from_le_bytes(
+                d[POS_WITHDRAWN_AMOUNT_OFF..POS_WITHDRAWN_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            77
+        );
+        assert!(Position::deserialize(&d).unwrap().terminal_returned);
+        d[POS_PRINCIPAL_OFF..POS_PRINCIPAL_OFF + 8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(Position::deserialize(&d).is_err());
     }
 
     #[test]
@@ -2604,6 +2659,7 @@ mod tests {
             withdrawn: true,
             start_slot: 4242,
             vote_locked: true,
+            terminal_returned: false,
             shares: 5_555,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
@@ -2614,6 +2670,7 @@ mod tests {
         assert!(dp.withdrawn);
         assert_eq!(dp.start_slot, 4242);
         assert!(dp.vote_locked);
+        assert!(!dp.terminal_returned);
         assert_eq!(dp.shares, 5_555);
     }
 
@@ -2712,6 +2769,7 @@ mod tests {
             withdrawn: false,
             start_slot: 99,
             vote_locked: true,
+            terminal_returned: false,
             shares: 777,
         };
         for size in [POSITION_SIZE_BASE, POSITION_SIZE_TENURE, POSITION_SIZE] {
@@ -2726,6 +2784,7 @@ mod tests {
                 if size >= POSITION_SIZE_TENURE { 99 } else { 0 }
             );
             assert_eq!(decoded.vote_locked, size >= POSITION_SIZE_TENURE);
+            assert!(!decoded.terminal_returned);
             assert_eq!(decoded.shares, if size >= POSITION_SIZE { 777 } else { 0 });
         }
 
