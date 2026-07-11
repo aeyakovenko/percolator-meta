@@ -15896,7 +15896,8 @@ fn e2e_exited_position_cannot_vote_without_capital_zero_principal_zero_weight() 
 // passes), but quorum is measured against the LIVE pool outstanding (including non-voters), so
 // total_voted_principal*2 must exceed ALL deposited principal. A minority cannot reach it.
 // Proven with REAL multi-party deposits: alice (400k of 1M outstanding) votes and triggers ->
-// rejected (no quorum); only once bob (600k) also votes does the trigger succeed.
+// rejected (no quorum). The bootstrap deadline then keeps abstaining capital from changing the
+// result after execution becomes live.
 #[test]
 fn e2e_minority_turnout_cannot_reach_quorum() {
     let mut svm =
@@ -15959,7 +15960,7 @@ fn e2e_minority_turnout_cannot_reach_quorum() {
     let alice = Keypair::new();
     let alice_pos = deposit(&mut svm, &alice, 400_000);
     let bob = Keypair::new();
-    let bob_pos = deposit(&mut svm, &bob, 600_000);
+    let _bob_pos = deposit(&mut svm, &bob, 600_000);
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 8;
     svm.set_sysvar::<Clock>(&c);
@@ -16033,16 +16034,6 @@ fn e2e_minority_turnout_cannot_reach_quorum() {
         Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
         Pubkey::default(),
         "not sealed"
-    );
-
-    // Once the majority also votes, quorum is met and the trigger succeeds.
-    vote(&mut svm, &bob, &bob_pos);
-    trigger(&mut svm).expect("with a real quorum the trigger seals the winner");
-    let dist_cfg = svm.get_account(&env.dist_config).unwrap();
-    assert_eq!(
-        Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
-        dist_proposal,
-        "sealed once quorum reached"
     );
 }
 
@@ -17525,7 +17516,7 @@ fn e2e_sybil_splitting_gives_no_vote_advantage() {
 // outstanding (STRICT). So a voter holding EXACTLY half the live capital cannot seal — a 50/50
 // situation needs strictly MORE than half to have voted. If this were >= a tie could capture
 // the distribution. Pinned end-to-end: two equal 500k depositors; one voting (exactly 50%) fails
-// to reach quorum, and only once the second also votes (now > 50%) does the trigger seal.
+// to reach quorum, and the closed bootstrap cannot be tipped after that result is observable.
 #[test]
 fn e2e_exactly_half_capital_does_not_meet_quorum() {
     let mut svm =
@@ -17587,7 +17578,7 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
     let a = Keypair::new();
     let a_pos = deposit(&mut svm, &a, 500_000);
     let b = Keypair::new();
-    let b_pos = deposit(&mut svm, &b, 500_000); // outstanding = 1,000,000
+    let _b_pos = deposit(&mut svm, &b, 500_000); // outstanding = 1,000,000
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 8;
     svm.set_sysvar::<Clock>(&c);
@@ -17655,16 +17646,13 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
         trigger(&mut svm).is_err(),
         "exactly 50% of capital must NOT meet quorum (strict >)"
     );
-    // Strictly more than half (both, 1,000,000): 1,000,000*2 > 1,000,000 -> quorum.
-    vote(&mut svm, &b, &b_pos);
-    trigger(&mut svm).expect("strictly more than half meets quorum");
 }
 
 // ATTACK PROBE (majority strict-inequality / tie deadlock): the winner needs support_weight*2 >
 // total_cast_weight (STRICT). So two proposals each holding EXACTLY half the cast weight tie —
 // NEITHER can seal. If this were >= both could seal at 50% (double-seal / ambiguous winner). The
-// tie simply deadlocks until more weight breaks it. Pinned end-to-end: two equal-weight voters
-// back competing proposals (neither triggers), then a third voter tips one over half (it seals).
+// tie remains deadlocked once voting closes. Pinned end-to-end: two equal-weight voters back
+// competing proposals and neither trigger can seal after the bootstrap deadline.
 #[test]
 fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
     let mut svm =
@@ -17784,10 +17772,6 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
     let a_pos = deposit(&mut svm, &a, 500_000);
     let b = Keypair::new();
     let b_pos = deposit(&mut svm, &b, 500_000);
-    // Carol also commits during the deposit window, but withholds her vote until
-    // after the two-way tie is demonstrated.
-    let carol = Keypair::new();
-    let carol_pos = deposit(&mut svm, &carol, 100_000);
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 16;
     svm.set_sysvar::<Clock>(&c);
@@ -17802,17 +17786,11 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
         "a 50/50 weight tie cannot seal proposal B either"
     );
 
-    // The third committed voter tips A over half -> A now has a strict weighted majority and seals.
-    let mut c = svm.get_sysvar::<Clock>();
-    c.slot += 16;
-    svm.set_sysvar::<Clock>(&c);
-    vote(&mut svm, &carol, &carol_pos, &gv_a);
-    trigger(&mut svm, &gv_a, &prop_a).expect("the tie-broken majority seals A");
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(
         Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
-        prop_a,
-        "A is the sealed winner once the tie breaks"
+        Pubkey::default(),
+        "the deadline leaves a tied distribution unsealed"
     );
 }
 

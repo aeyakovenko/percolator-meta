@@ -586,6 +586,62 @@ fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
     assert_eq!(sealed_to, dist_proposal, "alice's proposal sealed — governance follows the capital that stayed");
 }
 
+// POST-DEADLINE VOTE RACE: trigger becomes permissionless at bootstrap_end_slot,
+// so new backing must be closed at that exact boundary. Otherwise a depositor can
+// wait for the six-month result, refresh old weight or retract and switch proposals
+// before a trigger lands. Retraction must remain live so the vote lock never traps
+// principal after the deadline.
+#[test]
+fn bootstrap_deadline_closes_new_backing_but_keeps_retract_and_exit_live() {
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, 100, 100, 1_000);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(100), Some(100));
+    let ve = setup_vote(&mut env);
+    let (_, proposal_a) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+    let (_, proposal_b) =
+        create_and_register_proposal(&mut env, &ve, 2, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    let (bob, bob_ata) = new_depositor(&mut env, 1);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, 1)
+        .expect("alice deposits during the window");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, 1)
+        .expect("bob deposits during the window");
+
+    env.warp_slot(env.bootstrap_end_slot() - 1);
+    gv_vote(&mut env, &ve, &alice, &proposal_a, 1).expect("alice backs before the deadline");
+    env.warp_slot(env.bootstrap_end_slot());
+
+    gv_vote(&mut env, &ve, &alice, &proposal_a, 2)
+        .expect("post-deadline retract remains the owner escape hatch");
+    assert!(
+        gv_vote(&mut env, &ve, &bob, &proposal_b, 1).is_err(),
+        "a previously idle depositor cannot add support after voting closes"
+    );
+    assert!(
+        gv_vote(&mut env, &ve, &alice, &proposal_b, 1).is_err(),
+        "a depositor cannot retract and switch proposals after voting closes"
+    );
+    assert_eq!(
+        env.svm
+            .get_account(&env.position_pda(&alice.pubkey()))
+            .unwrap()
+            .data[97],
+        0,
+        "the rejected re-back cannot restore alice's vote lock"
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, 1)
+        .expect("alice exits after retracting");
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, 1)
+        .expect("the rejected late voter exits without a lock");
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.token_amount(&bob_ata), 1);
+}
+
 // VOTE-TIME WEIGHT THEFT (free winner-take-all capture): vote weight = floor(log2(age)) * principal, read from
 // the voter's SUBLEDGER POSITION. If the vote bound the position to the voter loosely, a tiny-stake attacker
 // could present a WHALE's position and cast the whale's huge weight onto the attacker's own proposal — seizing
