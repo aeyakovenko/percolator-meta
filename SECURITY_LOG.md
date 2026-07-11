@@ -2,6 +2,35 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - distinct asset-0 providers could retain an unusable rotation key (surface A/C)
+
+The delegated-admin donation guard covered funded insurance or backing only when the outgoing
+market authority itself held that value role and the handoff therefore had to restore it. A creator
+could instead rotate insurance authority/operator or backing authority to a distinct external
+provider, delegate `asset_admin` to a third key, let the provider fund through Percolator's public
+API, and donate `marketauth`. `UpdateAuthority` left the already-distinct provider unchanged, so the
+old guard accepted the handoff. After public stale resolution, the fixed asset-0 returns still needed
+the absent third key to rotate the provider role, and the provider balance could block `CloseSlab`.
+The same class was reachable from an empty handoff: a surviving delegated admin could later rotate
+both insurance roles to itself, deposit one atom through Percolator, and disappear.
+
+Two clean-room pinned-Percolator + controller LiteSVM regressions extend the existing donation
+fixture. The creator co-signs each real role rotation with a distinct provider, delegates the cold
+admin, and that provider funds either insurance or backing. The PR126 SBF accepts both unsafe
+handoffs. The retained tests require byte-atomic rejection and prove that each original provider's
+ordinary signed withdrawal remains live and receives every atom. The existing empty delegated-admin
+probe now rejects at handoff, and a new public-init canary proves that a canonical TWAP config for a
+different real market cannot attest the target market.
+
+FIX: donation requires `asset_admin` to be the outgoing market authority (which Percolator migrates)
+or the controller, regardless of current balances. The only exception accepts a read-only canonical
+current-layout Subledger pool or TWAP config that rederives to this market and Percolator program,
+matches the live admin, and already owns both insurance roles. The TWAP proof additionally binds the
+Squads governance vault and custody mode; the Subledger proof binds the complete pool PDA schedule and
+canonical Percolator vault. Existing fixed wrappers can therefore supply every terminal signature.
+No instruction, writable account, signer, destination, amount, withdrawal path, or authority mutation
+was added.
+
 ## Tick - preserved asset-0 backing could retain an unusable rotation key (surface A/C)
 
 The asset-0 backing return already handled an absent provider after resolution, but it requires the
