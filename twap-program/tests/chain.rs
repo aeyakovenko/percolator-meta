@@ -37241,3 +37241,407 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
             .map_or(true, |account| account.lamports == 0)
     );
 }
+
+// PUBLIC LIFECYCLE DOS PROBE: a controller-owned secondary insurance domain can
+// accrue protocol fees from ordinary trades without any provider top-up. Once the
+// asset is shut down, its fixed cleanup must be able to remove that fee balance;
+// otherwise one public round trip permanently prevents per-asset retirement unless the
+// DAO resolves the entire market.
+#[test]
+fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller market init");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let proxy = |raw: Vec<u8>| {
+        let mut data = vec![0u8]; // controller IX_PROXY_ADMIN
+        data.extend_from_slice(&raw);
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 0,
+                asset_index: 1,
+                now_slot: 100,
+                initial_price: 1_000_000,
+                insurance_authority: controller.to_bytes(),
+                insurance_operator: controller.to_bytes(),
+                backing_bucket_authority: governance.pubkey().to_bytes(),
+                oracle_authority: governance.pubkey().to_bytes(),
+            }
+            .encode(),
+        ),
+    )
+    .expect("activate controller-owned protocol insurance");
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 10,
+            }
+            .encode(),
+        ),
+    )
+    .expect("configure the shutdown delay");
+
+    let trader_a = Keypair::new();
+    let trader_b = Keypair::new();
+    for trader in [&trader_a, &trader_b] {
+        svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+    }
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_a = Pubkey::new_unique();
+    let portfolio_b = Pubkey::new_unique();
+    for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize trader portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &trader.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("fund trader portfolio");
+    }
+
+    let size_q = (percolator::POS_SCALE / 10) as i128;
+    for signed_size in [size_q, -size_q] {
+        send(
+            &mut svm,
+            &[&payer, &trader_a, &trader_b],
+            pix(
+                vec![
+                    AccountMeta::new(trader_a.pubkey(), true),
+                    AccountMeta::new(trader_b.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio_a, false),
+                    AccountMeta::new(portfolio_b, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 1,
+                    size_q: signed_size,
+                    exec_price: 1_000_000,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("round-trip public trade creates protocol insurance fees");
+    }
+    let fee_insurance = percolator_accounting::read_asset_insurance_remaining(
+        &svm.get_account(&market).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        fee_insurance, 120,
+        "the two real 3-bps round-trip trades credit asset-local insurance"
+    );
+
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let insurance_ledger = Pubkey::new_unique();
+    svm.set_account(
+        insurance_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::insurance_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let shutdown_operator =
+        market_controller_program::shutdown_insurance_operator_address(&controller, 1).0;
+    let fixed_cleanup = || {
+        let mut ix = controller_return_shutdown_insurance_ix(
+            &governance.pubkey(),
+            &controller,
+            &market,
+            &controller_transit,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &insurance_ledger,
+            &perc_id(),
+            1,
+        );
+        ix.accounts
+            .push(AccountMeta::new_readonly(shutdown_operator, false));
+        ix
+    };
+    let market_before_early_cleanup = svm.get_account(&market).unwrap();
+    let vault_before_early_cleanup = svm.get_account(&percolator_vault).unwrap();
+    let ledger_before_early_cleanup = svm.get_account(&insurance_ledger).unwrap();
+    let mut forged_cleanup = fixed_cleanup();
+    *forged_cleanup.accounts.last_mut().unwrap() =
+        AccountMeta::new_readonly(Pubkey::new_unique(), false);
+    assert!(
+        send(&mut svm, &[&payer], forged_cleanup).is_err(),
+        "a caller cannot substitute the instruction-only shutdown operator"
+    );
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_early_cleanup
+    );
+    assert!(
+        send(&mut svm, &[&payer], fixed_cleanup()).is_err(),
+        "fixed cleanup must not drain controller insurance before shutdown matures"
+    );
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_early_cleanup
+    );
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_early_cleanup
+    );
+    assert_eq!(
+        svm.get_account(&insurance_ledger).unwrap(),
+        ledger_before_early_cleanup
+    );
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+
+    let retire = |now_slot| {
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 2,
+                asset_index: 1,
+                now_slot,
+                initial_price: 0,
+                insurance_authority: [0u8; 32],
+                insurance_operator: [0u8; 32],
+                backing_bucket_authority: [0u8; 32],
+                oracle_authority: [0u8; 32],
+            }
+            .encode(),
+        )
+    };
+    assert!(
+        send(&mut svm, &[&payer, &governance], retire(100)).is_err(),
+        "fee insurance must block retirement until fixed cleanup returns it"
+    );
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 1,
+                now_slot: 100,
+                initial_price: 0,
+                insurance_authority: [0u8; 32],
+                insurance_operator: [0u8; 32],
+                backing_bucket_authority: [0u8; 32],
+                oracle_authority: [0u8; 32],
+            }
+            .encode(),
+        ),
+    )
+    .expect("shut down the fee-bearing asset");
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 111;
+    svm.set_sysvar(&clock);
+
+    let portfolio_a_before_cleanup = svm.get_account(&portfolio_a).unwrap();
+    let portfolio_b_before_cleanup = svm.get_account(&portfolio_b).unwrap();
+    send(&mut svm, &[&payer], fixed_cleanup())
+        .expect("permissionless fixed cleanup retains protocol fees in controller custody");
+    assert_eq!(
+        token_amount(&svm, &controller_transit),
+        fee_insurance as u64
+    );
+    assert_eq!(
+        svm.get_account(&portfolio_a).unwrap(),
+        portfolio_a_before_cleanup
+    );
+    assert_eq!(
+        svm.get_account(&portfolio_b).unwrap(),
+        portfolio_b_before_cleanup
+    );
+    let cleaned_profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(cleaned_profile.insurance_authority, controller.to_bytes());
+    assert_eq!(
+        cleaned_profile.insurance_operator,
+        shutdown_operator.to_bytes(),
+        "only the instruction-scoped operator rotates during cleanup"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        0
+    );
+    send(&mut svm, &[&payer, &governance], retire(111))
+        .expect("the empty secondary asset retires without resolving the whole market");
+
+    let mut recovered_trader_principal = 0u128;
+    for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
+        let portfolio_state = svm.get_account(&portfolio).unwrap();
+        let capital = percolator_prog::state::read_portfolio(&portfolio_state.data)
+            .unwrap()
+            .capital
+            .get();
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &trader.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount: capital },
+            ),
+        )
+        .expect("trader collateral remains withdrawable after secondary retirement");
+        recovered_trader_principal += token_amount(&svm, &destination) as u128;
+    }
+    assert_eq!(
+        recovered_trader_principal + token_amount(&svm, &controller_transit) as u128,
+        2_000_000,
+        "the cleanup moves only the 120 fee atoms and preserves all remaining trader capital"
+    );
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+}

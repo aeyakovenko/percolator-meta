@@ -30,6 +30,7 @@ use solana_program::{
 declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
 const CONTROLLER_SEED: &[u8] = b"market-controller";
+const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
 const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const SUBLEDGER_PROGRAM_ID: Pubkey =
@@ -95,6 +96,17 @@ pub fn controller_address(
             governance.as_ref(),
             market.as_ref(),
             percolator_program.as_ref(),
+        ],
+        &id(),
+    )
+}
+
+pub fn shutdown_insurance_operator_address(controller: &Pubkey, asset_index: u16) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SHUTDOWN_INSURANCE_OPERATOR_SEED,
+            controller.as_ref(),
+            &asset_index.to_le_bytes(),
         ],
         &id(),
     )
@@ -890,14 +902,17 @@ fn process_return_shutdown_backing<'a>(
 // return_shutdown_insurance accounts:
 // [governance, controller_pda, market(w), authority_owned_token_account(w),
 //  controller_owned_transit(w), percolator_vault(w), vault_authority,
-//  controller_insurance_ledger(w), percolator_program, token_program]
+//  controller_insurance_ledger(w), percolator_program, token_program,
+//  shutdown_operator(optional for controller-owned insurance)]
 // data: asset_index(u16)
 //
 // Permissionless only through Percolator's secondary-asset marketauth shutdown
 // override. The amount is the complete asset-local balance read from the pinned
 // slab, and both tokens and transit rent go only to a clean account owned by the
-// recorded insurance authority. Rejecting a controller-owned live operator keeps
-// this path unavailable before Percolator's shutdown delay has matured.
+// recorded insurance authority. Controller-owned protocol insurance is retained
+// in the canonical controller transit. Before that withdrawal, this instruction
+// atomically moves the local operator to a dedicated instruction-only PDA, forcing
+// Percolator to apply its own market-authority shutdown delay and empty-asset checks.
 fn process_return_shutdown_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -922,6 +937,7 @@ fn process_return_shutdown_insurance<'a>(
     let insurance_ledger = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let shutdown_operator = iter.next();
     if iter.next().is_some()
         || !market.is_writable
         || !provider_destination.is_writable
@@ -941,7 +957,7 @@ fn process_return_shutdown_insurance<'a>(
         market,
         percolator_program,
     )?;
-    let (provider, amount) = {
+    let (provider, amount, controller_owned) = {
         let market_data = market.try_borrow_data()?;
         if percolator_accounting::read_market_authority(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
@@ -964,21 +980,34 @@ fn process_return_shutdown_insurance<'a>(
             usize::from(asset_index),
         )
         .map_err(|_| ProgramError::InvalidAccountData)?;
+        let controller_owned =
+            authority == controller.key.to_bytes() && operator == controller.key.to_bytes();
         if authority == [0u8; 32]
             || operator == [0u8; 32]
-            || operator == controller.key.to_bytes()
+            || (operator == controller.key.to_bytes() && !controller_owned)
             || amount == 0
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        (Pubkey::new_from_array(authority), amount)
+        (Pubkey::new_from_array(authority), amount, controller_owned)
     };
-    validate_provider_return_token_accounts(
-        controller,
-        &provider,
-        controller_transit,
-        provider_destination,
-    )?;
+    if controller_owned {
+        validate_controller_insurance_transit(
+            controller,
+            controller_transit,
+            provider_destination,
+        )?;
+    } else {
+        if shutdown_operator.is_some() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        validate_provider_return_token_accounts(
+            controller,
+            &provider,
+            controller_transit,
+            provider_destination,
+        )?;
+    }
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -987,6 +1016,50 @@ fn process_return_shutdown_insurance<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    if controller_owned {
+        let shutdown_operator = shutdown_operator.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let asset_index_bytes = asset_index.to_le_bytes();
+        let (expected_operator, operator_bump) = Pubkey::find_program_address(
+            &[
+                SHUTDOWN_INSURANCE_OPERATOR_SEED,
+                controller.key.as_ref(),
+                &asset_index_bytes,
+            ],
+            program_id,
+        );
+        if *shutdown_operator.key != expected_operator {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        let operator_bump_seed = [operator_bump];
+        let operator_seeds: [&[u8]; 4] = [
+            SHUTDOWN_INSURANCE_OPERATOR_SEED,
+            controller.key.as_ref(),
+            &asset_index_bytes,
+            &operator_bump_seed,
+        ];
+        let mut rotate_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+        rotate_data.extend_from_slice(&asset_index.to_le_bytes());
+        rotate_data.push(ASSET_AUTH_INSURANCE_OPERATOR);
+        rotate_data.extend_from_slice(shutdown_operator.key.as_ref());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*controller.key, true),
+                    AccountMeta::new_readonly(*shutdown_operator.key, true),
+                    AccountMeta::new(*market.key, false),
+                ],
+                data: rotate_data,
+            },
+            &[
+                controller.clone(),
+                shutdown_operator.clone(),
+                market.clone(),
+                percolator_program.clone(),
+            ],
+            &[&seeds, &operator_seeds],
+        )?;
+    }
     let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
     ix_data.extend_from_slice(&asset_index.to_le_bytes());
     ix_data.extend_from_slice(&amount.to_le_bytes());
@@ -1016,16 +1089,20 @@ fn process_return_shutdown_insurance<'a>(
         ],
         &[&seeds],
     )?;
-    let return_amount = u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
-    forward_exact_and_close_if_empty(
-        controller,
-        provider_destination,
-        controller_transit,
-        provider_destination,
-        token_program,
-        &seeds,
-        return_amount,
-    )
+    if controller_owned {
+        Ok(())
+    } else {
+        let return_amount = u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
+        forward_exact_and_close_if_empty(
+            controller,
+            provider_destination,
+            controller_transit,
+            provider_destination,
+            token_program,
+            &seeds,
+            return_amount,
+        )
+    }
 }
 
 fn rotate_asset_role_to_controller<'a>(
