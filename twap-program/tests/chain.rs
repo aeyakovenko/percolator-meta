@@ -20911,6 +20911,181 @@ fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
     );
 }
 
+// INTERNAL SAVINGS ALIAS: the auction holding is twap_authority-owned collateral, so it passes
+// the savings-account type checks. If selected as the savings sink, the permissionless execute
+// combines the nominally segregated savings share with the auction budget and spends both. A bad
+// timelocked configuration must not turn a 400k auction allocation into a 450k fill.
+#[test]
+fn e2e_savings_sink_cannot_alias_holding_and_expand_the_auction_budget() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let alias = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.holding,
+        1_000,
+        0,
+    );
+    let alias_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(bk.holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &alias,
+        &alias_remaining,
+    )
+    .expect("exercise a type-valid internal savings alias");
+
+    let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, 450_000);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_ata,
+            &usd_ata,
+            &env.coin_mint,
+            &env.collateral_mint,
+            450_000,
+            450_000,
+            None,
+        ),
+    )
+    .expect("bid can consume an incorrectly enlarged budget");
+    let round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, round_end);
+
+    let market_before = svm.get_account(&env.slab).unwrap();
+    let vault_before = svm.get_account(&env.perc_vault).unwrap();
+    let book_before = svm.get_account(&bk.book).unwrap();
+    let coin_escrow_before = svm.get_account(&bk.coin_escrow).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            execute_ix_full(
+                &payer.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                Some(bk.holding),
+                None,
+            ),
+        )
+        .is_err(),
+        "savings custody cannot also be the auction budget account"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before);
+    assert_eq!(svm.get_account(&bk.book).unwrap(), book_before);
+    assert_eq!(svm.get_account(&bk.coin_escrow).unwrap(), coin_escrow_before);
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    let savings_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings_sink,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let valid = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings_sink,
+        1_000,
+        0,
+    );
+    let valid_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &valid,
+        &valid_remaining,
+    )
+    .expect("governance repairs the sink without replacing the pending book");
+
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix_full(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            Some(savings_sink),
+            None,
+        ),
+    )
+    .expect("the repaired configuration settles the existing bid");
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &usd_ata,
+            &coin_ata,
+            0,
+        ),
+    )
+    .expect("bidder claims the bounded fill and refund");
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000);
+    assert_eq!(token_amount(&svm, &usd_ata), 400_000);
+    assert_eq!(token_amount(&svm, &coin_ata), 50_000);
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &env.perc_vault), 1_050_000);
+}
+
 // LOF PROBE (savings-share redirect, sweep tick A): execute's 4-way split pulls the base_unit_savings share
 // straight out of percolator insurance to a DAO sink via tag-57. execute is PERMISSIONLESS (any cranker), and
 // the savings_dest is a caller-supplied trailing account, so the only thing stopping a cranker from routing that
