@@ -78,7 +78,9 @@ capital's own tenure.
   same fixed return while the pool attests that owner principal remains. Once genesis is sealed, an
   absent owner also cannot veto terminal cleanup: any cranker may
   return that owner's full loss-adjusted position only to a clean account owned by the depositor,
-  after the real market is resolved and empty. An empty pool cannot pull terminal protocol insurance
+  after the real market is resolved and empty. That fixed return records the principal still at risk,
+  so a cranker cannot erase an already-frozen capital reward and earlier owner withdrawals stay excluded.
+  An empty pool cannot pull terminal protocol insurance
   back from TWAP. After that insurance is first recovered to the canonical controller account,
   anyone may return the now value-less roles to the same pool so its fixed wrapper can release an
   absent asset-0 backing provider. The pool-less
@@ -103,7 +105,7 @@ capital's own tenure.
 |---|---|
 | `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, deregisters only empty resolved portfolios, and retains controller-owned protocol insurance for terminal reclaim. |
-| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP. Its amountless full-exit entry point reuses the ordinary owner, pool, destination, loss, and share checks for an atomic live TWAP recovery. After recovery the pool can otherwise sign only fixed resolved cleanup. Once genesis-vote attests an executed winner and the bound market is resolved and empty, anyone can retire an absent depositor's complete position only into a clean account owned by that depositor. Its terminal read-only attestation proves when the pool has no owner claims. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
+| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. Only a principal-policy pool can hand custody to TWAP. Its amountless full-exit entry point reuses the ordinary owner, pool, destination, loss, and share checks for an atomic live TWAP recovery. After recovery the pool can otherwise sign only fixed resolved cleanup. Once genesis-vote attests an executed winner and the bound market is resolved and empty, anyone can retire an absent depositor's complete position only into a clean account owned by that depositor, preserving the remaining-principal reward cap. Its terminal read-only attestation proves when the pool has no owner claims. With-surplus pools retain direct owner redemption and cannot enter a protocol-surplus auction. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. Only a proposal with its complete declared entry shape can become votable. After the configured bootstrap deadline, a permissionless trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries allocating at most the fixed supply. Each recipient authorizes its own claim; unclaimed or unallocated COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. Witnesses must carry the exact Subledger-position discriminator or pinned Percolator portfolio header, and permissionless portfolio-flow claims reject delegated recipient accounts. It reads principal-bearing accounts but cannot debit them. |
@@ -172,7 +174,9 @@ vault and burns 50%. At day 45 the accumulated reward vault distributes:
 Funding points have no age multiplier and receiver-side funding does not earn points. A portfolio
 can earn from both its long-paid and short-paid totals. Insurance/backing reward points use live
 base-unit principal times `floor(log2(tenure))`. Reward finalization and claims do not modify the
-underlying principal, shares, or Percolator balances. Permissionless portfolio-flow claims pay only
+underlying principal, shares, or Percolator balances. A permissionless finalized-genesis return
+preserves only the remaining crystallized capital cap; ordinary owner exits still forfeit rewards.
+Permissionless portfolio-flow claims pay only
 to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
 cannot force rewards into an account it can spend. The same full-chain test then returns TWAP
 custody and proves both the insurance and segregated backing depositors can redeem without losing

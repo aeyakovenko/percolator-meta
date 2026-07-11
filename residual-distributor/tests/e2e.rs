@@ -6199,6 +6199,73 @@ fn share_value_claim_partial_post_freeze_withdraw_pays_the_reduced_live_shares()
     );
 }
 
+// A permissionless terminal return is not an owner soft-veto: it must preserve
+// frozen rewards for the capital that was still at risk when the cranker returned
+// it. The terminal snapshot must not restore capital the owner withdrew earlier.
+#[test]
+fn terminal_return_preserves_only_the_remaining_frozen_capital_reward() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup(&mut svm, &payer, supply);
+    set_slot(&mut svm, 100);
+
+    let owner = Keypair::new();
+    let position = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &position,
+        &env.stub_sub,
+        &env.ins_pool,
+        &owner.pubkey(),
+        300,
+        false,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &position,
+        COHORT_INSURANCE,
+    )
+    .expect("register capital");
+    set_slot(&mut svm, 1_124);
+    crystallize(&mut svm, &payer, &env, &owner, &position)
+        .expect("crystallize 300 principal");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze");
+
+    // The owner previously reduced 300 to 150; terminal cleanup then returned
+    // that remaining 150 and retired the position.
+    let mut terminal = svm.get_account(&position).unwrap();
+    terminal.data[72..80].copy_from_slice(&0u64.to_le_bytes());
+    terminal.data[80..88].copy_from_slice(&150u64.to_le_bytes());
+    terminal.data[88] = 1;
+    terminal.data[98] = 1;
+    terminal.data[104..120].copy_from_slice(&0u128.to_le_bytes());
+    svm.set_account(position, terminal).unwrap();
+
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &recipient,
+        Some(&position),
+    )
+    .expect("claim terminally returned capital reward");
+    assert_eq!(
+        token_amount(&svm, &recipient),
+        50_000,
+        "the terminal snapshot preserves the remaining half, not the withdrawn half"
+    );
+}
+
 // ATTACK PROBE (post-freeze capital inflation): the insurance/backing claim pays
 // cohort_supply * min(frozen_points, live tenure*principal) / frozen_denominator.
 // The exit direction (live < frozen -> forfeit) is pinned by share_value_is_pro_rata_and_exit_forfeits. The

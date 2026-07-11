@@ -215,7 +215,9 @@ fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey, ProgramError> {
 
 // ===========================================================================
 // Insurance cohort (the SOFT VETO half) — points read LIVE from the subledger
-// position, so an exit (principal -> 0, withdrawn) AUTO-FORFEITS the COIN share.
+// position, so an owner exit (principal -> 0, withdrawn) AUTO-FORFEITS the COIN
+// share. A permissionless finalized-genesis return preserves only the principal
+// still at risk when the cranker returned it.
 // ===========================================================================
 // subledger Position offsets (stable across the share-model change — appended
 // fields only): principal u64@72, withdrawn u8@88, start_slot u64@89.
@@ -224,12 +226,22 @@ fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey, ProgramError> {
 pub const SUB_POS_POOL: usize = 8; // Position.pool @ 8 (real layout: disc@0, pool@8..40, owner@40..72).
 pub const SUB_POS_OWNER: usize = 40; // Position.owner @ 40. The depositor owed this position's COIN.
 pub const SUB_POS_PRINCIPAL: usize = 72;
+pub const SUB_POS_WITHDRAWN_AMOUNT: usize = 80;
 pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
+pub const SUB_POS_TERMINAL_RETURNED: usize = 98;
 
 fn validate_subledger_position(data: &[u8]) -> ProgramResult {
+    let withdrawn = data.get(SUB_POS_WITHDRAWN).copied().unwrap_or(2);
+    let terminal_returned = data.get(SUB_POS_TERMINAL_RETURNED).copied().unwrap_or(0);
+    let principal = data
+        .get(SUB_POS_PRINCIPAL..SUB_POS_PRINCIPAL + 8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .unwrap_or(1);
     if data.get(..8) != Some(SUB_POSITION_DISC.as_slice())
-        || data.get(SUB_POS_WITHDRAWN).copied().unwrap_or(2) > 1
+        || withdrawn > 1
+        || terminal_returned > 1
+        || (terminal_returned == 1 && (withdrawn != 1 || principal != 0))
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -249,6 +261,23 @@ pub fn read_subledger_principal(data: &[u8]) -> Result<(u128, bool), ProgramErro
         .ok_or(ProgramError::AccountDataTooSmall)?
         == 1;
     Ok((principal, withdrawn))
+}
+
+fn read_terminal_return_principal(data: &[u8]) -> Result<Option<u128>, ProgramError> {
+    validate_subledger_position(data)?;
+    if data.get(SUB_POS_TERMINAL_RETURNED).copied() != Some(1) {
+        return Ok(None);
+    }
+    let principal = u64::from_le_bytes(
+        data.get(SUB_POS_WITHDRAWN_AMOUNT..SUB_POS_WITHDRAWN_AMOUNT + 8)
+            .ok_or(ProgramError::AccountDataTooSmall)?
+            .try_into()
+            .unwrap(),
+    );
+    if principal == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(Some(principal as u128))
 }
 
 /// The subledger resets this clock whenever capital is added to the position. Reward tenure must
@@ -1779,7 +1808,13 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             }
             let data = position.try_borrow_data()?;
             let (principal, withdrawn) = read_subledger_principal(&data)?;
-            let live_principal = capital_points(principal, withdrawn);
+            // An owner-directed exit forfeits rewards, but a permissionless terminal
+            // cranker cannot choose that outcome for the owner. Subledger records the
+            // principal remaining immediately before that fixed full return. This is
+            // still capped by the crystallized principal below, and any earlier
+            // voluntary partial withdrawal remains excluded.
+            let live_principal = read_terminal_return_principal(&data)?
+                .unwrap_or_else(|| capital_points(principal, withdrawn));
             let position_start_slot = read_subledger_start_slot(&data)?;
             let crystallized_slot = u64::try_from(stake.eligible_accum)
                 .map_err(|_| ProgramError::InvalidAccountData)?;

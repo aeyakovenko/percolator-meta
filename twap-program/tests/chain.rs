@@ -34331,6 +34331,7 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
         .unwrap();
     svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
         .unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let env = setup_genesis(&mut svm, &payer);
@@ -34426,6 +34427,102 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     assert_eq!(token_amount(&svm, &deposit_source), 0);
     assert_eq!(token_amount(&svm, &owner_destination), 0);
 
+    // Freeze a one-staker capital reward before terminal cleanup. Permissionless
+    // principal return must not erase this already-earned reward for an absent owner.
+    let reward_supply = 10_000u64;
+    let reward_authority = Keypair::new();
+    let reward_mint = create_real_mint(&mut svm, &payer, &reward_authority.pubkey());
+    let reward_epoch_id = 77u64;
+    let reward_config = rd_epoch_config_pda(
+        &reward_authority.pubkey(),
+        &reward_mint,
+        reward_epoch_id,
+    );
+    let reward_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault,
+        &reward_mint,
+        &reward_config,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &reward_authority],
+        spl_token::instruction::mint_to(
+            &spl_token::ID,
+            &reward_mint,
+            &reward_vault,
+            &reward_authority.pubkey(),
+            &[],
+            reward_supply,
+        )
+        .unwrap(),
+    )
+    .expect("fund terminal-return reward epoch");
+    let reward_start = svm.get_sysvar::<Clock>().slot;
+    let reward_end = reward_start + 8;
+    send(
+        &mut svm,
+        &[&payer, &reward_authority],
+        rd_epoch_init_ix(
+            &payer.pubkey(),
+            &reward_authority.pubkey(),
+            &reward_mint,
+            &perc_id(),
+            &sub_id(),
+            &reward_config,
+            &reward_vault,
+            reward_epoch_id,
+            reward_start,
+            reward_end,
+            reward_supply,
+            10_000,
+            0,
+            0,
+            0,
+            1,
+            0,
+            &[(env.slab, env.pool, Pubkey::default())],
+        ),
+    )
+    .expect("initialize one-staker capital reward epoch");
+    send(
+        &mut svm,
+        &[&payer, &reward_authority],
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &reward_mint,
+            None,
+            spl_token::instruction::AuthorityType::MintTokens,
+            &reward_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("fix terminal-return reward supply");
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        rd_register_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &absent_voter.pubkey(),
+            &absent_voter.pubkey(),
+            &position,
+            0,
+        ),
+    )
+    .expect("register the genesis insurance position for rewards");
+    let reward_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_destination,
+        &reward_mint,
+        &absent_voter.pubkey(),
+        0,
+    );
+
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot += 8;
     svm.set_sysvar(&clock);
@@ -34457,6 +34554,18 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
         },
     )
     .expect("sole depositor votes and locks the atom");
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        rd_crystallize_ix(
+            &absent_voter.pubkey(),
+            &reward_config,
+            &absent_voter.pubkey(),
+            &position,
+            0,
+        ),
+    )
+    .expect("owner crystallizes the one-unit capital reward at epoch end");
     advance_to_test_bootstrap_end(&mut svm);
     send(
         &mut svm,
@@ -34476,6 +34585,17 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
         },
     )
     .expect("permissionless trigger seals the complete supply");
+    send(
+        &mut svm,
+        &[&payer],
+        rd_freeze_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &reward_mint,
+            &reward_vault,
+        ),
+    )
+    .expect("freeze the capital reward before terminal cleanup");
     assert_eq!(svm.get_account(&winner).unwrap().data[96], 1);
     assert_eq!(svm.get_account(&position).unwrap().data[97], 1);
 
@@ -34627,9 +34747,34 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     assert_eq!(u128::from_le_bytes(pool.data[192..208].try_into().unwrap()), 0);
     let retired = svm.get_account(&position).unwrap();
     assert_eq!(u64::from_le_bytes(retired.data[72..80].try_into().unwrap()), 0);
+    assert_eq!(
+        u64::from_le_bytes(retired.data[80..88].try_into().unwrap()),
+        1,
+        "terminal return snapshots only the remaining principal at risk"
+    );
     assert_eq!(retired.data[88], 1);
     assert_eq!(retired.data[97], 0);
+    assert_eq!(retired.data[98], 1);
     assert_eq!(u128::from_le_bytes(retired.data[104..120].try_into().unwrap()), 0);
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        rd_claim_ix(
+            &absent_voter.pubkey(),
+            &reward_config,
+            &absent_voter.pubkey(),
+            &position,
+            0,
+            &reward_vault,
+            &reward_destination,
+        ),
+    )
+    .expect("owner claims after a permissionless terminal principal return");
+    assert_eq!(
+        token_amount(&svm, &reward_destination),
+        reward_supply,
+        "terminal cleanup cannot erase the absent depositor's frozen capital reward"
+    );
 
     let governance_destination = Pubkey::new_unique();
     set_token(
