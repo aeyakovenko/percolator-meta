@@ -8061,9 +8061,11 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
 }
 
 // PUBLIC TERMINAL DOS: an external collateral issuer can freeze the provider's
-// canonical ATA after backing is deposited, then revoke the freeze authority.
-// The fixed return must retain the recorded provider and exact slab-derived
-// amount while allowing a fresh clean account owned only by that provider.
+// canonical ATA and the controller's empty canonical transit after backing is
+// deposited, then revoke the freeze authority. The fixed return must retain the
+// recorded provider and exact slab-derived amount while allowing fresh clean
+// accounts owned only by the provider and controller. Terminal CloseSlab must
+// likewise accept a clean controller transit when no user attribution remains.
 #[test]
 fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     let mut svm =
@@ -8202,9 +8204,17 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         .unwrap();
     }
 
-    let freeze = spl_token::instruction::freeze_account(
+    let freeze_provider = spl_token::instruction::freeze_account(
         &spl_token::ID,
         &provider_destination,
+        &collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let freeze_transit = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &controller_transit,
         &collateral_mint,
         &freeze_authority.pubkey(),
         &[],
@@ -8221,21 +8231,21 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     .unwrap();
     svm.expire_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[freeze, revoke],
+        &[freeze_provider, freeze_transit, revoke],
         Some(&payer.pubkey()),
         &[&payer, &freeze_authority],
         svm.latest_blockhash(),
     ))
-    .expect("issuer permanently freezes the provider's canonical ATA");
+    .expect("issuer permanently freezes both replaceable canonical accounts");
 
-    let return_to = |destination: Pubkey| {
+    let return_to = |destination: Pubkey, transit: Pubkey| {
         controller_return_resolved_asset0_backing_ix(
             &governance.pubkey(),
             &controller,
             &controller,
             &slab,
             &destination,
-            &controller_transit,
+            &transit,
             &percolator_vault,
             &vault_authority,
             &long_backing_ledger,
@@ -8245,8 +8255,44 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     };
     let slab_before_failed_return = svm.get_account(&slab).unwrap();
     let vault_before_failed_return = svm.get_account(&percolator_vault).unwrap();
+    let clean_provider_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_provider_destination,
+        &collateral_mint,
+        &provider.pubkey(),
+        0,
+    );
     assert!(
-        send(&mut svm, &[&payer], return_to(provider_destination)).is_err(),
+        send(
+            &mut svm,
+            &[&payer],
+            return_to(clean_provider_destination, controller_transit),
+        )
+        .is_err(),
+        "the permanently frozen canonical transit cannot receive backing"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), slab_before_failed_return);
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_failed_return
+    );
+
+    let clean_controller_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            return_to(provider_destination, clean_controller_transit),
+        )
+        .is_err(),
         "the permanently frozen canonical ATA cannot receive backing"
     );
     assert_eq!(svm.get_account(&slab).unwrap(), slab_before_failed_return);
@@ -8264,8 +8310,31 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         0,
     );
     assert!(
-        send(&mut svm, &[&payer], return_to(attacker_destination)).is_err(),
+        send(
+            &mut svm,
+            &[&payer],
+            return_to(attacker_destination, clean_controller_transit),
+        )
+        .is_err(),
         "a cranker cannot replace the recorded provider beneficiary"
+    );
+
+    let attacker_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_transit,
+        &collateral_mint,
+        &payer.pubkey(),
+        0,
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            return_to(clean_provider_destination, attacker_transit),
+        )
+        .is_err(),
+        "a fallback transit must remain owned solely by the controller"
     );
 
     let delegated_destination = Pubkey::new_unique();
@@ -8291,25 +8360,21 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     )
     .expect("provider delegates one alternate destination");
     assert!(
-        send(&mut svm, &[&payer], return_to(delegated_destination)).is_err(),
+        send(
+            &mut svm,
+            &[&payer],
+            return_to(delegated_destination, clean_controller_transit),
+        )
+        .is_err(),
         "a delegated fallback cannot expose returned principal to the cranker"
-    );
-
-    let clean_provider_destination = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &clean_provider_destination,
-        &collateral_mint,
-        &provider.pubkey(),
-        0,
     );
 
     send(
         &mut svm,
         &[&payer],
-        return_to(clean_provider_destination),
+        return_to(clean_provider_destination, clean_controller_transit),
     )
-    .expect("any cranker returns backing to a clean provider-owned account");
+    .expect("any cranker returns backing through clean owner-bound fallback accounts");
     assert_eq!(
         token_amount(&svm, &clean_provider_destination),
         backing_amount
@@ -8318,14 +8383,15 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     assert_eq!(token_amount(&svm, &provider_destination), 0);
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
     assert!(
-        svm.get_account(&controller_transit)
+        svm.get_account(&clean_controller_transit)
             .map_or(true, |account| account.lamports == 0),
-        "controller transit closes after the terminal return"
+        "fallback controller transit closes after the terminal return"
     );
 
+    let close_transit = Pubkey::new_unique();
     set_token(
         &mut svm,
-        &controller_transit,
+        &close_transit,
         &collateral_mint,
         &controller,
         0,
@@ -8349,27 +8415,45 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         },
     )
     .unwrap();
+    let close_market = |transit: Pubkey| Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new(governance.pubkey(), true),
+            AccountMeta::new(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new(transit, false),
+            AccountMeta::new(governance_destination, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![5u8],
+    };
+    let slab_before_bad_close = svm.get_account(&slab).unwrap();
+    let vault_before_bad_close = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            close_market(attacker_transit),
+        )
+        .is_err(),
+        "terminal fallback transit must remain owned solely by the controller"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), slab_before_bad_close);
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_bad_close
+    );
+
     send(
         &mut svm,
         &[&payer, &governance],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new(governance.pubkey(), true),
-                AccountMeta::new(controller, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new_readonly(vault_authority, false),
-                AccountMeta::new(percolator_vault, false),
-                AccountMeta::new(controller_transit, false),
-                AccountMeta::new(governance_destination, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: vec![5u8],
-        },
+        close_market(close_transit),
     )
-    .expect("the recovered backing no longer blocks real CloseSlab");
+    .expect("the recovered backing and frozen canonical transit no longer block real CloseSlab");
     assert!(
         svm.get_account(&slab)
             .map_or(true, |account| account.lamports == 0),

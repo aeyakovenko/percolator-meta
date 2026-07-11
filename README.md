@@ -40,7 +40,10 @@ capital's own tenure.
   Percolator proves the market empty. Controller-owned protocol insurance is recovered only to the
   canonical controller account after resolution and stays there until terminal close. Raw
   `CloseSlab` is excluded; a fixed terminal cleanup forwards that protocol insurance, vault dust,
-  and account rent to Squads. Before that close, anyone can ask the controller to deregister an
+  and account rent to Squads. Its controller-owned transit may be replaced by a token-empty account
+  when an empty canonical ATA was permanently frozen; governance still signs, Percolator still
+  requires a fully wound-down market, and the destination remains Squads-owned. Before that close,
+  anyone can ask the controller to deregister an
   abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
   portfolio and returns its rent only to the slab. Historical reward counters cannot hold insurance
   or backing exits hostage: after any terminal dematerialization, any cranker can pay that LP/trader
@@ -208,8 +211,9 @@ anyone can return its complete asset-local insurance and each backing domain thr
 The controller derives the insurance amount from the pinned slab and accepts no caller-selected
 amount. Each destination must be a clean token account owned solely by the recorded provider, not a
 DAO-selected beneficiary; this lets a cranker bypass a permanently frozen ATA without redirecting
-funds. Backing earnings are paid first and the controller forwards exactly the value attributed to
-that provider. It closes the temporary controller account only when no unrelated balance
+funds. The temporary receiving account is likewise replaceable but must be a clean same-mint account
+owned solely by the controller PDA. Backing earnings are paid first and the controller forwards
+exactly the value attributed to that provider. It closes the temporary controller account only when no unrelated balance
 remains. Protocol insurance or token dust already held there stays in controller custody for the
 fixed terminal reclaim. While live, Percolator authorizes these returns only through its delayed
 secondary-asset shutdown override.

@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - a frozen controller transit could block every provider return and terminal close (surface A/C)
+
+Provider cleanup preserved the slab-recorded beneficiary and exact amount, and the prior fix made a
+permanently frozen provider ATA replaceable. Every path still required the controller's canonical ATA
+as its temporary Percolator withdrawal destination. A collateral issuer could freeze that empty account
+after backing was deposited and revoke freeze authority while leaving the Percolator vault and provider
+accounts healthy. No cranker could substitute another controller-owned account, so the provider's one
+atom still blocked asset retirement and `CloseSlab`.
+
+The real-Percolator LiteSVM regression now freezes both canonical accounts and revokes the issuer key.
+The previous SBF rejects a fresh controller-owned transit. The retained chain proves frozen accounts,
+an attacker-owned transit, an attacker-owned provider destination, and a delegated provider destination
+all fail atomically. It then returns the exact backing atom through clean controller/provider fallbacks,
+rejects an attacker-owned terminal transit without changing the slab or vault, and completes real
+`CloseSlab` through a fresh controller-owned account.
+
+FIX: external-provider paths accept any initialized same-mint SPL transit owned solely by the controller
+PDA, with no delegate or close authority; exact-amount forwarding prevents unrelated transit value from
+reaching the provider. Governance-signed terminal reclaim accepts a noncanonical controller transit only
+when its pre-close token balance is zero and Percolator's existing fully-wound-down checks pass. Canonical
+transits retain their existing protocol-balance behavior, while an arbitrary funded controller account
+cannot be swept. Public controller-owned protocol-insurance recovery remains pinned to canonical custody,
+and every provider identity, amount, destination owner, Percolator CPI, and governance terminal signer is
+unchanged. No admin or arbitrary withdrawal surface was added.
+
 ## Tick - a proposal creator could turn anti-tamper rejection into a permanent genesis DoS (surface B/C)
 
 Genesis-vote snapshotting correctly refused to seal a distribution changed after registration, but
