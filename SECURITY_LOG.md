@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - an absent one-unit genesis voter could block terminal market close (surface B/C)
+
+Every genesis deposit is segregated behind the principal pool, and ordinary withdrawal correctly
+requires the position owner. That made a one-unit public deposit a permanent cleanup veto: after
+voting for the winning distribution, the depositor could disappear with the position still locked.
+Even after the complete COIN supply was sealed and the real Percolator market was resolved and
+empty, no public instruction could retire that atom. Protocol-insurance recovery and `CloseSlab`
+therefore remained blocked forever.
+
+A clean-room LiteSVM regression deposits one base unit, casts the sole quorum vote, seals all supply
+through the permissionless genesis trigger, resolves the pinned Percolator binary through real
+Squads, and drops the voter signer. The old SBF rejects the required terminal return. The retained
+test proves live-market, unexecuted-proposal, attacker-owned destination, and poisoned canonical-ATA
+attempts are byte-atomic failures; then a public cranker returns the complete loss-adjusted position
+to a clean token account owned only by the depositor and completes real `CloseSlab`.
+
+FIX: genesis-vote exposes a read-only attestation for its canonical current-layout config and exact
+executed proposal. Subledger's fixed terminal return accepts only a current principal-policy genesis
+pool and canonical owner position, requires that attestation plus a resolved-and-empty bound market,
+and always retires the full position. It has no amount, admin, governance signer, or beneficiary
+parameter. The supplied token account must be initialized for the pool mint, owned by the depositor,
+and have no delegate or close authority; a cranker can permissionlessly create a fresh such account,
+so the depositor cannot preserve the DoS by poisoning an old ATA. Vote lock, principal, and shares
+are cleared only in the same atomic transaction that transfers the payout.
+
 ## Tick - pool-to-TWAP handoff could cross controller governance seeds (surface A/C)
 
 A canonical Subledger pool binds its market and Percolator program but intentionally has no

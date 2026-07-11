@@ -10690,6 +10690,42 @@ fn build_direct_resolve_message(marketauth: &Pubkey, market: &Pubkey, perc: &Pub
     m
 }
 
+fn build_direct_close_slab_message(
+    marketauth: &Pubkey,
+    market: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    destination: &Pubkey,
+    perc: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // required signatures
+    m.push(1); // writable signed accounts
+    m.push(3); // writable unsigned accounts
+    m.push(7); // account keys
+    m.extend_from_slice(marketauth.as_ref());
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(vault.as_ref());
+    m.extend_from_slice(destination.as_ref());
+    m.extend_from_slice(vault_authority.as_ref());
+    m.extend_from_slice(spl_token::ID.as_ref());
+    m.extend_from_slice(perc.as_ref());
+    m.push(1); // instructions
+    m.push(6); // program id
+    m.push(6); // instruction accounts
+    m.push(0); // marketauth
+    m.push(1); // market
+    m.push(2); // vault
+    m.push(4); // vault authority
+    m.push(3); // destination
+    m.push(5); // token program
+    let data = percolator_prog::ix::Instruction::CloseSlab.encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0); // address table lookups
+    m
+}
+
 fn build_direct_terminal_insurance_withdraw_message(
     authority: &Pubkey,
     market: &Pubkey,
@@ -32879,5 +32915,370 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         svm.get_account(&env.slab)
             .map_or(true, |account| account.lamports == 0),
         "resolved market closes after every user and protocol balance exits"
+    );
+}
+
+// PUBLIC DOS: a one-unit genesis voter can disappear after the winning distribution is
+// sealed. Ordinary insurance withdrawal correctly requires that owner, but making the
+// owner the only cleanup actor leaves their atom in Percolator forever and prevents
+// CloseSlab. After finalization and real Percolator resolution, any cranker must be able
+// to retire the complete position only into a clean collateral account owned by that
+// depositor. The cranker may create that account, so a poisoned canonical ATA is not
+// another cleanup veto.
+#[test]
+fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let recipient = Pubkey::new_unique();
+    let (dist_proposal, winner) =
+        register_proposal(&mut svm, &payer, &env, 1, &recipient, 100);
+    let (_, unexecuted_proposal) =
+        register_proposal(&mut svm, &payer, &env, 2, &Pubkey::new_unique(), 100);
+
+    let absent_voter = Keypair::new();
+    let attacker = Keypair::new();
+    svm.airdrop(&absent_voter.pubkey(), 1_000_000_000)
+        .unwrap();
+    let deposit_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &deposit_source,
+        &env.collateral_mint,
+        &absent_voter.pubkey(),
+        1,
+    );
+    let owner_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &owner_destination,
+        &env.collateral_mint,
+        &absent_voter.pubkey(),
+        0,
+    );
+    let poisoned_canonical =
+        canonical_insurance_vault(&absent_voter.pubkey(), &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &poisoned_canonical,
+        &env.collateral_mint,
+        &Pubkey::new_unique(),
+        0,
+    );
+    let delegated_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &delegated_destination,
+        &env.collateral_mint,
+        &absent_voter.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        spl_token::instruction::approve(
+            &spl_token::ID,
+            &delegated_destination,
+            &attacker.pubkey(),
+            &absent_voter.pubkey(),
+            &[],
+            1,
+        )
+        .unwrap(),
+    )
+    .expect("depositor can poison one of their own destinations before disappearing");
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &absent_voter.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(absent_voter.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(deposit_source, false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("one-unit genesis risk deposit");
+    assert_eq!(token_amount(&svm, &deposit_source), 0);
+    assert_eq!(token_amount(&svm, &owner_destination), 0);
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot += 8;
+    svm.set_sysvar(&clock);
+    let ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            env.gv_config.as_ref(),
+            absent_voter.pubkey().as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(absent_voter.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(winner, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: vec![3u8, 1u8],
+        },
+    )
+    .expect("sole depositor votes and locks the atom");
+    advance_to_test_bootstrap_end(&mut svm);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(winner, false),
+                AccountMeta::new_readonly(dist_id_e2e(), false),
+                AccountMeta::new(env.dist_config, false),
+                AccountMeta::new(dist_proposal, false),
+                AccountMeta::new_readonly(env.pool, false),
+            ],
+            data: vec![4u8],
+        },
+    )
+    .expect("permissionless trigger seals the complete supply");
+    assert_eq!(svm.get_account(&winner).unwrap().data[96], 1);
+    assert_eq!(svm.get_account(&position).unwrap().data[97], 1);
+
+    let terminal_return = |proposal: Pubkey, destination: Pubkey| Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(absent_voter.pubkey(), false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(destination, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(env.gv_config, false),
+            AccountMeta::new_readonly(proposal, false),
+            AccountMeta::new_readonly(gv_id_e2e(), false),
+        ],
+        data: vec![12u8],
+    };
+
+    let pool_before = svm.get_account(&env.pool).unwrap();
+    let position_before = svm.get_account(&position).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(winner, owner_destination),
+        )
+        .is_err(),
+        "finalization alone cannot force an exit from a live market"
+    );
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(svm.get_account(&position).unwrap(), position_before);
+
+    let resolve = build_direct_resolve_message(&env.squads_vault, &env.slab, &perc_id());
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &resolve,
+        &resolve_remaining,
+    )
+    .expect("governance resolves the empty real Percolator market");
+
+    let mut ordinary_withdraw_data = vec![5u8];
+    ordinary_withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(absent_voter.pubkey(), false),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(owner_destination, false),
+                    AccountMeta::new(holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(
+                        perc_vault_authority(&env.slab, &perc_id()),
+                        false,
+                    ),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: ordinary_withdraw_data,
+            },
+        )
+        .is_err(),
+        "the existing owner-bound exit cannot be cranked for an absent voter"
+    );
+
+    let attacker_destination = canonical_insurance_vault(&attacker.pubkey(), &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(winner, attacker_destination),
+        )
+        .is_err(),
+        "a cranker cannot redirect the absent owner's principal"
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(winner, poisoned_canonical),
+        )
+        .is_err(),
+        "a poisoned canonical ATA is not a valid return account"
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(winner, delegated_destination),
+        )
+        .is_err(),
+        "terminal cleanup cannot expose the payout to a token delegate"
+    );
+    let mut amount_injection = terminal_return(winner, owner_destination);
+    amount_injection.data.extend_from_slice(&1u64.to_le_bytes());
+    assert!(
+        send(&mut svm, &[&payer], amount_injection).is_err(),
+        "the fixed terminal return accepts no caller-selected amount"
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(unexecuted_proposal, owner_destination),
+        )
+        .is_err(),
+        "an unexecuted proposal cannot authorize terminal retirement"
+    );
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+    assert_eq!(token_amount(&svm, &owner_destination), 0);
+
+    send(
+        &mut svm,
+        &[&payer],
+        terminal_return(winner, owner_destination),
+    )
+    .expect("any cranker returns the full loss-adjusted atom to a clean owner account");
+    assert_eq!(token_amount(&svm, &owner_destination), 1);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+    let pool = svm.get_account(&env.pool).unwrap();
+    assert_eq!(u64::from_le_bytes(pool.data[80..88].try_into().unwrap()), 0);
+    assert_eq!(u128::from_le_bytes(pool.data[192..208].try_into().unwrap()), 0);
+    let retired = svm.get_account(&position).unwrap();
+    assert_eq!(u64::from_le_bytes(retired.data[72..80].try_into().unwrap()), 0);
+    assert_eq!(retired.data[88], 1);
+    assert_eq!(retired.data[97], 0);
+    assert_eq!(u128::from_le_bytes(retired.data[104..120].try_into().unwrap()), 0);
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+    let close = build_direct_close_slab_message(
+        &env.squads_vault,
+        &env.slab,
+        &env.perc_vault,
+        &vault_authority,
+        &governance_destination,
+        &perc_id(),
+    );
+    let close_remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &close,
+        &close_remaining,
+    )
+    .expect("terminal owner return removes the final CloseSlab blocker");
+    assert!(
+        svm.get_account(&env.slab)
+            .map_or(true, |account| account.lamports == 0)
     );
 }

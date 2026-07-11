@@ -4,8 +4,10 @@
 //! (Percolator markets/assets 1..N) can use to offer local insurance/backing
 //! deposits that earn local fees/yield. It is deliberately *not* part of genesis
 //! COIN farming and the MetaDAO has **no authority over it** — there is no admin,
-//! no governance key, no upgrade-of-policy path. Each depositor can always exit
-//! their own position; nobody else can move their funds.
+//! no governance key, no upgrade-of-policy path. Each depositor can exit their own
+//! position. After genesis finalization and terminal market resolution, a public
+//! cranker can only return the complete position to a clean account owned by that
+//! depositor; nobody can redirect it.
 //!
 //! Accounting (per pool):
 //!   - `outstanding_principal` = sum of un-withdrawn deposit principal.
@@ -116,6 +118,7 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const GENESIS_VOTE_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("GenesisVote11111111111111111111111111111111");
+const GENESIS_IX_ASSERT_EXECUTED: u8 = 5;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
@@ -158,6 +161,10 @@ const IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 // Read-only CPI attestation for a permissionless resolved custody return. Keeping
 // this check in the subledger supports every pool layout without duplicating it in TWAP.
 const IX_ASSERT_PRINCIPAL: u8 = 11;
+// Permissionless terminal return for an absent finalized-genesis depositor. It
+// retires the complete position and can pay only a clean token account owned by
+// that depositor.
+const IX_RETURN_FINALIZED_POSITION: u8 = 12;
 
 // Percolator CPI tags (verified against the pinned v16 program, percolator-prog 624b13d).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
@@ -782,6 +789,9 @@ pub fn process_instruction(
         }
         IX_ASSERT_NO_PRINCIPAL => process_assert_no_principal(program_id, accounts, &mut data),
         IX_ASSERT_PRINCIPAL => process_assert_principal(program_id, accounts, &mut data),
+        IX_RETURN_FINALIZED_POSITION => {
+            process_return_finalized_position(program_id, accounts, &mut data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1690,6 +1700,33 @@ fn process_insurance_withdraw(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
+    process_insurance_withdraw_impl(program_id, accounts, data, false)
+}
+
+// return_finalized_position accounts: [owner, pool(w), position(w), owner_ata(w),
+//   holding(w), market_slab(w), percolator_vault(w), vault_authority,
+//   percolator_program, token_program, genesis_config, executed_proposal,
+//   genesis_vote_program]
+// data: none
+//
+// Once genesis is irreversibly sealed and its real market is resolved and empty,
+// anyone may retire an absent depositor's complete position. The instruction has
+// no amount and accepts only a clean token account owned by the depositor, so
+// neither a cranker nor governance can capture or partially manipulate the payout.
+fn process_return_finalized_position(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    process_insurance_withdraw_impl(program_id, accounts, data, true)
+}
+
+fn process_insurance_withdraw_impl(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+    terminal: bool,
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let owner = next_account_info(iter)?;
     let pool_account = next_account_info(iter)?;
@@ -1701,12 +1738,31 @@ fn process_insurance_withdraw(
     let vault_authority = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let genesis_accounts = if terminal {
+        let config = next_account_info(iter)?;
+        let proposal = next_account_info(iter)?;
+        let genesis_program = next_account_info(iter)?;
+        if iter.next().is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some((config, proposal, genesis_program))
+    } else {
+        None
+    };
 
-    let amount = read_u64(data)?;
-    if amount == 0 || !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    if !owner.is_signer {
+    let requested_amount = if terminal {
+        if !data.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        None
+    } else {
+        let amount = read_u64(data)?;
+        if amount == 0 || !data.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some(amount)
+    };
+    if !terminal && !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
     if *token_program.key != spl_token::ID {
@@ -1738,21 +1794,76 @@ fn process_insurance_withdraw(
     if holding_state.mint != pool.mint || holding_state.owner != *pool_account.key {
         return Err(ProgramError::InvalidAccountData);
     }
-    // Owner-bound: only the position owner can exit.
+    // Position identity is always owner-bound. Ordinary exits additionally need
+    // that owner's signature; terminal exits prove finality below.
     if position.owner != *owner.key || position.pool != *pool_account.key {
         return Err(ProgramError::IllegalOwner);
+    }
+    let expected_position =
+        Pubkey::find_program_address(&position_seeds(pool_account.key, owner.key), program_id).0;
+    if *position_account.key != expected_position {
+        return Err(ProgramError::InvalidSeeds);
     }
     validate_owner_token_destination(owner_ata, owner.key, &pool.mint)?;
     if position.withdrawn {
         return Err(ProgramError::InvalidAccountData);
     }
-    // Vote-locked: the principal is pledged to a live genesis vote. The owner must
-    // retract that vote first (which clears the lock). This keeps the vote's
-    // principal snapshot backed by capital that is still at risk — without it a
-    // voter could exit and leave a free, capital-less ballot inflating quorum.
-    if position.vote_locked {
-        // Vote-locked: retract the genesis vote first (which clears the lock).
+
+    if terminal {
+        let (genesis_config, executed_proposal, genesis_program) =
+            genesis_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if pool_account.data_len() < POOL_SIZE
+            || position_account.data_len() < POSITION_SIZE
+            || pool.policy != POLICY_PRINCIPAL
+            || pool.domain != DOMAIN_INSURANCE
+            || pool.vote_authority != *genesis_config.key
+            || *genesis_program.key != GENESIS_VOTE_PROGRAM_ID
+            || !genesis_program.executable
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // A cranker may create a fresh token account for an absent owner. Require
+        // that owner and mint above, and reject authority-bearing destinations,
+        // so a poisoned canonical ATA cannot preserve the cleanup DoS and the
+        // cranker still cannot gain control of the payout.
+        let owner_token = spl_token::state::Account::unpack(&owner_ata.try_borrow_data()?)?;
+        if owner_token.delegate.is_some() || owner_token.close_authority.is_some() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        {
+            let market_data = market_slab.try_borrow_data()?;
+            if !percolator_accounting::market_is_resolved_and_empty(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        // The genesis program owns this state and attests it read-only. A
+        // successful trigger marks executed in the same transaction that seals
+        // distribution, so this cannot observe a half-finalized outcome.
+        invoke(
+            &Instruction {
+                program_id: *genesis_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*genesis_config.key, false),
+                    AccountMeta::new_readonly(*executed_proposal.key, false),
+                ],
+                data: vec![GENESIS_IX_ASSERT_EXECUTED],
+            },
+            &[
+                genesis_config.clone(),
+                executed_proposal.clone(),
+                genesis_program.clone(),
+            ],
+        )?;
+    } else if position.vote_locked {
+        // A live ballot must be retracted before its signing owner exits.
         return Err(ProgramError::InvalidAccountData);
+    }
+
+    let amount = requested_amount.unwrap_or(position.principal);
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
     }
     // Principal-only: never exceeds the owner's own recorded principal.
     if amount > position.principal || amount > pool.outstanding_principal {
@@ -1881,6 +1992,11 @@ fn process_insurance_withdraw(
     position.withdrawn_amount = position.withdrawn_amount.saturating_add(owed);
     if position.principal == 0 {
         position.withdrawn = true;
+        if terminal {
+            // The executed proposal proves the ballot has no remaining
+            // governance effect; do not leave a stale lock on retired capital.
+            position.vote_locked = false;
+        }
     }
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;

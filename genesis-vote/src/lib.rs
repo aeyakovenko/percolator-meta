@@ -92,6 +92,9 @@ const IX_INIT_CONFIG: u8 = 0;
 const IX_REGISTER_PROPOSAL: u8 = 2;
 const IX_VOTE: u8 = 3;
 const IX_TRIGGER: u8 = 4;
+// Read-only finalization attestation used by terminal subledger cleanup. This
+// program owns the proposal layout, so consumers do not duplicate byte offsets.
+const IX_ASSERT_EXECUTED: u8 = 5;
 
 const VOTE_BACK: u8 = 1;
 const VOTE_RETRACT: u8 = 2;
@@ -346,8 +349,53 @@ pub fn process_instruction<'a>(
         IX_REGISTER_PROPOSAL => register_proposal(program_id, accounts),
         IX_VOTE => vote(program_id, accounts, data),
         IX_TRIGGER => trigger(program_id, accounts, data),
+        IX_ASSERT_EXECUTED => assert_executed(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
+}
+
+// assert_executed accounts: [config, proposal_vote]
+// data: none
+//
+// A read-only proof that this exact current-layout genesis config has sealed the
+// supplied proposal. It grants no signer privilege and mutates no state.
+fn assert_executed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let proposal_account = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if config_account.owner != program_id || proposal_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let proposal = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
+
+    let delay = config.bootstrap_delay_slots.to_le_bytes();
+    let start = config.bootstrap_start_slot.to_le_bytes();
+    let (expected_config, bump) = Pubkey::find_program_address(
+        &config_seeds(&config.coin_mint, &config.subledger_pool, &delay, &start),
+        program_id,
+    );
+    if expected_config != *config_account.key || bump != config.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let expected_proposal = Pubkey::find_program_address(
+        &proposal_seeds(config_account.key, &proposal.distribution_proposal),
+        program_id,
+    )
+    .0;
+    if expected_proposal != *proposal_account.key
+        || proposal.config != *config_account.key
+        || !proposal.executed
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
 }
 
 // Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
