@@ -2113,6 +2113,27 @@ fn validate_coin_sink_configuration(account: &AccountInfo, coin_mint: &Pubkey) -
     Ok(())
 }
 
+fn validate_clean_owner_token_account(
+    account: &AccountInfo,
+    expected_owner: &Pubkey,
+    expected_mint: &Pubkey,
+) -> ProgramResult {
+    if account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let state = spl_token::state::Account::unpack(&account.try_borrow_data()?)?;
+    if state.state != spl_token::state::AccountState::Initialized
+        || state.owner != *expected_owner
+        || state.mint != *expected_mint
+        || state.delegate.is_some()
+        || state.delegated_amount != 0
+        || state.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 // init_book accounts: [squads_vault(signer, payer), config, book(w, init), book_escrow(pda),
 //   coin_escrow, settlement_usd, holding, coin_mint, collateral_mint, system_program, coin_sink?]
 // data: reserve_num (u128) || reserve_den (u128) || round_length (u64) || sink_mode (u8)
@@ -3046,8 +3067,10 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 //   coin_escrow(w), usd_dest(w), coin_ata(w), token_program]
 // data: slot_index (u8)
 //
-// PERMISSIONLESS (no bidder signature — pays the destinations recorded at placement), so anyone
-// may crank every claim and reopen the book. Pays the bid's won USD and refunds its unsold COIN.
+// PERMISSIONLESS (no bidder signature), so anyone may crank every claim and reopen the book. USD
+// may go to any clean token account owned by the recorded bidder, allowing recovery if a freezable
+// collateral issuer freezes the canonical ATA after placement. Unsold COIN remains pinned to the
+// recorded canonical refund account.
 fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -3092,7 +3115,7 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let (usd_owed, coin_refund, dest_key, coin_key) = {
+    let (usd_owed, coin_refund, bidder_key, coin_key) = {
         let d = book_account.try_borrow_data()?;
         let o = book_layout.slot_off(slot_index);
         if d[o + SL_OCCUPIED] != 1 || d[o + SL_SETTLED] != 1 {
@@ -3101,13 +3124,14 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
         (
             book_rd_u128(&d, o + SL_USD_OWED),
             book_rd_u128(&d, o + SL_COIN_REFUND),
-            book_rd_key(&d, o + SL_USD_DEST),
+            book_rd_key(&d, o + SL_BIDDER),
             book_rd_key(&d, o + SL_COIN_ATA),
         )
     };
-    if *usd_dest.key != dest_key || *coin_ata.key != coin_key {
+    if *coin_ata.key != coin_key {
         return Err(ProgramError::InvalidAccountData);
     }
+    validate_clean_owner_token_account(usd_dest, &bidder_key, &book.collateral_mint)?;
     if usd_owed > 0 {
         spl_transfer(
             token_program,

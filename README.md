@@ -164,9 +164,11 @@ redirect a user's claim, or sweep principal. After a sink epoch freezes, later r
 sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
 also falls back to burn instead of stalling settlement.
 
-Auction bids escrow from and settle only to the bidder's canonical initialized COIN and collateral
-ATAs. Closed ATAs are permissionlessly recreatable; a permanently frozen canonical account is rejected
-before any bid fee or escrow transfer can move.
+Auction placement requires the bidder's canonical initialized COIN and collateral ATAs. Closed ATAs
+are permissionlessly recreatable, and an already-frozen destination is rejected before any bid fee or
+escrow transfer can move. If a freezable collateral issuer freezes the canonical ATA only after
+placement, a permissionless claim may instead use a clean account for the same mint owned solely by
+the recorded bidder. The cranker still cannot change the beneficiary; COIN refunds remain canonical.
 
 ## Authority Model
 

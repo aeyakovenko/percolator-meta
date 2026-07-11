@@ -24471,6 +24471,258 @@ fn e2e_closing_usd_dest_cannot_permanently_brick_the_book() {
     let _ = (winner, late);
 }
 
+// PUBLIC DOS: validating the canonical USD ATA only at placement is insufficient for a
+// freezable collateral mint. The issuer can freeze that healthy ATA after the bid commits,
+// then revoke the freeze key. Settlement succeeds, but the mandatory canonical transfer can
+// never complete and one slot keeps the singleton book settled forever. A permissionless claim
+// must be able to use a fresh, clean token account owned by the recorded bidder, without letting
+// the cranker change the beneficiary.
+#[test]
+fn e2e_post_placement_frozen_usd_ata_cannot_permanently_lock_settled_book() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let freeze_authority = Keypair::new();
+    let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::Some(freeze_authority.pubkey()),
+        },
+        &mut mint_data,
+    )
+    .unwrap();
+    svm.set_account(
+        env.collateral_mint,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN),
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let (winner, winner_coin, canonical_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(
+        &mut svm,
+        &[&winner],
+        place_bid_ix(
+            &winner.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &winner_coin,
+            &canonical_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            400_000,
+            400_000,
+            None,
+        ),
+    )
+    .expect("healthy canonical destinations allow the bid");
+
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &canonical_usd,
+        &env.collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &env.collateral_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[freeze, revoke],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    ))
+    .expect("issuer permanently freezes the payout ATA after placement");
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("the auction settles before touching bidder destinations");
+    assert!(
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &canonical_usd,
+                &winner_coin,
+                0,
+            ),
+        )
+        .is_err(),
+        "the permanently frozen canonical ATA cannot receive settlement"
+    );
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &env.collateral_mint,
+        &cranker.pubkey(),
+        0,
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &attacker_destination,
+                &winner_coin,
+                0,
+            ),
+        )
+        .is_err(),
+        "a fallback cannot change the recorded bidder beneficiary"
+    );
+
+    let delegated_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &delegated_destination,
+        &env.collateral_mint,
+        &winner.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &winner],
+        spl_token::instruction::approve(
+            &spl_token::ID,
+            &delegated_destination,
+            &cranker.pubkey(),
+            &winner.pubkey(),
+            &[],
+            400_000,
+        )
+        .unwrap(),
+    )
+    .expect("bidder delegates one alternate account");
+    assert!(
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &delegated_destination,
+                &winner_coin,
+                0,
+            ),
+        )
+        .is_err(),
+        "a cranker cannot route settlement through an account delegated to itself"
+    );
+
+    let clean_owner_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_owner_destination,
+        &env.collateral_mint,
+        &winner.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &clean_owner_destination,
+            &winner_coin,
+            0,
+        ),
+    )
+    .expect("any cranker pays a fresh clean account owned by the recorded bidder");
+    assert_eq!(token_amount(&svm, &clean_owner_destination), 400_000);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+    assert_eq!(token_amount(&svm, &canonical_usd), 0);
+
+    let (late, late_coin, late_usd) = new_bidder(&mut svm, &payer, &env, 1);
+    send(
+        &mut svm,
+        &[&late],
+        place_bid_ix(
+            &late.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &late_coin,
+            &late_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            1,
+            1,
+            None,
+        ),
+    )
+    .expect("owner-bound fallback drains the settled slot and reopens the book");
+}
+
 // ADVERSARIAL CU-DOS (finding AC): the bid ranking is O(N^2) comparisons. When bid-vs-bid used the
 // continued-fraction (Euclidean) cmp_rate over attacker-controlled rates, a full 32-slot book of
 // close, long-continued-fraction (Fibonacci-ratio) bids made execute EXCEED the 1.4M compute budget
