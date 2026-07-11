@@ -23820,9 +23820,9 @@ fn e2e_integer_reconciliation_never_takes_coin_below_the_bidder_limit() {
     let env = setup_handoff(&mut svm, &payer);
     let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
 
-    // Alice nominally consumes 399,996 of the 400k budget. Bob's marginal 3-for-10 bid receives
-    // the 4-USD residual: floor(4*3/10)=1 COIN, but reconciling that atom at the marginal price
-    // yields floor(1*10/3)=3 USD, below Bob's 10/3 limit. Bob must sell nothing.
+    // Alice consumes 399,996 of the 400k budget. Bob's 3-for-10 bid receives the 4-USD residual:
+    // floor(4*3/10)=1 COIN, but reconciling that atom at Bob's rate yields 3 USD, below his
+    // 10/3 limit. Bob must sell nothing and, because he transacts nothing, cannot set the price.
     let (alice, alice_coin, alice_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
     send(
         &mut svm,
@@ -23864,6 +23864,7 @@ fn e2e_integer_reconciliation_never_takes_coin_below_the_bidder_limit() {
     )
     .expect("bob marginal bid");
 
+    let supply_before = mint_supply(&svm, &env.coin_mint);
     let cranker = Keypair::new();
     svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
     warp_to(&mut svm, 111);
@@ -23901,9 +23902,323 @@ fn e2e_integer_reconciliation_never_takes_coin_below_the_bidder_limit() {
     .expect("bob claims an unfilled marginal bid");
     assert_eq!(token_amount(&svm, &bob_usd), 0);
     assert_eq!(token_amount(&svm, &bob_coin), 3);
-    assert_eq!(token_amount(&svm, &bk.settlement_usd), 399_993);
-    assert_eq!(token_amount(&svm, &bk.holding), 7);
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        400_000,
+        "the last executable bid sets the price and sells its complete escrow"
+    );
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 399_996);
+    assert_eq!(token_amount(&svm, &bk.holding), 4);
     let _ = (alice, alice_coin, alice_usd, bob);
+}
+
+// PUBLIC DOS: nominal allocation must not let a top-ranked bid consume the whole round budget
+// when no whole-COIN pair can satisfy that bid's own limit. Otherwise the bid is refunded after
+// reconciliation, but a lower-ranked executable bid never receives an allocation; because a
+// zero-purchase round keeps every bid committed, one three-atom rounding edge can repeat forever.
+#[test]
+fn e2e_unexecutable_top_bid_cannot_starve_lower_executable_bid() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // Both bids satisfy the 1 COIN / 500 USD reserve. The first is strictly better, but a
+    // 400,000-USD nominal fill buys 800 COIN and reconciles to 399,501 USD. That realized pair
+    // crosses its 801/400,001 limit, so it must not consume the allocation needed by the exact bid.
+    let reserve = build_set_reserve_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        1,
+        500,
+    );
+    let reserve_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &reserve,
+        &reserve_accounts,
+    )
+    .expect("set discrete reserve");
+
+    let (attacker, attacker_coin, attacker_usd) = new_bidder(&mut svm, &payer, &env, 801);
+    send(
+        &mut svm,
+        &[&attacker],
+        place_bid_ix(
+            &attacker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &attacker_coin,
+            &attacker_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            801,
+            400_001,
+            None,
+        ),
+    )
+    .expect("place strictly better but integer-unexecutable bid");
+    let (honest, honest_coin, honest_usd) = new_bidder(&mut svm, &payer, &env, 800);
+    send(
+        &mut svm,
+        &[&honest],
+        place_bid_ix(
+            &honest.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &honest_coin,
+            &honest_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            800,
+            400_000,
+            None,
+        ),
+    )
+    .expect("place exact executable reserve bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute skips the unexecutable allocation and settles the honest bid");
+
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        800,
+        "the lower-ranked exact bid must still sell its 800 COIN"
+    );
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &attacker_usd,
+            &attacker_coin,
+            0,
+        ),
+    )
+    .expect("unexecutable top bid receives its complete refund");
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &honest_usd,
+            &honest_coin,
+            1,
+        ),
+    )
+    .expect("honest bidder receives the exact reserve payout");
+    assert_eq!(token_amount(&svm, &attacker_coin), 801);
+    assert_eq!(token_amount(&svm, &attacker_usd), 0);
+    assert_eq!(token_amount(&svm, &honest_coin), 0);
+    assert_eq!(token_amount(&svm, &honest_usd), 400_000);
+}
+
+// PUBLIC DOS: skipping an integer-infeasible marginal candidate is insufficient when Sybils fill
+// every slot with that rate. A lower executable bid cannot evict any of them, and a no-purchase
+// roll would preserve all 32 commitments forever. Once the round has aged, execute must make every
+// infeasible slot permissionlessly refundable so a later executable round can start.
+#[test]
+fn e2e_full_integer_infeasible_book_cannot_remain_permanently_committed() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let mut attackers = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 801);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                801,
+                400_001,
+                None,
+            ),
+        )
+        .expect("fill one slot with an integer-infeasible partial bid");
+        attackers.push((bidder, coin, usd));
+    }
+
+    let (honest, honest_coin, honest_usd) = new_bidder(&mut svm, &payer, &env, 800);
+    assert!(
+        send(
+            &mut svm,
+            &[&honest],
+            place_bid_ix(
+                &honest.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &honest_coin,
+                &honest_usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                800,
+                400_000,
+                None,
+            ),
+        )
+        .is_err(),
+        "the lower exact bid cannot evict a strictly higher-rate full book"
+    );
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute retires the aged infeasible book without spending USD");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    assert_eq!(token_amount(&svm, &bk.holding), 400_000);
+
+    for (slot, (_, coin, usd)) in attackers.iter().enumerate() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                usd,
+                coin,
+                slot as u8,
+            ),
+        )
+        .expect("permissionless claim returns an infeasible commitment");
+        assert_eq!(token_amount(&svm, coin), 801);
+        assert_eq!(token_amount(&svm, usd), 0);
+    }
+
+    send(
+        &mut svm,
+        &[&honest],
+        place_bid_ix(
+            &honest.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &honest_coin,
+            &honest_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            800,
+            400_000,
+            None,
+        ),
+    )
+    .expect("honest exact bid enters the reopened book");
+    warp_to(&mut svm, 122);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("next round settles the exact bid");
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        800,
+        "infeasible cleanup preserves the complete budget for the executable round"
+    );
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000);
 }
 
 // INIT_BOOK DEGENERATE PARAMS (round_length == 0 re-opens the spoof hole; reserve_den == 0 bricks
@@ -26870,187 +27185,12 @@ fn execute_with_an_unarmed_max_sentinel_floor_drains_nothing() {
     );
 }
 
-// FINDING AE (roll restore, the HARD case): a roll where `marginal` was set but every fill rounded to
-// coin_i == 0 (a positive budget too small to buy a whole COIN atom at the bid's rate). The settle loop
-// ALREADY wrote SL_SETTLED=1 + SL_COIN_REFUND=full on the slot BEFORE total_coin==0 forces the roll, so
-// the restore (lib.rs ~1505) MUST reset those marks. If it didn't, the bid is left phantom-SETTLED with a
-// full COIN_REFUND -> the bidder could immediately `claim` their whole escrow back, exiting a committed
-// bid for FREE with no cooldown (anti-spoof bypass) and draining the shared coin_escrow. The existing
-// roll test triggers the roll with budget==0, where `marginal` is never set and the settle loop is
-// skipped — so the restore there is a no-op and does NOT exercise this path. This one does: reserve is 0
-// (any positive rate eligible) and a tiny pre-seeded holding makes a real but sub-atom fill.
+// ZERO-COIN PRICE SETTER (never pay USD for 0 COIN, and never let a non-seller set the price): a bid can
+// receive a residual budget so small that coin_i = floor(usd_i * cm/um) == 0. It must receive no USD,
+// get its complete COIN refund, and be excluded from marginal selection. Otherwise it either receives
+// free USD or reprices a real seller while transacting nothing.
 #[test]
-fn e2e_roll_with_a_marginal_zero_coin_fill_leaves_no_phantom_claim() {
-    let mut svm =
-        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
-            compute_unit_limit: 1_400_000,
-            heap_size: 256 * 1024,
-            ..solana_program_runtime::compute_budget::ComputeBudget::default()
-        });
-    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
-    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
-        .unwrap();
-    let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let env = setup_handoff(&mut svm, &payer);
-    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // reserve 0/1
-
-    // A low-rate bid: 1 COIN atom offered for 1000 USD (rate 0.001). Eligible (reserve 0).
-    let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 1);
-    send(
-        &mut svm,
-        &[&alice],
-        place_bid_ix(
-            &alice.pubkey(),
-            &env.twap_cfg,
-            &bk.book,
-            &bk.book_escrow,
-            &bk.coin_escrow,
-            &a_src,
-            &a_usd,
-            &env.coin_mint,
-            &env.collateral_mint,
-            1,
-            1000,
-            None,
-        ),
-    )
-    .expect("alice bid");
-    assert_eq!(
-        token_amount(&svm, &bk.coin_escrow),
-        1,
-        "the 1 COIN atom is escrowed"
-    );
-    let supply_before = mint_supply(&svm, &env.coin_mint);
-
-    // Make surplus == 0 (insurance below the 1M floor) so execute pulls NOTHING (no percolator CPI),
-    // then hand-seed the holding with a tiny 5-USD budget. The fill is min(5,1000)=5 USD (marginal IS
-    // set), but coin_i = floor(5 * 1/1000) = 0 -> total_coin==0 -> ROLL through the restore.
-    let mut slab = svm.get_account(&env.slab).unwrap();
-    let insurance_off = twap_program::INSURANCE_OFFSET;
-    slab.data[insurance_off..insurance_off + 16].copy_from_slice(&800_000u128.to_le_bytes());
-    svm.set_account(env.slab, slab).unwrap();
-    set_token(
-        &mut svm,
-        &bk.holding,
-        &env.collateral_mint,
-        &env.twap_authority,
-        5,
-    );
-
-    let cranker = Keypair::new();
-    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
-    warp_to(&mut svm, 111);
-    send(
-        &mut svm,
-        &[&cranker],
-        execute_ix(
-            &cranker.pubkey(),
-            &env,
-            &bk.book,
-            &bk.holding,
-            &bk.settlement_usd,
-            &bk.book_escrow,
-            &bk.coin_escrow,
-            None,
-        ),
-    )
-    .expect("execute rolls (marginal set, but bought 0 COIN)");
-    assert_eq!(
-        mint_supply(&svm, &env.coin_mint),
-        supply_before,
-        "a roll burns no COIN"
-    );
-    assert_eq!(
-        token_amount(&svm, &bk.settlement_usd),
-        0,
-        "nothing parked — no USD was spent"
-    );
-    assert_eq!(
-        token_amount(&svm, &bk.holding),
-        5,
-        "the 5-USD budget rolled over, unspent"
-    );
-    assert_eq!(
-        token_amount(&svm, &bk.coin_escrow),
-        1,
-        "the bid's COIN is still committed"
-    );
-
-    // THE GUARD: the rolled bid must NOT be phantom-claimable. If the restore left SL_SETTLED=1 +
-    // COIN_REFUND=full, this claim would drain the escrow with no cooldown (anti-spoof bypass).
-    assert!(
-        send(&mut svm, &[&cranker], claim_ix(&cranker.pubkey(), &env.twap_cfg, &bk.book, &bk.book_escrow, &bk.settlement_usd, &bk.coin_escrow, &a_usd, &a_src, 0)).is_err(),
-        "a rolled bid (marginal-zero-coin) must not be claimable — no phantom settle was left behind"
-    );
-    assert_eq!(
-        token_amount(&svm, &bk.coin_escrow),
-        1,
-        "escrow intact — the phantom claim moved nothing"
-    );
-    assert_eq!(token_amount(&svm, &a_src), 0, "alice got no COIN back");
-
-    // And the bid is byte-clean: a next round with a real 1000-USD budget settles it correctly.
-    set_token(
-        &mut svm,
-        &bk.holding,
-        &env.collateral_mint,
-        &env.twap_authority,
-        1000,
-    );
-    warp_to(&mut svm, 222);
-    send(
-        &mut svm,
-        &[&cranker],
-        execute_ix(
-            &cranker.pubkey(),
-            &env,
-            &bk.book,
-            &bk.holding,
-            &bk.settlement_usd,
-            &bk.book_escrow,
-            &bk.coin_escrow,
-            None,
-        ),
-    )
-    .expect("execute round 2 settles the survivor");
-    assert_eq!(
-        mint_supply(&svm, &env.coin_mint),
-        supply_before - 1,
-        "the 1 COIN atom is finally bought + burned"
-    );
-    send(
-        &mut svm,
-        &[&cranker],
-        claim_ix(
-            &cranker.pubkey(),
-            &env.twap_cfg,
-            &bk.book,
-            &bk.book_escrow,
-            &bk.settlement_usd,
-            &bk.coin_escrow,
-            &a_usd,
-            &a_src,
-            0,
-        ),
-    )
-    .expect("alice claims after the real settle");
-    assert_eq!(
-        token_amount(&svm, &a_usd),
-        1000,
-        "alice paid her full 1000 USD at the clearing price"
-    );
-    let _ = alice;
-}
-
-// SETTLE WITH A ZERO-COIN MARGINAL (never pay USD for 0 COIN, LOF): in a real settle (total_coin > 0) the
-// marginal bid can receive a residual budget so small that coin_i = floor(usd_i * cm/um) == 0. execute
-// treats any coin_i == 0 fill as UNFILLED (usd_owed -> 0, full COIN refund). Without that `coin_i > 0`
-// guard the marginal bidder would be credited usd_owed = residual (free USD) AND a full COIN refund — i.e.
-// receive USD while handing over 0 COIN and keeping all of it. e2e_roll_with_a_marginal_zero_coin_fill pins
-// the all-zero ROLL case; this pins the zero-coin marginal inside a real SETTLE.
-#[test]
-fn e2e_settle_with_a_zero_coin_marginal_pays_no_usd_for_zero_coin() {
+fn e2e_zero_coin_bid_cannot_set_marginal_price_or_receive_usd() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -27065,9 +27205,9 @@ fn e2e_settle_with_a_zero_coin_marginal_pays_no_usd_for_zero_coin() {
     let env = setup_handoff(&mut svm, &payer); // surplus 500k -> budget 400k (80%)
     let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0); // reserve 0/1
 
-    // alice (high rate) nominally fills 399_600 of the 400k budget; bob (low rate, the marginal)
-    // gets the remaining 400 USD residual, which at P* = 1/500 buys zero whole COIN. Alice sells
-    // 799 whole COIN, so her executable uniform-price payout is 799 * 500 = 399_500 USD.
+    // Alice fills 399,600 of the 400k budget. Bob gets the remaining 400 USD residual, which at
+    // 1/500 buys zero whole COIN. Bob cannot set P*, so Alice remains the marginal executable bid
+    // and sells her complete 400,000 COIN for exactly 399,600 USD.
     let (alice, a_src, a_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
     let (bob, b_src, b_usd) = new_bidder(&mut svm, &payer, &env, 1);
     send(
@@ -27129,20 +27269,20 @@ fn e2e_settle_with_a_zero_coin_marginal_pays_no_usd_for_zero_coin() {
     )
     .expect("execute settles");
 
-    // This IS a settle (alice's COIN bought + burned), but bob's zero-COIN marginal residual was NOT paid.
-    assert!(
-        mint_supply(&svm, &env.coin_mint) < supply_before,
-        "a SETTLE happened — alice's COIN was bought + burned"
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        400_000,
+        "the executable seller, not the zero-COIN bid, sets the price"
     );
     assert_eq!(
         token_amount(&svm, &bk.settlement_usd),
-        399_500,
-        "only alice's integer-reconciled USD was spent — not bob's residual"
+        399_600,
+        "only Alice's exact executable USD was spent"
     );
     assert_eq!(
         token_amount(&svm, &bk.holding),
-        500,
-        "rounding remainder and bob's residual roll over instead of overpaying"
+        400,
+        "Bob's zero-COIN residual rolls over instead of setting the price"
     );
 
     // bob claims slot 1: ZERO USD (he sold nothing) and his full 1 COIN back.
