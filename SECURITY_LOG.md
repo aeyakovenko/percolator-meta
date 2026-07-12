@@ -13374,3 +13374,26 @@ constrained controller PDA. Backing and oracle authorities remain independently 
 external provider can still deposit backing and earn utilization fees only while that capacity is at
 risk. No instruction, signer, destination, amount selector, custody account, withdrawal path, or
 administrative surface was added.
+
+## Tick - empty with-surplus custody could strand later protocol fees (surface A/C)
+
+A controller-supported with-surplus insurance pool could complete every owner withdrawal and remain
+the asset-0 insurance authority, operator, and admin. An ordinary public maintenance crank could then
+credit a later fee to that empty pool. After permissionless stale resolution, no position owned the
+fee, `CloseSlab` rejected the nonzero insurance balance, and Subledger rejected the only TWAP handoff
+solely because the immutable pool policy was with-surplus. Unlike a principal pool, this configuration
+had no post-resolution path that could ever consume the balance.
+
+The retained real-SBF LiteSVM regression creates a controller market through a real Squads chain,
+grants the supported with-surplus pool, deposits and returns one owner atom, and proves a Squads
+handoff still rejects while that principal is live. A public user then abandons one portfolio atom;
+a permissionless maintenance crank converts it into asset-0 insurance and removes the portfolio, and
+an unaffiliated stale resolver resolves the market. The old Subledger rejects the zero-claim handoff
+after real `CloseSlab` demonstrates the persistent blocker. The fixed chain hands only the unowned
+atom to TWAP, permissionlessly routes it to controller custody, and completes real terminal close.
+
+FIX: the existing handoff accepts with-surplus custody only when Subledger's own accounting proves
+`outstanding_principal == 0`. Its existing terminal attestation treats normalized share-rounding
+reserve as unowned only in that state. Principal pools retain their prior behavior. No instruction,
+signer, recipient, amount selector, authority setter, or withdrawal surface was added; the change
+only reuses the already constrained TWAP and controller terminal path after every user claim is gone.

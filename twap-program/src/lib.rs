@@ -1356,7 +1356,7 @@ fn process_return_to_subledger(
 //  controller_transit(w), percolator_vault(w), vault_authority,
 //  percolator_program, subledger_program, token_program]
 //
-// Once the market is resolved and the bound principal pool attests that every
+// Once the market is resolved and the bound pool attests that every
 // owner claim is gone, the monotonic retained floor is protocol insurance rather
 // than user principal. Anyone may move the exact remaining asset-0 balance through
 // clean accounts owned by the TWAP and controller PDAs, where terminal close

@@ -156,8 +156,9 @@ const IX_SET_VOTE_LOCK: u8 = 6;
 // Taking asset_admin away from the governance vault is what prevents governance from
 // later reassigning the operator to itself and bypassing owner-bound withdrawals.
 const IX_ACCEPT_OPERATOR: u8 = 7;
-// Governance-authorized, hardcoded principal-only pool -> TWAP custody handoff. The pool
-// remains the current asset_admin until the TWAP atomically receives all three roles.
+// Governance-authorized, hardcoded pool -> TWAP custody handoff. Principal pools carry
+// their protected floor; with-surplus pools are accepted only after all owner claims exit.
+// The pool remains current asset_admin until TWAP atomically receives all three roles.
 const IX_HANDOFF_TO_TWAP: u8 = 8;
 // Permissionless resolved-mode backing return. The pool signs only the controller's
 // fixed, recipient-free asset-0 cleanup after custody has returned from TWAP.
@@ -406,6 +407,17 @@ impl Pool {
 
     fn is_insurance(&self) -> bool {
         self.percolator_program != Pubkey::default()
+    }
+
+    fn owner_claims_cleared(&self) -> bool {
+        self.outstanding_principal == 0
+            && match self.policy {
+                POLICY_PRINCIPAL => self.total_shares == 0,
+                // Empty share pools normalize any whole-atom rounding reserve
+                // into unowned pricing shares for a possible later deposit epoch.
+                POLICY_WITH_SURPLUS => true,
+                _ => false,
+            }
     }
 }
 
@@ -2472,9 +2484,10 @@ fn process_return_resolved_asset0_backing(
 // again without governance; TWAP verifies that immutable binding before changing a
 // role. The pool signs a CPI to the fixed TWAP program, which hardcodes the only
 // incoming authority to its config-bound PDA and atomically protects this pool's live
-// outstanding principal. Only POLICY_PRINCIPAL may cross this boundary: TWAP moves
-// protocol surplus, while POLICY_WITH_SURPLUS makes the live balance part of depositor
-// share value, so combining them could socialize a protocol pull into user principal.
+// outstanding principal. POLICY_WITH_SURPLUS may cross this boundary only after every
+// owner claim is gone: while principal exists the live balance is depositor share value,
+// but after the final exit any later fee or rounding reserve is protocol insurance that
+// otherwise has no signer-backed terminal path.
 // Percolator verifies that this pool is the current asset_admin, while the TWAP verifies
 // the Squads identity and all market bindings.
 fn process_handoff_to_twap(
@@ -2505,7 +2518,7 @@ fn process_handoff_to_twap(
     }
     let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     if !pool.is_insurance()
-        || pool.policy != POLICY_PRINCIPAL
+        || (pool.policy == POLICY_WITH_SURPLUS && !pool.owner_claims_cleared())
         || *market_slab.key != pool.market_slab
         || *percolator_program.key != pool.percolator_program
     {
@@ -2566,11 +2579,7 @@ fn process_assert_no_principal(
     }
     let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     validate_pool_pda(program_id, pool_account, &pool)?;
-    if !pool.is_insurance()
-        || pool.policy != POLICY_PRINCIPAL
-        || pool.outstanding_principal != 0
-        || pool.total_shares != 0
-    {
+    if !pool.is_insurance() || !pool.owner_claims_cleared() {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(())
@@ -3006,6 +3015,26 @@ mod tests {
             deposit_start_slot: 100,
             bootstrap_delay_slots: 1_000,
         }
+    }
+
+    #[test]
+    fn terminal_claim_attestation_distinguishes_unowned_share_reserve() {
+        let mut pool = historical_pool_fixture();
+        pool.outstanding_principal = 0;
+        pool.total_shares = 2 * VIRTUAL_SHARES;
+        assert!(
+            pool.owner_claims_cleared(),
+            "an empty with-surplus pool's normalized reserve shares have no owner"
+        );
+
+        pool.outstanding_principal = 1;
+        assert!(!pool.owner_claims_cleared());
+
+        pool.outstanding_principal = 0;
+        pool.policy = POLICY_PRINCIPAL;
+        assert!(!pool.owner_claims_cleared());
+        pool.total_shares = 0;
+        assert!(pool.owner_claims_cleared());
     }
 
     #[test]
