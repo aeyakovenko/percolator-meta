@@ -2585,6 +2585,123 @@ fn pre_market_index_extra_market_stake_crystallizes_and_claims_after_upgrade() {
     );
 }
 
+#[test]
+fn pre_market_index_extra_market_stake_claims_after_pre_archive_portfolio_close() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let extra_market = Pubkey::new_unique();
+    let env = setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[extra_market]);
+
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_slot(&mut svm, 100);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &extra_market,
+        &owner.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    )
+    .expect("register the predecessor extra-market stake");
+
+    let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_LP);
+    let mut predecessor = svm.get_account(&stake).unwrap();
+    predecessor.data.truncate(211);
+    svm.set_account(stake, predecessor).unwrap();
+
+    set_slot(&mut svm, 1_500);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &extra_market,
+        &owner.pubkey(),
+        12_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+        .expect("crystallize while the predecessor portfolio is live");
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze the predecessor contribution");
+
+    // Older direct Percolator close paths could remove the live account without creating the
+    // controller archive. Claim already supports this terminal shape for frozen points; the exact
+    // marker PDA is the remaining authenticated market identity for a pre-index extra-market stake.
+    svm.set_account(
+        portfolio,
+        Account {
+            lamports: 0,
+            data: vec![],
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    let claim_for_market = |market: &Pubkey| {
+        let archive = Pubkey::find_program_address(
+            &[
+                b"rd_portfolio_archive",
+                env.stub_perc.as_ref(),
+                market.as_ref(),
+                owner.pubkey().as_ref(),
+                portfolio.as_ref(),
+            ],
+            &rd_id(),
+        )
+        .0;
+        Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(env.rd_config, false),
+                AccountMeta::new(stake, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new(recipient, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(portfolio, false),
+                AccountMeta::new_readonly(archive, false),
+                AccountMeta::new_readonly(retired_market_pda(&env.stub_perc, market), false),
+            ],
+            data: vec![5u8],
+        }
+    };
+    let unlisted_market = Pubkey::new_unique();
+    assert!(
+        send(
+            &mut svm,
+            &payer,
+            &[claim_for_market(&unlisted_market)],
+            &[&owner],
+        )
+        .is_err(),
+        "an unlisted marker/archive pair cannot select the compatibility fallback"
+    );
+    assert_eq!(token_amount(&svm, &recipient), 0);
+    send(
+        &mut svm,
+        &payer,
+        &[claim_for_market(&extra_market)],
+        &[&owner],
+    )
+    .expect("claim frozen predecessor points after a pre-archive close");
+    assert_eq!(token_amount(&svm, &recipient), 400_000);
+}
+
 // DoS/HYGIENE PROBE (allow-list init bounds, sweep tick D): the extra-market tail is `count: u8` + count keys.
 // init must bound count to MAX_EXTRA_MARKETS (=9) and reject a default or primary-duplicate extra — else a
 // malformed list could over-read or admit a junk/aliased market into the trusted scope.

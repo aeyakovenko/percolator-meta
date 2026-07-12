@@ -1273,6 +1273,7 @@ fn portfolio_market_for_stake(
     stake: &Stake,
     portfolio: &AccountInfo,
     archive_account: &AccountInfo,
+    retired_market: &AccountInfo,
 ) -> Result<Pubkey, ProgramError> {
     if stake_data_len >= STAKE_SIZE {
         return config
@@ -1296,7 +1297,25 @@ fn portfolio_market_for_stake(
     }
 
     if archive_account.data_len() == 0 {
-        return Err(ProgramError::InvalidAccountData);
+        // Frozen predecessor stakes can outlive a direct pre-archive Percolator close. The claim
+        // already accepts that terminal shape, so recover its configured market from the exact
+        // marker PDA. The caller authenticates the marker and empty archive PDAs immediately after
+        // this lookup; a key outside the allow-list cannot select a market.
+        let count = core::cmp::min(
+            usize::from(config.extra_market_count) + 1,
+            MAX_EXTRA_MARKETS + 1,
+        );
+        for index in 0..count {
+            let index = u8::try_from(index).map_err(|_| ProgramError::InvalidAccountData)?;
+            if let Some(market) = config.market_at(index) {
+                if *retired_market.key
+                    == retired_market_address(&config.percolator_program, &market)
+                {
+                    return Ok(market);
+                }
+            }
+        }
+        return Err(ProgramError::InvalidSeeds);
     }
     if archive_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
@@ -2259,6 +2278,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 &stake,
                 backing_ledger,
                 portfolio_archive,
+                retired_market,
             )?;
             let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
             let totals = portfolio_totals(
@@ -2320,6 +2340,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 &stake,
                 backing_ledger,
                 portfolio_archive,
+                retired_market,
             )?;
             let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
             let totals = portfolio_totals(
@@ -2636,6 +2657,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 &stake,
                 portfolio,
                 portfolio_archive,
+                retired_market,
             )?;
             let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
             if (dematerialized || retired) && portfolio_archive.data_len() == 0 {
