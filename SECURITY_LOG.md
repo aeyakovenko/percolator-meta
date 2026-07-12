@@ -13264,3 +13264,27 @@ control. Pinned Percolator then migrates its empty insurance authority and opera
 controller during the same existing handoff. Canonical Subledger/TWAP custody and the recorded backing
 provider remain supported. No signer, authority setter, destination, amount selector, custody account,
 withdrawal instruction, or administrative surface was added.
+
+## Tick - secondary activation could install an unfunded fee operator (surface A/C)
+
+The controller required secondary insurance authority and operator to match, but governance could
+still name any matching external key while the new asset held zero insurance. The asset became
+immediately tradeable. Two ordinary public round-trip trades accrued 120 insurance atoms before the
+named key deposited anything, and pinned Percolator then let that zero-capital operator withdraw all
+120. Governance could therefore grant a collaborator a direct claim on user-paid fees without any
+insurance at risk.
+
+The retained controller + pinned-Percolator LiteSVM regression first keeps the prior split-role
+principal-drain proof. It then attempts the equal external-role activation, runs two funded public
+trader portfolios through a real asset-1 round trip against the old SBF, and proves the external key
+withdraws the complete 120-atom fee balance. The fixed path rejects both external activation shapes
+byte-atomically, activates with controller-owned insurance plus the same external backing/oracle
+provider, recreates the 120 fee atoms, and rejects the provider's withdrawal without changing the
+market or vault. Existing deployed external-insurance states retain their provider-bound shutdown and
+resolved cleanup coverage as explicit compatibility fixtures.
+
+FIX: secondary activation now requires insurance authority and operator to equal the market's
+constrained controller PDA. Backing and oracle authorities remain independently configurable, so an
+external provider can still deposit backing and earn utilization fees only while that capacity is at
+risk. No instruction, signer, destination, amount selector, custody account, withdrawal path, or
+administrative surface was added.

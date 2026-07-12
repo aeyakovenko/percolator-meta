@@ -360,7 +360,7 @@ fn admin_tag_allowed(tag: u8) -> bool {
     )
 }
 
-fn validate_admin_instruction_data(data: &[u8]) -> ProgramResult {
+fn validate_admin_instruction_data(data: &[u8], controller: &Pubkey) -> ProgramResult {
     if data.first().copied() != Some(PERC_IX_UPDATE_ASSET_LIFECYCLE)
         || data.get(1).copied() != Some(ASSET_ACTION_ACTIVATE)
     {
@@ -375,7 +375,10 @@ fn validate_admin_instruction_data(data: &[u8]) -> ProgramResult {
     let insurance_operator = data
         .get(ACTIVATE_INSURANCE_OPERATOR_OFFSET..ACTIVATE_INSURANCE_OPERATOR_OFFSET + 32)
         .ok_or(ProgramError::InvalidInstructionData)?;
-    if insurance_authority != insurance_operator {
+    // A raw external role can receive trade-fee insurance before depositing any capital. Keep
+    // secondary insurance on the constrained controller; backing and oracle providers remain
+    // independently configurable by the activation wire.
+    if insurance_authority != insurance_operator || insurance_authority != controller.as_ref() {
         return Err(ProgramError::InvalidInstructionData);
     }
     Ok(())
@@ -429,7 +432,6 @@ fn process_proxy_admin<'a>(
     if !admin_tag_allowed(perc_tag) {
         return Err(ProgramError::InvalidInstructionData);
     }
-    validate_admin_instruction_data(data)?;
     let iter = &mut accounts.iter();
     let governance = next_account_info(iter)?;
     let controller = next_account_info(iter)?;
@@ -438,6 +440,7 @@ fn process_proxy_admin<'a>(
     if !governance.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    validate_admin_instruction_data(data, controller.key)?;
     let bump = controller_bump(
         program_id,
         governance,
@@ -2339,27 +2342,34 @@ mod tests {
     }
 
     #[test]
-    fn activation_cannot_split_deposit_and_withdrawal_authorities() {
+    fn activation_keeps_insurance_custody_on_the_controller() {
+        let controller = Pubkey::new_unique();
         let provider = Pubkey::new_unique();
-        let safe = asset_lifecycle_data(ASSET_ACTION_ACTIVATE, provider, provider);
-        assert_eq!(validate_admin_instruction_data(&safe), Ok(()));
+        let safe = asset_lifecycle_data(ASSET_ACTION_ACTIVATE, controller, controller);
+        assert_eq!(validate_admin_instruction_data(&safe, &controller), Ok(()));
+
+        let unfunded_external = asset_lifecycle_data(ASSET_ACTION_ACTIVATE, provider, provider);
+        assert_eq!(
+            validate_admin_instruction_data(&unfunded_external, &controller),
+            Err(ProgramError::InvalidInstructionData)
+        );
 
         let split = asset_lifecycle_data(ASSET_ACTION_ACTIVATE, provider, Pubkey::new_unique());
         assert_eq!(
-            validate_admin_instruction_data(&split),
+            validate_admin_instruction_data(&split, &controller),
             Err(ProgramError::InvalidInstructionData)
         );
 
         let mut truncated = safe;
         truncated.pop();
         assert_eq!(
-            validate_admin_instruction_data(&truncated),
+            validate_admin_instruction_data(&truncated, &controller),
             Err(ProgramError::InvalidInstructionData)
         );
 
         let lifecycle_transition = asset_lifecycle_data(1, provider, Pubkey::new_unique());
         assert_eq!(
-            validate_admin_instruction_data(&lifecycle_transition),
+            validate_admin_instruction_data(&lifecycle_transition, &controller),
             Ok(())
         );
     }
