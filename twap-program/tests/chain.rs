@@ -4530,7 +4530,7 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
     .expect("unaffiliated stale resolver ends the pool-less market");
 
     let twap_transit = canonical_insurance_vault(&env.twap_authority, &env.collateral_mint);
-    let controller_transit = canonical_insurance_vault(&controller, &env.collateral_mint);
+    let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
         &twap_transit,
@@ -4540,9 +4540,9 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
     );
     set_token(
         &mut svm,
-        &controller_transit,
+        &governance_destination,
         &env.collateral_mint,
-        &controller,
+        &env.squads_vault,
         0,
     );
     let attacker = Keypair::new();
@@ -4586,15 +4586,15 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
             &system_program::ID,
             &env.slab,
             &twap_transit,
-            &controller_transit,
+            &governance_destination,
             &env.perc_vault,
             &env.vault_authority,
             &perc_id(),
         ),
     )
-    .expect("any cranker recovers pool-less protocol insurance to the canonical controller");
+    .expect("any cranker returns pool-less protocol insurance to governance");
     assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
-    assert_eq!(token_amount(&svm, &controller_transit), amount);
+    assert_eq!(token_amount(&svm, &governance_destination), amount);
 }
 
 // PUBLIC DOS: a pool-less TWAP config has no Subledger PDA that can sign the controller's fixed
@@ -4692,6 +4692,7 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
 
     let twap_transit = canonical_insurance_vault(&env.twap_authority, &env.collateral_mint);
     let controller_transit = canonical_insurance_vault(&controller, &env.collateral_mint);
+    let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
         &twap_transit,
@@ -4706,6 +4707,13 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
         &controller,
         0,
     );
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
     send(
         &mut svm,
         &[&payer],
@@ -4715,14 +4723,15 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
             &system_program::ID,
             &env.slab,
             &twap_transit,
-            &controller_transit,
+            &governance_destination,
             &env.perc_vault,
             &env.vault_authority,
             &perc_id(),
         ),
     )
-    .expect("unaffiliated cranker isolates protocol insurance in controller custody");
-    assert_eq!(token_amount(&svm, &controller_transit), protocol_insurance);
+    .expect("unaffiliated cranker returns protocol insurance to governance");
+    assert_eq!(token_amount(&svm, &governance_destination), protocol_insurance);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
 
     let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
     let long_backing_ledger = Pubkey::new_unique();
@@ -4826,7 +4835,12 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
     )
     .expect("any cranker returns pool-less asset-0 backing through the TWAP signer");
     assert_eq!(token_amount(&svm, &provider_destination), backing_amount);
-    assert_eq!(token_amount(&svm, &controller_transit), protocol_insurance);
+    assert!(
+        svm.get_account(&controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "the empty backing transit closes instead of persisting controller custody"
+    );
+    assert_eq!(token_amount(&svm, &governance_destination), protocol_insurance);
     assert_eq!(token_amount(&svm, &env.perc_vault), 0);
     assert_eq!(
         percolator_accounting::read_asset_backing_authority(
@@ -5806,7 +5820,7 @@ fn twap_return_resolved_protocol_insurance_ix(
     pool: &Pubkey,
     market: &Pubkey,
     twap_transit: &Pubkey,
-    controller_transit: &Pubkey,
+    governance_destination: &Pubkey,
     percolator_vault: &Pubkey,
     vault_authority: &Pubkey,
     percolator_program: &Pubkey,
@@ -5819,7 +5833,7 @@ fn twap_return_resolved_protocol_insurance_ix(
             AccountMeta::new_readonly(*pool, false),
             AccountMeta::new(*market, false),
             AccountMeta::new(*twap_transit, false),
-            AccountMeta::new(*controller_transit, false),
+            AccountMeta::new(*governance_destination, false),
             AccountMeta::new(*percolator_vault, false),
             AccountMeta::new_readonly(*vault_authority, false),
             AccountMeta::new_readonly(*percolator_program, false),
@@ -8722,8 +8736,8 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
 
 // PUBLIC DOS: anyone can donate to controller-owned asset-0 insurance and later trigger configured
 // stale resolution, but CloseSlab still requires that insurance to be empty. The fixed recovery
-// must retain protocol insurance in the canonical controller ATA for terminal governance reclaim
-// without exposing a caller-selected destination.
+// must return protocol insurance through an empty one-shot transit to governance without exposing
+// a caller-selected beneficiary or persistent controller balance.
 fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance(
     freeze_canonical_transit: bool,
 ) {
@@ -9058,6 +9072,37 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
         set_token(&mut svm, &close_transit, &collateral_mint, &controller, 0);
         close_transit
     } else {
+        let market_before_retention = svm.get_account(&slab).unwrap();
+        assert!(
+            send(
+                &mut svm,
+                &[&payer],
+                controller_return_resolved_asset_insurance_ix(
+                    &governance.pubkey(),
+                    &controller,
+                    &slab,
+                    &controller_transit,
+                    &controller_transit,
+                    &percolator_vault,
+                    &vault_authority,
+                    &insurance_ledger,
+                    &perc_id(),
+                    0,
+                ),
+            )
+            .is_err(),
+            "protocol insurance cannot persist in controller custody"
+        );
+        assert_eq!(svm.get_account(&slab).unwrap(), market_before_retention);
+
+        let fallback_transit = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &fallback_transit,
+            &collateral_mint,
+            &controller,
+            0,
+        );
         send(
             &mut svm,
             &[&payer],
@@ -9065,8 +9110,8 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
                 &governance.pubkey(),
                 &controller,
                 &slab,
-                &controller_transit,
-                &controller_transit,
+                &governance_destination,
+                &fallback_transit,
                 &percolator_vault,
                 &vault_authority,
                 &insurance_ledger,
@@ -9074,9 +9119,15 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
                 0,
             ),
         )
-        .expect("public cleanup recovers protocol insurance to the controller ATA");
-        assert_eq!(token_amount(&svm, &controller_transit), 1);
-        controller_transit
+        .expect("public cleanup returns protocol insurance directly to governance");
+        assert!(
+            svm.get_account(&fallback_transit)
+                .map_or(true, |account| account.lamports == 0),
+            "the one-shot return cannot fragment controller custody"
+        );
+        let close_transit = Pubkey::new_unique();
+        set_token(&mut svm, &close_transit, &collateral_mint, &controller, 0);
+        close_transit
     };
     assert_eq!(
         percolator_accounting::read_asset_insurance_remaining(
@@ -12945,15 +12996,16 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
             &pool,
             &market,
             &twap_transit,
-            &controller_transit,
+            &governance_destination,
             &percolator_vault,
             &vault_authority,
             &perc_id(),
         ),
     )
-    .expect("any cranker moves the exact unowned fee into controller custody");
+    .expect("any cranker moves the exact unowned fee into governance custody");
     assert_eq!(read_asset0_insurance(&svm, &market), 0);
-    assert_eq!(token_amount(&svm, &controller_transit), 1);
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
+    assert_eq!(token_amount(&svm, &governance_destination), 1);
 
     squads_execute(
         &mut svm,
@@ -40460,7 +40512,7 @@ fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
 // principal in its monotonic floor. After resolution and every owner exit, a zero-principal
 // re-handoff intentionally preserves that floor, so the auction cannot pull it while CloseSlab
 // cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
-// exact residual only through clean PDA-owned transits into controller custody.
+// exact residual through an empty TWAP-owned transit only to the bound Squads vault.
 #[test]
 fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
     let mut svm =
@@ -41151,6 +41203,14 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &controller,
         0,
     );
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
     assert!(
         send(
             &mut svm,
@@ -41161,7 +41221,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 &decoy_pool,
                 &env.slab,
                 &twap_transit,
-                &controller_transit,
+                &governance_destination,
                 &env.perc_vault,
                 &perc_vault_authority(&env.slab, &perc_id()),
                 &perc_id(),
@@ -41181,7 +41241,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 &env.pool,
                 &env.slab,
                 &twap_transit,
-                &controller_transit,
+                &governance_destination,
                 &env.perc_vault,
                 &perc_vault_authority(&env.slab, &perc_id()),
                 &perc_id(),
@@ -41324,14 +41384,6 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         },
     )
     .unwrap();
-    let governance_destination = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &governance_destination,
-        &env.collateral_mint,
-        &env.squads_vault,
-        0,
-    );
     let close = build_controller_close_and_reclaim_message(
         &env.squads_vault,
         &controller,
@@ -41459,20 +41511,20 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 &env.pool,
                 &env.slab,
                 &twap_transit,
-                &controller_transit,
+                &governance_destination,
                 &env.perc_vault,
                 &perc_vault_authority(&env.slab, &perc_id()),
                 &perc_id(),
             ),
         )
         .is_err(),
-        "permanently frozen canonical transits cannot receive protocol insurance"
+        "the permanently frozen canonical TWAP transit cannot return protocol insurance"
     );
     assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_frozen_return);
 
     // A replacement TWAP account must start empty. Otherwise a public caller
     // could use terminal recovery to sweep an unrelated TWAP-owned balance into
-    // controller custody.
+    // governance custody.
     let funded_twap_transit = Pubkey::new_unique();
     set_token(
         &mut svm,
@@ -41491,7 +41543,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 &env.pool,
                 &env.slab,
                 &funded_twap_transit,
-                &clean_controller_transit,
+                &governance_destination,
                 &env.perc_vault,
                 &perc_vault_authority(&env.slab, &perc_id()),
                 &perc_id(),
@@ -41544,18 +41596,19 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             &env.pool,
             &env.slab,
             &clean_twap_transit,
-            &clean_controller_transit,
+            &governance_destination,
             &env.perc_vault,
             &perc_vault_authority(&env.slab, &perc_id()),
             &perc_id(),
         ),
     )
-    .expect("permissionless terminal recovery uses clean owner-bound fallback transits");
+    .expect("permissionless terminal recovery uses a clean governance-owned destination");
     assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
     assert_eq!(
-        token_amount(&svm, &clean_controller_transit),
+        token_amount(&svm, &governance_destination),
         retained_protocol_insurance
     );
+    assert_eq!(token_amount(&svm, &clean_controller_transit), 0);
 
     send(
         &mut svm,
@@ -41610,10 +41663,23 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         asset0_backing_amount,
         "asset-0 backing reaches only its recorded provider"
     );
+    assert!(
+        svm.get_account(&clean_controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "asset-0 backing cleanup closes its one-shot controller transit"
+    );
     assert_eq!(
-        token_amount(&svm, &clean_controller_transit),
+        token_amount(&svm, &governance_destination),
         retained_protocol_insurance,
-        "asset-0 backing cleanup cannot sweep retained protocol insurance"
+        "asset-0 backing cleanup cannot sweep governance-owned protocol insurance"
+    );
+    let secondary_controller_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &secondary_controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
     );
     send(
         &mut svm,
@@ -41623,7 +41689,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             &controller,
             &env.slab,
             &provider_destination,
-            &clean_controller_transit,
+            &secondary_controller_transit,
             &env.perc_vault,
             &perc_vault_authority(&env.slab, &perc_id()),
             &long_backing_ledger,
@@ -41638,19 +41704,32 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         backing_amount,
         "provider receives backing only, never retained protocol insurance"
     );
+    assert!(
+        svm.get_account(&secondary_controller_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "secondary backing cleanup closes its one-shot controller transit"
+    );
     assert_eq!(
-        token_amount(&svm, &clean_controller_transit),
+        token_amount(&svm, &governance_destination),
         retained_protocol_insurance,
-        "terminal protocol insurance remains in controller custody"
+        "terminal protocol insurance remains in governance custody"
     );
 
+    let close_controller_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &close_controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
     let fallback_close = build_controller_close_and_reclaim_message(
         &env.squads_vault,
         &controller,
         &env.slab,
         &env.perc_vault,
         &perc_vault_authority(&env.slab, &perc_id()),
-        &clean_controller_transit,
+        &close_controller_transit,
         &governance_destination,
     );
     let fallback_close_remaining = vec![
@@ -41658,7 +41737,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new(controller, false),
         AccountMeta::new(env.slab, false),
         AccountMeta::new(env.perc_vault, false),
-        AccountMeta::new(clean_controller_transit, false),
+        AccountMeta::new(close_controller_transit, false),
         AccountMeta::new(governance_destination, false),
         AccountMeta::new(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
@@ -42586,6 +42665,19 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot = 111;
     svm.set_sysvar(&clock);
+
+    let market_before_retention = svm.get_account(&market).unwrap();
+    let vault_before_retention = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], fixed_cleanup()).is_err(),
+        "controller-owned protocol fees cannot persist in controller custody"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_retention);
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_retention
+    );
+    assert_eq!(token_amount(&svm, &controller_transit), 0);
 
     let freeze_canonical = spl_token::instruction::freeze_account(
         &spl_token::ID,

@@ -2,6 +2,30 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - public terminal returns could fragment protocol custody (surface A/C)
+
+Controller-owned secondary insurance cleanup could retain real trade fees in the canonical
+controller token account. Independently, TWAP's permissionless resolved asset-0 return accepted any
+clean controller-owned destination so a frozen canonical account could be bypassed. An unaffiliated
+caller could execute both valid paths with different accounts. `CloseSlab` accepts only one primary-
+mint transit, so closing the real slab forwarded one balance and permanently removed the only
+controller signing context that could reach the other.
+
+The clean-room real-binary LiteSVM probe generated 96 secondary fee atoms through an ordinary public
+round trip, completed the pool/TWAP owner-recovery lifecycle, returned the asset-0 protocol floor to a
+second controller account, returned both backing providers, and closed the real slab. The old binaries
+left all 96 atoms in the canonical controller account; a second governed close failed byte-atomically.
+Retained regressions also cover the 120-atom secondary-fee fixture, controller-owned asset-0 donation,
+pool-less custody, a with-surplus terminal fee, frozen canonical accounts, and the complete pool-bound
+owner/backing/close lifecycle.
+
+FIX: controller-owned insurance always uses an empty one-shot controller transit, forwards the exact
+slab-derived amount to a clean account owned by the bound Squads vault, and closes the transit. TWAP's
+resolved asset-0 return likewise pays a clean Squads-vault-owned account directly after Subledger proves
+that no owner claim remains. External provider returns are unchanged and still pay only the recorded
+provider. No signer, amount selector, authority setter, user-principal path, or admin withdrawal was
+added; public terminal cleanup can no longer create persistent controller balances.
+
 ## Tick - restart revived a zero-capital legacy fee operator (surface A/C)
 
 Predecessor controller activation and donation paths could leave matched external insurance roles on
