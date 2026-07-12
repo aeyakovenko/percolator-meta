@@ -2442,7 +2442,7 @@ fn max_executable_integer_pair(
     let bid_pair = try_coin(exact_coin)?;
     let mut best = marginal_pair;
     consider_larger_pair(&mut best, bid_pair);
-    if best.is_some_and(|pair| pair.1 == max_usd) {
+    if best.is_some_and(|pair| pair == (candidate_coin, max_usd)) {
         return Ok(best);
     }
 
@@ -2516,7 +2516,7 @@ fn max_executable_integer_pair(
                         0
                     };
                     if denominator == 0
-                        || best.is_some_and(|pair| denominator <= pair.1)
+                        || best.is_some_and(|pair| denominator < pair.1)
                         || reduced_usd_lot
                             .checked_mul(excess)
                             .ok_or(ProgramError::ArithmeticOverflow)?
@@ -2629,7 +2629,7 @@ fn max_executable_integer_pair(
     // otherwise executable auctions.
     let mut projected_usd = max_usd;
     for _ in 0..128 {
-        if projected_usd == 0 || best.is_some_and(|pair| projected_usd <= pair.1) {
+        if projected_usd == 0 || best.is_some_and(|pair| projected_usd < pair.1) {
             break;
         }
         let coin = projected_coin_for_usd(projected_usd)?;
@@ -4179,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_excess_solver_matches_exhaustive_maximum_spend() {
+    fn narrow_excess_solver_matches_exhaustive_maximum_pair() {
         for marginal_coin in 1u128..=12 {
             for marginal_usd in 1u128..=12 {
                 let marginal_gcd = gcd_u64(marginal_coin as u64, marginal_usd as u64);
@@ -4232,8 +4232,8 @@ mod tests {
                                 consider_larger_pair(&mut expected, Some((coin, usd)));
                             }
                             assert_eq!(
-                                actual.map(|pair| pair.1),
-                                expected.map(|pair| pair.1),
+                                actual,
+                                expected,
                                 "marginal={marginal_coin}/{marginal_usd}, bid={bid_coin}/{bid_usd}, remaining={remaining_usd}"
                             );
                         }

@@ -13123,3 +13123,21 @@ the marginal rate. The bounded pass mutates the existing 32-slot allocation vect
 nominal preflight, preserving heap and compute bounds. Every enlarged pair is capped by escrow, remaining
 budget, and the bidder's submitted limit. No authority, destination, signer, custody path, principal counter,
 or admin surface was added.
+
+## Tick - equal-USD reconciliation could underbuy public TWAP bids (surface C)
+
+TWAP's bounded integer reconciliation maximized USD spend first and COIN purchased second. Its narrow-interval
+branch stopped when an existing candidate already used the same USD denominator, even when another bidder-safe
+candidate delivered more COIN for that exact payment. A public bidder could choose this rounding shape to
+receive the normal collateral payout while suppressing part of the DAO's configured buyback burn.
+
+A retained real-SBF LiteSVM regression funds an exact four-unit public round, submits a skipped `16 COIN / 5 USD`
+bid and a capped `5 / 2` marginal bid, then executes and claims both slots permissionlessly. The old binary spent
+all four USD but burned only ten COIN: it paid two USD for five target COIN even though six target COIN satisfy
+both the `5 / 2` marginal and `16 / 5` bidder limits. The fixed binary burns eleven and preserves every escrow,
+refund, settlement, and holding conservation check. The host-side exhaustive oracle now compares the complete
+`(COIN, USD)` maximum instead of masking equal-USD underbuys.
+
+FIX: equal-USD candidates remain eligible until the solver proves that its current pair also has the largest
+possible COIN numerator. The same tie-break is applied to the bounded denominator projection. This changes no
+authority, destination, signer, custody path, bid cap, principal counter, or admin surface.

@@ -24906,6 +24906,183 @@ fn e2e_uniform_repricing_reconsiders_a_bid_excluded_at_a_provisional_marginal() 
     let _ = (top, marginal);
 }
 
+// PUBLIC LOSS-OF-FUNDS PROBE: a higher-rate bid whose reduced lot does not fit the nominal
+// remainder can still sell a strictly larger COIN numerator for the same final-price USD leg.
+// Reconciliation must compare equal-USD candidates by COIN as well as USD; otherwise a public
+// bidder can make the DAO pay the same collateral while suppressing the configured buyback burn.
+#[test]
+fn e2e_uniform_repricing_maximizes_coin_at_equal_usd() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        4,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            4,
+        )
+        .unwrap(),
+    )
+    .expect("fund exact four-unit budget");
+
+    // The target's five-USD reduced lot does not fit the four-unit nominal remainder. The 5/2
+    // bid sets the uniform marginal and leaves two USD for target reconciliation. Both 5/2 and
+    // 6/2 satisfy [5/2, 16/5], but 6/2 buys one more coin for the same two USD.
+    let (target, target_coin, target_usd) = new_bidder(&mut svm, &payer, &env, 16);
+    send(
+        &mut svm,
+        &[&target],
+        place_bid_ix(
+            &target.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &target_coin,
+            &target_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            16,
+            5,
+            None,
+        ),
+    )
+    .expect("place skipped higher-rate target");
+
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 5);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            5,
+            2,
+            None,
+        ),
+    )
+    .expect("place capped marginal bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute equal-USD numerator probe");
+
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 4);
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        11,
+        "the DAO must receive the largest bidder-safe COIN amount for its four USD"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &target_usd,
+            &target_coin,
+            0,
+        ),
+    )
+    .expect("claim reconciled target");
+    assert_eq!(token_amount(&svm, &target_coin), 10);
+    assert_eq!(token_amount(&svm, &target_usd), 2);
+
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            1,
+        ),
+    )
+    .expect("claim marginal bid");
+    assert_eq!(token_amount(&svm, &marginal_coin), 0);
+    assert_eq!(token_amount(&svm, &marginal_usd), 2);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (target, marginal);
+}
+
 // PUBLIC DOS PROBE: a final-price fill can be safe even when neither the largest rounded COIN
 // candidate nor a whole lot at the bid's own reduced ratio is safe. Reconciliation must also
 // consider an exact reduced marginal-price lot; otherwise a five-bid public book can strand 40%
