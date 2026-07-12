@@ -13553,3 +13553,24 @@ marker key; the existing exact marker and empty archive PDA checks authenticate 
 before its fixed-recipient payout. The change adds no signer, authority, token account, destination,
 amount selector, custody CPI, or principal-moving surface; it restores access only to already allocated
 COIN rewards.
+
+## Tick - a retired slab marker could block every later market generation's terminal close (surface C)
+
+Pinned Percolator permits a zeroed slab key to be initialized again without the slab key signing, and
+the controller's public market-authority handoff can accept that clean replacement generation. Reward
+identity correctly remains retired forever, but `CloseMarketAndReclaim` previously required the marker
+account to be system-owned and empty on every close. The valid permanent marker from generation one
+therefore made generation two's governed `CloseSlab` unreachable, even after all portfolios and value
+attribution were gone.
+
+The retained real-binary LiteSVM lifecycle creates and resolves a controller market, closes its users and
+slab, and verifies the permanent marker. It then reinitializes the same key through pinned Percolator,
+proves reward registration stays rejected, closes the replacement portfolio, uses the public controller
+handoff, resolves through governance, and closes the replacement slab. The old controller fails the final
+public close with `InvalidAccountData`; the fixed controller closes it and leaves the marker byte-identical.
+
+FIX: terminal close accepts either the uninitialized canonical marker PDA or the exact 72-byte marker this
+controller previously wrote for the same Percolator program and market key. It creates the former once and
+reuses the latter without mutation. Governance signature, controller derivation, token destinations,
+Percolator's resolved-empty `CloseSlab`, and all value forwarding remain unchanged. The marker has no close
+or reset path and continues to retire reward eligibility for every later generation.

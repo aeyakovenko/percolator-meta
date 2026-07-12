@@ -1984,9 +1984,24 @@ fn process_close_market_and_reclaim<'a>(
         market.key.as_ref(),
         &retired_market_bump_seed,
     ];
-    if retired_market.owner != system_program.key || retired_market.data_len() != 0 {
+    let marker_exists = if retired_market.owner == system_program.key
+        && retired_market.data_len() == 0
+    {
+        false
+    } else if retired_market.owner == program_id
+        && retired_market.data_len() == RETIRED_MARKET_SIZE
+    {
+        let marker = retired_market.try_borrow_data()?;
+        if marker[..8] != RETIRED_MARKET_DISC
+            || marker[8..40] != percolator_program.key.to_bytes()
+            || marker[40..72] != market.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        true
+    } else {
         return Err(ProgramError::InvalidAccountData);
-    }
+    };
 
     let mut metas = vec![
         AccountMeta::new(*controller.key, true),
@@ -2021,19 +2036,19 @@ fn process_close_market_and_reclaim<'a>(
         &[&seeds],
     )?;
 
-    // CloseSlab has now returned the slab and vault rent to the controller. Reserve a small,
-    // permanent marker from that recovered rent before forwarding the remainder to governance;
-    // Squads vault PDAs therefore never need an ambient lamport balance to retire a market.
-    create_pda(
-        controller,
-        retired_market,
-        system_program,
-        program_id,
-        &retired_market_seeds,
-        &seeds,
-        RETIRED_MARKET_SIZE,
-    )?;
-    {
+    if !marker_exists {
+        // CloseSlab has now returned the slab and vault rent to the controller. Reserve a small,
+        // permanent marker from that recovered rent before forwarding the remainder to governance;
+        // Squads vault PDAs therefore never need an ambient lamport balance to retire a market.
+        create_pda(
+            controller,
+            retired_market,
+            system_program,
+            program_id,
+            &retired_market_seeds,
+            &seeds,
+            RETIRED_MARKET_SIZE,
+        )?;
         let data = &mut retired_market.try_borrow_mut_data()?;
         data[..8].copy_from_slice(&RETIRED_MARKET_DISC);
         data[8..40].copy_from_slice(percolator_program.key.as_ref());
