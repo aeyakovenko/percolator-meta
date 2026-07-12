@@ -2109,8 +2109,18 @@ fn process_accept_market_authority<'a>(
                 insurance_authority,
                 insurance_operator,
             )?;
-        } else if custody_state.is_some() {
-            return Err(ProgramError::InvalidAccountData);
+        } else {
+            // UpdateAuthority also leaves insurance roles untouched when they belong
+            // to a third party. Matching authority/operator keys avoid principal
+            // theft, but an empty, unfunded key could still withdraw trade fees that
+            // accrue after handoff. Only the consenting outgoing authority, this
+            // controller, or canonical custody proven above may survive donation.
+            if custody_state.is_some()
+                || (insurance_authority != current_bytes
+                    && insurance_authority != controller.key.to_bytes())
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
         }
         (
             restore_insurance_authority,

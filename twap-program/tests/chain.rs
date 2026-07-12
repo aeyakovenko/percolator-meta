@@ -7260,6 +7260,225 @@ fn e2e_controller_donation_rejects_external_roles_with_a_drain_path() {
     assert_controller_donation_rejects_delegated_role(2); // operator can withdraw immediately
 }
 
+// PUBLIC VALUE-LEAK PROBE: an empty creator market must not become controller-governed while an
+// unrelated, unfunded insurance provider survives. Matching authority/operator keys are not enough:
+// ordinary public trades accrue asset-local fee insurance without using the donation wrapper. If
+// the handoff succeeds, the stale provider can take fees paid by later users without risking capital.
+#[test]
+fn e2e_market_donation_cannot_preserve_an_unfunded_provider_that_skims_later_trade_fees() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let stale_operator = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&stale_operator.pubkey(), 1_000_000_000)
+        .unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &market);
+
+    for kind in [1, 2] {
+        send(
+            &mut svm,
+            &[&payer, &creator, &stale_operator],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(stale_operator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                data: PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: stale_operator.pubkey().to_bytes(),
+                }
+                .encode(),
+            },
+        )
+        .expect("creator delegates an empty-market insurance role");
+    }
+
+    let controller = controller_pda(&governance, &market, &perc_id());
+    let market_before_handoff = svm.get_account(&market).unwrap();
+    let handoff = send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance, false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    );
+    if handoff.is_err() {
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_handoff);
+        return;
+    }
+
+    let profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(profile.asset_admin, controller.to_bytes());
+    assert_eq!(
+        profile.insurance_authority,
+        stale_operator.pubkey().to_bytes()
+    );
+    assert_eq!(
+        profile.insurance_operator,
+        stale_operator.pubkey().to_bytes()
+    );
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let trader_a = Keypair::new();
+    let trader_b = Keypair::new();
+    let portfolio_a = Pubkey::new_unique();
+    let portfolio_b = Pubkey::new_unique();
+    for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
+        svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize trader portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &trader.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("fund trader portfolio");
+    }
+
+    let size_q = (percolator::POS_SCALE / 10) as i128;
+    for signed_size in [size_q, -size_q] {
+        send(
+            &mut svm,
+            &[&payer, &trader_a, &trader_b],
+            pix(
+                vec![
+                    AccountMeta::new(trader_a.pubkey(), true),
+                    AccountMeta::new(trader_b.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio_a, false),
+                    AccountMeta::new(portfolio_b, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: signed_size,
+                    exec_price: 1_000_000,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("public round trip pays asset-local trade fees");
+    }
+    let fee_insurance = percolator_accounting::read_asset_insurance_remaining(
+        &svm.get_account(&market).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(fee_insurance, 120);
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &stale_operator.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &stale_operator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(stale_operator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: PIx::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: fee_insurance,
+            }
+            .encode(),
+        },
+    )
+    .expect("unfunded provider skims fees paid after the controller handoff");
+    assert_eq!(token_amount(&svm, &attacker_destination), 120);
+    panic!("controller accepted a market with an unfunded fee-draining insurance provider");
+}
+
 #[test]
 fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
     let mut svm =
