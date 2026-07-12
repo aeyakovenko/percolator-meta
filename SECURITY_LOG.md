@@ -13264,3 +13264,22 @@ final-price priority replay. It reserves one exact marginal lot, reprices eligib
 adopts the replay only if it improves `(USD spent, COIN bought)` lexicographically. Existing cascade coverage
 keeps the 32-bid path below 500k CU and rechecks every bidder limit, DAO reserve, payout, refund, and escrow
 conservation invariant. This adds no signer, authority, destination, bid slot, custody path, or admin surface.
+
+## Tick - fully spent nominal allocations could retain bidder COIN (surface C)
+
+The ordinary final-price reconciliation ran only when integer flooring left unused USD. A nominal winner could
+therefore spend its complete allocation while still having more bidder-safe COIN available for that identical
+payment. Because no bid was absent and no USD remainder existed, neither reconciliation path reconsidered it.
+A public bidder received the full payout while retaining COIN that its submitted limit and the final marginal
+both made executable.
+
+A retained real-SBF LiteSVM regression funds a two-unit round and submits `3 COIN / 1 USD` followed by a `2 / 1`
+marginal bid. Both `2 / 1` and `3 / 1` priority fills have the same one-USD floored payment and satisfy the
+priority bidder's limit. The old SBF spent both USD but bought only four COIN, refunding one priority COIN. The
+fixed execution buys all five, pays each bidder one USD, and drains both shared escrows exactly.
+
+FIX: the existing bounded reconciliation scan now runs for every stable marginal and continues after its USD
+remainder reaches zero. It can therefore increase any allocated COIN numerator without increasing that bid's
+payment, while the same solver continues to enforce the marginal, bidder limit, escrow cap, and DAO reserve.
+The skipped-priority replay remains separate and unchanged. No signer, authority, destination, custody path,
+bid cap, principal counter, or admin surface was added.

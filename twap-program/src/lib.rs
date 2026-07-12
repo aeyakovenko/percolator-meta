@@ -3665,13 +3665,15 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         }
 
         // Integer reconciliation can leave each executable bid consuming less actual USD than its
-        // nominal allocation. Combine those remainders into additional whole lots without changing
-        // the stable marginal. This may enlarge an existing allocation or admit a previously
-        // unallocated bid that is ranked above the marginal (for example, its lot did not fit the
-        // nominal remainder) or exactly equal to it. Lower-price bids remain ineligible. Mutating the
-        // existing fixed-size allocation vector avoids attacker-amplified heap use; cached GCDs bound
-        // each fallback.
-        if has_stable && total_usd < budget {
+        // nominal allocation, or leave additional bidder-safe COIN available for the same floored
+        // USD payment. Combine remainders into additional whole lots and maximize equal-USD fills
+        // without changing the stable marginal. This may enlarge an existing allocation or admit a
+        // previously unallocated bid that is ranked above the marginal (for example, its lot did not
+        // fit the nominal remainder) or exactly equal to it. Lower-price bids remain ineligible.
+        // Mutating the existing fixed-size allocation vector avoids attacker-amplified heap use;
+        // cached GCDs bound each fallback. Continue after the USD remainder reaches zero because
+        // later allocated bids may still increase COIN without increasing their payment.
+        if has_stable {
             let marginal_rank = stable_marginal_rank.ok_or(ProgramError::InvalidAccountData)?;
             let marginal_slot = idx[marginal_rank];
             let mo = slot_off(marginal_slot);
@@ -3726,9 +3728,6 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                     .checked_add(added_usd)
                     .ok_or(ProgramError::ArithmeticOverflow)?;
                 remaining -= added_usd;
-                if remaining == 0 {
-                    break;
-                }
             }
         }
 

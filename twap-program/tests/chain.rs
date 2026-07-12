@@ -20689,11 +20689,12 @@ fn e2e_buy_burn_uniform_price_dutch_auction() {
     )
     .expect("execute");
 
-    // 400k COIN (alice) + 400k COIN (bob) bought at P*=2 and BURNED; carol untouched.
+    // Whole-atom flooring buys 400,001 COIN from alice for 200k USD plus bob's exact
+    // 400k/200k marginal pair; carol remains untouched.
     assert_eq!(
         mint_supply(&svm, &env.coin_mint),
-        1_100_000 - 800_000,
-        "800k COIN really burned"
+        1_100_000 - 800_001,
+        "the largest bidder-safe COIN amount for 400k USD is really burned"
     );
     assert_eq!(
         token_amount(&svm, &bk.settlement_usd),
@@ -20769,8 +20770,8 @@ fn e2e_buy_burn_uniform_price_dutch_auction() {
     );
     assert_eq!(
         token_amount(&svm, &a_src),
-        200_000,
-        "alice's surplus COIN (600k offered - 400k sold) refunded"
+        199_999,
+        "alice's surplus COIN (600k offered - 400,001 sold) refunded"
     );
     assert_eq!(
         token_amount(&svm, &b_usd),
@@ -25715,6 +25716,179 @@ fn e2e_uniform_repricing_reconsiders_a_bid_excluded_at_a_provisional_marginal() 
     let _ = (top, marginal);
 }
 
+// PUBLIC LOSS OF FUNDS: nominal repricing can spend a bid's complete USD allocation while leaving
+// additional bidder-safe COIN available for that same payment. A zero USD remainder must not skip
+// the equal-USD maximization pass, or a public bidder keeps COIN despite receiving the full payout.
+#[test]
+fn e2e_uniform_repricing_maximizes_an_allocated_bid_at_equal_usd() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        2,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            2,
+        )
+        .unwrap(),
+    )
+    .expect("fund exact two-unit budget");
+
+    // The nominal pass gives this priority bid one USD. At the final 2/1 marginal,
+    // both 2/1 and 3/1 cost one floored USD and satisfy the submitted 3/1 limit.
+    let (priority, priority_coin, priority_usd) = new_bidder(&mut svm, &payer, &env, 3);
+    send(
+        &mut svm,
+        &[&priority],
+        place_bid_ix(
+            &priority.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &priority_coin,
+            &priority_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            3,
+            1,
+            None,
+        ),
+    )
+    .expect("place equal-USD priority bid");
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 2);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            2,
+            1,
+            None,
+        ),
+    )
+    .expect("place exact marginal bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute allocated equal-USD edge");
+
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 2);
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        5,
+        "the complete priority bid and marginal bid cost the same two USD"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &priority_usd,
+            &priority_coin,
+            0,
+        ),
+    )
+    .expect("claim maximized priority bid");
+    assert_eq!(token_amount(&svm, &priority_coin), 0);
+    assert_eq!(token_amount(&svm, &priority_usd), 1);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            1,
+        ),
+    )
+    .expect("claim exact marginal bid");
+    assert_eq!(token_amount(&svm, &marginal_coin), 0);
+    assert_eq!(token_amount(&svm, &marginal_usd), 1);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (priority, marginal);
+}
+
 // PUBLIC DOS: a higher-rate bid can be skipped by the own-rate reduced-lot preflight even though
 // it becomes executable at the lower final marginal. If the marginal bid consumes the full budget,
 // the ordinary remainder pass has no USD with which to reconsider the skipped priority bid.
@@ -30237,13 +30411,13 @@ fn e2e_uniform_price_partial_marginal_fill() {
     )
     .expect("execute");
 
-    // Marginal = bob, P* = 400k/200k = 2 COIN/USD. alice fully filled at P*; bob partial at P*.
-    // alice: 300k USD -> 600k COIN (offered 900k -> refund 300k). bob: 100k USD -> 200k COIN
-    // (offered 400k -> refund 200k). total burned = 800k; total USD spent = 400k.
+    // Marginal = bob, P* = 400k/200k = 2 COIN/USD. Whole-atom flooring buys 600,001
+    // alice COIN for 300k USD and bob's exact partial 200k/100k pair. Total burned is
+    // 800,001 COIN while total USD spent remains 400k.
     assert_eq!(
         mint_supply(&svm, &env.coin_mint),
-        supply_before - 800_000,
-        "800k COIN bought + burned"
+        supply_before - 800_001,
+        "the largest bidder-safe COIN amount for 400k USD is bought and burned"
     );
     assert_eq!(
         token_amount(&svm, &bk.settlement_usd),
@@ -30289,8 +30463,8 @@ fn e2e_uniform_price_partial_marginal_fill() {
     );
     assert_eq!(
         token_amount(&svm, &a_src),
-        300_000,
-        "alice's surplus COIN refunded (offered 900k, sold 600k at P*=2)"
+        299_999,
+        "alice's surplus COIN refunded after selling 600,001 for the same 300k USD"
     );
     assert_eq!(
         token_amount(&svm, &b_usd),
