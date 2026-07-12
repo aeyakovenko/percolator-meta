@@ -34,6 +34,10 @@ fn controller_pda(governance: &Pubkey, market: &Pubkey, perc: &Pubkey) -> Pubkey
     market_controller_program::controller_address(governance, market, perc).0
 }
 
+fn retired_market_pda(market: &Pubkey, perc: &Pubkey) -> Pubkey {
+    market_controller_program::retired_market_address(perc, market).0
+}
+
 const IX_MULTISIG_CREATE_V2: [u8; 8] = [50, 221, 199, 93, 40, 245, 139, 233];
 const ACCT_PROGRAM_CONFIG: [u8; 8] = [196, 210, 90, 231, 144, 149, 140, 63];
 const SEED_PREFIX: &[u8] = b"multisig";
@@ -5166,10 +5170,11 @@ fn build_controller_close_and_reclaim_message(
     governance_destination: &Pubkey,
 ) -> Vec<u8> {
     let mut m = Vec::new();
+    let retired_market = retired_market_pda(market, &perc_id());
     m.push(1); // governance signer
     m.push(1); // governance receives the reclaimed lamports
-    m.push(5); // controller, market, vault, and both token destinations
-    m.push(11);
+    m.push(6); // controller, market, vault, token destinations, and retirement marker
+    m.push(12);
     for key in [
         governance,
         controller,
@@ -5177,6 +5182,7 @@ fn build_controller_close_and_reclaim_message(
         vault,
         controller_destination,
         governance_destination,
+        &retired_market,
         vault_authority,
         &perc_id(),
         &spl_token::ID,
@@ -5186,9 +5192,9 @@ fn build_controller_close_and_reclaim_message(
         m.extend_from_slice(key.as_ref());
     }
     m.push(1);
-    m.push(10); // market-controller program
-    m.push(10);
-    for index in [0u8, 1, 2, 6, 3, 4, 5, 7, 8, 9] {
+    m.push(11); // market-controller program
+    m.push(11);
+    for index in [0u8, 1, 2, 7, 3, 4, 5, 8, 9, 10, 6] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -8852,6 +8858,7 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(retired_market_pda(&slab, &perc_id()), false),
             ],
             data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
         },
@@ -8879,6 +8886,7 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
         .unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
 
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
@@ -8928,6 +8936,78 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         },
     )
     .expect("permissionless controller-owned market init");
+
+    // The DAO selects this exact live market key before it is retired. Reusing the key after close
+    // must not turn the immutable reward allow-list into an attacker-controlled oracle scope.
+    let reward_mint_authority = Keypair::new();
+    let reward_mint = create_real_mint(&mut svm, &payer, &reward_mint_authority.pubkey());
+    let reward_epoch_id = 991u64;
+    let reward_config = rd_epoch_config_pda(
+        &governance.pubkey(),
+        &reward_mint,
+        reward_epoch_id,
+    );
+    let reward_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault,
+        &reward_mint,
+        &reward_config,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &reward_mint_authority],
+        spl_token::instruction::mint_to(
+            &spl_token::ID,
+            &reward_mint,
+            &reward_vault,
+            &reward_mint_authority.pubkey(),
+            &[],
+            100,
+        )
+        .unwrap(),
+    )
+    .expect("fund the fixed reward epoch");
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        rd_epoch_init_ix(
+            &payer.pubkey(),
+            &governance.pubkey(),
+            &reward_mint,
+            &perc_id(),
+            &sub_id(),
+            &reward_config,
+            &reward_vault,
+            reward_epoch_id,
+            100,
+            200,
+            100,
+            0,
+            0,
+            0,
+            10_000,
+            10,
+            0,
+            &[(slab, Pubkey::default(), Pubkey::default())],
+        ),
+    )
+    .expect("DAO selects the original controller market for funding rewards");
+    send(
+        &mut svm,
+        &[&payer, &reward_mint_authority],
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &reward_mint,
+            None,
+            spl_token::instruction::AuthorityType::MintTokens,
+            &reward_mint_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("make the reward supply immutable");
 
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -9183,6 +9263,13 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         },
     )
     .unwrap();
+    let retired_market = retired_market_pda(&slab, &perc_id());
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &retired_market, 1),
+    )
+    .expect("an unaffiliated caller prefunds the canonical retirement marker");
     let close_market = Instruction {
         program_id: controller_id(),
         accounts: vec![
@@ -9196,6 +9283,7 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(retired_market, false),
         ],
         data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
     };
@@ -9208,6 +9296,10 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         .is_err(),
         "the abandoned materialized portfolio blocks terminal CloseSlab"
     );
+    let prefunded_marker = svm.get_account(&retired_market).unwrap();
+    assert_eq!(prefunded_marker.owner, system_program::ID);
+    assert!(prefunded_marker.data.is_empty());
+    assert_eq!(prefunded_marker.lamports, 1, "failed close rolls marker creation back");
 
     let slab_lamports_before_portfolio_cleanup = svm.get_account(&slab).unwrap().lamports;
     send(&mut svm, &[&payer], close_abandoned)
@@ -9236,6 +9328,101 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         svm.get_account(&slab)
             .map_or(true, |account| account.lamports == 0),
         "the abandoned empty portfolio cannot strand the slab"
+    );
+    let retired_marker = svm.get_account(&retired_market).unwrap();
+    assert_eq!(retired_marker.owner, controller_id());
+    assert_eq!(&retired_marker.data[..8], b"MKTRET01");
+    assert_eq!(&retired_marker.data[8..40], perc_id().as_ref());
+    assert_eq!(&retired_marker.data[40..72], slab.as_ref());
+
+    let market_hijacker = Keypair::new();
+    svm.airdrop(&market_hijacker.pubkey(), 1_000_000_000)
+        .unwrap();
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            percolator_prog::ix::Instruction::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 3,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: 1,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("pinned Percolator reinitializes the retired slab without its key signing");
+    assert_eq!(
+        percolator_accounting::read_market_authority(&svm.get_account(&slab).unwrap().data)
+            .unwrap(),
+        market_hijacker.pubkey().to_bytes(),
+        "the old allow-list key now names an attacker-controlled market generation",
+    );
+
+    let hijack_portfolio = Keypair::new();
+    send(
+        &mut svm,
+        &[&market_hijacker, &hijack_portfolio],
+        solana_sdk::system_instruction::create_account(
+            &market_hijacker.pubkey(),
+            &hijack_portfolio.pubkey(),
+            portfolio_rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("attacker allocates a portfolio in the replacement market");
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(hijack_portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::InitPortfolio,
+        ),
+    )
+    .expect("attacker initializes replacement-market reward witness");
+    assert!(
+        send(
+            &mut svm,
+            &[&market_hijacker],
+            rd_register_ix(
+                &market_hijacker.pubkey(),
+                &reward_config,
+                &market_hijacker.pubkey(),
+                &market_hijacker.pubkey(),
+                &slab,
+                &hijack_portfolio.pubkey(),
+                4,
+            ),
+        )
+        .is_err(),
+        "a retired allow-list key cannot admit an attacker-controlled reward stake"
     );
 }
 
@@ -9607,6 +9794,7 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![5u8],
     };
@@ -10091,6 +10279,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
     };
@@ -11871,6 +12060,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         AccountMeta::new(perc_vault, false),
         AccountMeta::new(controller_destination, false),
         AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&slab, &perc_id()), false),
         AccountMeta::new_readonly(vault_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(spl_token::ID, false),
@@ -11904,11 +12094,16 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     assert!(svm
         .get_account(&controller)
         .map_or(true, |account| account.lamports == 0));
+    let retired_market = svm
+        .get_account(&retired_market_pda(&slab, &perc_id()))
+        .expect("terminal close leaves a permanent market retirement marker");
+    assert_eq!(retired_market.owner, controller_id());
+    assert_eq!(retired_market.data.len(), 72);
     let governance_after = svm.get_account(&squads_vault).unwrap().lamports;
     assert_eq!(
-        governance_after - governance_before,
+        governance_after - governance_before + retired_market.lamports,
         controller_before + market_before + vault_before + transit_before,
-        "controller prefund, slab rent, vault rent, and transit rent are all reclaimed"
+        "all recovered rent is either reclaimed or retained in the permanent marker"
     );
 }
 
@@ -12335,6 +12530,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         AccountMeta::new(percolator_vault, false),
         AccountMeta::new(controller_transit, false),
         AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&market, &perc_id()), false),
         AccountMeta::new_readonly(vault_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(spl_token::ID, false),
@@ -12506,6 +12702,7 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
         0,
     );
     svm.airdrop(&controller, 777).unwrap();
+    let retired_market = retired_market_pda(&slab, &perc_id());
 
     let close_accounts = |include_secondary: bool| {
         let mut accounts = vec![
@@ -12519,6 +12716,7 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new(retired_market, false),
         ];
         if include_secondary {
             accounts.extend_from_slice(&[
@@ -12651,8 +12849,11 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
             .map_or(true, |account| account.lamports == 0));
     }
     let governance_after = svm.get_account(&governance.pubkey()).unwrap().lamports;
+    let retired_market_account = svm.get_account(&retired_market).unwrap();
+    assert_eq!(retired_market_account.owner, controller_id());
+    assert_eq!(retired_market_account.data.len(), 72);
     assert_eq!(
-        governance_after - governance_before,
+        governance_after - governance_before + retired_market_account.lamports,
         controller_before
             + market_before
             + primary_vault_before
@@ -34830,6 +35031,10 @@ fn rd_register_ix(
             false,
         ));
         accounts.push(AccountMeta::new_readonly(*market, false));
+        accounts.push(AccountMeta::new_readonly(
+            retired_market_pda(market, &perc_id()),
+            false,
+        ));
     }
     Instruction {
         program_id: rd_id(),
@@ -34855,6 +35060,10 @@ fn rd_crystallize_ix(
     if matches!(cohort, 2 | 3 | 4) {
         accounts.push(AccountMeta::new_readonly(
             rd_portfolio_archive_pda(market, owner, linked),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(
+            retired_market_pda(market, &perc_id()),
             false,
         ));
     }
@@ -34908,6 +35117,10 @@ fn rd_claim_ix(
             accounts.push(AccountMeta::new_readonly(*linked, false));
             accounts.push(AccountMeta::new_readonly(
                 rd_portfolio_archive_pda(market, owner, linked),
+                false,
+            ));
+            accounts.push(AccountMeta::new_readonly(
+                retired_market_pda(market, &perc_id()),
                 false,
             ));
         }
@@ -35521,6 +35734,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 false,
             ),
             AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![1u8, 4u8],
     }; // COHORT_FUNDING_PAYER
@@ -35545,6 +35759,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 false,
             ),
             AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
@@ -35564,6 +35779,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 false,
             ),
             AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![1u8, 4u8],
     }; // COHORT_FUNDING_PAYER
@@ -35588,6 +35804,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 false,
             ),
             AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
@@ -35607,6 +35824,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 false,
             ),
             AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![1u8, 4u8],
     };
@@ -35631,6 +35849,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 false,
             ),
             AccountMeta::new_readonly(slab, false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![1u8, 4u8],
     };
@@ -36126,6 +36345,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 rd_portfolio_archive_pda(&slab, &long_payer.pubkey(), &long_payer_pf),
                 false,
             ),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![2u8],
     };
@@ -36144,6 +36364,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ),
                 false,
             ),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![2u8],
     };
@@ -36158,6 +36379,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 rd_portfolio_archive_pda(&slab, &short_payer.pubkey(), &short_payer_pf),
                 false,
             ),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![2u8],
     };
@@ -36176,6 +36398,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ),
                 false,
             ),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![2u8],
     };
@@ -36190,6 +36413,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 rd_portfolio_archive_pda(&slab, &dual_payer.pubkey(), &dual_payer_pf),
                 false,
             ),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![2u8],
     };
@@ -36208,6 +36432,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ),
                 false,
             ),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![2u8],
     };
@@ -37605,7 +37830,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
 // empty-portfolio predicate. A permissionless resolved-market cleanup must therefore preserve the
 // final counters before it dematerializes the only authenticated witness a reward epoch can read.
 // An unrelated caller must also be unable to append a foreign InitPortfolio in the same transaction
-// and make that later account generation block the completed original archive.
+// or reuse the retired slab key and make a later generation block the completed original archive.
 #[test]
 fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     use percolator_prog::ix::Instruction as PIx;
@@ -37885,7 +38110,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
             &rd_vault,
             epoch_id,
             100,
-            200,
+            500,
             reward_supply,
             0,
             0,
@@ -38102,16 +38327,23 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     clock.slot = 110;
     clock.unix_timestamp = 110;
     svm.set_sysvar(&clock);
+    let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
     send(
         &mut svm,
-        &[&payer],
+        &[&payer, &governance],
         Instruction {
-            program_id: perc_id(),
-            accounts: vec![AccountMeta::new(market_key, false)],
-            data: PIx::ResolveStalePermissionless { now_slot: 110 }.encode(),
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: resolve_data,
         },
     )
-    .expect("unaffiliated cranker resolves the stale market");
+    .expect("governance resolves through the constrained controller");
     clock.slot = 111;
     clock.unix_timestamp = 111;
     svm.set_sysvar(&clock);
@@ -38148,6 +38380,36 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         "resolved payout still leaves the uncrystallized counter live"
     );
 
+    // Resolve both accounts before terminal cleanup. Their authenticated receipts remain live until
+    // the controller can archive their reward telemetry, and any provider-owned backing dust is
+    // returned through the fixed path below before CloseSlab.
+    let short_collateral = canonical_insurance_vault(&short_owner.pubkey(), &collateral_mint);
+    set_token(
+        &mut svm,
+        &short_collateral,
+        &collateral_mint,
+        &short_owner.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(short_owner.pubkey(), false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+                AccountMeta::new(short_collateral, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+        ),
+    )
+    .expect("public resolved payout empties the remaining short");
     // The legacy account shape omitted the distributor entirely. It must reject atomically whenever
     // cleanup could otherwise delete the only copy of an uncrystallized reward counter.
     let long_before_legacy_cleanup = svm.get_account(&long_portfolio.pubkey()).unwrap();
@@ -38220,8 +38482,151 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     );
     assert_eq!(svm.get_account(&archive).unwrap().owner, rd_id());
 
-    // Crystallize from the canonical immutable-identity archive, freeze, and pay the sole funding
-    // stake. The archive never holds collateral or COIN and cannot alter either claim path.
+    // Retire the remaining original-market portfolio and then the whole slab. The long's foreign live
+    // generation remains materialized, so the reward claim below proves the immutable market marker
+    // selects the completed original archive instead of trusting bytes at the reused portfolio key.
+    let short_archive = rd_portfolio_archive_pda(
+        &market_key,
+        &short_owner.pubkey(),
+        &short_portfolio.pubkey(),
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(short_archive, false),
+                AccountMeta::new_readonly(rd_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: vec![11u8],
+        },
+    )
+    .expect("public cleanup archives and retires the remaining short");
+
+    // Funding settlement left two provider-owned backing atoms. Return them through the fixed,
+    // amountless controller path before CloseSlab; no protocol or DAO account may absorb them.
+    let market_account = svm.get_account(&market_key).unwrap();
+    let backing_provider = Pubkey::new_from_array(
+        percolator_accounting::read_asset_backing_authority(&market_account.data, 0).unwrap(),
+    );
+    let backing_amount = percolator_accounting::read_asset_backing_balances(
+        &market_account.data,
+        0,
+    )
+    .unwrap()
+    .iter()
+    .map(|balance| balance.principal_atoms + balance.earnings_atoms)
+    .sum::<u128>();
+    assert!(backing_amount > 0, "the probe must exercise terminal backing return");
+    let backing_destination = Pubkey::new_unique();
+    let backing_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_destination,
+        &collateral_mint,
+        &backing_provider,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &backing_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    let long_backing_ledger = Pubkey::new_unique();
+    let short_backing_ledger = Pubkey::new_unique();
+    for ledger in [long_backing_ledger, short_backing_ledger] {
+        svm.set_account(
+            ledger,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; backing_ledger_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    send(
+        &mut svm,
+        &[&payer],
+        controller_return_resolved_asset0_backing_ix(
+            &governance.pubkey(),
+            &controller,
+            &controller,
+            &market_key,
+            &backing_destination,
+            &backing_transit,
+            &percolator_vault,
+            &vault_authority,
+            &long_backing_ledger,
+            &short_backing_ledger,
+            &perc_id(),
+        ),
+    )
+    .expect("public terminal path returns the provider's backing dust");
+    assert_eq!(
+        token_amount(&svm, &backing_destination) as u128,
+        backing_amount,
+    );
+
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    let retired_market = retired_market_pda(&market_key, &perc_id());
+    clock.slot = 300;
+    clock.unix_timestamp = 300;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new(governance.pubkey(), true),
+                AccountMeta::new(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new(controller_transit, false),
+                AccountMeta::new(governance_destination, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(retired_market, false),
+            ],
+            data: vec![5u8],
+        },
+    )
+    .expect("governance retires the empty original market");
+    assert_eq!(svm.get_account(&retired_market).unwrap().owner, controller_id());
+
+    // Crystallize from the canonical immutable-identity archive after market retirement, freeze, and
+    // pay the sole funding stake. The archive never holds collateral or COIN.
     send(
         &mut svm,
         &[&payer],
@@ -38241,13 +38646,14 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
                 ),
                 AccountMeta::new_readonly(long_portfolio.pubkey(), false),
                 AccountMeta::new_readonly(archive, false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
             ],
             data: vec![2u8],
         },
     )
     .expect("crystallize the archived paid-funding delta");
-    clock.slot = 210;
-    clock.unix_timestamp = 210;
+    clock.slot = 510;
+    clock.unix_timestamp = 510;
     svm.set_sysvar(&clock);
     send(
         &mut svm,
@@ -39264,6 +39670,10 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(loser_archive, false),
             AccountMeta::new_readonly(supplied_market, false),
+            AccountMeta::new_readonly(
+                retired_market_pda(&supplied_market, &perc_id()),
+                false,
+            ),
         ],
         data: vec![1u8, 3u8],
     };
@@ -39488,6 +39898,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
                 AccountMeta::new(t_stake, false),
                 AccountMeta::new_readonly(loser_pf, false),
                 AccountMeta::new_readonly(loser_archive, false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: vec![2u8],
         }],
@@ -39707,6 +40118,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(loser_pf, false), // trader live-cap portfolio (stake.backing_ledger)
             AccountMeta::new_readonly(loser_archive, false),
+            AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
         ],
         data: vec![5u8],
     };
@@ -39899,6 +40311,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
                     AccountMeta::new_readonly(perc_id(), false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new(retired_market_pda(&market, &perc_id()), false),
                 ],
                 data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
             },
@@ -40816,6 +41229,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new(env.perc_vault, false),
         AccountMeta::new(controller_transit, false),
         AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(spl_token::ID, false),
@@ -41127,6 +41541,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new(env.perc_vault, false),
         AccountMeta::new(clean_controller_transit, false),
         AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(spl_token::ID, false),

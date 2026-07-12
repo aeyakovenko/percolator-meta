@@ -25,6 +25,7 @@ use solana_program::{
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
+    rent::Rent,
     system_instruction,
     sysvar::Sysvar,
 };
@@ -33,6 +34,9 @@ declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
 const CONTROLLER_SEED: &[u8] = b"market-controller";
 const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
+pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
+pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
+pub const RETIRED_MARKET_SIZE: usize = 72;
 const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const SUBLEDGER_PROGRAM_ID: Pubkey =
@@ -116,6 +120,58 @@ pub fn shutdown_insurance_operator_address(controller: &Pubkey, asset_index: u16
             &asset_index.to_le_bytes(),
         ],
         &id(),
+    )
+}
+
+pub fn retired_market_address(
+    percolator_program: &Pubkey,
+    market: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            RETIRED_MARKET_SEED,
+            percolator_program.as_ref(),
+            market.as_ref(),
+        ],
+        &id(),
+    )
+}
+
+fn create_pda<'a>(
+    payer: &AccountInfo<'a>,
+    target: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    program_id: &Pubkey,
+    seeds: &[&[u8]],
+    payer_seeds: &[&[u8]],
+    size: usize,
+) -> ProgramResult {
+    if !payer.is_writable
+        || !target.is_writable
+        || *system_program.key != solana_program::system_program::ID
+        || target.owner != system_program.key
+        || target.data_len() != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let rent = Rent::get()?.minimum_balance(size);
+    let current = target.lamports();
+    if current < rent {
+        invoke_signed(
+            &system_instruction::transfer(payer.key, target.key, rent - current),
+            &[payer.clone(), target.clone(), system_program.clone()],
+            &[payer_seeds],
+        )?;
+    }
+    invoke_signed(
+        &system_instruction::allocate(target.key, size as u64),
+        &[target.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, program_id),
+        &[target.clone(), system_program.clone()],
+        &[seeds],
     )
 }
 
@@ -1832,7 +1888,7 @@ fn process_close_resolved_portfolio<'a>(
 // close_market_and_reclaim accounts:
 // [governance(s,w), controller(w), market(w), vault_authority,
 //  primary_vault(w), controller_primary_transit(w), governance_primary_dest(w),
-//  percolator_program, token_program, system_program,
+//  percolator_program, token_program, system_program, retired_market_marker(w),
 //  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w)]
 //
 // Percolator's CloseSlab requires its current marketauth to receive the slab rent,
@@ -1865,6 +1921,7 @@ fn process_close_market_and_reclaim<'a>(
     let percolator_program = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let retired_market = next_account_info(iter)?;
     let optional: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
     let secondary = match optional.as_slice() {
         [] => None,
@@ -1880,6 +1937,7 @@ fn process_close_market_and_reclaim<'a>(
         || !primary_vault.is_writable
         || !primary_transit.is_writable
         || !primary_destination.is_writable
+        || !retired_market.is_writable
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -1914,6 +1972,22 @@ fn process_close_market_and_reclaim<'a>(
         &bump_seed,
     );
 
+    let (expected_retired_market, retired_market_bump) =
+        retired_market_address(percolator_program.key, market.key);
+    if *retired_market.key != expected_retired_market {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let retired_market_bump_seed = [retired_market_bump];
+    let retired_market_seeds: [&[u8]; 4] = [
+        RETIRED_MARKET_SEED,
+        percolator_program.key.as_ref(),
+        market.key.as_ref(),
+        &retired_market_bump_seed,
+    ];
+    if retired_market.owner != system_program.key || retired_market.data_len() != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     let mut metas = vec![
         AccountMeta::new(*controller.key, true),
         AccountMeta::new(*market.key, false),
@@ -1946,6 +2020,25 @@ fn process_close_market_and_reclaim<'a>(
         &cpi_accounts,
         &[&seeds],
     )?;
+
+    // CloseSlab has now returned the slab and vault rent to the controller. Reserve a small,
+    // permanent marker from that recovered rent before forwarding the remainder to governance;
+    // Squads vault PDAs therefore never need an ambient lamport balance to retire a market.
+    create_pda(
+        controller,
+        retired_market,
+        system_program,
+        program_id,
+        &retired_market_seeds,
+        &seeds,
+        RETIRED_MARKET_SIZE,
+    )?;
+    {
+        let data = &mut retired_market.try_borrow_mut_data()?;
+        data[..8].copy_from_slice(&RETIRED_MARKET_DISC);
+        data[8..40].copy_from_slice(percolator_program.key.as_ref());
+        data[40..72].copy_from_slice(market.key.as_ref());
+    }
 
     forward_and_close_token_account(
         controller,
