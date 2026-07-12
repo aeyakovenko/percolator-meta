@@ -73,6 +73,11 @@ const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
 
 const CONFIG_DISC: [u8; 8] = *b"RDCONFG1";
 const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
+const PORTFOLIO_ARCHIVE_DISC: [u8; 8] = *b"RDARCH01";
+const PORTFOLIO_ARCHIVE_SEED: &[u8] = b"rd_portfolio_archive";
+const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
+const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 // Up to this many ADDITIONAL allow-listed markets beyond the primary `market_group` (finding IL+): the
 // portfolio-flow cohorts read percolator portfolio counters that an attacker can manufacture if they control the
 // market's oracle, so a portfolio is only countable if its market is on this orchestrator-vetted allow-list.
@@ -92,6 +97,7 @@ const CONFIG_EXTRA_BACKING_POOLS_OFF: usize =
     CONFIG_EXTRA_INSURANCE_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const CONFIG_SIZE: usize = CONFIG_EXTRA_BACKING_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
+const PORTFOLIO_ARCHIVE_SIZE: usize = 264;
                                // Capital + portfolio-flow cohorts. Insurance/backing reward base-unit principal;
                                // LP/trader reward residual counters; optional funding-payer rewards the sum of
                                // Percolator funding-paid counters. See tests/offsets.rs.
@@ -102,8 +108,11 @@ const COHORT_TRADER: u8 = 3;
 const COHORT_FUNDING_PAYER: u8 = 4;
 
 const SUB_POSITION_DISC: [u8; 8] = *b"SUBPOS01";
+#[cfg(test)]
 const PERC_MAGIC: u64 = 0x5045_5243_5631_3600;
+#[cfg(test)]
 const PERC_VERSION: u16 = 16;
+#[cfg(test)]
 const PERC_KIND_PORTFOLIO: u8 = 2;
 
 const IX_INIT: u8 = 0;
@@ -115,6 +124,7 @@ const IX_CRYSTALLIZE: u8 = 2;
 const IX_FREEZE: u8 = 4;
 const IX_CLAIM: u8 = 5;
 const IX_INIT_REWARD_EPOCH: u8 = 6;
+const IX_ARCHIVE_PORTFOLIO: u8 = 7;
 
 const CONFIG_KIND_LEGACY: u8 = 0;
 const CONFIG_KIND_REWARD_EPOCH: u8 = 1;
@@ -216,6 +226,7 @@ fn read_u128(data: &[u8], off: usize) -> Result<u128, ProgramError> {
     Ok(u128::from_le_bytes(b.try_into().unwrap()))
 }
 
+#[cfg(test)]
 fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey, ProgramError> {
     let b = data
         .get(off..off + 32)
@@ -388,6 +399,7 @@ fn funding_payer_counter(long_paid: u128, short_paid: u128) -> u128 {
     long_paid.saturating_add(short_paid)
 }
 
+#[cfg(test)]
 fn validate_portfolio_identity(config: &Config, data: &[u8], owner: &Pubkey) -> ProgramResult {
     if data.len() < OFF_PORTFOLIO_OWNER + 32 {
         return Err(ProgramError::AccountDataTooSmall);
@@ -788,6 +800,183 @@ impl Config {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PortfolioArchive {
+    percolator_program: Pubkey,
+    market: Pubkey,
+    owner: Pubkey,
+    portfolio: Pubkey,
+    residual_crystallized_loss: u128,
+    residual_spent_principal: u128,
+    residual_received: u128,
+    funding_long_paid: u128,
+    funding_long_received: u128,
+    funding_short_paid: u128,
+    funding_short_received: u128,
+    generation: u64,
+    archived_slot: u64,
+}
+
+impl PortfolioArchive {
+    fn empty(
+        percolator_program: Pubkey,
+        market: Pubkey,
+        owner: Pubkey,
+        portfolio: Pubkey,
+    ) -> Self {
+        Self {
+            percolator_program,
+            market,
+            owner,
+            portfolio,
+            residual_crystallized_loss: 0,
+            residual_spent_principal: 0,
+            residual_received: 0,
+            funding_long_paid: 0,
+            funding_long_received: 0,
+            funding_short_paid: 0,
+            funding_short_received: 0,
+            generation: 0,
+            archived_slot: 0,
+        }
+    }
+
+    fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
+        if data.len() != PORTFOLIO_ARCHIVE_SIZE || data[..8] != PORTFOLIO_ARCHIVE_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(Self {
+            percolator_program: pk(data, 8),
+            market: pk(data, 40),
+            owner: pk(data, 72),
+            portfolio: pk(data, 104),
+            residual_crystallized_loss: u128::from_le_bytes(
+                data[136..152].try_into().unwrap(),
+            ),
+            residual_spent_principal: u128::from_le_bytes(
+                data[152..168].try_into().unwrap(),
+            ),
+            residual_received: u128::from_le_bytes(data[168..184].try_into().unwrap()),
+            funding_long_paid: u128::from_le_bytes(data[184..200].try_into().unwrap()),
+            funding_long_received: u128::from_le_bytes(data[200..216].try_into().unwrap()),
+            funding_short_paid: u128::from_le_bytes(data[216..232].try_into().unwrap()),
+            funding_short_received: u128::from_le_bytes(data[232..248].try_into().unwrap()),
+            generation: u64::from_le_bytes(data[248..256].try_into().unwrap()),
+            archived_slot: u64::from_le_bytes(data[256..264].try_into().unwrap()),
+        })
+    }
+
+    fn serialize(&self, data: &mut [u8]) {
+        data[..8].copy_from_slice(&PORTFOLIO_ARCHIVE_DISC);
+        data[8..40].copy_from_slice(self.percolator_program.as_ref());
+        data[40..72].copy_from_slice(self.market.as_ref());
+        data[72..104].copy_from_slice(self.owner.as_ref());
+        data[104..136].copy_from_slice(self.portfolio.as_ref());
+        data[136..152].copy_from_slice(&self.residual_crystallized_loss.to_le_bytes());
+        data[152..168].copy_from_slice(&self.residual_spent_principal.to_le_bytes());
+        data[168..184].copy_from_slice(&self.residual_received.to_le_bytes());
+        data[184..200].copy_from_slice(&self.funding_long_paid.to_le_bytes());
+        data[200..216].copy_from_slice(&self.funding_long_received.to_le_bytes());
+        data[216..232].copy_from_slice(&self.funding_short_paid.to_le_bytes());
+        data[232..248].copy_from_slice(&self.funding_short_received.to_le_bytes());
+        data[248..256].copy_from_slice(&self.generation.to_le_bytes());
+        data[256..264].copy_from_slice(&self.archived_slot.to_le_bytes());
+    }
+
+    fn validate_identity(
+        &self,
+        percolator_program: &Pubkey,
+        market: &Pubkey,
+        owner: &Pubkey,
+        portfolio: &Pubkey,
+    ) -> ProgramResult {
+        if self.percolator_program != *percolator_program
+            || self.market != *market
+            || self.owner != *owner
+            || self.portfolio != *portfolio
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    fn add_live(
+        &mut self,
+        live: &percolator_accounting::PortfolioRewardSnapshot,
+        archived_slot: u64,
+    ) -> ProgramResult {
+        self.validate_identity(
+            &self.percolator_program,
+            &Pubkey::new_from_array(live.market_group),
+            &Pubkey::new_from_array(live.owner),
+            &Pubkey::new_from_array(live.portfolio),
+        )?;
+        macro_rules! add_counter {
+            ($field:ident) => {
+                self.$field = self
+                    .$field
+                    .checked_add(live.$field)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+            };
+        }
+        add_counter!(residual_crystallized_loss);
+        add_counter!(residual_spent_principal);
+        add_counter!(residual_received);
+        add_counter!(funding_long_paid);
+        add_counter!(funding_long_received);
+        add_counter!(funding_short_paid);
+        add_counter!(funding_short_received);
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        self.archived_slot = archived_slot;
+        Ok(())
+    }
+
+    fn totals_with_live(
+        &self,
+        live: Option<&percolator_accounting::PortfolioRewardSnapshot>,
+    ) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
+        let mut totals = percolator_accounting::PortfolioRewardSnapshot {
+            market_group: self.market.to_bytes(),
+            portfolio: self.portfolio.to_bytes(),
+            owner: self.owner.to_bytes(),
+            residual_crystallized_loss: self.residual_crystallized_loss,
+            residual_spent_principal: self.residual_spent_principal,
+            residual_received: self.residual_received,
+            funding_long_paid: self.funding_long_paid,
+            funding_long_received: self.funding_long_received,
+            funding_short_paid: self.funding_short_paid,
+            funding_short_received: self.funding_short_received,
+        };
+        if let Some(live) = live {
+            self.validate_identity(
+                &self.percolator_program,
+                &Pubkey::new_from_array(live.market_group),
+                &Pubkey::new_from_array(live.owner),
+                &Pubkey::new_from_array(live.portfolio),
+            )?;
+            macro_rules! add_counter {
+                ($field:ident) => {
+                    totals.$field = totals
+                        .$field
+                        .checked_add(live.$field)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                };
+            }
+            add_counter!(residual_crystallized_loss);
+            add_counter!(residual_spent_principal);
+            add_counter!(residual_received);
+            add_counter!(funding_long_paid);
+            add_counter!(funding_long_received);
+            add_counter!(funding_short_paid);
+            add_counter!(funding_short_received);
+        }
+        Ok(totals)
+    }
+}
+
 struct Stake {
     config: Pubkey,
     owner: Pubkey,
@@ -852,6 +1041,149 @@ fn pk(d: &[u8], off: usize) -> Pubkey {
     Pubkey::new_from_array(d[off..off + 32].try_into().unwrap())
 }
 
+pub fn portfolio_archive_address(
+    percolator_program: &Pubkey,
+    market: &Pubkey,
+    owner: &Pubkey,
+    portfolio: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            PORTFOLIO_ARCHIVE_SEED,
+            percolator_program.as_ref(),
+            market.as_ref(),
+            owner.as_ref(),
+            portfolio.as_ref(),
+        ],
+        &id(),
+    )
+}
+
+fn read_live_portfolio_snapshot(
+    config: &Config,
+    portfolio_key: &Pubkey,
+    owner: &Pubkey,
+    data: &[u8],
+) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
+    let snapshot = percolator_accounting::read_portfolio_reward_snapshot(
+        data,
+        &portfolio_key.to_bytes(),
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?;
+    if snapshot.owner != owner.to_bytes()
+        || !config.market_allowed(&Pubkey::new_from_array(snapshot.market_group))
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    Ok(snapshot)
+}
+
+fn archive_for_identity(
+    program_id: &Pubkey,
+    archive_account: &AccountInfo,
+    percolator_program: &Pubkey,
+    market: &Pubkey,
+    owner: &Pubkey,
+    portfolio: &Pubkey,
+) -> Result<(PortfolioArchive, u8, bool), ProgramError> {
+    let (expected, bump) = portfolio_archive_address(percolator_program, market, owner, portfolio);
+    if *archive_account.key != expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if archive_account.data_len() == 0 {
+        if *archive_account.owner != solana_program::system_program::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        return Ok((
+            PortfolioArchive::empty(*percolator_program, *market, *owner, *portfolio),
+            bump,
+            false,
+        ));
+    }
+    if archive_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let archive = PortfolioArchive::deserialize(&archive_account.try_borrow_data()?)?;
+    archive.validate_identity(percolator_program, market, owner, portfolio)?;
+    Ok((archive, bump, true))
+}
+
+fn archive_key_matches_allowed_market(
+    config: &Config,
+    archive_key: &Pubkey,
+    owner: &Pubkey,
+    portfolio: &Pubkey,
+) -> bool {
+    let matches_market = |market: &Pubkey| {
+        *market != Pubkey::default()
+            && portfolio_archive_address(
+                &config.percolator_program,
+                market,
+                owner,
+                portfolio,
+            )
+            .0
+                == *archive_key
+    };
+    if matches_market(&config.market_group) {
+        return true;
+    }
+    let count = core::cmp::min(config.extra_market_count as usize, config.extra_markets.len());
+    config.extra_markets[..count].iter().any(matches_market)
+}
+
+fn portfolio_totals(
+    program_id: &Pubkey,
+    config: &Config,
+    owner: &Pubkey,
+    portfolio: &AccountInfo,
+    archive_account: &AccountInfo,
+) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
+    if portfolio.data_len() != 0 {
+        if *portfolio.owner != config.percolator_program {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let live = read_live_portfolio_snapshot(
+            config,
+            portfolio.key,
+            owner,
+            &portfolio.try_borrow_data()?,
+        )?;
+        let market = Pubkey::new_from_array(live.market_group);
+        let (archive, _, _) = archive_for_identity(
+            program_id,
+            archive_account,
+            &config.percolator_program,
+            &market,
+            owner,
+            portfolio.key,
+        )?;
+        return archive.totals_with_live(Some(&live));
+    }
+
+    if archive_account.owner != program_id || archive_account.data_len() == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let archive = PortfolioArchive::deserialize(&archive_account.try_borrow_data()?)?;
+    if archive.percolator_program != config.percolator_program
+        || archive.owner != *owner
+        || archive.portfolio != *portfolio.key
+        || !config.market_allowed(&archive.market)
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let (expected, _) = portfolio_archive_address(
+        &archive.percolator_program,
+        &archive.market,
+        &archive.owner,
+        &archive.portfolio,
+    );
+    if *archive_account.key != expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    archive.totals_with_live(None)
+}
+
 fn config_seeds<'a>(coin_mint: &'a Pubkey) -> [&'a [u8]; 2] {
     [b"rd_config", coin_mint.as_ref()]
 }
@@ -900,6 +1232,7 @@ pub fn process_instruction(
         IX_FREEZE => freeze(program_id, accounts),
         IX_CLAIM => claim(program_id, accounts),
         IX_INIT_REWARD_EPOCH => init_reward_epoch(program_id, accounts, rest),
+        IX_ARCHIVE_PORTFOLIO => archive_portfolio(program_id, accounts, rest),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -934,6 +1267,98 @@ fn create_pda<'a>(
         &[target.clone(), system.clone()],
         &[seeds],
     )
+}
+
+// archive_portfolio accounts:
+// [payer(s,w), controller_pda(s), governance, archive_pda(w), market,
+//  portfolio, percolator_program, system]
+//
+// The fixed market controller invokes this immediately before Percolator's
+// terminal ClosePortfolio CPI in the same transaction. If that close rejects,
+// the archive update rolls back. No token account is accepted and this program
+// cannot move collateral; it only checked-adds authenticated monotonic telemetry.
+fn archive_portfolio(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let governance = next_account_info(iter)?;
+    let archive_account = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let portfolio = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let system = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !payer.is_signer
+        || !payer.is_writable
+        || !controller.is_signer
+        || !archive_account.is_writable
+        || *system.key != solana_program::system_program::ID
+        || !percolator_program.executable
+        || market.owner != percolator_program.key
+        || portfolio.owner != percolator_program.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let expected_controller = Pubkey::find_program_address(
+        &[
+            MARKET_CONTROLLER_SEED,
+            governance.key.as_ref(),
+            market.key.as_ref(),
+            percolator_program.key.as_ref(),
+        ],
+        &MARKET_CONTROLLER_PROGRAM_ID,
+    )
+    .0;
+    if *controller.key != expected_controller {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let live = percolator_accounting::read_portfolio_reward_snapshot(
+        &portfolio.try_borrow_data()?,
+        &portfolio.key.to_bytes(),
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?;
+    if live.market_group != market.key.to_bytes() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let owner = Pubkey::new_from_array(live.owner);
+    let (mut archive, bump, exists) = archive_for_identity(
+        program_id,
+        archive_account,
+        percolator_program.key,
+        market.key,
+        &owner,
+        portfolio.key,
+    )?;
+    if !exists {
+        let bump_seed = [bump];
+        let seeds: [&[u8]; 6] = [
+            PORTFOLIO_ARCHIVE_SEED,
+            percolator_program.key.as_ref(),
+            market.key.as_ref(),
+            owner.as_ref(),
+            portfolio.key.as_ref(),
+            &bump_seed,
+        ];
+        create_pda(
+            payer,
+            archive_account,
+            system,
+            program_id,
+            &seeds,
+            PORTFOLIO_ARCHIVE_SIZE,
+        )?;
+    }
+    archive.add_live(&live, Clock::get()?.slot)?;
+    archive.serialize(&mut archive_account.try_borrow_mut_data()?);
+    Ok(())
 }
 
 // init accounts: [payer(s,w), coin_mint, distribution_program, distribution_config,
@@ -1346,8 +1771,9 @@ fn init_reward_epoch(
 }
 
 // register_start accounts: [payer(s,w), config, owner, recipient, linked, stake(pda,w), system,
-//   legacy_owner_stake?, legacy_linked_stake?]
-//   residual:  linked = percolator backing ledger; insurance: linked = subledger position.
+//   portfolio_archive (portfolio cohorts only), legacy_owner_stake?, legacy_linked_stake?]
+//   portfolio cohorts: linked = Percolator portfolio and archive = its canonical cumulative telemetry PDA;
+//   capital cohorts: linked = subledger position.
 // data: cohort(u8)
 fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let cohort = *data.first().ok_or(ProgramError::InvalidInstructionData)?;
@@ -1362,6 +1788,11 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let linked = next_account_info(iter)?;
     let stake_account = next_account_info(iter)?;
     let system = next_account_info(iter)?;
+    let portfolio_archive = if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        Some(next_account_info(iter)?)
+    } else {
+        None
+    };
 
     // `owner` must SIGN: registering binds this stake's COIN recipient, a privileged act only the
     // rightful party may authorize. Without it, anyone could front-run the victim's (per-owner)
@@ -1471,23 +1902,26 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             0
         }
         _ => {
-            // Portfolio-flow cohort: `linked` is a Percolator PortfolioAccount.
-            if *linked.owner != config.percolator_program {
-                return Err(ProgramError::IllegalOwner); // counters must be percolator-authenticated
-            }
-            let data = linked.try_borrow_data()?;
-            // Bind the portfolio to its owner and an allow-listed market (findings GY/IL+). Re-checked at
-            // crystallize because Percolator can dematerialize and later reinitialize the same account key.
-            validate_portfolio_identity(&config, &data, owner.key)?;
+            // Include cumulative terminal archives in the start snapshot. A portfolio address can be
+            // dematerialized and reused; omitting prior generations here would count old flow twice.
+            let totals = portfolio_totals(
+                program_id,
+                &config,
+                owner.key,
+                linked,
+                portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
             match cohort {
-                COHORT_LP | COHORT_TRADER => {
-                    let (received, crystallized, spent) = read_portfolio_residual(&data)?;
-                    residual_counter(cohort, received, crystallized, spent)
-                }
-                _ => {
-                    let (long_paid, _, short_paid, _) = read_portfolio_funding_flow(&data)?;
-                    funding_payer_counter(long_paid, short_paid)
-                }
+                COHORT_LP | COHORT_TRADER => residual_counter(
+                    cohort,
+                    totals.residual_received,
+                    totals.residual_crystallized_loss,
+                    totals.residual_spent_principal,
+                ),
+                _ => funding_payer_counter(
+                    totals.funding_long_paid,
+                    totals.funding_short_paid,
+                ),
             }
         }
     };
@@ -1527,7 +1961,8 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     Ok(())
 }
 
-// crystallize accounts: [cranker(s), config(w), stake(w), backing_ledger]
+// crystallize accounts: [cranker(s), config(w), stake(w), backing_ledger,
+//   portfolio_archive (portfolio cohorts only)]
 fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -1555,6 +1990,17 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidAccountData);
+    }
+    let portfolio_archive = if matches!(
+        stake.cohort,
+        COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER
+    ) {
+        Some(next_account_info(iter)?)
+    } else {
+        None
+    };
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
     }
     // Reward counters stop accruing at emission_end. During the delayed freeze window, permit only
     // a reduce-only trader refresh: residual spent can consume a previously crystallized loss and
@@ -1630,13 +2076,20 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
             // crystallized_loss - spent since register.
-            if *backing_ledger.owner != config.percolator_program {
-                return Err(ProgramError::IllegalOwner);
-            }
-            let data = backing_ledger.try_borrow_data()?;
-            validate_portfolio_identity(&config, &data, &stake.owner)?;
-            let (received, crystallized, spent) = read_portfolio_residual(&data)?;
-            let counter = residual_counter(stake.cohort, received, crystallized, spent);
+            let totals = portfolio_totals(
+                program_id,
+                &config,
+                &stake.owner,
+                backing_ledger,
+                portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
+            let spent = totals.residual_spent_principal;
+            let counter = residual_counter(
+                stake.cohort,
+                totals.residual_received,
+                totals.residual_crystallized_loss,
+                spent,
+            );
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let (new_pts, new_net) = if post_emission_finalize {
                 let cap_net =
@@ -1671,13 +2124,17 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // Funding-payer cohort: points = raw delta of paid funding since register. No age multiplier:
             // funding accumulators already represent settled payment volume, and late payments should not
             // inherit early registration tenure.
-            if *backing_ledger.owner != config.percolator_program {
-                return Err(ProgramError::IllegalOwner);
-            }
-            let data = backing_ledger.try_borrow_data()?;
-            validate_portfolio_identity(&config, &data, &stake.owner)?;
-            let (long_paid, _, short_paid, _) = read_portfolio_funding_flow(&data)?;
-            let counter = funding_payer_counter(long_paid, short_paid);
+            let totals = portfolio_totals(
+                program_id,
+                &config,
+                &stake.owner,
+                backing_ledger,
+                portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
+            let counter = funding_payer_counter(
+                totals.funding_long_paid,
+                totals.funding_short_paid,
+            );
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let new_pts = net_delta;
             replace_cohort_points(
@@ -1793,8 +2250,8 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 
 // claim accounts: [cranker(s), config, stake(w), vault(w), recipient_ata(w), token_program]
 //   insurance/backing cohorts append one more: the subledger position (for the live HE cap).
-//   LP/trader cohorts append one more: the Percolator portfolio (for the residual live cap), or its
-//   exact dematerialized account key for the frozen terminal fallback.
+//   LP/trader cohorts append two more: the Percolator portfolio and canonical cumulative archive.
+//   A pre-archive direct Percolator maintenance close retains the historical frozen fallback.
 //
 // PERMISSIONLESS self-service claim (replaces the cranker-assembled seal for the portfolio
 // cohort). Pays the stake's OWN deterministic share —
@@ -1927,6 +2384,9 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // Less principal lowers the payout; a full exit pays zero. A later top-up cannot restore frozen
             // tenure because the live clock is measured at the stored crystallization slot.
             let position = next_account_info(iter)?;
+            if iter.next().is_some() {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             if *position.key != stake.backing_ledger || *position.owner != config.subledger_program
             {
                 return Err(ProgramError::InvalidAccountData);
@@ -1958,32 +2418,48 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: live-cap the frozen points against a post-crystallize net drop.
             let portfolio = next_account_info(iter)?;
+            let portfolio_archive = next_account_info(iter)?;
+            if iter.next().is_some() {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             if *portfolio.key != stake.backing_ledger {
                 return Err(ProgramError::InvalidAccountData);
             }
             let dematerialized = portfolio.data_len() == 0
                 && (*portfolio.owner == solana_program::system_program::ID
                     || *portfolio.owner == config.percolator_program);
-            if dematerialized {
+            if dematerialized && portfolio_archive.data_len() == 0 {
+                if *portfolio_archive.owner != solana_program::system_program::ID
+                    || !archive_key_matches_allowed_market(
+                        &config,
+                        portfolio_archive.key,
+                        &stake.owner,
+                        portfolio.key,
+                    )
+                {
+                    return Err(ProgramError::InvalidSeeds);
+                }
                 // Percolator can dematerialize an empty portfolio through maintenance-fee or
-                // resolved-market cleanup. Ignore lamports donated to the resulting zero-data
-                // address, whether the runtime still reports its old Percolator owner or has purged
-                // it back to the system program: a PDA-owned witness cannot sign to remove that dust.
-                // The historical counters then no longer exist for the normal live cap. The recipient
-                // remains bound and payout is still bounded by the frozen cohort denominator, so
-                // keeping this path permissionless avoids stranding PDA-owned portfolios. A close
-                // can at worst avoid a later points cap; it cannot redirect COIN, change the cohort
-                // supply, or touch collateral custody.
+                // old owner-directed paths that predate the controller archive. If counters were
+                // crystallized and frozen before that close, the bound recipient and denominator
+                // remain sufficient. Controller cleanup now always supplies an archive instead.
                 points_to_amount(cohort_supply, stake.points, frozen_denom)
             } else {
-                if *portfolio.owner != config.percolator_program {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                let data = portfolio.try_borrow_data()?;
-                validate_portfolio_identity(&config, &data, &stake.owner)?;
-                let (received, crystallized, spent) = read_portfolio_residual(&data)?;
-                let live_net = residual_counter(stake.cohort, received, crystallized, spent)
-                    .saturating_sub(stake.residual_snap);
+                let totals = portfolio_totals(
+                    program_id,
+                    &config,
+                    &stake.owner,
+                    portfolio,
+                    portfolio_archive,
+                )?;
+                let spent = totals.residual_spent_principal;
+                let live_net = residual_counter(
+                    stake.cohort,
+                    totals.residual_received,
+                    totals.residual_crystallized_loss,
+                    spent,
+                )
+                .saturating_sub(stake.residual_snap);
                 let frozen_net = stake.earnings_snap; // net_delta captured at the last crystallize
                 let cap_net = if stake.cohort == COHORT_TRADER {
                     trader_live_cap(frozen_net, stake.eligible_accum, live_net, spent)
@@ -1999,6 +2475,9 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // from monotonic paid-funding counters. Do not require the portfolio again at claim time; a flat
             // portfolio may be closed or terminal-cleaned before the owner claims COIN, and the frozen numerator
             // plus frozen denominator already conserve the cohort.
+            if iter.next().is_some() {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             points_to_amount(cohort_supply, stake.points, frozen_denom)
         }
     };

@@ -46,10 +46,11 @@ capital's own tenure.
   remains Squads-owned. Before that close,
   anyone can ask the controller to deregister an
   abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
-  portfolio and returns its rent only to the slab. Historical reward counters cannot hold insurance
-  or backing exits hostage: after any terminal dematerialization, any cranker can pay that LP/trader
-  allocation from the frozen snapshot only to its bound recipient; lamports donated to the closed,
-  zero-data witness cannot disable that recovery. Before donating a creator-owned market, its raw
+  portfolio and returns its rent only to the slab. Before deleting nonzero LP/trader/funding-payer
+  telemetry, the same atomic call checked-adds it into a residual-distributor PDA scoped to the
+  Percolator program, market, owner, and portfolio. Reward epochs read archived totals plus any live
+  account generation, so terminal cleanup cannot erase an uncrystallized allocation or hold insurance
+  and backing exits hostage. The archive has no token or value-moving instruction. Before donating a creator-owned market, its raw
   outgoing asset-0 insurance provider must withdraw any nonzero balance. The empty insurance roles
   then migrate to the controller, while the recorded backing provider remains unchanged. This keeps
   a former provider from withdrawing its principal yet retaining a claim on later trade fees.
@@ -115,12 +116,12 @@ capital's own tenure.
 
 | Crate | Responsibility |
 |---|---|
-| `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, and resolved-empty state in the pinned Percolator slab. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
+| `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, resolved-empty state, and portfolio reward telemetry in the pinned Percolator layout. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
 | `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, deregisters only empty resolved portfolios, and retains controller-owned protocol insurance for terminal reclaim. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. A principal-policy pool can hand live custody to TWAP with its protected floor. A with-surplus pool cannot cross that boundary until every owner claim is gone; it may then reuse the same terminal path for later protocol fees or unowned rounding reserve. Its amountless full-exit entry point reuses the ordinary owner, pool, destination, loss, and share checks for an atomic live TWAP recovery. After recovery the pool can otherwise sign only fixed resolved cleanup. Once genesis-vote attests an executed winner and the bound market is resolved and empty, anyone can retire an absent depositor's complete position only into a clean account owned by that depositor, preserving its remaining-principal and return-slot reward cap. Its terminal read-only attestation proves when the pool has no owner claims. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. Only a proposal with its complete declared entry shape can become votable. New backing closes exactly when the configured bootstrap deadline makes the permissionless trigger live; retraction remains open so a vote lock cannot trap principal. The trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries allocating at most the fixed supply. Each recipient authorizes its own claim; unclaimed or unallocated COIN is burned after the claim window. Never mints. |
-| `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. Witnesses must carry the exact Subledger-position discriminator or pinned Percolator portfolio header, and permissionless portfolio-flow claims reject delegated recipient accounts. It reads principal-bearing accounts but cannot debit them. |
+| `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. Controller cleanup preserves terminal portfolio counters in a cumulative read-only PDA, while registration snapshots archived plus live generations exactly once. Witnesses must carry the exact Subledger-position discriminator or pinned Percolator portfolio provenance, and permissionless portfolio-flow claims reject delegated recipient accounts. It reads principal-bearing accounts but cannot debit them. |
 | `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, apply the exact trade/backing fee setters, and timelock-restart only an empty recovering asset 0. Pool-bound recovery stays bound to the original genesis pool; a signing owner may use its fixed live full-exit proxy, whose value accounts are all revalidated by Subledger. After resolution, either that pool proves zero claims or a current-layout pool-less config proves it began empty; TWAP can then route the terminal protocol floor only through clean PDA-owned transits to market-controller custody. A pool-less config can also sign only the controller's amountless, provider-bound asset-0 backing return. |
 | `twap/` | Host-side auction simulation and Percolator wire helpers. It does not expose the obsolete raw Squads/operator rotation conveniences; deployed custody transitions live in `subledger` and `twap-program`. |
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
@@ -250,11 +251,12 @@ insurance authority and operator must be one key so deposit and withdrawal custo
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
 cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
 fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Percolator rejects live or
-nonempty portfolios and sends the closed account's lamports only into the bound market slab.
-Monotonic LP/trader/funding counters are reward telemetry, not a custody gate. If this cleanup or a
-public maintenance sync dematerializes their exact linked portfolio, the residual distributor
-still permits anyone to pay its frozen numerator only to the bound recipient, even if a third party
-donates lamports to the closed address. The wrapper accepts no
+nonempty portfolios and sends the closed account's lamports only into the bound market slab. If a
+reward-relevant counter is nonzero, the legacy cleanup shape rejects and the extended shape first
+archives the authenticated counters; both CPIs are atomic. Reward registration and crystallization
+sum that canonical archive with the current live generation. A public maintenance sync that runs
+after crystallization/freeze still uses the bound frozen fallback, even if a third party donates
+lamports to the closed address. The wrapper accepts no
 amount, token account, or destination and exposes no generic portfolio authority.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one

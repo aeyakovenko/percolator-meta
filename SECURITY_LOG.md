@@ -13435,3 +13435,28 @@ FIX: the existing amountless finalized-position instruction now applies its ordi
 share payout to either valid insurance policy. Every finality, market, pool, position, destination,
 owner, amount, and resolved-empty check is unchanged. No signer, recipient, authority, instruction,
 or withdrawal surface was added, and the cranker still cannot receive any part of the payout.
+
+## Tick - terminal portfolio cleanup could erase uncrystallized rewards (surface A/C)
+
+Percolator correctly excludes monotonic reward telemetry from its empty-portfolio predicate. The
+controller's permissionless resolved-market cleanup nevertheless called `ClosePortfolio` without
+preserving that telemetry. An unaffiliated cranker could therefore wait for a funding payer to flatten,
+permissionlessly resolve and pay out the portfolio, then dematerialize its only authenticated paid-
+funding counters before the reward epoch crystallized them. The fixed COIN allocation became
+unrecoverable even though no collateral remained at risk.
+
+The retained pinned-Percolator LiteSVM regression creates a real funding-enabled market through public
+instructions, registers a 100% funding-payer epoch, opens a real long/short pair, moves the authenticated
+EWMA mark, records nonzero long-paid funding, flattens, donates lifecycle authority, and lets unrelated
+callers resolve and pay the long. It proves the legacy five-account cleanup rejects atomically, then
+uses the extended public cleanup to archive and close in one transaction. Post-close crystallization,
+freeze, and claim pay the sole payer all 100 COIN. The full genesis-to-45-day-buyback lifecycle and all
+91 distributor LiteSVM tests also pass.
+
+FIX: a shared pinned-layout parser authenticates portfolio provenance and reward counters. Nonzero
+reward telemetry requires the controller to CPI a fixed residual-distributor instruction before
+`ClosePortfolio`; Percolator rejection rolls both writes back. The archive is a cumulative PDA scoped
+to Percolator program, market, owner, and portfolio, so address reuse snapshots prior generations
+exactly once. Register/crystallize read archived plus live totals. The archive accepts no token account,
+amount, destination, authority mutation, or value-moving CPI; zero-telemetry cleanup keeps its original
+account shape.

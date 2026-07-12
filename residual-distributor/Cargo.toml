@@ -17,6 +17,7 @@ no-entrypoint = []
 [dependencies]
 solana-program = { workspace = true }
 spl-token = { workspace = true }
+percolator-accounting = { path = "../percolator-accounting" }
 
 [dev-dependencies]
 solana-sdk = { workspace = true }

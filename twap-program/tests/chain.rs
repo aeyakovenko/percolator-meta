@@ -34666,6 +34666,20 @@ fn rd_stake_pda(config: &Pubkey, owner: &Pubkey, linked: &Pubkey, cohort: u8) ->
     .0
 }
 
+fn rd_portfolio_archive_pda(market: &Pubkey, owner: &Pubkey, portfolio: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"rd_portfolio_archive",
+            perc_id().as_ref(),
+            market.as_ref(),
+            owner.as_ref(),
+            portfolio.as_ref(),
+        ],
+        &rd_id(),
+    )
+    .0
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rd_epoch_init_ix(
     payer: &Pubkey,
@@ -34797,20 +34811,28 @@ fn rd_register_ix(
     config: &Pubkey,
     owner: &Pubkey,
     recipient: &Pubkey,
+    market: &Pubkey,
     linked: &Pubkey,
     cohort: u8,
 ) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(*payer, true),
+        AccountMeta::new_readonly(*config, false),
+        AccountMeta::new_readonly(*owner, true),
+        AccountMeta::new_readonly(*recipient, false),
+        AccountMeta::new_readonly(*linked, false),
+        AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ];
+    if matches!(cohort, 2 | 3 | 4) {
+        accounts.push(AccountMeta::new_readonly(
+            rd_portfolio_archive_pda(market, owner, linked),
+            false,
+        ));
+    }
     Instruction {
         program_id: rd_id(),
-        accounts: vec![
-            AccountMeta::new(*payer, true),
-            AccountMeta::new_readonly(*config, false),
-            AccountMeta::new_readonly(*owner, true),
-            AccountMeta::new_readonly(*recipient, false),
-            AccountMeta::new_readonly(*linked, false),
-            AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
-            AccountMeta::new_readonly(system_program::ID, false),
-        ],
+        accounts,
         data: vec![1, cohort],
     }
 }
@@ -34819,17 +34841,25 @@ fn rd_crystallize_ix(
     cranker: &Pubkey,
     config: &Pubkey,
     owner: &Pubkey,
+    market: &Pubkey,
     linked: &Pubkey,
     cohort: u8,
 ) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(*cranker, true),
+        AccountMeta::new(*config, false),
+        AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
+        AccountMeta::new_readonly(*linked, false),
+    ];
+    if matches!(cohort, 2 | 3 | 4) {
+        accounts.push(AccountMeta::new_readonly(
+            rd_portfolio_archive_pda(market, owner, linked),
+            false,
+        ));
+    }
     Instruction {
         program_id: rd_id(),
-        accounts: vec![
-            AccountMeta::new(*cranker, true),
-            AccountMeta::new(*config, false),
-            AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
-            AccountMeta::new_readonly(*linked, false),
-        ],
+        accounts,
         data: vec![2],
     }
 }
@@ -34857,22 +34887,34 @@ fn rd_claim_ix(
     cranker: &Pubkey,
     config: &Pubkey,
     owner: &Pubkey,
+    market: &Pubkey,
     linked: &Pubkey,
     cohort: u8,
     vault: &Pubkey,
     recipient: &Pubkey,
 ) -> Instruction {
+    let mut accounts = vec![
+        AccountMeta::new(*cranker, true),
+        AccountMeta::new_readonly(*config, false),
+        AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
+        AccountMeta::new(*vault, false),
+        AccountMeta::new(*recipient, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    match cohort {
+        0 | 1 => accounts.push(AccountMeta::new_readonly(*linked, false)),
+        2 | 3 => {
+            accounts.push(AccountMeta::new_readonly(*linked, false));
+            accounts.push(AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(market, owner, linked),
+                false,
+            ));
+        }
+        _ => {}
+    }
     Instruction {
         program_id: rd_id(),
-        accounts: vec![
-            AccountMeta::new(*cranker, true),
-            AccountMeta::new_readonly(*config, false),
-            AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
-            AccountMeta::new(*vault, false),
-            AccountMeta::new(*recipient, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(*linked, false),
-        ],
+        accounts,
         data: vec![5],
     }
 }
@@ -35473,6 +35515,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(long_payer_pf, false),
             AccountMeta::new(long_payer_stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&slab, &long_payer.pubkey(), &long_payer_pf),
+                false,
+            ),
         ],
         data: vec![1u8, 4u8],
     }; // COHORT_FUNDING_PAYER
@@ -35488,6 +35534,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(short_receiver_pf, false),
             AccountMeta::new(short_receiver_stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(
+                    &slab,
+                    &short_receiver.pubkey(),
+                    &short_receiver_pf,
+                ),
+                false,
+            ),
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
@@ -35502,6 +35556,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(short_payer_pf, false),
             AccountMeta::new(short_payer_stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&slab, &short_payer.pubkey(), &short_payer_pf),
+                false,
+            ),
         ],
         data: vec![1u8, 4u8],
     }; // COHORT_FUNDING_PAYER
@@ -35517,6 +35575,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(long_receiver_pf, false),
             AccountMeta::new(long_receiver_stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(
+                    &slab,
+                    &long_receiver.pubkey(),
+                    &long_receiver_pf,
+                ),
+                false,
+            ),
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
@@ -35531,6 +35597,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(dual_payer_pf, false),
             AccountMeta::new(dual_payer_stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&slab, &dual_payer.pubkey(), &dual_payer_pf),
+                false,
+            ),
         ],
         data: vec![1u8, 4u8],
     };
@@ -35546,6 +35616,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(dual_receiver_pf, false),
             AccountMeta::new(dual_receiver_stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(
+                    &slab,
+                    &dual_receiver.pubkey(),
+                    &dual_receiver_pf,
+                ),
+                false,
+            ),
         ],
         data: vec![1u8, 4u8],
     };
@@ -36037,6 +36115,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_config, false),
             AccountMeta::new(long_payer_stake, false),
             AccountMeta::new_readonly(long_payer_pf, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&slab, &long_payer.pubkey(), &long_payer_pf),
+                false,
+            ),
         ],
         data: vec![2u8],
     };
@@ -36047,6 +36129,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_config, false),
             AccountMeta::new(short_receiver_stake, false),
             AccountMeta::new_readonly(short_receiver_pf, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(
+                    &slab,
+                    &short_receiver.pubkey(),
+                    &short_receiver_pf,
+                ),
+                false,
+            ),
         ],
         data: vec![2u8],
     };
@@ -36057,6 +36147,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_config, false),
             AccountMeta::new(short_payer_stake, false),
             AccountMeta::new_readonly(short_payer_pf, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&slab, &short_payer.pubkey(), &short_payer_pf),
+                false,
+            ),
         ],
         data: vec![2u8],
     };
@@ -36067,6 +36161,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_config, false),
             AccountMeta::new(long_receiver_stake, false),
             AccountMeta::new_readonly(long_receiver_pf, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(
+                    &slab,
+                    &long_receiver.pubkey(),
+                    &long_receiver_pf,
+                ),
+                false,
+            ),
         ],
         data: vec![2u8],
     };
@@ -36077,6 +36179,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_config, false),
             AccountMeta::new(dual_payer_stake, false),
             AccountMeta::new_readonly(dual_payer_pf, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&slab, &dual_payer.pubkey(), &dual_payer_pf),
+                false,
+            ),
         ],
         data: vec![2u8],
     };
@@ -36087,6 +36193,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_config, false),
             AccountMeta::new(dual_receiver_stake, false),
             AccountMeta::new_readonly(dual_receiver_pf, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(
+                    &slab,
+                    &dual_receiver.pubkey(),
+                    &dual_receiver_pf,
+                ),
+                false,
+            ),
         ],
         data: vec![2u8],
     };
@@ -36229,7 +36343,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_vault, false),
             AccountMeta::new(long_payer_coin, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(long_payer_pf, false),
         ],
         data: vec![5u8],
     };
@@ -36242,7 +36355,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_vault, false),
             AccountMeta::new(short_receiver_coin, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(short_receiver_pf, false),
         ],
         data: vec![5u8],
     };
@@ -36255,7 +36367,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_vault, false),
             AccountMeta::new(short_payer_coin, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(short_payer_pf, false),
         ],
         data: vec![5u8],
     };
@@ -36268,7 +36379,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(rd_vault, false),
             AccountMeta::new(long_receiver_coin, false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(long_receiver_pf, false),
         ],
         data: vec![5u8],
     };
@@ -36715,6 +36825,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &reward_config,
             &alice.pubkey(),
             &alice.pubkey(),
+            &slab,
             &position,
             0,
         ),
@@ -36728,6 +36839,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &reward_config,
             &bob.pubkey(),
             &bob.pubkey(),
+            &slab,
             &backing_position,
             1,
         ),
@@ -36741,6 +36853,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &reward_config,
             &long_payer.pubkey(),
             &long_payer.pubkey(),
+            &epoch_market,
             &epoch_long_pf,
             4,
         ),
@@ -36754,6 +36867,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &reward_config,
             &short_payer.pubkey(),
             &short_payer.pubkey(),
+            &epoch_market,
             &epoch_short_pf,
             4,
         ),
@@ -37110,6 +37224,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &alice.pubkey(),
             &reward_config,
             &alice.pubkey(),
+            &slab,
             &position,
             0,
         ),
@@ -37122,6 +37237,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &bob.pubkey(),
             &reward_config,
             &bob.pubkey(),
+            &slab,
             &backing_position,
             1,
         ),
@@ -37134,6 +37250,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &payer.pubkey(),
             &reward_config,
             &long_payer.pubkey(),
+            &epoch_market,
             &epoch_long_pf,
             4,
         ),
@@ -37146,6 +37263,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &payer.pubkey(),
             &reward_config,
             &short_payer.pubkey(),
+            &epoch_market,
             &epoch_short_pf,
             4,
         ),
@@ -37184,6 +37302,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &alice.pubkey(),
             &reward_config,
             &alice.pubkey(),
+            &slab,
             &position,
             0,
             &reward_vault,
@@ -37198,6 +37317,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &bob.pubkey(),
             &reward_config,
             &bob.pubkey(),
+            &slab,
             &backing_position,
             1,
             &reward_vault,
@@ -37212,6 +37332,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &payer.pubkey(),
             &reward_config,
             &long_payer.pubkey(),
+            &epoch_market,
             &epoch_long_pf,
             4,
             &reward_vault,
@@ -37226,6 +37347,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &payer.pubkey(),
             &reward_config,
             &short_payer.pubkey(),
+            &epoch_market,
             &epoch_short_pf,
             4,
             &reward_vault,
@@ -37472,6 +37594,613 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
 // "surplus" via execute -> buy-burn. The §3 "exit during the timelock window" mitigation does NOT apply
 // post-handoff (exits are already closed). FIX: set_reserved_floor is monotonic after the initial set —
 // once a real floor is set (!= the u128::MAX unset sentinel) it can only RISE.
+// PUBLIC REWARD LOF: Percolator deliberately excludes monotonic reward telemetry from its
+// empty-portfolio predicate. A permissionless resolved-market cleanup must therefore preserve the
+// final counters before it dematerializes the only authenticated witness a reward epoch can read.
+#[test]
+fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    // Build the attacked market exclusively through the pinned public Percolator instructions.
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public user allocates the market");
+    let market_key = market.pubkey();
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 1_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 10_000,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize the public funding market");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("configure authenticated EWMA funding");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 5,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure public stale resolution");
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_portfolio = Keypair::new();
+    let short_portfolio = Keypair::new();
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&long_owner, &long_portfolio),
+        (&short_owner, &short_portfolio),
+    ] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("public user deposits collateral");
+    }
+
+    // Register the long before any funding is paid. The full fixed supply belongs to this sole
+    // funding-payer stake if its final authenticated counter survives terminal cleanup.
+    let coin_authority = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_authority.pubkey());
+    let reward_supply = 100u64;
+    let epoch_id = 77u64;
+    let rd_config = rd_epoch_config_pda(&coin_authority.pubkey(), &coin_mint, epoch_id);
+    let rd_vault = Pubkey::new_unique();
+    set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
+    send(
+        &mut svm,
+        &[&payer, &coin_authority],
+        spl_token::instruction::mint_to(
+            &spl_token::ID,
+            &coin_mint,
+            &rd_vault,
+            &coin_authority.pubkey(),
+            &[],
+            reward_supply,
+        )
+        .unwrap(),
+    )
+    .expect("fund the fixed reward vault");
+    send(
+        &mut svm,
+        &[&payer, &coin_authority],
+        rd_epoch_init_ix(
+            &payer.pubkey(),
+            &coin_authority.pubkey(),
+            &coin_mint,
+            &perc_id(),
+            &sub_id(),
+            &rd_config,
+            &rd_vault,
+            epoch_id,
+            100,
+            200,
+            reward_supply,
+            0,
+            0,
+            0,
+            10_000,
+            10,
+            0,
+            &[(market_key, Pubkey::default(), Pubkey::default())],
+        ),
+    )
+    .expect("initialize the funding-only reward epoch");
+    let long_coin = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &long_coin,
+        &coin_mint,
+        &long_owner.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &long_owner],
+        rd_register_ix(
+            &payer.pubkey(),
+            &rd_config,
+            &long_owner.pubkey(),
+            &long_owner.pubkey(),
+            &market_key,
+            &long_portfolio.pubkey(),
+            4,
+        ),
+    )
+    .expect("long registers before paying funding");
+    send(
+        &mut svm,
+        &[&payer, &coin_authority],
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &coin_mint,
+            None,
+            spl_token::instruction::AuthorityType::MintTokens,
+            &coin_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("revoke the fixed-supply mint authority");
+
+    let size_q = (percolator::POS_SCALE / 10) as i128;
+    send(
+        &mut svm,
+        &[&payer, &long_owner, &short_owner],
+        pix(
+            vec![
+                AccountMeta::new(long_owner.pubkey(), true),
+                AccountMeta::new(short_owner.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("public users open balanced long and short positions");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 101;
+    clock.unix_timestamp = 101;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::PushEwmaMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 2_000_000,
+            },
+        ),
+    )
+    .expect("authenticated mark premium makes longs pay funding");
+    for _ in 0..8 {
+        crank(&mut svm, long_portfolio.pubkey(), 101).expect("refresh long at premium");
+        crank(&mut svm, short_portfolio.pubkey(), 101).expect("refresh short at premium");
+    }
+    for slot in [102u64, 103u64] {
+        clock.slot = slot;
+        clock.unix_timestamp = slot as i64;
+        svm.set_sysvar(&clock);
+        for _ in 0..8 {
+            crank(&mut svm, long_portfolio.pubkey(), slot).expect("record long-paid funding");
+            crank(&mut svm, short_portfolio.pubkey(), slot)
+                .expect("record short-received funding");
+        }
+    }
+    let paid_before_cleanup =
+        read_portfolio_funding_long_paid(&svm, &long_portfolio.pubkey());
+    assert!(paid_before_cleanup > 0, "the real long paid funding");
+
+    let close_price = read_asset0_effective_price(&svm, &market_key);
+    send(
+        &mut svm,
+        &[&payer, &long_owner, &short_owner],
+        pix(
+            vec![
+                AccountMeta::new(long_owner.pubkey(), true),
+                AccountMeta::new(short_owner.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -size_q,
+                exec_price: close_price,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("public users flatten the funding positions");
+    for portfolio in [long_portfolio.pubkey(), short_portfolio.pubkey()] {
+        for _ in 0..4 {
+            crank(&mut svm, portfolio, 103).expect("settle the flat portfolio");
+        }
+    }
+    assert_eq!(read_asset0_oi(&svm, &market_key), (0, 0));
+    assert!(
+        read_portfolio_funding_long_paid(&svm, &long_portfolio.pubkey())
+            >= paid_before_cleanup,
+        "flattening preserves the monotonic paid counter"
+    );
+
+    // Conservative funding rounding can leave protocol insurance owned by the outgoing creator.
+    // Return that value before donation, as the controller requires, without touching either trader.
+    let outgoing_insurance = read_asset0_insurance(&svm, &market_key);
+    if outgoing_insurance > 0 {
+        let admin_collateral =
+            canonical_insurance_vault(&admin.pubkey(), &collateral_mint);
+        set_token(
+            &mut svm,
+            &admin_collateral,
+            &collateral_mint,
+            &admin.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(admin_collateral, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::WithdrawInsuranceAsset {
+                    asset_index: 0,
+                    amount: outgoing_insurance,
+                },
+            ),
+        )
+        .expect("outgoing creator returns funding-rounding insurance before donation");
+    }
+
+    // Donate lifecycle authority, then let unaffiliated callers resolve, pay, and empty the long.
+    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8],
+        },
+    )
+    .expect("creator donates lifecycle authority to the controller");
+    clock.slot = 110;
+    clock.unix_timestamp = 110;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(market_key, false)],
+            data: PIx::ResolveStalePermissionless { now_slot: 110 }.encode(),
+        },
+    )
+    .expect("unaffiliated cranker resolves the stale market");
+    clock.slot = 111;
+    clock.unix_timestamp = 111;
+    svm.set_sysvar(&clock);
+    let long_collateral = canonical_insurance_vault(&long_owner.pubkey(), &collateral_mint);
+    set_token(
+        &mut svm,
+        &long_collateral,
+        &collateral_mint,
+        &long_owner.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(long_owner.pubkey(), false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(long_collateral, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+        ),
+    )
+    .expect("public resolved payout empties the funding payer");
+    assert!(
+        read_portfolio_funding_long_paid(&svm, &long_portfolio.pubkey())
+            >= paid_before_cleanup,
+        "resolved payout still leaves the uncrystallized counter live"
+    );
+
+    // The legacy account shape omitted the distributor entirely. It must reject atomically whenever
+    // cleanup could otherwise delete the only copy of an uncrystallized reward counter.
+    let long_before_legacy_cleanup = svm.get_account(&long_portfolio.pubkey()).unwrap();
+    let legacy_cleanup = send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![11u8],
+        },
+    );
+    assert!(
+        legacy_cleanup.is_err(),
+        "permissionless cleanup destroyed an uncrystallized funding allocation"
+    );
+    assert_eq!(
+        svm.get_account(&long_portfolio.pubkey()).unwrap(),
+        long_before_legacy_cleanup,
+        "rejected legacy cleanup is atomic"
+    );
+
+    let archive = rd_portfolio_archive_pda(
+        &market_key,
+        &long_owner.pubkey(),
+        &long_portfolio.pubkey(),
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(archive, false),
+                AccountMeta::new_readonly(rd_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: vec![11u8],
+        },
+    )
+    .expect("public cleanup archives counters before closing the portfolio");
+    assert!(
+        svm.get_account(&long_portfolio.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "the paid portfolio is dematerialized"
+    );
+    assert_eq!(svm.get_account(&archive).unwrap().owner, rd_id());
+
+    // Crystallize from the canonical immutable-identity archive, freeze, and pay the sole funding
+    // stake. The archive never holds collateral or COIN and cannot alter either claim path.
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: rd_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(rd_config, false),
+                AccountMeta::new(
+                    rd_stake_pda(
+                        &rd_config,
+                        &long_owner.pubkey(),
+                        &long_portfolio.pubkey(),
+                        4,
+                    ),
+                    false,
+                ),
+                AccountMeta::new_readonly(long_portfolio.pubkey(), false),
+                AccountMeta::new_readonly(archive, false),
+            ],
+            data: vec![2u8],
+        },
+    )
+    .expect("crystallize the archived paid-funding delta");
+    clock.slot = 210;
+    clock.unix_timestamp = 210;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        rd_freeze_ix(&payer.pubkey(), &rd_config, &coin_mint, &rd_vault),
+    )
+    .expect("freeze the completed reward epoch");
+    send(
+        &mut svm,
+        &[&payer],
+        rd_claim_ix(
+            &payer.pubkey(),
+            &rd_config,
+            &long_owner.pubkey(),
+            &market_key,
+            &long_portfolio.pubkey(),
+            4,
+            &rd_vault,
+            &long_coin,
+        ),
+    )
+    .expect("claim the archived funding allocation");
+    assert_eq!(
+        token_amount(&svm, &long_coin),
+        reward_supply,
+        "terminal cleanup cannot erase any of the sole payer's fixed reward supply"
+    );
+
+}
+
 #[test]
 fn dao_cannot_lower_the_surplus_floor_to_drain_principal() {
     let mut svm =
@@ -38028,6 +38757,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
 
     // register the `loser` as a TRADER *before* the loss (start snapshot = 0).
     let t_stake = rd_stake_pda(&rd_config, &loser.pubkey(), &loser_pf, 3);
+    let loser_archive = rd_portfolio_archive_pda(&market, &loser.pubkey(), &loser_pf);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -38041,6 +38771,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
                 AccountMeta::new_readonly(loser_pf, false),
                 AccountMeta::new(t_stake, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(loser_archive, false),
             ],
             data: vec![1u8, 3u8],
         }],
@@ -38229,6 +38960,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
                 AccountMeta::new(rd_config, false),
                 AccountMeta::new(t_stake, false),
                 AccountMeta::new_readonly(loser_pf, false),
+                AccountMeta::new_readonly(loser_archive, false),
             ],
             data: vec![2u8],
         }],
@@ -38447,6 +39179,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
             AccountMeta::new(loser_coin, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(loser_pf, false), // trader live-cap portfolio (stake.backing_ledger)
+            AccountMeta::new_readonly(loser_archive, false),
         ],
         data: vec![5u8],
     };
@@ -38478,6 +39211,10 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
                     AccountMeta::new(market, false),
                     AccountMeta::new(loser_pf, false),
                     AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(loser_archive, false),
+                    AccountMeta::new_readonly(rd_id(), false),
+                    AccountMeta::new_readonly(system_program::ID, false),
                 ],
                 data: vec![11u8],
             },
@@ -38516,6 +39253,8 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
             ),
         )
         .expect("public resolved close pays the absent counterparty");
+        let winner_archive =
+            rd_portfolio_archive_pda(&market, &winner.pubkey(), &winner_pf);
         send(
             &mut svm,
             &[&payer],
@@ -38527,6 +39266,10 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
                     AccountMeta::new(market, false),
                     AccountMeta::new(winner_pf, false),
                     AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(winner_archive, false),
+                    AccountMeta::new_readonly(rd_id(), false),
+                    AccountMeta::new_readonly(system_program::ID, false),
                 ],
                 data: vec![11u8],
             },
@@ -40090,6 +40833,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(pool_po
             &reward_config,
             &absent_voter.pubkey(),
             &absent_voter.pubkey(),
+            &env.slab,
             &position,
             0,
         ),
@@ -40334,6 +41078,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(pool_po
             &absent_voter.pubkey(),
             &reward_config,
             &absent_voter.pubkey(),
+            &env.slab,
             &position,
             0,
         ),
@@ -40388,6 +41133,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(pool_po
             &absent_voter.pubkey(),
             &reward_config,
             &absent_voter.pubkey(),
+            &env.slab,
             &position,
             0,
             &reward_vault,
