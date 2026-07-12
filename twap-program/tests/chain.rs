@@ -9399,6 +9399,111 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         .is_err(),
         "a retired allow-list key cannot admit an attacker-controlled reward stake"
     );
+
+    // Reward identity stays permanently retired, but the stateless controller may still accept a
+    // later market generation at this key. That replacement must retain the ordinary governed
+    // shutdown/cleanup lifecycle instead of becoming uncloseable solely because the marker exists.
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(hijack_portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::ClosePortfolio,
+        ),
+    )
+    .expect("replacement owner closes its empty portfolio");
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("public handoff accepts the clean replacement generation");
+    assert_eq!(
+        percolator_accounting::read_market_authority(&svm.get_account(&slab).unwrap().data)
+            .unwrap(),
+        controller.to_bytes()
+    );
+
+    let mut replacement_resolve = vec![0u8]; // IX_PROXY_ADMIN
+    replacement_resolve
+        .extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: replacement_resolve,
+        },
+    )
+    .expect("governance resolves the replacement market");
+
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let marker_before_reclose = svm.get_account(&retired_market).unwrap();
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new(governance.pubkey(), true),
+                AccountMeta::new(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new(controller_transit, false),
+                AccountMeta::new(governance_destination, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(retired_market, false),
+            ],
+            data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
+        },
+    )
+    .expect("an existing valid marker cannot block replacement-market cleanup");
+    assert!(
+        svm.get_account(&slab)
+            .map_or(true, |account| account.lamports == 0),
+        "the replacement slab closes normally"
+    );
+    assert_eq!(
+        svm.get_account(&retired_market).unwrap(),
+        marker_before_reclose,
+        "terminal cleanup reuses the immutable marker without rewriting it"
+    );
 }
 
 // PUBLIC TERMINAL DOS: an external collateral issuer can freeze the provider's
