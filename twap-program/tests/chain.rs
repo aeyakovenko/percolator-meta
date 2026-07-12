@@ -23972,10 +23972,11 @@ fn e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink() {
     );
 }
 
-// SHUTDOWN: only the DAO (via a timelock'd Squads execute) can sweep the TWAP's accumulated USD to
-// a supplied destination; a permissionless caller cannot.
+// SHUTDOWN: only the DAO (via a timelock'd Squads execute) can sweep TWAP-owned
+// collateral. The same fixed instruction recovers both the auction holding and
+// the separately configured savings reserve; a permissionless caller cannot.
 #[test]
-fn e2e_shutdown_sweeps_holding_only_via_squads() {
+fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -23990,14 +23991,42 @@ fn e2e_shutdown_sweeps_holding_only_via_squads() {
     let env = setup_handoff(&mut svm, &payer);
     let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
 
-    // Accumulate USD in the holding (one no-bid execute pulls the 400k burn-share).
+    let savings = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings, 1_000, 0);
+    let economics_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &economics,
+        &economics_remaining,
+    )
+    .expect("DAO configures a 10% savings reserve");
+
+    // One no-bid execute pulls 80% into the holding and 10% into savings.
     let cranker = Keypair::new();
     svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
     warp_to(&mut svm, 111);
     send(
         &mut svm,
         &[&cranker],
-        execute_ix(
+        execute_ix_full(
             &cranker.pubkey(),
             &env,
             &bk.book,
@@ -24005,11 +24034,13 @@ fn e2e_shutdown_sweeps_holding_only_via_squads() {
             &bk.settlement_usd,
             &bk.book_escrow,
             &bk.coin_escrow,
+            Some(savings),
             None,
         ),
     )
     .expect("execute");
     assert_eq!(token_amount(&svm, &bk.holding), 400_000);
+    assert_eq!(token_amount(&svm, &savings), 50_000);
 
     // A non-DAO caller cannot sweep: forge a shutdown ix signed by an attacker as the "squads vault".
     let attacker = Keypair::new();
@@ -24061,7 +24092,7 @@ fn e2e_shutdown_sweeps_holding_only_via_squads() {
         &env.multisig,
         &env.dao,
         &payer,
-        6,
+        7,
         &msg,
         &rem,
     )
@@ -24072,6 +24103,36 @@ fn e2e_shutdown_sweeps_holding_only_via_squads() {
         400_000,
         "swept to the DAO-supplied address"
     );
+
+    let savings_msg = build_shutdown_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &savings,
+        &dest,
+    );
+    let savings_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(savings, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &savings_msg,
+        &savings_remaining,
+    )
+    .expect("DAO recovers the segregated savings through the same fixed path");
+    assert_eq!(token_amount(&svm, &savings), 0);
+    assert_eq!(token_amount(&svm, &dest), 450_000);
 }
 
 // ATTACK PROBE (DAO shutdown confiscates winners' parked USD): shutdown (tag 11) sweeps the passed `holding`
