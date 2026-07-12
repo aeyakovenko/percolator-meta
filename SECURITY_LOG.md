@@ -13530,3 +13530,26 @@ registration and counter reads require that exact read-only PDA. Registration re
 existing stakes ignore every later live generation and use only their canonical archive. The marker has
 no close path, token account, amount, beneficiary, signer, custody CPI, or authority mutation, and it
 cannot move user insurance, backing, collateral, or Subledger principal.
+
+## Tick - pre-index extra-market stakes could not crystallize after upgrade (surface C/D)
+
+The public binary immediately before immutable market indexing already allowed portfolio-flow stakes
+for configured extra markets, but serialized only 211 bytes and therefore stored no market index. The
+upgraded deserializer treated the absent byte as index zero. A legitimate extra-market stake then paired
+its extra-market portfolio and marker with the primary market, so public crystallization failed with
+`InvalidSeeds` and its fixed COIN allocation could never reach freeze or claim.
+
+The retained real-SBF LiteSVM regressions register through the public extra-market API, convert only
+the appended byte to the exact predecessor layout, advance authenticated residual counters, and prove
+the upgraded crystallize, freeze, and claim lifecycle pays the sole LP its complete cohort. A second
+case dematerializes the live portfolio after freeze with no archive, rejects an unlisted marker/archive
+pair without consuming the stake, then pays through the configured extra-market pair. The legacy stake
+remains 211 bytes, so compatibility does not depend on reallocating deployed state.
+
+FIX: current 212-byte stakes retain the strict stored allow-list index. Only predecessor stakes recover
+their market from the same authenticated live portfolio or canonical cumulative archive that registration
+used. A frozen pre-archive close can instead select one configured market through the already-required
+marker key; the existing exact marker and empty archive PDA checks authenticate that terminal fallback
+before its fixed-recipient payout. The change adds no signer, authority, token account, destination,
+amount selector, custody CPI, or principal-moving surface; it restores access only to already allocated
+COIN rewards.
