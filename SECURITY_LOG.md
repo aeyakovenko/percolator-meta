@@ -2,6 +2,24 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - stale donated-market operator could skim later trade fees (surface A/C)
+
+An empty creator market could donate `marketauth` to the controller while preserving an unrelated
+asset-0 insurance operator. The controller's inbound donation path correctly rejected that shape,
+but ordinary trades credit fee insurance directly. The old operator therefore was not inert: after
+handoff, two public round-trip trades created 120 fee atoms and the stale key withdrew all 120 from
+the controller-governed market through pinned Percolator's public insurance-withdraw instruction.
+
+The clean-room LiteSVM regression uses the real Percolator SBF for the complete public sequence:
+creator market initialization, operator delegation, lifecycle donation, two funded trader
+portfolios, a round trip that pays fees, and the stale operator's successful withdrawal. It fails on
+the vulnerable controller only after proving the attacker received the exact fee balance.
+
+FIX: market donation now requires the asset-0 insurance authority and operator to be the same key
+regardless of the current insurance balance. This changes no role and adds no signer or recovery
+surface; it rejects the unsafe handoff byte-atomically. Canonical Subledger/TWAP custody already uses
+one constrained PDA for both roles, and external providers retain their original matched custody.
+
 ## Tick - frozen controller ATA could block protocol-insurance cleanup (surface A/C)
 
 The fixed provider-return paths already tolerated a collateral issuer permanently freezing a
