@@ -13397,3 +13397,24 @@ FIX: the existing handoff accepts with-surplus custody only when Subledger's own
 reserve as unowned only in that state. Principal pools retain their prior behavior. No instruction,
 signer, recipient, amount selector, authority setter, or withdrawal surface was added; the change
 only reuses the already constrained TWAP and controller terminal path after every user claim is gone.
+
+## Tick - absent with-surplus voter could veto terminal market close (surface A/C)
+
+The permissionless finalized-position return accepted only principal-policy genesis pools even though
+the controller and voting lifecycle also support with-surplus pools. A public user could deposit one
+base unit during the bounded window, vote, and disappear. After the winner was sealed and the real
+market resolved, ordinary withdrawal still correctly required that absent owner, while the fixed
+terminal return rejected solely on the immutable policy byte. The live owner claim prevented both
+empty-pool custody recovery and `CloseSlab`, creating a permanent one-atom cleanup veto.
+
+The retained real-SBF LiteSVM regression runs the existing complete absent-voter lifecycle under a
+second, independently bound with-surplus pool: real Squads custody, deposit, vote lock, 100% supply
+seal, reward registration, governed Percolator resolution, redirect/delegate/amount/unexecuted-
+proposal attacks, permissionless owner-bound return, delayed reward crystallization, and real terminal
+close. The old SBF reaches the canonical return and rejects with `InvalidAccountData`; the fixed SBF
+pays the absent owner, retires the share claim, preserves the frozen reward cap, and closes the slab.
+
+FIX: the existing amountless finalized-position instruction now applies its ordinary policy-specific
+share payout to either valid insurance policy. Every finality, market, pool, position, destination,
+owner, amount, and resolved-empty check is unchanged. No signer, recipient, authority, instruction,
+or withdrawal surface was added, and the cranker still cannot receive any part of the payout.

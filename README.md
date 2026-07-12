@@ -151,8 +151,9 @@ The workspace pins `percolator-prog` to commit
    remaining position without DAO cooperation. After resolution, returning the roles is
    permissionless while the bound market is empty and the pool still has owner principal. Sealed
    votes are no longer governance authority. If an owner disappears after sealing, any cranker can retire
-   only that owner's full position into a clean token account owned by the depositor; the instruction
-   has no caller-selected amount or beneficiary, so one atom cannot veto terminal market closure.
+   only that owner's full principal- or with-surplus-policy position into a clean token account owned
+   by the depositor; the instruction has no caller-selected amount or beneficiary, so one atom cannot
+   veto terminal market closure.
    Standalone with-surplus pools return their live share value pro rata and cannot enter TWAP
    custody while any owner claim remains. After every owner exits, the same handoff may route only
    later protocol fees or unowned rounding reserve through fixed terminal recovery.
