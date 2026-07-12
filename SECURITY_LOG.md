@@ -13321,6 +13321,8 @@ late-entry, and own-vault exits.
 
 FIX: a position still retires all of its nominal shares, but the pool burns only the maximal subset
 that cannot increase the post-withdrawal exchange rate. The difference becomes unowned rounding
-reserve and resets when no principal remains, leaving final whole-atom dust as protocol insurance.
+reserve. Principal pools reset it when no principal remains; empty with-surplus pools normalize it to
+the protocol balance so future deposit epochs price final whole-atom insurance without blocking
+minimum deposits.
 Overflow-safe wide division and an exhaustive maximal-burn test cover the full-width arithmetic. No
 account, signer, authority, recipient, amount selector, or administrative withdrawal path was added.

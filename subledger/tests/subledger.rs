@@ -783,6 +783,38 @@ fn with_surplus_policy_returns_yield_pro_rata() {
     assert_eq!(env.token_amount(&vault), 2, "both floor remainders stay in the protocol pool");
 }
 
+#[test]
+fn with_surplus_rounding_reserve_does_not_block_the_next_minimum_deposit() {
+    let mut env = Env::new();
+    let asset_id = 3;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let (alice, alice_ata) = new_depositor(&mut env, 60);
+    let (bob, bob_ata) = new_depositor(&mut env, 40);
+    env.send(&[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, 60)], &[&alice])
+        .expect("alice deposit");
+    env.send(&[deposit_ix(&env, &pool, &bob.pubkey(), &bob_ata, &vault, 40)], &[&bob])
+        .expect("bob deposit");
+    let auth = clone_kp(&env.mint_authority);
+    mint_to(&mut env.svm, &clone_kp(&env.payer), &env.mint, &auth, &vault, 50);
+    env.send(&[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)], &[&alice])
+        .expect("alice exits");
+    env.send(&[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)], &[&bob])
+        .expect("bob exits");
+    assert_eq!(env.token_amount(&vault), 2, "two floor atoms remain as protocol reserve");
+
+    let (carol, carol_ata) = new_depositor(&mut env, 1);
+    env.send(&[deposit_ix(&env, &pool, &carol.pubkey(), &carol_ata, &vault, 1)], &[&carol])
+        .expect("the empty epoch's reserve cannot block a fresh minimum deposit");
+    env.send(&[withdraw_ix(&pool, &carol.pubkey(), &carol_ata, &vault)], &[&carol])
+        .expect("fresh minimum position remains withdrawable");
+    assert_eq!(env.token_amount(&carol_ata), 1);
+    assert_eq!(env.token_amount(&vault), 2, "protocol reserve remains segregated");
+}
+
 // TENURE-FAIRNESS (finding HT): the branch claims (lib.rs) POLICY_WITH_SURPLUS is SHARE-based so a
 // LATE depositor cannot claim surplus that accrued before it joined. The INSURANCE path honours that
 // (shares), but the OWN-VAULT path used pro-rata-by-principal, so a late depositor captured a pro-rata
