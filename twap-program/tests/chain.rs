@@ -25273,6 +25273,148 @@ fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
     let _ = (alice, a_usd, mallory);
 }
 
+// LIVENESS CONTINUATION: cancelling the last aged bid is an exit-only operation, so it leaves the
+// expired round timer in place. A bounded permissionless empty-book execute must advance that timer;
+// the next bidder then receives a complete competition window and can settle normally.
+#[test]
+fn e2e_empty_crank_reopens_auction_after_last_cooldown_cancel() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let round_length = 10u64;
+    let bk = setup_auction(&mut svm, &payer, &env, round_length, 0, None, 0);
+
+    let (alice, alice_coin, alice_usd) = new_bidder(&mut svm, &payer, &env, 10_000);
+    send(
+        &mut svm,
+        &[&alice],
+        place_bid_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            &alice_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            10_000,
+            10_000,
+            None,
+        ),
+    )
+    .expect("alice commits the expiring round");
+
+    warp_to(&mut svm, 100 + 2 * round_length + 1);
+    send(
+        &mut svm,
+        &[&alice],
+        cancel_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            0,
+        ),
+    )
+    .expect("the last aged bid exits");
+    assert_eq!(token_amount(&svm, &alice_coin), 10_000);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+
+    let (bob, bob_coin, bob_usd) = new_bidder(&mut svm, &payer, &env, 50_000);
+    let bob_bid = || {
+        place_bid_ix(
+            &bob.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &bob_coin,
+            &bob_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            50_000,
+            50_000,
+            None,
+        )
+    };
+    assert!(
+        send(&mut svm, &[&bob], bob_bid()).is_err(),
+        "placement waits for the expired empty round to be cranked"
+    );
+    assert_eq!(token_amount(&svm, &bob_coin), 50_000);
+
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("any cranker advances the empty book");
+    let reopened_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    assert_eq!(reopened_end, 100 + 3 * round_length + 1);
+
+    send(&mut svm, &[&bob], bob_bid()).expect("bob enters the fresh round");
+    warp_to(&mut svm, reopened_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("bob settles after the full fresh round");
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &bob_usd,
+            &bob_coin,
+            0,
+        ),
+    )
+    .expect("bob's settled slot remains permissionlessly claimable");
+    assert_eq!(token_amount(&svm, &bob_usd), 50_000);
+    assert_eq!(token_amount(&svm, &bob_coin), 0);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+}
+
 // ISSUE #28 — a NO-OP EXECUTE ROLL must NOT enable an early cancel (anti-spoof commitment). process_execute
 // advances book.round_end on EVERY run, INCLUDING a no-op roll (surplus 0 -> total_coin 0) that leaves a
 // committed bid OCCUPIED + unsettled. The cancel cooldown deliberately gates on AGING ALONE
