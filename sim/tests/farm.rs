@@ -42,6 +42,19 @@ fn rd_stake_pda(config: &Pubkey, owner: &Pubkey, linked: &Pubkey, cohort: u8) ->
     let family = if cohort == 3 { 2 } else { cohort };
     Pubkey::find_program_address(&[b"rd_stake", config.as_ref(), owner.as_ref(), linked.as_ref(), &[family]], &rd_id()).0
 }
+fn rd_portfolio_archive_pda(market: &Pubkey, owner: &Pubkey, portfolio: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"rd_portfolio_archive",
+            perc_id().as_ref(),
+            market.as_ref(),
+            owner.as_ref(),
+            portfolio.as_ref(),
+        ],
+        &rd_id(),
+    )
+    .0
+}
 fn dist_id() -> Pubkey { Pubkey::from_str("D1str1but1on11111111111111111111111111111111").unwrap() }
 fn sub_id() -> Pubkey { Pubkey::from_str("Sub1edger1111111111111111111111111111111111").unwrap() }
 const ATA_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -197,7 +210,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
     let posq = (percolator::POS_SCALE / 2) as i128;
     // (owner, cohort, portfolio, coin_ata)
-    let mut stakes: Vec<(Keypair, u8, Pubkey, Pubkey)> = Vec::new();
+    let mut stakes: Vec<(Keypair, u8, Pubkey, Pubkey, Pubkey)> = Vec::new();
     for (market, pv) in &markets {
         let long = Keypair::new(); let short = Keypair::new();
         svm.airdrop(&long.pubkey(), 1_000_000_000).unwrap(); svm.airdrop(&short.pubkey(), 1_000_000_000).unwrap();
@@ -218,9 +231,11 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
                 AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(o.pubkey(), true),
                 AccountMeta::new_readonly(o.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), &pf), false),
+                AccountMeta::new_readonly(*market, false),
             ], data: vec![1u8, cohort] }], &[o]).expect("register");
             let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &o.pubkey(), 0);
-            stakes.push((o.insecure_clone(), cohort, pf, ata));
+            stakes.push((o.insecure_clone(), cohort, pf, ata, *market));
         }
         // open the delta-neutral pair: size_q negative -> owner_a(short) short, owner_b(long) long.
         send(&mut svm, &[pix(vec![
@@ -252,10 +267,11 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     }
 
     // ---- crystallize every miner stake (Δ), freeze, claim ----
-    for (o, cohort, pf, _ata) in &stakes {
+    for (o, cohort, pf, _ata, market) in &stakes {
         let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, *cohort);
         send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), pf), false),
         ], data: vec![2u8] }], &[]).expect("crystallize");
     }
     svm.set_sysvar(&Clock { slot: 2_101, unix_timestamp: 2_101, ..Default::default() });
@@ -264,12 +280,13 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     ], data: vec![4u8] }], &[]).expect("freeze");
     let mut miner_coin = 0u64;
     let mut lp_coin = 0u64; let mut trader_coin = 0u64;
-    for (o, cohort, pf, ata) in &stakes {
+    for (o, cohort, pf, ata, market) in &stakes {
         let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, *cohort);
         send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(*pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), pf), false),
         ], data: vec![5u8] }], &[]).expect("claim");
         let got = token_amount(&svm, ata);
         miner_coin += got;
@@ -313,7 +330,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     // tell a delta-neutral farmer's wash-loss from a normal directional trader's REAL loss (both are just
     // crystallized loss), so 9 normal traders' real backing dilutes the 1 farmer to 1/10 — and to beat the
     // dilution the farmer must Sybil into more accounts, each needing its OWN locked capital + per-trade fee.
-    let trader_stakes: Vec<u64> = stakes.iter().filter(|(_, c, _, _)| *c == 3).map(|(_, _, _, a)| token_amount(&svm, a)).collect();
+    let trader_stakes: Vec<u64> = stakes.iter().filter(|(_, c, _, _, _)| *c == 3).map(|(_, _, _, a, _)| token_amount(&svm, a)).collect();
     let n = trader_stakes.len();
     let lone_farmer = trader_stakes.first().copied().unwrap_or(0);
     println!("================ 9 NORMAL TRADERS vs 1 FARMER ================");
@@ -678,6 +695,8 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(market, false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register trader");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         rational.push((owner, pf, ata, mi, is_long));
@@ -705,6 +724,8 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&fm, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(fm, false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register farmer leg");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         farmer.push((owner, pf, ata));
@@ -725,14 +746,15 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     for (_o, pf, _a) in &farmer { let _ = crank(&mut svm, &tx_unit, &fm, pf); let _ = crank(&mut svm, &tx_unit, &fm, pf); }
 
     // ---- crystallize every TRADER stake (rational + farmer), freeze, claim all ----
-    let cryst = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, pf: &Pubkey| {
+    let cryst = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, market: &Pubkey, pf: &Pubkey| {
         let stake = rd_stake_pda(&rd_config, &owner.pubkey(), pf, 3);
         tx(svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &owner.pubkey(), pf), false),
         ], data: vec![2u8] }], &[]).map(|_| ())
     };
-    for (o, pf, _a, _mi, _l) in &rational { let _ = cryst(&mut svm, &tx_unit, o, pf); }
-    for (o, pf, _a) in &farmer { let _ = cryst(&mut svm, &tx_unit, o, pf); }
+    for (o, pf, _a, mi, _l) in &rational { let market = markets[*mi].0; let _ = cryst(&mut svm, &tx_unit, o, &market, pf); }
+    for (o, pf, _a) in &farmer { let _ = cryst(&mut svm, &tx_unit, o, &fm, pf); }
     // Capital cohorts: crystallize sets points from live principal and tenure; cranker MUST be the owner.
     for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
         for (o, pos, _a) in parts {
@@ -764,17 +786,19 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pos, false),
         ], data: vec![5u8] }], &[o]); back_coin += token_amount(&svm, ata);
     }
-    let claim_trader = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, pf: &Pubkey, ata: &Pubkey| {
+    let claim_trader = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, market: &Pubkey, pf: &Pubkey, ata: &Pubkey| {
         let stake = rd_stake_pda(&rd_config, &owner.pubkey(), pf, 3);
         let _ = tx(svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &owner.pubkey(), pf), false),
         ], data: vec![5u8] }], &[]);
     };
     let mut rational_winner_coin = 0u64; let mut rational_loser_coin = 0u64;
     let mut n_winners = 0usize; let mut n_losers = 0usize; let mut loser_examples: Vec<u64> = Vec::new();
     for (o, pf, ata, mi, is_long) in &rational {
-        claim_trader(&mut svm, &tx_unit, o, pf, ata);
+        let market = markets[*mi].0;
+        claim_trader(&mut svm, &tx_unit, o, &market, pf, ata);
         let got = token_amount(&svm, ata);
         // even market -50% (long loses); odd market +50% (short loses).
         let lost = if mi % 2 == 0 { *is_long } else { !*is_long };
@@ -782,7 +806,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         else if lost { n_losers += 1; } else { n_winners += 1; }
     }
     let mut farmer_coin = 0u64;
-    for (o, pf, ata) in &farmer { claim_trader(&mut svm, &tx_unit, o, pf, ata); farmer_coin += token_amount(&svm, ata); }
+    for (o, pf, ata) in &farmer { claim_trader(&mut svm, &tx_unit, o, &fm, pf, ata); farmer_coin += token_amount(&svm, ata); }
 
     let trader_bps = 10_000 - INS_BPS - BACK_BPS - LP_BPS;
     let supply = SUPPLY as u128;
@@ -977,6 +1001,8 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(market, false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register trader");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         rational.push((owner, pf, ata, legs));
@@ -1008,6 +1034,8 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(market, false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register farmer leg");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         farmer.push((owner, pf, ata, assets));
@@ -1032,12 +1060,14 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
         let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
         ], data: vec![2u8] }], &[]);
     }
     for (o, pf, _a, _as) in &farmer {
         let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
         ], data: vec![2u8] }], &[]);
     }
     for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
@@ -1075,6 +1105,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
         ], data: vec![5u8] }], &[]);
         let got = token_amount(&svm, ata);
         // a leg loses if (even asset & long) or (odd asset & short).
@@ -1088,6 +1119,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
         ], data: vec![5u8] }], &[]);
         farmer_coin += token_amount(&svm, ata);
         farmer_gross_loss += read_crystallized(&svm, pf);

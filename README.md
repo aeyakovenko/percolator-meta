@@ -50,7 +50,10 @@ capital's own tenure.
   telemetry, the same atomic call checked-adds it into a residual-distributor PDA scoped to the
   Percolator program, market, owner, and portfolio. Reward epochs read archived totals plus any live
   account generation, so terminal cleanup cannot erase an uncrystallized allocation or hold insurance
-  and backing exits hostage. The archive has no token or value-moving instruction. Before donating a creator-owned market, its raw
+  and backing exits hostage. Portfolio-flow registration also authenticates the matching market and
+  requires its immutable account maintenance fee to be zero, so direct permissionless fee sync cannot
+  erase counters before they reach the archive. The archive has no token or value-moving instruction.
+  Before donating a creator-owned market, its raw
   outgoing asset-0 insurance provider must withdraw any nonzero balance. The empty insurance roles
   then migrate to the controller, while the recorded backing provider remains unchanged. This keeps
   a former provider from withdrawing its principal yet retaining a claim on later trade fees.
@@ -254,9 +257,10 @@ fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Perco
 nonempty portfolios and sends the closed account's lamports only into the bound market slab. If a
 reward-relevant counter is nonzero, the legacy cleanup shape rejects and the extended shape first
 archives the authenticated counters; both CPIs are atomic. Reward registration and crystallization
-sum that canonical archive with the current live generation. A public maintenance sync that runs
-after crystallization/freeze still uses the bound frozen fallback, even if a third party donates
-lamports to the closed address. The wrapper accepts no
+sum that canonical archive with the current live generation. Registration binds the live portfolio
+to its real Percolator market and rejects a nonzero immutable maintenance fee; capital cohorts are
+unaffected. The historical public-maintenance fallback remains claim-only for an already frozen
+stake, even if a third party donates lamports to the closed address. The wrapper accepts no
 amount, token account, or destination and exposes no generic portfolio authority.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one

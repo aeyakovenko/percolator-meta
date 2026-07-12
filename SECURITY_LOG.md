@@ -13460,3 +13460,26 @@ to Percolator program, market, owner, and portfolio, so address reuse snapshots 
 exactly once. Register/crystallize read archived plus live totals. The archive accepts no token account,
 amount, destination, authority mutation, or value-moving CPI; zero-telemetry cleanup keeps its original
 account shape.
+
+## Tick - public maintenance close could erase uncrystallized rewards (surface C/D)
+
+Pinned Percolator's unsigned `SyncMaintenanceFee` can intentionally consume a flat portfolio's final
+capital atom and dematerialize it. A portfolio-flow reward epoch previously accepted that market even
+when its immutable account maintenance fee was nonzero. An unaffiliated caller could therefore wait
+until a registered user had real residual or funding telemetry but had not crystallized it, consume the
+last atom during the open epoch, and erase the only live counters. The archive cannot recover bytes
+that a direct Percolator instruction deleted before the controller observed them.
+
+The clean-room red LiteSVM probe initialized the pinned real Percolator with a one-atom-per-slot fee,
+registered a real trader, created and settled an organic loss, flattened through public trades, left
+one capital atom, and invoked `SyncMaintenanceFee` at slot 400. The portfolio dematerialized and the
+still-open reward epoch's crystallize call failed with `InvalidAccountData`.
+
+FIX: every LP, trader, or funding-payer registration now supplies the portfolio's market account. The
+distributor authenticates its Percolator owner, key-to-provenance match, non-executable account kind,
+pinned wrapper layout, and zero `maintenance_fee_per_slot` before creating a stake. The fee amount has
+no update instruction in the pinned API, so this one-time rule remains true for the stake lifetime;
+governance can alter only fee routing shares. The retained real-binary regression proves both that a
+valid zero-fee market cannot substitute for the portfolio's provenance market and that the real
+nonzero-fee market creates no stake or portfolio mutation. The paired zero-fee organic-loss and full
+genesis-to-45-day-buyback lifecycles pass. Capital cohorts and all custody/value paths are unchanged.

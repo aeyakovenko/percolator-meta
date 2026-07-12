@@ -13,6 +13,9 @@ pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
+// Pinned `WrapperConfigV16::maintenance_fee_per_slot` follows the three
+// market-level mint/authority keys.
+pub const MAINTENANCE_FEE_PER_SLOT_OFFSET: usize = HEADER_LEN + 96;
 // Pinned `WrapperConfigV16::permissionless_market_init_fee` relative to the account.
 pub const PERMISSIONLESS_MARKET_INIT_FEE_OFFSET: usize = HEADER_LEN + 112;
 // Pinned `WrapperConfigV16` global stale-resolution fields relative to the account.
@@ -234,6 +237,12 @@ fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
 pub fn read_market_authority(data: &[u8]) -> Result<[u8; 32], ReadError> {
     validate_market(data)?;
     bytes(data, MARKET_AUTHORITY_OFFSET)
+}
+
+/// Returns the immutable account-level maintenance fee from the pinned wrapper config.
+pub fn read_maintenance_fee_per_slot(data: &[u8]) -> Result<u128, ReadError> {
+    validate_market(data)?;
+    read_u128(data, MAINTENANCE_FEE_PER_SLOT_OFFSET)
 }
 
 /// Returns the fee that enables direct, non-marketauth secondary-slot activation.
@@ -490,6 +499,20 @@ mod tests {
 
         let by_market = market_with_stale_slots(50, 100, 150);
         assert!(permissionless_resolution_matured(&by_market, 149).unwrap());
+    }
+
+    #[test]
+    fn maintenance_fee_uses_the_pinned_wrapper_offset() {
+        let mut market = market_with_stale_slots(0, 0, 0);
+        market[MAINTENANCE_FEE_PER_SLOT_OFFSET..MAINTENANCE_FEE_PER_SLOT_OFFSET + 16]
+            .copy_from_slice(&123u128.to_le_bytes());
+        assert_eq!(read_maintenance_fee_per_slot(&market), Ok(123));
+
+        market[10] = KIND_PORTFOLIO;
+        assert_eq!(
+            read_maintenance_fee_per_slot(&market),
+            Err(ReadError::InvalidHeader)
+        );
     }
 
     #[test]

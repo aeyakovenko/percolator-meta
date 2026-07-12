@@ -1771,8 +1771,9 @@ fn init_reward_epoch(
 }
 
 // register_start accounts: [payer(s,w), config, owner, recipient, linked, stake(pda,w), system,
-//   portfolio_archive (portfolio cohorts only), legacy_owner_stake?, legacy_linked_stake?]
-//   portfolio cohorts: linked = Percolator portfolio and archive = its canonical cumulative telemetry PDA;
+//   portfolio_archive?, portfolio_market?, legacy_owner_stake?, legacy_linked_stake?]
+//   portfolio cohorts: linked = Percolator portfolio, archive = its canonical cumulative telemetry PDA,
+//   and portfolio_market = its immutable-fee Percolator market account;
 //   capital cohorts: linked = subledger position.
 // data: cohort(u8)
 fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -1788,8 +1789,8 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let linked = next_account_info(iter)?;
     let stake_account = next_account_info(iter)?;
     let system = next_account_info(iter)?;
-    let portfolio_archive = if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
-        Some(next_account_info(iter)?)
+    let portfolio_context = if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        Some((next_account_info(iter)?, next_account_info(iter)?))
     } else {
         None
     };
@@ -1909,8 +1910,27 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 &config,
                 owner.key,
                 linked,
-                portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                portfolio_context
+                    .map(|(archive, _)| archive)
+                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
             )?;
+            let portfolio_market = portfolio_context
+                .map(|(_, market)| market)
+                .ok_or(ProgramError::NotEnoughAccountKeys)?;
+            if *portfolio_market.key != Pubkey::new_from_array(totals.market_group)
+                || portfolio_market.owner != &config.percolator_program
+                || portfolio_market.executable
+                || percolator_accounting::read_maintenance_fee_per_slot(
+                    &portfolio_market.try_borrow_data()?,
+                )
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                    != 0
+            {
+                // A nonzero immutable maintenance fee lets an unsigned Percolator sync
+                // dematerialize an otherwise-empty portfolio before its counters are
+                // crystallized. Zero-fee market binding makes that loss path unreachable.
+                return Err(ProgramError::InvalidAccountData);
+            }
             match cohort {
                 COHORT_LP | COHORT_TRADER => residual_counter(
                     cohort,
