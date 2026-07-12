@@ -13218,3 +13218,26 @@ the controller itself, or canonical current-layout Subledger/TWAP custody proven
 Matching arbitrary roles no longer suffice; such a provider must exit before donation. Distinct backing remains
 supported because backing fees require that provider's own deposited capacity. No signer, authority, recipient,
 withdrawal path, or admin instruction was added.
+
+## Tick - exit ordering could transfer floored share claims to the last depositor (surface A/C)
+
+Subledger burned every nominal share even when whole-atom redemption rounded its payout down. That
+raised the live exchange rate for the remaining positions. A depositor could therefore wait while a
+permissionless terminal return retired another position, then collect the earlier position's floor
+remainder. Repeating the shape across identities made exit ordering an allocation mechanism for
+segregated user value. This finding supersedes earlier blocked ticks that treated last-exiter dust as
+harmless conservation.
+
+The retained real-SBF LiteSVM regression deposits three and one base units, opens funded public long
+and short Percolator portfolios, moves the authenticated mark, and permissionlessly cranks a real
+liquidation that spends one insurance atom. After public resolution and portfolio cleanup, the old
+Subledger pays the one-unit position zero and the last three-unit position all three remaining atoms.
+The fixed binary pays the last position only its own floored two-atom claim and leaves one atom in the
+asset-0 insurance ledger. The same reserve semantics are pinned for principal, with-surplus, partial,
+late-entry, and own-vault exits.
+
+FIX: a position still retires all of its nominal shares, but the pool burns only the maximal subset
+that cannot increase the post-withdrawal exchange rate. The difference becomes unowned rounding
+reserve and resets when no principal remains, leaving final whole-atom dust as protocol insurance.
+Overflow-safe wide division and an exhaustive maximal-burn test cover the full-width arithmetic. No
+account, signer, authority, recipient, amount selector, or administrative withdrawal path was added.

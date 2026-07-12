@@ -271,10 +271,11 @@ struct Pool {
     /// Authority allowed to toggle a position's vote-lock (the genesis-vote config
     /// PDA). `Pubkey::default()` disables vote-locking (own-vault pools).
     vote_authority: Pubkey,
-    /// Total outstanding shares (POLICY_WITH_SURPLUS). A deposit mints
+    /// Total pricing shares (POLICY_WITH_SURPLUS). A deposit mints
     /// `amount * total_shares / insurance_balance` shares (1:1 for the first); a
-    /// withdraw redeems `shares * insurance_balance / total_shares`. The share price
-    /// = balance/total_shares moves with market PnL, so exit is tenure-fair.
+    /// withdraw redeems `shares * insurance_balance / total_shares`. Floor remainders
+    /// leave unowned reserve shares here so an exiting holder cannot transfer that
+    /// value to whoever exits last. The reserve resets once no principal remains.
     total_shares: u128,
     /// Distributed COIN mint whose genesis-vote config may lock this pool's positions.
     /// Own-vault pools store Pubkey::default().
@@ -700,9 +701,10 @@ fn mul_div_floor(a: u64, b: u64, denom: u64) -> Option<u64> {
     Some((a as u128 * b as u128 / denom as u128) as u64)
 }
 
-/// Exact `floor(a * b / denom)` without requiring the product to fit in `u128`.
-/// Returns `None` only for a zero denominator or a quotient above `u128::MAX`.
-fn wide_mul_div_floor(a: u128, b: u128, denom: u128) -> Option<u128> {
+/// Exact quotient and remainder for `a * b / denom` without requiring the product
+/// to fit in `u128`. Returns `None` only for a zero denominator or a quotient above
+/// `u128::MAX`.
+fn wide_mul_div_rem(a: u128, b: u128, denom: u128) -> Option<(u128, u128)> {
     if denom == 0 {
         return None;
     }
@@ -731,7 +733,16 @@ fn wide_mul_div_floor(a: u128, b: u128, denom: u128) -> Option<u128> {
     }
 
     quotient = quotient.checked_add(fractional)?;
-    Some(quotient)
+    Some((quotient, remainder))
+}
+
+fn wide_mul_div_floor(a: u128, b: u128, denom: u128) -> Option<u128> {
+    wide_mul_div_rem(a, b, denom).map(|(quotient, _)| quotient)
+}
+
+fn wide_mul_div_ceil(a: u128, b: u128, denom: u128) -> Option<u128> {
+    let (quotient, remainder) = wide_mul_div_rem(a, b, denom)?;
+    quotient.checked_add(u128::from(remainder != 0))
 }
 
 /// `(x + y) mod denom` and `floor((x + y) / denom)` for `x,y < denom`.
@@ -781,6 +792,39 @@ fn redeem_shares(shares: u128, balance: u64, total_shares: u128) -> Result<u64, 
     )
     .ok_or(ProgramError::ArithmeticOverflow)?;
     u64::try_from(owed).map_err(|_| ProgramError::ArithmeticOverflow)
+}
+
+/// Burn no more pricing shares than keeps the post-redemption exchange rate from
+/// increasing. Retired shares above this amount become unowned rounding reserve,
+/// preventing a later exiter from collecting earlier holders' floored claims.
+fn rate_safe_pool_share_burn(
+    shares_retired: u128,
+    balance_before: u64,
+    balance_after: u64,
+    total_shares: u128,
+) -> Result<u128, ProgramError> {
+    if shares_retired > total_shares || balance_after > balance_before {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let denominator_before = total_shares
+        .checked_add(VIRTUAL_SHARES)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let numerator_before = (balance_before as u128)
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let numerator_after = (balance_after as u128)
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let minimum_denominator_after = wide_mul_div_ceil(
+        numerator_after,
+        denominator_before,
+        numerator_before,
+    )
+    .ok_or(ProgramError::ArithmeticOverflow)?;
+    let maximum_burn = denominator_before
+        .checked_sub(minimum_denominator_after)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    Ok(core::cmp::min(shares_retired, maximum_burn))
 }
 
 /// Reject a deposit before transfer when its shares lose more than one atom to entry rounding at
@@ -1267,9 +1311,9 @@ fn process_withdraw(
     if share_accounting && position_account.data_len() < POSITION_SIZE {
         return Err(ProgramError::InvalidAccountData);
     }
-    let (paid, shares_to_burn) = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
-        let stb = position.shares;
-        (redeem_shares(stb, balance, pool.total_shares)?, stb)
+    let (paid, shares_to_retire) = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
+        let shares = position.shares;
+        (redeem_shares(shares, balance, pool.total_shares)?, shares)
     } else {
         (
             payout(
@@ -1280,6 +1324,23 @@ fn process_withdraw(
             )?,
             0u128,
         )
+    };
+    let outstanding_after = pool
+        .outstanding_principal
+        .checked_sub(position.principal)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let balance_after = balance
+        .checked_sub(paid)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let pool_shares_to_burn = if shares_to_retire == 0 {
+        0
+    } else {
+        rate_safe_pool_share_burn(
+            shares_to_retire,
+            balance,
+            balance_after,
+            pool.total_shares,
+        )?
     };
 
     if paid > 0 {
@@ -1305,8 +1366,14 @@ fn process_withdraw(
 
     // A zero-payout exit still retires the position so an impaired/empty pool
     // cannot be replayed to distort other depositors' outstanding accounting.
-    pool.outstanding_principal -= position.principal;
-    pool.total_shares = pool.total_shares.saturating_sub(shares_to_burn);
+    pool.outstanding_principal = outstanding_after;
+    pool.total_shares = if outstanding_after == 0 {
+        0
+    } else {
+        pool.total_shares
+            .checked_sub(pool_shares_to_burn)
+            .ok_or(ProgramError::InvalidAccountData)?
+    };
     position.shares = 0;
     position.withdrawn = true;
     position.withdrawn_amount = paid;
@@ -1993,14 +2060,16 @@ fn process_insurance_withdraw_impl(
     if share_accounting && position_account.data_len() < POSITION_SIZE {
         return Err(ProgramError::InvalidAccountData);
     }
-    let shares_to_burn = if !share_accounting || position.principal == 0 {
+    let shares_to_retire = if !share_accounting || position.principal == 0 {
         0u128
+    } else if amount == position.principal {
+        position.shares
     } else {
         wide_mul_div_floor(position.shares, amount as u128, position.principal as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?
     };
     let owed = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
-        redeem_shares(shares_to_burn, priced_balance, pool.total_shares)?
+        redeem_shares(shares_to_retire, priced_balance, pool.total_shares)?
     } else {
         if share_accounting && position.shares != 0 {
             if pool.total_shares == 0 {
@@ -2011,7 +2080,7 @@ fn process_insurance_withdraw_impl(
             // therefore cannot recapitalize an older position at par.
             core::cmp::min(
                 amount,
-                redeem_shares(shares_to_burn, priced_balance, pool.total_shares)?,
+                redeem_shares(shares_to_retire, priced_balance, pool.total_shares)?,
             )
         } else {
             // Historical principal positions predate share accounting. Preserve
@@ -2019,6 +2088,28 @@ fn process_insurance_withdraw_impl(
             // a custody lock.
             payout(pool.policy, insurance, pool.outstanding_principal, amount)?
         }
+    };
+    let outstanding_after = pool
+        .outstanding_principal
+        .checked_sub(amount)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let insurance_after = insurance
+        .checked_sub(owed)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let priced_balance_after = if pool.policy == POLICY_PRINCIPAL {
+        core::cmp::min(insurance_after, outstanding_after)
+    } else {
+        insurance_after
+    };
+    let pool_shares_to_burn = if shares_to_retire == 0 {
+        0
+    } else {
+        rate_safe_pool_share_burn(
+            shares_to_retire,
+            priced_balance,
+            priced_balance_after,
+            pool.total_shares,
+        )?
     };
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,
@@ -2082,16 +2173,22 @@ fn process_insurance_withdraw_impl(
 
     // The full requested principal leaves the outstanding accounting (the loss, if any, is
     // realized); the owner collected `owed` (their pro-rata share).
-    pool.outstanding_principal -= amount;
+    pool.outstanding_principal = outstanding_after;
     position.principal -= amount;
-    // Burn the redeemed shares (POLICY_WITH_SURPLUS). saturating_sub guards rounding;
-    // a full exit (principal -> 0) sweeps any share dust so no stranded shares remain.
-    pool.total_shares = pool.total_shares.saturating_sub(shares_to_burn);
-    position.shares = position.shares.saturating_sub(shares_to_burn);
-    if position.principal == 0 {
-        pool.total_shares = pool.total_shares.saturating_sub(position.shares);
-        position.shares = 0;
-    }
+    // The position retires its nominal shares. The pool burns only the rate-safe
+    // subset; the difference is unowned reserve that keeps floor dust out of a
+    // later holder's redemption. With no principal left, all pricing shares reset.
+    position.shares = position
+        .shares
+        .checked_sub(shares_to_retire)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    pool.total_shares = if outstanding_after == 0 {
+        0
+    } else {
+        pool.total_shares
+            .checked_sub(pool_shares_to_burn)
+            .ok_or(ProgramError::InvalidAccountData)?
+    };
     // Historical telemetry must not become a custody gate. A position can cycle
     // the finite token supply enough times for cumulative withdrawals to exceed
     // u64 even though every individual balance and principal remains valid. A
@@ -2633,6 +2730,105 @@ mod tests {
     }
 
     #[test]
+    fn wide_mul_div_ceil_is_exact_across_overflow_boundaries() {
+        for a in [0, 1, 2, 17, u64::MAX as u128, u128::MAX / 2] {
+            for b in [0, 1, 3, 19, u64::MAX as u128] {
+                for denom in [1, 2, 7, u64::MAX as u128] {
+                    if let Some(product) = a.checked_mul(b) {
+                        let expected = product / denom + u128::from(product % denom != 0);
+                        assert_eq!(wide_mul_div_ceil(a, b, denom), Some(expected));
+                    }
+                }
+            }
+        }
+
+        let amount = 20_000_000_000_000_000u128;
+        let shares = amount * VIRTUAL_SHARES;
+        assert!(shares.checked_mul(amount + 2).is_none());
+        assert_eq!(
+            wide_mul_div_ceil(shares, amount + 2, shares + VIRTUAL_SHARES),
+            Some(amount + 1)
+        );
+        assert_eq!(wide_mul_div_ceil(u128::MAX, u128::MAX, u128::MAX), Some(u128::MAX));
+        assert_eq!(wide_mul_div_ceil(u128::MAX, u128::MAX, 1), None);
+        assert_eq!(wide_mul_div_ceil(1, 1, 0), None);
+    }
+
+    #[test]
+    fn rate_safe_burn_reserves_floor_dust_instead_of_rewarding_last_exit() {
+        let attacker_shares = mint_shares(3, 0, 0).unwrap();
+        let victim_shares = mint_shares(1, attacker_shares, 3).unwrap();
+        let total_shares = attacker_shares + victim_shares;
+
+        let victim_payout = redeem_shares(victim_shares, 3, total_shares).unwrap();
+        assert_eq!(victim_payout, 0);
+        let victim_burn = rate_safe_pool_share_burn(
+            victim_shares,
+            3,
+            3 - victim_payout,
+            total_shares,
+        )
+        .unwrap();
+        assert_eq!(victim_burn, 0, "a zero payout cannot burn another holder richer");
+
+        let shares_after_victim = total_shares - victim_burn;
+        let attacker_payout = redeem_shares(attacker_shares, 3, shares_after_victim).unwrap();
+        assert_eq!(attacker_payout, 2);
+        assert_eq!(3 - victim_payout - attacker_payout, 1);
+    }
+
+    #[test]
+    fn rate_safe_burn_retires_all_shares_for_an_exact_healthy_redemption() {
+        let shares = mint_shares(7, 0, 0).unwrap();
+        let payout = redeem_shares(shares, 7, shares).unwrap();
+        assert_eq!(payout, 7);
+        assert_eq!(
+            rate_safe_pool_share_burn(shares, 7, 7 - payout, shares).unwrap(),
+            shares
+        );
+    }
+
+    #[test]
+    fn rate_safe_burn_is_the_maximal_non_appreciating_burn() {
+        for total_units in 1u128..=16 {
+            let total_shares = total_units * VIRTUAL_SHARES;
+            for retired_units in 0..=total_units {
+                let shares_retired = retired_units * VIRTUAL_SHARES;
+                for balance_before in 0u64..=32 {
+                    for balance_after in 0..=balance_before {
+                        let burned = rate_safe_pool_share_burn(
+                            shares_retired,
+                            balance_before,
+                            balance_after,
+                            total_shares,
+                        )
+                        .unwrap();
+                        assert!(burned <= shares_retired);
+
+                        let numerator_before = balance_before as u128 + 1;
+                        let numerator_after = balance_after as u128 + 1;
+                        let denominator_before = total_shares + VIRTUAL_SHARES;
+                        let denominator_after = denominator_before - burned;
+                        assert!(
+                            numerator_after * denominator_before
+                                <= numerator_before * denominator_after,
+                            "remaining shares appreciated: before={balance_before}, after={balance_after}, total={total_shares}, retired={shares_retired}, burned={burned}",
+                        );
+
+                        if burned < shares_retired {
+                            assert!(
+                                numerator_after * denominator_before
+                                    > numerator_before * (denominator_after - 1),
+                                "one more share could have been burned safely",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn state_round_trips() {
         let slab = Pubkey::new_unique();
         let perc = Pubkey::new_unique();
@@ -3007,7 +3203,8 @@ mod tests {
         let mut balance: u64 = 600;
         let mut shares_left = total_shares;
         let mut redeemed: u64 = 0;
-        // Exit in order a, b, c — each prices its shares at the CURRENT (shrinking) balance/shares.
+        // Exit in order a, b, c. Each nominal position retires, while only the
+        // rate-safe subset leaves pool pricing shares.
         for (sh, principal) in [(a, 300u64), (b, 200), (c, 500)] {
             let owed = redeem_shares(sh, balance, shares_left).unwrap();
             // Each holder takes the SAME ~60% haircut regardless of exit order (pro-rata fairness).
@@ -3021,19 +3218,14 @@ mod tests {
                 owed <= balance,
                 "a redemption can never exceed the live balance"
             );
-            balance -= owed; // saturating not needed: owed <= balance pinned above
-            shares_left -= sh;
+            let balance_after = balance - owed;
+            let burned = rate_safe_pool_share_burn(sh, balance, balance_after, shares_left).unwrap();
+            balance = balance_after;
+            shares_left -= burned;
             redeemed += owed;
         }
-        // Conservation: the sum of all exits equals the impaired balance — nothing minted, nothing stranded,
-        // and the LAST exiter drained the pool to exactly empty (no insolvency, no leftover dust trapped).
-        assert_eq!(
-            redeemed, 600,
-            "all exits sum to exactly the impaired insurance — pool conserved"
-        );
-        assert_eq!(
-            balance, 0,
-            "the pool drains to zero; the last exiter is not stranded"
-        );
+        assert!(redeemed <= 600, "redemptions cannot exceed impaired insurance");
+        assert!(balance <= 3, "only bounded whole-atom floor reserve remains");
+        assert_eq!(redeemed + balance, 600, "tokens remain conserved");
     }
 }

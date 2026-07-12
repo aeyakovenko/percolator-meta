@@ -958,6 +958,16 @@ fn impair_asset0_with_external_insurance(env: &mut Env) {
 }
 
 fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot: u64) -> Vec<u8> {
+    make_live_market_with_public_chunk(slab, mint, marketauth, init_slot, 1)
+}
+
+fn make_live_market_with_public_chunk(
+    slab: &Pubkey,
+    mint: &Pubkey,
+    marketauth: &Pubkey,
+    init_slot: u64,
+    public_b_chunk_atoms: u128,
+) -> Vec<u8> {
     let initial_price = 1_000_000u64;
     let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
     wrapper.marketauth = marketauth.to_bytes();
@@ -990,7 +1000,7 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     cfg.max_account_b_settlement_chunks = 1;
     cfg.max_bankrupt_close_chunks = 1;
     cfg.max_bankrupt_close_lifetime_slots = 1;
-    cfg.public_b_chunk_atoms = 1;
+    cfg.public_b_chunk_atoms = public_b_chunk_atoms;
     percolator_prog::state::init_market_account_zero_copy(
         &mut data,
         &wrapper,
@@ -1001,6 +1011,81 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     )
     .expect("manual percolator market init");
     data
+}
+
+fn install_public_loss_fixture(env: &mut Env, oracle_authority: &Pubkey) {
+    let mut data = make_live_market_with_public_chunk(
+        &env.slab,
+        &env.mint,
+        &env.pool,
+        100,
+        percolator::MAX_VAULT_TVL,
+    );
+    let (mut wrapper, _) = percolator_prog::state::read_market(&data).unwrap();
+    wrapper.marketauth = oracle_authority.to_bytes();
+    percolator_prog::state::write_wrapper_config(&mut data, &wrapper).unwrap();
+    let mut profile = percolator_prog::state::read_asset_oracle_profile(&data, 0).unwrap();
+    profile.oracle_authority = oracle_authority.to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(&mut data, 0, &profile).unwrap();
+
+    let mut account = env.svm.get_account(&env.slab).unwrap();
+    account.data = data;
+    env.svm.set_account(env.slab, account).unwrap();
+}
+
+fn create_percolator_portfolio(env: &mut Env, owner: &Keypair, capital: u64) -> Pubkey {
+    let portfolio = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![
+                    0u8;
+                    percolator_prog::state::portfolio_account_len_for_market_slots(1)
+                        .unwrap()
+                ],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data: percolator_prog::ix::Instruction::InitPortfolio.encode(),
+        }],
+        &[owner],
+    )
+    .expect("initialize public Percolator portfolio");
+
+    let payer = clone_kp(&env.payer);
+    let mint_auth = clone_kp(&env.mint_auth);
+    let source = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+    mint_to(&mut env.svm, &payer, &env.mint, &mint_auth, &source, capital);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::Deposit { amount: capital as u128 }.encode(),
+        }],
+        &[owner],
+    )
+    .expect("fund public Percolator portfolio");
+    portfolio
 }
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
@@ -1640,12 +1725,13 @@ fn principal_pool_late_deposit_does_not_socialize_an_earlier_loss() {
             (amount - 1..=amount).contains(&bob_received),
             "Bob's post-loss capital is protected in either exit order"
         );
+        let reserve = env.token_amount(&env.perc_vault);
+        assert_eq!(reserve, 1, "the share-floor remainder stays protocol insurance");
         assert_eq!(
-            alice_received + bob_received,
+            alice_received + bob_received + reserve,
             impaired + amount,
-            "the one-atom share-floor remainder cannot create or strand value"
+            "user payouts plus protocol reserve conserve the funded insurance"
         );
-        assert_eq!(env.token_amount(&env.perc_vault), 0);
         assert_eq!(env.pool_outstanding(), 0);
     }
 }
@@ -1852,12 +1938,12 @@ fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative
         "POLICY_WITH_SURPLUS pays principal + a pro-rata slice of the surplus (~1.5M), unlike POLICY_PRINCIPAL");
     assert_eq!(env.pool_outstanding(), amount, "alice's full principal left the outstanding accounting");
 
-    // Bob exits too and collects the remaining surplus slice. Both depositors share the 1M surplus pro-rata;
-    // together they withdraw ~all 3M (principal + full surplus), leaving only virtual-offset dust in insurance.
+    // Bob exits too and collects his own floored surplus slice. Neither exit may
+    // absorb the other's floor remainder; both atoms stay protocol insurance.
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
-    assert_eq!(env.token_amount(&bob_ata), 1_500_000, "bob collects his principal + the rest of the surplus pro-rata");
+    assert_eq!(env.token_amount(&bob_ata), 1_499_999, "bob collects his own pro-rata surplus slice without prior-exit dust");
     assert_eq!(env.pool_outstanding(), 0, "all principal retired");
-    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "the surplus was distributed pro-rata under POLICY_WITH_SURPLUS (1 atom to the virtual-share offset)");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2, "both whole-atom floor remainders remain protocol insurance");
 }
 
 // FREE-FARM PROBE (late depositor cannot capture pre-existing surplus, sweep tick B): POLICY_WITH_SURPLUS makes
@@ -1903,11 +1989,12 @@ fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
     assert_eq!(env.token_amount(&bob_ata), 999_999, "the late depositor recovers PRINCIPAL ONLY (1 atom to the offset) — he captured none of the pre-existing surplus");
 
-    // Alice (who bore the risk while the surplus built) exits and collects principal + ~the FULL surplus.
+    // Alice (who bore the risk while the surplus built) exits and collects her
+    // own floored claim without absorbing Bob's prior remainder.
     env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice exits");
-    assert_eq!(env.token_amount(&alice_ata), 2_000_000, "the early depositor collects principal + ~the full 1M surplus");
+    assert_eq!(env.token_amount(&alice_ata), 1_999_999, "the early depositor collects principal + the floored pre-existing surplus");
     assert_eq!(env.pool_outstanding(), 0, "all principal retired; no surplus leaked to the late joiner");
-    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "only 1 atom of virtual-offset dust remains; the surplus went to the early backer, never the late joiner");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2, "both users' floor remainders stay protocol insurance");
 }
 
 // POLICY_WITH_SURPLUS under a DOWNSIDE impairment — share-redemption haircut is ORDER-INDEPENDENT + CONSERVES
@@ -2185,8 +2272,8 @@ fn cannot_redeposit_into_a_retired_position() {
 // sophisticated exiter could try to beat their pro-rata share — or drain a co-depositor — by
 // splitting their exit into many small partial withdraws, hoping the per-chunk rounding accumulates
 // in their favour. Because each chunk FLOORS, splitting can only ever round DOWN: the splitter can
-// never exceed their single-shot share, and the rounding dust is left in the insurance fund for
-// whoever stays — never extracted. With an odd insurance (1,000,001) the dust is a real atom, so a
+// never exceed their single-shot share, and the rounding dust remains unowned protocol insurance
+// rather than becoming an exit-order reward. With an odd insurance (1,000,001) the dust is a real atom, so a
 // round-UP regression would let the splitter cross 500_000 and the vault would be over-drawn (the
 // co-depositor drained or the percolator CPI failing). Pins finding-L's conservation under the
 // realistic split attack — the existing test only does single lump-sum exits.
@@ -2219,6 +2306,207 @@ fn cannot_over_withdraw_to_drain_a_codepositor() {
     // bob can still exit with his full principal — it was never drained.
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits his own principal");
     assert_eq!(env.token_amount(&bob_ata), amount, "bob recovers his full 1M — not drained");
+}
+
+// PUBLIC LOF: whole-atom share redemption must not let the last exiter absorb every earlier
+// depositor's fractional claim. The venue loss below is produced entirely through the pinned
+// Percolator public interface; only the initial authority wiring is fixture state.
+#[test]
+fn impaired_exit_order_cannot_transfer_rounding_value_to_the_last_depositor() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    env.svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_insurance_pool();
+
+    let (attacker, attacker_ata) = new_depositor(&mut env, 3);
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let pool = env.pool;
+    let attacker_holding = create_holding(&mut env, &pool);
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, 3)
+        .expect("attacker deposits three insurance atoms");
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, 1)
+        .expect("victim deposits one insurance atom");
+    assert_eq!(asset_insurance_remaining(&env, 0), 4);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the legitimate authenticated mark");
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
+    let short_portfolio = create_percolator_portfolio(&mut env, &short, 200);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (2 * percolator::POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open the public long/short pair");
+
+    env.warp_slot(101);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 1_000,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("move the public mark against the undercapitalized short");
+
+    let crank = |env: &mut Env, portfolio: Pubkey, now_slot: u64| {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                data: PIx::PermissionlessCrank {
+                    now_slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                }
+                .encode(),
+            }],
+            &[],
+        )
+    };
+    crank(&mut env, long_portfolio, 101).expect("crank the winning side");
+    env.warp_slot(102);
+    crank(&mut env, long_portfolio, 102).expect("refresh the winning side");
+    env.warp_slot(103);
+    for _ in 0..2 {
+        crank(&mut env, short_portfolio, 103)
+            .expect("permissionless liquidation consumes only the funded domain");
+    }
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        3,
+        "the public liquidation spends one atom from its funded domain",
+    );
+
+    // Resolve and remove both public portfolios so the real Percolator withdrawal gate is clear.
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve the publicly impaired market");
+    for (owner, portfolio) in [(&long, long_portfolio), (&short, short_portfolio)] {
+        let payer = clone_kp(&env.payer);
+        let destination = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+        let mut last_resolved = None;
+        let mut last_close = None;
+        for _ in 0..512 {
+            last_resolved = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(env.vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    data: PIx::CloseResolved { fee_rate_per_slot: 0 }.encode(),
+                }],
+                &[owner],
+            ));
+            last_close = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    data: PIx::ClosePortfolio.encode(),
+                }],
+                &[owner],
+            ));
+            if last_close.as_ref().is_some_and(Result::is_ok) {
+                break;
+            }
+        }
+        assert!(
+            env.svm.get_account(&portfolio).map_or(true, |account| account.lamports == 0),
+            "resolved public portfolio must not remain a withdrawal gate: close_resolved={last_resolved:?}, close={last_close:?}",
+        );
+    }
+
+    // The victim exits first. Their fractional claim rounds down, but the aggregate rounding atom
+    // must become protocol reserve rather than increasing the attacker's later exchange rate.
+    env.insurance_withdraw(&victim, &victim_ata, &victim_holding, &victim, 1)
+        .expect("victim retires the impaired one-atom position");
+    env.insurance_withdraw(&attacker, &attacker_ata, &attacker_holding, &attacker, 3)
+        .expect("attacker retires last");
+    assert_eq!(env.token_amount(&victim_ata), 0);
+    assert_eq!(
+        env.token_amount(&attacker_ata),
+        2,
+        "last-exit ordering cannot transfer the victim's rounded claim to the attacker",
+    );
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        1,
+        "aggregate whole-atom rounding remains protocol insurance",
+    );
 }
 
 #[test]
@@ -2268,8 +2556,8 @@ fn splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor() 
         "a splitter can never exceed her floored 50% pro-rata share (got {alice_total})"
     );
 
-    // Bob, who never split, exits last and is NOT drained — he collects at least as much as the
-    // splitter, and the rounding atom the floor withheld from alice accrues to him.
+    // Bob, who never split, exits last and is NOT drained. Alice's floor remainder
+    // remains protocol insurance rather than becoming an exit-order reward for Bob.
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits whole");
     let bob_total = env.token_amount(&bob_ata);
     assert!(
@@ -2277,10 +2565,9 @@ fn splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor() 
         "the co-depositor who stayed is not drained by the splitter (bob {bob_total} >= alice {alice_total})"
     );
 
-    // Conservation: the two exits together distribute EXACTLY the impaired insurance — never more
-    // (no over-extraction) and the vault ends empty (no stranded principal).
-    assert_eq!(alice_total + bob_total, impaired as u64, "exactly the impaired insurance was paid out — no more");
-    assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "vault fully and fairly distributed");
+    let reserve = env.token_amount(&env.perc_vault);
+    assert_eq!(reserve, 1, "the aggregate floor remainder stays protocol insurance");
+    assert_eq!(alice_total + bob_total + reserve, impaired as u64, "payouts plus reserve conserve the impaired insurance");
 }
 
 // OVER-WITHDRAW DRAIN (principal-only cap, per-depositor): insurance_withdraw caps the amount to

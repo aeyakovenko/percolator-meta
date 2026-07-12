@@ -104,8 +104,10 @@ capital's own tenure.
   capital does not recapitalize an older position's historical loss and protocol-surplus pulls do
   not look like depositor losses. A deposit whose newly minted shares would be worth more than one
   base unit less than the deposit at the post-deposit price rejects before transfer, so virtual-share
-  rounding cannot silently consume material principal; governance still cannot redirect a depositor's
-  withdrawal.
+  rounding cannot silently consume material principal. Each exit rounds only that position's claim
+  down; enough unowned pricing shares remain to prevent a later exit from collecting the remainder.
+  Any final whole-atom remainder stays protocol insurance. Governance still cannot redirect a
+  depositor's withdrawal.
 
 ## Programs
 
