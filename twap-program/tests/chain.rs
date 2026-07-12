@@ -16339,6 +16339,14 @@ struct GenesisEnv {
     mint_auth: Keypair,
 }
 fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
+    setup_genesis_with_policy(svm, payer, POLICY_PRINCIPAL)
+}
+
+fn setup_genesis_with_policy(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    pool_policy: u8,
+) -> GenesisEnv {
     let squads = squads_id();
     let treasury = install_squads(svm, &squads, &payer.pubkey());
     let mint_auth = Keypair::new();
@@ -16397,14 +16405,14 @@ fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
         &slab,
         &perc_id(),
         &coin_mint,
-        POLICY_PRINCIPAL,
+        pool_policy,
         DOMAIN_INSURANCE,
     );
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
     let mut dp = vec![3u8];
     dp.extend_from_slice(&0u64.to_le_bytes());
-    dp.push(0);
+    dp.push(pool_policy);
     append_test_genesis_schedule(&mut dp);
     let init_pool = Instruction {
         program_id: sub_id(),
@@ -39926,6 +39934,15 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
 // another cleanup veto.
 #[test]
 fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
+    run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(POLICY_PRINCIPAL);
+}
+
+#[test]
+fn e2e_absent_with_surplus_voter_cannot_block_terminal_market_close() {
+    run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(POLICY_WITH_SURPLUS);
+}
+
+fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(pool_policy: u8) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -39942,7 +39959,7 @@ fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
-    let env = setup_genesis(&mut svm, &payer);
+    let env = setup_genesis_with_policy(&mut svm, &payer, pool_policy);
     let recipient = Pubkey::new_unique();
     let (dist_proposal, winner) =
         register_proposal(&mut svm, &payer, &env, 1, &recipient, 100);

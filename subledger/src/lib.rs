@@ -2021,7 +2021,6 @@ fn process_insurance_withdraw_impl(
             genesis_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
         if pool_account.data_len() < POOL_SIZE
             || position_account.data_len() < POSITION_SIZE
-            || pool.policy != POLICY_PRINCIPAL
             || pool.domain != DOMAIN_INSURANCE
             || pool.vote_authority != *genesis_config.key
             || *genesis_program.key != GENESIS_VOTE_PROGRAM_ID
