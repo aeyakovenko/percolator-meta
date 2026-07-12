@@ -127,8 +127,10 @@ The workspace pins `percolator-prog` to commit
 ## Genesis
 
 1. **Create the market.** Anyone initializes a market with the governance-bound controller PDA as
-   `marketauth`. Before user funding, Squads grants asset-0 custody to the canonical genesis pool;
-   the only governance-held asset role is the oracle role.
+   `marketauth`. The newly allocated slab keypair must co-sign, so another payer cannot consume a
+   preallocated market or bind its rent to hostile governance. Before user funding, Squads grants
+   asset-0 custody to the canonical genesis pool; the only governance-held asset role is the oracle
+   role.
 2. **Deposit window.** Deposits are accepted only during
    `[bootstrap_start, bootstrap_start + deposit_window)`. The default window is about one week and
    cannot extend past bootstrap end. Topping up resets that position's age.

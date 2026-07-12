@@ -13189,3 +13189,20 @@ the marginal rate. The bounded pass mutates the existing 32-slot allocation vect
 nominal preflight, preserving heap and compute bounds. Every enlarged pair is capped by escrow, remaining
 budget, and the bidder's submitted limit. No authority, destination, signer, custody path, principal counter,
 or admin surface was added.
+
+## Tick - unsigned preallocated market could be captured and reclaimed (surface A/C)
+
+The controller's permissionless market initializer required an arbitrary payer signature but not the
+preallocated market account's signature. A caller could therefore initialize another user's rent-funded blank
+Percolator slab with caller-selected governance. The resulting market authority was the controller PDA derived
+from that hostile governance key, giving the caller the only signer that could resolve, close, and reclaim the
+victim-funded slab rent.
+
+A fresh real-SBF LiteSVM regression creates the blank slab through the System Program with the victim market
+keypair, then submits controller tag 1 with only an unrelated attacker payer. The old controller binary accepts
+the call and consumes the victim's zeroed market account. The fixed regression requires byte-identical rejection,
+then proves the same permissionless initialization succeeds when the market keypair co-signs.
+
+FIX: controller market initialization now requires both the transaction payer and the writable market account to
+sign. This preserves permissionless creation, binds initialization to the account's creator, and adds no
+governance signer, admin authority, token destination, or user-fund movement.

@@ -3131,6 +3131,88 @@ fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
 }
 
 #[test]
+fn e2e_permissionless_market_init_cannot_consume_an_unsigned_preallocated_slab() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    let governance = Keypair::new();
+    let market = Keypair::new();
+    svm.airdrop(&victim.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &victim, &mint_authority.pubkey());
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    send(
+        &mut svm,
+        &[&victim, &market],
+        solana_sdk::system_instruction::create_account(
+            &victim.pubkey(),
+            &market.pubkey(),
+            1_000_000_000,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("victim preallocates a blank Percolator slab");
+
+    let controller = controller_pda(&governance.pubkey(), &market.pubkey(), &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    let blank_market = svm.get_account(&market.pubkey()).unwrap();
+    let attacker_init = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market.pubkey(), false),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: init_data.clone(),
+    };
+    assert!(
+        send(&mut svm, &[&attacker], attacker_init).is_err(),
+        "an arbitrary payer must not consume another user's rent-funded market account"
+    );
+    assert_eq!(
+        svm.get_account(&market.pubkey()).unwrap(),
+        blank_market,
+        "rejected initialization leaves the victim's slab byte-identical"
+    );
+
+    send(
+        &mut svm,
+        &[&victim, &market],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("the market keypair permissionlessly initializes its own slab");
+    assert_ne!(svm.get_account(&market.pubkey()).unwrap(), blank_market);
+}
+
+#[test]
 fn controller_can_restart_asset0_after_governed_shutdown() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -3156,7 +3238,8 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
 
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
-    let market = Pubkey::new_unique();
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
     svm.set_account(
         market,
         Account {
@@ -3177,14 +3260,14 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     init_data.extend_from_slice(&controller_init_market_data(1));
     send(
         &mut svm,
-        &[&payer],
+        &[&payer, &market_signer],
         Instruction {
             program_id: controller_id(),
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new_readonly(governance.pubkey(), false),
                 AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
             ],
@@ -6786,7 +6869,8 @@ fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
     svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
-    let slab = Pubkey::new_unique();
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
     svm.set_account(
         slab,
         Account {
@@ -6812,13 +6896,13 @@ fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new_readonly(governance.pubkey(), false),
             AccountMeta::new_readonly(controller, false),
-            AccountMeta::new(slab, false),
+            AccountMeta::new(slab, true),
             AccountMeta::new_readonly(collateral_mint, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
         data: init_data,
     };
-    send(&mut svm, &[&payer], init_market)
+    send(&mut svm, &[&payer, &slab_signer], init_market)
         .expect("any payer initializes the controller-owned appendable market");
 
     let proxy_activation = |insurance_authority: Pubkey, insurance_operator: Pubkey| {
@@ -7795,7 +7879,8 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
         &mint_authority.pubkey(),
         &freeze_authority.pubkey(),
     );
-    let slab = Pubkey::new_unique();
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
     svm.set_account(
         slab,
         Account {
@@ -7817,14 +7902,14 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
     init_data.extend_from_slice(&controller_init_market_data(1));
     send(
         &mut svm,
-        &[&payer],
+        &[&payer, &slab_signer],
         Instruction {
             program_id: controller_id(),
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new_readonly(governance.pubkey(), false),
                 AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(slab, false),
+                AccountMeta::new(slab, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
             ],
@@ -8206,7 +8291,8 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
     svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
-    let slab = Pubkey::new_unique();
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
     svm.set_account(
         slab,
         Account {
@@ -8229,14 +8315,14 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
     init_data.extend_from_slice(&controller_init_market_data(1));
     send(
         &mut svm,
-        &[&payer],
+        &[&payer, &slab_signer],
         Instruction {
             program_id: controller_id(),
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new_readonly(governance.pubkey(), false),
                 AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(slab, false),
+                AccountMeta::new(slab, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
             ],
@@ -9480,7 +9566,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
 
     let mint_authority = Keypair::new();
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
-    let slab = Pubkey::new_unique();
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
         svm.set_account(
             slab,
             Account {
@@ -9506,7 +9593,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
             AccountMeta::new_readonly(payer.pubkey(), true),
             AccountMeta::new_readonly(squads_vault, false),
             AccountMeta::new_readonly(controller, false),
-            AccountMeta::new(slab, false),
+            AccountMeta::new(slab, true),
             AccountMeta::new_readonly(collateral_mint, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -9516,7 +9603,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[init],
         Some(&payer.pubkey()),
-        &[&payer],
+        &[&payer, &slab_signer],
         bh,
     ))
     .expect("any payer can initialize a controller-governed market");
@@ -38384,7 +38471,8 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         &mint_authority.pubkey(),
         &freeze_authority.pubkey(),
     );
-    let market = Pubkey::new_unique();
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
     svm.set_account(
         market,
         Account {
@@ -38407,14 +38495,14 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     init_data.extend_from_slice(&controller_init_market_data(1));
     send(
         &mut svm,
-        &[&payer],
+        &[&payer, &market_signer],
         Instruction {
             program_id: controller_id(),
             accounts: vec![
                 AccountMeta::new_readonly(payer.pubkey(), true),
                 AccountMeta::new_readonly(governance.pubkey(), false),
                 AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
             ],

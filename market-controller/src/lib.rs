@@ -1900,9 +1900,11 @@ fn process_close_market_and_reclaim<'a>(
 }
 
 // init_market accounts:
-// [payer(s), governance, controller_pda, market(w), collateral_mint, percolator_program]
+// [payer(s), governance, controller_pda, market(s,w), collateral_mint, percolator_program]
 // data: exact raw Percolator InitMarket bytes. Governance need not sign, so market
 // creation is permissionless while future controller actions remain governance-gated.
+// The preallocated market must sign so a caller cannot consume another user's
+// rent-funded blank slab and bind its eventual reclaim to caller-selected governance.
 fn process_init_market<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1918,7 +1920,7 @@ fn process_init_market<'a>(
     let market = next_account_info(iter)?;
     let collateral_mint = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
-    if !payer.is_signer || iter.next().is_some() {
+    if !payer.is_signer || !market.is_signer || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
     let bump = controller_bump(
