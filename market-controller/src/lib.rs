@@ -17,6 +17,7 @@ use alloc::format;
 use alloc::vec;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
+    clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
@@ -25,6 +26,7 @@ use solana_program::{
     program_pack::Pack,
     pubkey::Pubkey,
     system_instruction,
+    sysvar::Sysvar,
 };
 
 declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
@@ -803,6 +805,17 @@ fn withdraw_backing_principal<'a>(
     )
 }
 
+fn reject_shutdown_return_after_stale_resolution_matures(market: &AccountInfo) -> ProgramResult {
+    let clock_slot = Clock::get()?.slot;
+    let market_data = market.try_borrow_data()?;
+    if percolator_accounting::permissionless_resolution_matured(&market_data, clock_slot)
+        .map_err(|_| ProgramError::InvalidAccountData)?
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 // return_shutdown_backing accounts:
 // [governance, controller_pda, market(w), provider_owned_token_account(w),
 //  controller_owned_transit(w), percolator_vault(w), vault_authority,
@@ -860,6 +873,7 @@ fn process_return_shutdown_backing<'a>(
         market,
         percolator_program,
     )?;
+    reject_shutdown_return_after_stale_resolution_matures(market)?;
     let provider = {
         let market_data = market.try_borrow_data()?;
         let authority = percolator_accounting::read_asset_backing_authority(
@@ -988,6 +1002,7 @@ fn process_return_shutdown_insurance<'a>(
         market,
         percolator_program,
     )?;
+    reject_shutdown_return_after_stale_resolution_matures(market)?;
     let (provider, amount, controller_owned) = {
         let market_data = market.try_borrow_data()?;
         if percolator_accounting::read_market_authority(&market_data)
