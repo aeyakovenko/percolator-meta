@@ -74,8 +74,10 @@ const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
+const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_ACTION_ACTIVATE: u8 = 0;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
+const RESTART_ASSET_ORACLE_LEN: usize = 19;
 const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
 const ACTIVATE_INSURANCE_OPERATOR_OFFSET: usize = 52;
 const ASSET_AUTH_INSURANCE: u8 = 1;
@@ -384,6 +386,21 @@ fn validate_admin_instruction_data(data: &[u8], controller: &Pubkey) -> ProgramR
     Ok(())
 }
 
+fn restart_asset_index(data: &[u8]) -> Result<Option<usize>, ProgramError> {
+    if data.first().copied() != Some(PERC_IX_RESTART_ASSET_ORACLE) {
+        return Ok(None);
+    }
+    if data.len() != RESTART_ASSET_ORACLE_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let index = data
+        .get(1..3)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    Ok(Some(usize::from(u16::from_le_bytes([
+        index[0], index[1],
+    ]))))
+}
+
 pub fn process_instruction<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -448,6 +465,19 @@ fn process_proxy_admin<'a>(
         market,
         percolator_program,
     )?;
+    if let Some(asset_index) = restart_asset_index(data)? {
+        let market_data = market.try_borrow_data()?;
+        let controller_key = controller.key.to_bytes();
+        if percolator_accounting::read_asset_insurance_authority(&market_data, asset_index)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != controller_key
+            || percolator_accounting::read_asset_insurance_operator(&market_data, asset_index)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != controller_key
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+    }
 
     let tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
     let controller_meta = if controller.is_writable {
@@ -2372,6 +2402,29 @@ mod tests {
             validate_admin_instruction_data(&lifecycle_transition, &controller),
             Ok(())
         );
+    }
+
+    #[test]
+    fn restart_parser_accepts_only_the_pinned_wire_shape() {
+        let mut restart = vec![PERC_IX_RESTART_ASSET_ORACLE];
+        restart.extend_from_slice(&7u16.to_le_bytes());
+        restart.extend_from_slice(&100u64.to_le_bytes());
+        restart.extend_from_slice(&1_000_000u64.to_le_bytes());
+        assert_eq!(restart.len(), RESTART_ASSET_ORACLE_LEN);
+        assert_eq!(restart_asset_index(&restart), Ok(Some(7)));
+
+        let mut truncated = restart.clone();
+        truncated.pop();
+        assert_eq!(
+            restart_asset_index(&truncated),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        restart.push(0);
+        assert_eq!(
+            restart_asset_index(&restart),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        assert_eq!(restart_asset_index(&[19]), Ok(None));
     }
 
     #[test]

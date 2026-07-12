@@ -326,7 +326,10 @@ use permissionless controller initialization followed by governance-approved ass
 insurance roles stay on the constrained controller, while external backing and oracle providers remain
 independently selectable. This prevents an unfunded raw key from collecting user-paid trade fees.
 The same constrained proxy can restart an empty recovering asset through Percolator's value-neutral
-restart instruction; it cannot choose a recipient or move insurance/backing while doing so.
+restart instruction only while both insurance roles remain on the controller; it cannot choose a
+recipient or move insurance/backing while doing so. A deployed predecessor asset that still names an
+external insurance key can finish recovery and retire, but cannot reopen and credit that zero-capital
+key with fees from a new lifecycle.
 Here, empty means every Percolator position, funding, loss, spent-budget, backing, and reservation
 ledger is zero, not only zero OI. A previously traded slot with residual K/F accumulators cannot use
 restart and must complete terminal recovery before governance initializes a fresh controller market.

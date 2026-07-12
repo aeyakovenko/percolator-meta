@@ -2,6 +2,92 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - restart revived a zero-capital legacy fee operator (surface A/C)
+
+Predecessor controller activation and donation paths could leave matched external insurance roles on
+an otherwise controller-governed asset. The external provider could publicly deposit and withdraw all
+principal, governance could shut down and restart the empty asset, and pinned
+`RestartAssetOracle` preserved that zero-capital key as the live operator. Two ordinary public trades
+then generated 120 fee atoms that the stale key could withdraw despite risking no capital in the new
+lifecycle.
+
+The clean-room LiteSVM regression starts from the exact predecessor-compatible role layout, performs
+the provider's public deposit and full exit, then executes governed shutdown and restart against the
+real pinned Percolator SBF. On the vulnerable controller it completes a funded public trade round trip
+and proves the stale key withdraws the complete 120-atom fee balance.
+
+FIX: the constrained governance proxy now forwards `RestartAssetOracle` only when both selected-asset
+insurance roles already equal the controller PDA. Existing controller-owned restart remains unchanged.
+Legacy external-role assets can still complete provider-bound recovery and retire, but must activate a
+fresh controller-insured slot instead of carrying an unfunded fee recipient into a new lifecycle. The
+guard adds no signer, destination, amount, role mutation, or value-moving instruction.
+
+## Tick - restart preserved a one-shot insurance operator and blocked later retirement (surface A/C)
+
+Controller-owned secondary insurance cleanup temporarily installed an instruction-scoped PDA as
+the local insurance operator to force Percolator's delayed market-authority shutdown path. The
+withdrawal emptied the first fee balance but left that PDA installed. Pinned
+`RestartAssetOracle` intentionally preserves all asset roles, so a legitimate governance restart
+carried the one-shot operator into the next active lifecycle. Public round-trip trades could then
+recreate fee insurance, but the controller no longer classified it as controller-owned and neither
+public cleanup account shape could return it. One 120-atom fee cycle permanently blocked secondary
+retirement unless governance resolved the entire market.
+
+The clean-room LiteSVM regression runs two complete lifecycles against the real pinned Percolator
+SBF. It creates fees through funded public trades, matures shutdown, returns the exact balance via a
+clean fallback because the canonical transit is permanently frozen, restarts the oracle, recreates
+the same fee balance, and repeats shutdown, cleanup, and retirement. It verifies both cleanup
+account shapes, both one-shot transit closures, and exact conservation of all trader collateral and
+the two 120-atom fee balances.
+
+FIX: after Percolator accepts the delayed full insurance withdrawal, the controller atomically
+restores itself as local operator before retaining or forwarding the withdrawn tokens. The restore
+runs only after the slab-derived balance reaches zero and any later forwarding failure rolls the
+whole transaction back. It adds no instruction, signer, destination, amount, or reusable external
+authority and preserves Percolator's shutdown delay by construction.
+
+## Tick - stale donated-market operator could skim later trade fees (surface A/C)
+
+An empty creator market could donate `marketauth` to the controller while preserving an unrelated
+asset-0 insurance operator. The controller's inbound donation path correctly rejected that shape,
+but ordinary trades credit fee insurance directly. The old operator therefore was not inert: after
+handoff, two public round-trip trades created 120 fee atoms and the stale key withdrew all 120 from
+the controller-governed market through pinned Percolator's public insurance-withdraw instruction.
+
+The clean-room LiteSVM regression uses the real Percolator SBF for the complete public sequence:
+creator market initialization, operator delegation, lifecycle donation, two funded trader
+portfolios, a round trip that pays fees, and the stale operator's successful withdrawal. It fails on
+the vulnerable controller only after proving the attacker received the exact fee balance.
+
+FIX: market donation now requires the asset-0 insurance authority and operator to be the same key
+regardless of the current insurance balance. This changes no role and adds no signer or recovery
+surface; it rejects the unsafe handoff byte-atomically. Canonical Subledger/TWAP custody already uses
+one constrained PDA for both roles, and external providers retain their original matched custody.
+
+## Tick - frozen controller ATA could block protocol-insurance cleanup (surface A/C)
+
+The fixed provider-return paths already tolerated a collateral issuer permanently freezing a
+canonical token account, but the newest controller-owned insurance path required the canonical
+controller ATA. A freeze-authority holder could freeze that empty ATA, revoke the freeze key, and
+leave asset-local fee insurance with no valid withdrawal destination. The balance then prevented a
+secondary asset from retiring after its shutdown delay; the same hard pin blocked terminal cleanup
+after whole-market resolution.
+
+Clean-room LiteSVM regressions exercise both public branches against the pinned Percolator SBF. One
+creates secondary fee insurance through real round-trip trades and matures the governed shutdown;
+the other publicly donates asset-0 insurance and resolves the stale market. Each permanently freezes
+the canonical controller ATA, proves that path fails byte-atomically, and completes cleanup through
+a fresh controller-owned transit. Attacker-owned destinations and preloaded replacement transits
+reject without changing the slab or vault. The accepted fallback pays only a clean account owned by
+the governance key, closes in the same transaction, and preserves every trader collateral atom.
+
+FIX: canonical retention remains unchanged. For controller-owned insurance only, shutdown and
+resolved cleanup may alternatively use an empty clean controller transit plus a clean
+governance-owned destination of the same mint. The amount is still the complete slab-derived
+asset-local balance, and the replacement is forwarded and closed atomically. A public caller gains
+no amount, provider, user-principal, reusable signer, or attacker recipient surface and cannot split
+protocol custody across fallback accounts.
+
 ## Tick - controller-owned secondary fee insurance could block asset retirement (surface A/C)
 
 Secondary activation may intentionally bind both insurance roles to the constrained controller.
