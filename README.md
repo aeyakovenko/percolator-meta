@@ -165,15 +165,16 @@ TWAP rounds are externally cranked. Each round pulls only asset-0's live insuran
 the configured insurance share by ratcheting the floor upward, and buys COIN at one marginal
 clearing price. Whole-atom fills reconcile the USD payout to the integer COIN actually bought; every
 executed pair must still satisfy both the bidder's limit and the DAO reserve. Reconciliation releases
-fully refunded nominal allocations to lower executable bids in the same round. A bounded final-price
-replay also restores skipped priority bids when they buy more COIN for the same spend while preserving
-the marginal lot. Ordinary integer rounding remains in holding for a later round. A bid that cannot
-transact a whole-atom pair cannot reserve nominal budget or set the marginal price. If every eligible
-bid is integer-infeasible, the aged book settles for permissionless refunds without spending
-collateral. Insurance deposited for other assets is never counted toward that surplus. Bought COIN
-can be split between burn and a canonical dynamic reward vault. The collateral savings reserve must
-be distinct from the auction holding; an aliased configuration fails atomically before either
-surplus pull, so savings cannot enlarge the buy budget.
+fully refunded nominal allocations to lower executable bids in the same round and maximizes COIN at
+each unchanged USD payment even when no aggregate remainder remains. A bounded final-price replay also
+restores skipped priority bids when they buy more COIN for the same spend while preserving the marginal
+lot. Ordinary integer rounding remains in holding for a later round. A bid that cannot transact a
+whole-atom pair cannot reserve nominal budget or set the marginal price. If every eligible bid is
+integer-infeasible, the aged book settles for permissionless refunds without spending collateral.
+Insurance deposited for other assets is never counted toward that surplus. Bought COIN can be split
+between burn and a canonical dynamic reward vault. The collateral savings reserve must be distinct
+from the auction holding; an aliased configuration fails atomically before either surplus pull, so
+savings cannot enlarge the buy budget.
 
 The full chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
 vault and burns 50%. At day 45 the accumulated reward vault distributes:
