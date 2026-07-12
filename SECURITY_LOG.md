@@ -13141,3 +13141,23 @@ refund, settlement, and holding conservation check. The host-side exhaustive ora
 FIX: equal-USD candidates remain eligible until the solver proves that its current pair also has the largest
 possible COIN numerator. The same tie-break is applied to the bounded denominator projection. This changes no
 authority, destination, signer, custody path, bid cap, principal counter, or admin surface.
+
+## Tick - public shutdown returns could race the stale-resolution snapshot (surface A/C)
+
+Percolator freezes live value withdrawals once whole-market stale resolution becomes permissionless, but its
+empty secondary-asset shutdown branch returned before that freeze. The controller exposed that marketauth-only
+branch through signerless insurance and backing return cranks. A public caller could therefore remove a
+provider's backstop immediately before resolution, changing which balances and losses the terminal snapshot
+contained even though neither the provider nor governance consented to that ordering.
+
+A retained pinned-Percolator + controller LiteSVM regression configures a 50-slot stale threshold and five-slot
+asset shutdown delay, funds an external provider's secondary asset with 100 insurance and 100 backing units,
+shuts it down at slot 101, and reaches the exact global stale boundary at slot 150. Both public controller calls
+succeeded against the old SBF and consumed all 200 units. The fixed test requires byte-identical rejection,
+then permissionlessly resolves and returns the preserved 200 units through the constrained resolved paths.
+
+FIX: both controller shutdown-return instructions now apply the pinned whole-market stale predicate before any
+role rotation or value CPI. The read-only accounting view uses `max(Clock.slot, market.current_slot)` and the
+exact inclusive boundary used by Percolator; layout canaries bind both wrapper offsets to the Cargo-pinned
+program type. This adds no signer, authority, destination, amount selector, or admin surface. Direct calls by
+upstream Percolator role holders remain covered by percolator-prog issue #207 and require an upstream fix.

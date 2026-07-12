@@ -15,6 +15,9 @@ pub const INSURANCE_OFFSET: usize =
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
 // Pinned `WrapperConfigV16::permissionless_market_init_fee` relative to the account.
 pub const PERMISSIONLESS_MARKET_INIT_FEE_OFFSET: usize = HEADER_LEN + 112;
+// Pinned `WrapperConfigV16` global stale-resolution fields relative to the account.
+pub const PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET: usize = HEADER_LEN + 136;
+pub const LAST_GOOD_ORACLE_SLOT_OFFSET: usize = HEADER_LEN + 152;
 // Pinned `WrapperConfigV16::free_market_slot_count` relative to the account.
 // The wrapper config starts after the 16-byte account header; this field follows
 // its authority/mint, fee, resolve, insurance-withdraw, and oracle-policy prefix.
@@ -130,6 +133,29 @@ pub fn read_market_authority(data: &[u8]) -> Result<[u8; 32], ReadError> {
 pub fn read_permissionless_market_init_fee(data: &[u8]) -> Result<u128, ReadError> {
     validate_market(data)?;
     read_u128(data, PERMISSIONLESS_MARKET_INIT_FEE_OFFSET)
+}
+
+/// Returns whether Percolator's whole-market stale resolution is permissionless now.
+///
+/// Percolator authenticates instruction-supplied slots against both the Clock sysvar
+/// and its monotonic market slot. Controller value paths must use the same maximum so
+/// they cannot race a resolution snapshot using a lagging Clock or market header.
+pub fn permissionless_resolution_matured(
+    data: &[u8],
+    clock_slot: u64,
+) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    let stale_slots = read_u64(data, PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET)?;
+    if stale_slots == 0 {
+        return Ok(false);
+    }
+    let market_slot = read_u64(
+        data,
+        MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, current_slot),
+    )?;
+    let now_slot = clock_slot.max(market_slot);
+    let last_good_oracle_slot = read_u64(data, LAST_GOOD_ORACLE_SLOT_OFFSET)?;
+    Ok(now_slot.saturating_sub(last_good_oracle_slot) >= stale_slots)
 }
 
 /// Returns true when asset 0 is the only non-retired configured slot.
@@ -290,4 +316,38 @@ pub fn read_asset_insurance_remaining(data: &[u8], asset_index: usize) -> Result
         })
         .ok_or(ReadError::InvalidAccounting)?;
     Ok(remaining.min(read_u128(data, INSURANCE_OFFSET)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn market_with_stale_slots(stale_slots: u64, last_good: u64, market_slot: u64) -> Vec<u8> {
+        let mut data = vec![0u8; MARKET_GROUP_OFFSET + size_of::<MarketGroupV16HeaderAccount>()];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..10].copy_from_slice(&VERSION.to_le_bytes());
+        data[10] = KIND_MARKET;
+        data[PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET
+            ..PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET + 8]
+            .copy_from_slice(&stale_slots.to_le_bytes());
+        data[LAST_GOOD_ORACLE_SLOT_OFFSET..LAST_GOOD_ORACLE_SLOT_OFFSET + 8]
+            .copy_from_slice(&last_good.to_le_bytes());
+        let current_slot =
+            MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, current_slot);
+        data[current_slot..current_slot + 8].copy_from_slice(&market_slot.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn stale_resolution_uses_the_authenticated_slot_and_exact_boundary() {
+        let disabled = market_with_stale_slots(0, 100, 1_000);
+        assert!(!permissionless_resolution_matured(&disabled, 1_000).unwrap());
+
+        let by_clock = market_with_stale_slots(50, 100, 149);
+        assert!(!permissionless_resolution_matured(&by_clock, 149).unwrap());
+        assert!(permissionless_resolution_matured(&by_clock, 150).unwrap());
+
+        let by_market = market_with_stale_slots(50, 100, 150);
+        assert!(permissionless_resolution_matured(&by_market, 149).unwrap());
+    }
 }
