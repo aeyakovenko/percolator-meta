@@ -13243,3 +13243,24 @@ the protocol balance so future deposit epochs price final whole-atom insurance w
 minimum deposits.
 Overflow-safe wide division and an exhaustive maximal-burn test cover the full-width arithmetic. No
 account, signer, authority, recipient, amount selector, or administrative withdrawal path was added.
+
+## Tick - withdrawn creator could retain the post-handoff fee key (surface A/C)
+
+Market donation preserved a funded outgoing creator as asset-0 insurance authority and operator.
+After the controller accepted lifecycle authority, the creator could publicly withdraw its complete
+principal while both insurance roles remained unchanged. Ordinary public trades then accrued new fee
+insurance to that same asset, letting the zero-capital former creator withdraw value paid by later
+users without continuing to back the market.
+
+A retained pinned-Percolator + controller LiteSVM regression deposits 100 insurance atoms, proves the
+old funded handoff succeeds, withdraws all 100, opens and closes a real public long/short pair, and
+observes 120 new fee atoms. The old SBF lets the former creator withdraw all 120. The fixed regression
+requires the funded donation to reject byte-atomically, proves the creator can still recover all 100
+through Percolator, repeats the same donation while empty, verifies both roles migrate to the
+controller, and rejects the former creator's withdrawal after the identical fee-producing round trip.
+
+FIX: a raw outgoing market authority must exit nonzero asset-0 insurance before donating lifecycle
+control. Pinned Percolator then migrates its empty insurance authority and operator to the constrained
+controller during the same existing handoff. Canonical Subledger/TWAP custody and the recorded backing
+provider remain supported. No signer, authority setter, destination, amount selector, custody account,
+withdrawal instruction, or administrative surface was added.
