@@ -19,6 +19,19 @@ use residual_distributor::{
     OFF_PORTFOLIO_RECEIVED, OFF_PORTFOLIO_SPENT, PERC_HEADER_LEN,
 };
 
+#[test]
+fn maintenance_fee_offset_matches_the_pinned_percolator_wrapper() {
+    assert_eq!(
+        percolator_accounting::MAINTENANCE_FEE_PER_SLOT_OFFSET,
+        percolator_accounting::HEADER_LEN
+            + offset_of!(
+                percolator_prog::state::WrapperConfigV16,
+                maintenance_fee_per_slot
+            ),
+        "registration's immutable maintenance-fee gate must track the pinned wrapper layout"
+    );
+}
+
 // OVERFLOW SAFETY + EXACTNESS of the pro-rata split: total_supply (u64) * points_i (u128) can exceed u128 when
 // points_i is large. points_to_amount must never panic/wrap, and must preserve the exact floor quotient rather
 // than saturating the intermediate and permanently locking a claimant's COIN.

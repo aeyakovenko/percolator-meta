@@ -34656,6 +34656,7 @@ fn rd_register_ix(
             rd_portfolio_archive_pda(market, owner, linked),
             false,
         ));
+        accounts.push(AccountMeta::new_readonly(*market, false));
     }
     Instruction {
         program_id: rd_id(),
@@ -35346,6 +35347,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 rd_portfolio_archive_pda(&slab, &long_payer.pubkey(), &long_payer_pf),
                 false,
             ),
+            AccountMeta::new_readonly(slab, false),
         ],
         data: vec![1u8, 4u8],
     }; // COHORT_FUNDING_PAYER
@@ -35369,6 +35371,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ),
                 false,
             ),
+            AccountMeta::new_readonly(slab, false),
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
@@ -35387,6 +35390,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 rd_portfolio_archive_pda(&slab, &short_payer.pubkey(), &short_payer_pf),
                 false,
             ),
+            AccountMeta::new_readonly(slab, false),
         ],
         data: vec![1u8, 4u8],
     }; // COHORT_FUNDING_PAYER
@@ -35410,6 +35414,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ),
                 false,
             ),
+            AccountMeta::new_readonly(slab, false),
         ],
         data: vec![1u8, 4u8],
     }; // receiver-only account in COHORT_FUNDING_PAYER
@@ -35428,6 +35433,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 rd_portfolio_archive_pda(&slab, &dual_payer.pubkey(), &dual_payer_pf),
                 false,
             ),
+            AccountMeta::new_readonly(slab, false),
         ],
         data: vec![1u8, 4u8],
     };
@@ -35451,6 +35457,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
                 ),
                 false,
             ),
+            AccountMeta::new_readonly(slab, false),
         ],
         data: vec![1u8, 4u8],
     };
@@ -38649,10 +38656,15 @@ fn e2e_ewma_mark_move_is_bounded_by_collected_trade_fees() {
     }
 }
 
-fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
-    maintenance_fee_cleanup: bool,
-) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OrganicRewardCleanup {
+    None,
+    BeforeCrystallize,
+}
+
+fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCleanup) {
     use percolator_prog::ix::Instruction as PIx;
+    let maintenance_fee_cleanup = cleanup != OrganicRewardCleanup::None;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -38934,28 +38946,117 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
     // register the `loser` as a TRADER *before* the loss (start snapshot = 0).
     let t_stake = rd_stake_pda(&rd_config, &loser.pubkey(), &loser_pf, 3);
     let loser_archive = rd_portfolio_archive_pda(&market, &loser.pubkey(), &loser_pf);
+    let zero_fee_decoy = if cleanup == OrganicRewardCleanup::BeforeCrystallize {
+        let decoy = Pubkey::new_unique();
+        svm.set_account(
+            decoy,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; mlen],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(decoy, false),
+                    AccountMeta::new_readonly(collateral, false),
+                ],
+                PIx::InitMarket {
+                    max_portfolio_assets: 1,
+                    h_min: 0,
+                    h_max: 10,
+                    initial_price,
+                    min_nonzero_mm_req: 1,
+                    min_nonzero_im_req: 2,
+                    maintenance_margin_bps: 10_000,
+                    initial_margin_bps: 10_000,
+                    max_trading_fee_bps: 10_000,
+                    trade_fee_base_bps: 0,
+                    liquidation_fee_bps: 0,
+                    liquidation_fee_cap: 0,
+                    min_liquidation_abs: 0,
+                    max_price_move_bps_per_slot: 10_000,
+                    max_accrual_dt_slots: 1,
+                    max_abs_funding_e9_per_slot: 0,
+                    min_funding_lifetime_slots: 1,
+                    max_account_b_settlement_chunks: 1,
+                    max_bankrupt_close_chunks: 1,
+                    max_bankrupt_close_lifetime_slots: 100,
+                    public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                    maintenance_fee_per_slot: 0,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &admin],
+            bh,
+        ))
+        .expect("initialize a valid zero-fee substitution market");
+        Some(decoy)
+    } else {
+        None
+    };
+    let register_ix = |supplied_market| Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new_readonly(loser.pubkey(), true),
+            AccountMeta::new_readonly(loser.pubkey(), false),
+            AccountMeta::new_readonly(loser_pf, false),
+            AccountMeta::new(t_stake, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(loser_archive, false),
+            AccountMeta::new_readonly(supplied_market, false),
+        ],
+        data: vec![1u8, 3u8],
+    };
+    if let Some(decoy) = zero_fee_decoy {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        let substituted = svm.send_transaction(Transaction::new_signed_with_payer(
+            &[register_ix(decoy)],
+            Some(&payer.pubkey()),
+            &[&payer, &loser],
+            bh,
+        ));
+        assert!(
+            substituted.is_err(),
+            "a valid zero-fee market cannot substitute for the portfolio's provenance market"
+        );
+        assert!(svm.get_account(&t_stake).is_none());
+    }
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(
-        &[Instruction {
-            program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(rd_config, false),
-                AccountMeta::new_readonly(loser.pubkey(), true),
-                AccountMeta::new_readonly(loser.pubkey(), false),
-                AccountMeta::new_readonly(loser_pf, false),
-                AccountMeta::new(t_stake, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(loser_archive, false),
-            ],
-            data: vec![1u8, 3u8],
-        }],
+    let registration = svm.send_transaction(Transaction::new_signed_with_payer(
+        &[register_ix(market)],
         Some(&payer.pubkey()),
         &[&payer, &loser],
         bh,
-    ))
-    .expect("register loser (trader)");
+    ));
+    if cleanup == OrganicRewardCleanup::BeforeCrystallize {
+        assert!(
+            registration.is_err(),
+            "a portfolio on a publicly dematerializable maintenance-fee market cannot enter a reward epoch"
+        );
+        assert!(
+            svm.get_account(&t_stake).is_none(),
+            "rejected registration creates no denominator-bearing stake"
+        );
+        assert!(
+            svm.get_account(&loser_pf)
+                .is_some_and(|account| !account.data.is_empty()),
+            "registration rejection leaves the user's real portfolio untouched"
+        );
+        return;
+    }
+    registration.expect("register loser (trader)");
     assert_eq!(
         read_portfolio_crystallized(&svm, &loser_pf),
         0,
@@ -39052,7 +39153,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         "the settled loss organically bumped crystallized_loss (got {crystallized})"
     );
 
-    // ---- crystallize (Δ = the organic loss), freeze, claim -> the trader cohort earns it ----
+    // ---- crystallize (delta = the organic loss), freeze, claim -> the trader cohort earns it ----
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -39432,12 +39533,14 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
 
 #[test]
 fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
-    run_organic_pnl_loss_real_trade_feeds_trader_cohort(false);
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(OrganicRewardCleanup::None);
 }
 
 #[test]
-fn e2e_public_maintenance_close_cannot_lock_frozen_trader_reward() {
-    run_organic_pnl_loss_real_trade_feeds_trader_cohort(true);
+fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(
+        OrganicRewardCleanup::BeforeCrystallize,
+    );
 }
 
 // PUBLIC DOS: a canonical TWAP handoff preserves retained protocol insurance above depositor

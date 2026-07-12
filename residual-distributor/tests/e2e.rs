@@ -3368,6 +3368,27 @@ fn portfolio_market(svm: &LiteSVM, env: &Env, portfolio: &Pubkey) -> Pubkey {
         .unwrap_or(env.market)
 }
 
+fn ensure_mock_market(svm: &mut LiteSVM, percolator: &Pubkey, market: &Pubkey) {
+    if svm.get_account(market).is_some() {
+        return;
+    }
+    let mut data = vec![0u8; 16 + 448];
+    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+    data[8..10].copy_from_slice(&16u16.to_le_bytes());
+    data[10] = 1;
+    svm.set_account(
+        *market,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: *percolator,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
 fn portfolio_archive_pda(
     svm: &LiteSVM,
     env: &Env,
@@ -3466,10 +3487,13 @@ fn register(
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
     ];
     if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        let market = portfolio_market(svm, env, linked);
+        ensure_mock_market(svm, &env.stub_perc, &market);
         accounts.push(AccountMeta::new_readonly(
             portfolio_archive_pda(svm, env, &owner.pubkey(), linked),
             false,
         ));
+        accounts.push(AccountMeta::new_readonly(market, false));
     }
     if svm.get_account(&env.rd_config).unwrap().data.len() == 823 {
         let legacy_owner_stake = Pubkey::find_program_address(
@@ -11466,6 +11490,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
             &rd_id(),
         )
         .0;
+        ensure_mock_market(svm, &stub_perc, &market);
         send(
             svm,
             &payer,
@@ -11480,6 +11505,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
                     AccountMeta::new(stake, false),
                     AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                     AccountMeta::new_readonly(archive, false),
+                    AccountMeta::new_readonly(market, false),
                 ],
                 data: vec![1u8, COHORT_LP],
             }],
