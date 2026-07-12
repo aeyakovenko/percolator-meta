@@ -3030,7 +3030,7 @@ fn make_live_market_with_options(
         percolator_prog::constants::DEFAULT_MARK_EWMA_HALFLIFE_SLOTS
     };
     wrapper.oracle_target_price_e6 = initial_price;
-    // Genesis market fees (product decision):
+    // Predecessor funded-handoff fixture:
     //  - 3 bps per trade (asset yield) + 3 bps backing trade fee (backing yield). The per-trade fee is the
     //    Sybil-flat cost that scales the delta-neutral wash-farm by its size regardless of how many anon
     //    accounts it splits into (no per-participant cap is enforceable under anonymity).
@@ -3071,13 +3071,10 @@ fn make_live_market_with_options(
     data
 }
 
-// PRODUCT DECISION (genesis market fees): the genesis market is initialized with a 3 bps per-trade fee
-// (asset + backing yield) and 20% of all that yield routed to asset-0 insurance. The per-trade fee is the
-// Sybil-flat cost that bounds the delta-neutral wash-farm (no per-participant cap is enforceable under
-// anonymity); the 20% insurance share funds the backstop the residual cohorts reward. This pins the exact
-// values the market is actually born with (read back via the real percolator config reader).
+// Upgrade fixture: predecessor markets could enter TWAP custody with active backing fees. Keep the
+// exact state so the zero-only current wrappers continuously prove that those policies remain clearable.
 #[test]
-fn genesis_market_initialized_with_3bps_fee_and_20pct_yield_to_insurance() {
+fn predecessor_market_fixture_preserves_backing_fee_recovery_state() {
     let data = make_live_market(
         &Pubkey::new_unique(),
         &Pubkey::new_unique(),
@@ -3419,6 +3416,301 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
         value_before,
         "restart moves no collateral or insurance"
     );
+}
+
+// PUBLIC POSITION DOS PROBE: the pinned Percolator rejects every atomic batch while any backing
+// fee policy is active. A cross-margined user may need a final-state-only batch because either
+// standalone rotation leg exceeds initial margin. The controller must therefore reject nonzero
+// policies until the pinned program includes batch-safe backing-fee accounting.
+#[test]
+fn e2e_controller_cannot_enable_the_pinned_global_batch_gate() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(2).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(
+        &PIx::InitMarket {
+            max_portfolio_assets: 2,
+            h_min: 0,
+            h_max: 10,
+            initial_price: 100,
+            min_nonzero_mm_req: 1,
+            min_nonzero_im_req: 2,
+            maintenance_margin_bps: 10_000,
+            initial_margin_bps: 10_000,
+            max_trading_fee_bps: 10_000,
+            trade_fee_base_bps: 0,
+            liquidation_fee_bps: 0,
+            liquidation_fee_cap: 0,
+            min_liquidation_abs: 0,
+            max_price_move_bps_per_slot: 500,
+            max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 1,
+            max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1,
+            max_bankrupt_close_lifetime_slots: 100,
+            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+            maintenance_fee_per_slot: 0,
+        }
+        .encode(),
+    );
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless two-asset controller market init");
+
+    let proxy = |raw: Vec<u8>| {
+        let mut data = vec![0u8]; // controller IX_PROXY_ADMIN
+        data.extend_from_slice(&raw);
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let taker = Keypair::new();
+    let lp = Keypair::new();
+    let taker_portfolio = Pubkey::new_unique();
+    let lp_portfolio = Pubkey::new_unique();
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    for (owner, portfolio, capital) in [
+        (&taker, taker_portfolio, 8_000u64),
+        (&lp, lp_portfolio, 1_000_000u64),
+    ] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize cross-margin portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            capital,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: capital as u128,
+                },
+            ),
+        )
+        .expect("fund cross-margin portfolio");
+    }
+
+    let size_q = (80 * percolator::POS_SCALE) as i128;
+    send(
+        &mut svm,
+        &[&payer, &lp, &taker],
+        pix(
+            vec![
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(lp_portfolio, false),
+                AccountMeta::new(taker_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q,
+                exec_price: 100,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("open the taker's asset-0 short");
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &taker, &lp],
+            pix(
+                vec![
+                    AccountMeta::new(taker.pubkey(), true),
+                    AccountMeta::new(lp.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(taker_portfolio, false),
+                    AccountMeta::new(lp_portfolio, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 1,
+                    size_q,
+                    exec_price: 100,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .is_err(),
+        "the first standalone rotation leg must exceed initial margin"
+    );
+
+    let market_before_policy = svm.get_account(&market).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            proxy(
+                PIx::UpdateBackingFeePolicy {
+                    domain: 0,
+                    fee_bps: 77,
+                    insurance_share_bps: 5_000,
+                }
+                .encode(),
+            ),
+        )
+        .is_err(),
+        "governance must not be able to activate the pinned global batch gate"
+    );
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_policy,
+        "rejected policy activation is byte-atomic"
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateBackingFeePolicy {
+                domain: 0,
+                fee_bps: 0,
+                insurance_share_bps: 0,
+            }
+            .encode(),
+        ),
+    )
+    .expect("controller preserves the public zero-policy recovery route");
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_policy);
+
+    send(
+        &mut svm,
+        &[&payer, &taker, &lp],
+        pix(
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(taker_portfolio, false),
+                AccountMeta::new(lp_portfolio, false),
+            ],
+            PIx::BatchTradeNoCpi {
+                legs: vec![
+                    percolator_prog::ix::BatchTradeLeg {
+                        asset_index: 1,
+                        size_q,
+                        exec_price: 100,
+                        fee_bps: 0,
+                    },
+                    percolator_prog::ix::BatchTradeLeg {
+                        asset_index: 0,
+                        size_q,
+                        exec_price: 100,
+                        fee_bps: 0,
+                    },
+                ],
+            },
+        ),
+    )
+    .expect("the final-state-healthy atomic rotation remains live");
+    let (cfg, _, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(cfg.backing_trade_fee_policy_count, 0);
 }
 
 // PUBLIC VALUE LEAK: deployed predecessor markets may retain a raw external insurance provider.
@@ -16029,7 +16321,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
 }
 
 #[test]
-fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
+fn e2e_post_genesis_futarchy_clears_batch_gating_backing_fees_through_twap() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -16043,7 +16335,8 @@ fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
     let env = setup_handoff(&mut svm, &payer);
     let insurance_before = token_amount(&svm, &env.perc_vault);
-    let message = build_set_market_fees_message(
+    let market_before_rejected_policy = svm.get_account(&env.slab).unwrap();
+    let rejected_policy = build_set_market_fees_message(
         &env.squads_vault,
         &env.twap_cfg,
         &env.twap_authority,
@@ -16063,34 +16356,66 @@ fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &rejected_policy,
+            &remaining,
+        )
+        .is_err(),
+        "futarchy must not activate backing fees that globally disable pinned batches"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        market_before_rejected_policy,
+        "rejected backing policy leaves the market byte-identical"
+    );
+
+    let clear_policies = build_set_market_fees_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        7,
+        0,
+        0,
+        0,
+        0,
+    );
     squads_execute(
         &mut svm,
         &env.squads,
         &env.multisig,
         &env.dao,
         &payer,
-        5,
-        &message,
+        6,
+        &clear_policies,
         &remaining,
     )
-    .expect("timelocked futarchy fee update");
+    .expect("timelocked futarchy clears predecessor backing policies");
     let slab = svm.get_account(&env.slab).unwrap();
     let (cfg, _, _, _) =
         percolator_prog::state::read_market_config_mode_and_capacity(&slab.data).unwrap();
     assert_eq!(cfg.trade_fee_base_bps, 7);
-    assert_eq!(cfg.backing_trade_fee_bps_long, 8);
-    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 2_000);
-    assert_eq!(cfg.backing_trade_fee_bps_short, 9);
-    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 3_000);
+    assert_eq!(cfg.backing_trade_fee_bps_long, 0);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 0);
+    assert_eq!(cfg.backing_trade_fee_bps_short, 0);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 0);
+    assert_eq!(cfg.backing_trade_fee_policy_count, 0);
     assert_eq!(
         token_amount(&svm, &env.perc_vault),
         insurance_before,
         "fee configuration cannot move insurance"
     );
 
-    // The third CPI is deliberately invalid: Percolator rejects an insurance
-    // split on a zero backing fee. The outer transaction must roll back the
-    // otherwise-valid trade and long-side updates that ran first.
+    // A nonzero insurance split with a zero backing fee remains malformed. The
+    // wrapper rejects without changing the ordinary trade fee or cleared policies.
     let rejected = build_set_market_fees_message(
         &env.squads_vault,
         &env.twap_cfg,
@@ -16110,7 +16435,7 @@ fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
             &env.multisig,
             &env.dao,
             &payer,
-            6,
+            7,
             &rejected,
             &remaining,
         )
@@ -16121,10 +16446,11 @@ fn e2e_post_genesis_futarchy_sets_trade_and_backing_fees_through_twap() {
     let (cfg, _, _, _) =
         percolator_prog::state::read_market_config_mode_and_capacity(&slab.data).unwrap();
     assert_eq!(cfg.trade_fee_base_bps, 7);
-    assert_eq!(cfg.backing_trade_fee_bps_long, 8);
-    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 2_000);
-    assert_eq!(cfg.backing_trade_fee_bps_short, 9);
-    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 3_000);
+    assert_eq!(cfg.backing_trade_fee_bps_long, 0);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_long, 0);
+    assert_eq!(cfg.backing_trade_fee_bps_short, 0);
+    assert_eq!(cfg.backing_trade_fee_insurance_share_bps_short, 0);
+    assert_eq!(cfg.backing_trade_fee_policy_count, 0);
     assert_eq!(token_amount(&svm, &env.perc_vault), insurance_before);
 }
 
