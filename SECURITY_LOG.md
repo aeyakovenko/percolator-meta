@@ -13283,3 +13283,21 @@ remainder reaches zero. It can therefore increase any allocated COIN numerator w
 payment, while the same solver continues to enforce the marginal, bidder limit, escrow cap, and DAO reserve.
 The skipped-priority replay remains separate and unchanged. No signer, authority, destination, custody path,
 bid cap, principal counter, or admin surface was added.
+
+## Tick - unfunded insurance roles could skim post-handoff trade fees (surface A/C)
+
+Market donation required asset-0 insurance authority and operator to match, but accepted any matching third-
+party key when `asset_admin` migrated normally. Percolator's authority handoff leaves those roles unchanged.
+The third party therefore survived as the withdrawal key even with zero insurance principal, while ordinary
+public trades later credited withdrawable fee insurance to the asset.
+
+A retained pinned-Percolator + controller LiteSVM regression rotates both empty-market insurance roles from the
+creator to one unrelated key, donates market authority to the controller, opens and closes a real trader pair,
+and observes 120 fee atoms. The old SBF let the unfunded key withdraw all 120. The fixed test requires the
+handoff to reject atomically before the fee-producing market can enter controller governance.
+
+FIX: donation may preserve insurance roles only when they belong to the consenting outgoing market authority,
+the controller itself, or canonical current-layout Subledger/TWAP custody proven against the exact market.
+Matching arbitrary roles no longer suffice; such a provider must exit before donation. Distinct backing remains
+supported because backing fees require that provider's own deposited capacity. No signer, authority, recipient,
+withdrawal path, or admin instruction was added.

@@ -7298,11 +7298,11 @@ fn e2e_market_donation_rejects_external_roles_with_a_drain_path() {
 }
 
 // PUBLIC VALUE-LEAK PROBE: an empty creator market must not become controller-governed while an
-// unrelated insurance operator survives. Controller donations are disabled in that shape, but
+// unrelated, unfunded insurance provider survives. Matching authority/operator keys are not enough:
 // ordinary public trades accrue asset-local fee insurance without using the donation wrapper. If
-// the handoff succeeds, the stale operator can take fees paid by later users.
+// the handoff succeeds, the stale provider can take fees paid by later users without risking capital.
 #[test]
-fn e2e_market_donation_cannot_preserve_an_operator_that_skims_later_trade_fees() {
+fn e2e_market_donation_cannot_preserve_an_unfunded_provider_that_skims_later_trade_fees() {
     use percolator_prog::ix::Instruction as PIx;
 
     let mut svm =
@@ -7328,25 +7328,27 @@ fn e2e_market_donation_cannot_preserve_an_operator_that_skims_later_trade_fees()
     let market = Pubkey::new_unique();
     init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &market);
 
-    send(
-        &mut svm,
-        &[&payer, &creator, &stale_operator],
-        Instruction {
-            program_id: perc_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(creator.pubkey(), true),
-                AccountMeta::new_readonly(stale_operator.pubkey(), true),
-                AccountMeta::new(market, false),
-            ],
-            data: PIx::UpdateAssetAuthority {
-                asset_index: 0,
-                kind: 2,
-                new_pubkey: stale_operator.pubkey().to_bytes(),
-            }
-            .encode(),
-        },
-    )
-    .expect("creator delegates the empty market's insurance operator");
+    for kind in [1, 2] {
+        send(
+            &mut svm,
+            &[&payer, &creator, &stale_operator],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(stale_operator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                data: PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: stale_operator.pubkey().to_bytes(),
+                }
+                .encode(),
+            },
+        )
+        .expect("creator delegates an empty-market insurance role");
+    }
 
     let controller = controller_pda(&governance, &market, &perc_id());
     let market_before_handoff = svm.get_account(&market).unwrap();
@@ -7376,7 +7378,10 @@ fn e2e_market_donation_cannot_preserve_an_operator_that_skims_later_trade_fees()
     )
     .unwrap();
     assert_eq!(profile.asset_admin, controller.to_bytes());
-    assert_eq!(profile.insurance_authority, controller.to_bytes());
+    assert_eq!(
+        profile.insurance_authority,
+        stale_operator.pubkey().to_bytes()
+    );
     assert_eq!(
         profile.insurance_operator,
         stale_operator.pubkey().to_bytes()
@@ -7506,9 +7511,9 @@ fn e2e_market_donation_cannot_preserve_an_operator_that_skims_later_trade_fees()
             .encode(),
         },
     )
-    .expect("surviving operator skims fees paid after the controller handoff");
+    .expect("unfunded provider skims fees paid after the controller handoff");
     assert_eq!(token_amount(&svm, &attacker_destination), 120);
-    panic!("controller accepted a market with a stale fee-draining insurance operator");
+    panic!("controller accepted a market with an unfunded fee-draining insurance provider");
 }
 
 #[test]
