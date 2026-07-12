@@ -13685,3 +13685,27 @@ owns asset admin, insurance authority, and insurance operator. It atomically sig
 `UpdateBackingFeePolicy` CPIs, for domains 0 and 1 with both values fixed to zero. The instruction has
 no signer gate, caller-selected policy, authority, amount, recipient, token account, or token CPI, so
 it restores public batch liveness without adding a path to insurance, backing, collateral, or rewards.
+
+## Tick - retired secondary policy revived the global batch gate on activation (surface A/C)
+
+Pinned Percolator intentionally preserves a retired asset's oracle and backing-fee profile so that
+slot reuse can restore its configuration. Retirement subtracts those policies from the market-global
+active count, however. A raw creator could publicly append asset 1, set a 77-bps backing fee, retire
+the empty slot, and donate a market whose active policy count was zero. A later valid governance
+activation through the Meta controller restored the hidden per-asset policy and incremented the
+global count to one. Both atomic batch interfaces were then disabled even though every controller
+fee setter rejects nonzero policies; recovery required another timelocked zero-policy action.
+
+The retained real-SBF LiteSVM regression executes the complete creator append, fee activation,
+retirement, market donation, and controller activation sequence. It proves the retired market has a
+zero active count while its profile still stores 77/5000, and the old controller commits the later
+activation with count one. The fixed controller activates the same slot, preserves the selected
+insurance, backing, and oracle authorities and ordinary trade fee, but commits with both domain fee
+and split fields plus the global count at zero.
+
+FIX: the already-governed activation proxy records the activated asset index, performs Percolator's
+normal activation, and then signs two hardcoded exact-zero policy updates for that asset before the
+outer instruction returns. Controller activation already requires the controller PDA to be both
+insurance authority and operator, so Percolator authenticates both follow-up CPIs. Any failure rolls
+back all three CPIs. This adds no instruction tag, account, signer, authority selector, recipient,
+amount, token account, or token CPI and cannot move insurance, backing, collateral, or reward coins.

@@ -6811,6 +6811,203 @@ fn e2e_subledger_custody_can_clear_an_inherited_batch_gate() {
         .expect("the exact blocked batch succeeds after fixed zero-only recovery");
 }
 
+// PUBLIC POSITION DOS: Percolator preserves a secondary asset's backing-fee profile when the slot
+// is retired, but removes it from the market-global active-policy count. A raw creator can therefore
+// donate an apparently clean market whose later governance-approved activation silently restores the
+// pinned batch gate. Controller activation must clear both newly active domains in the same transaction.
+#[test]
+fn e2e_controller_activation_clears_a_retired_slots_latent_batch_gate() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let creator_roles = creator.pubkey().to_bytes();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            PIx::UpdateAssetLifecycle {
+                action: 0,
+                asset_index: 1,
+                now_slot: 100,
+                initial_price: 1_000_000,
+                insurance_authority: creator_roles,
+                insurance_operator: creator_roles,
+                backing_bucket_authority: creator_roles,
+                oracle_authority: creator_roles,
+            },
+        ),
+    )
+    .expect("creator activates the secondary predecessor slot");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            PIx::UpdateBackingFeePolicy {
+                domain: 2,
+                fee_bps: 77,
+                insurance_share_bps: 5_000,
+            },
+        ),
+    )
+    .expect("creator plants a secondary long-side batch gate");
+    svm.warp_to_slot(101);
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            PIx::UpdateAssetLifecycle {
+                action: 2,
+                asset_index: 1,
+                now_slot: 101,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            },
+        ),
+    )
+    .expect("creator retires the empty secondary slot");
+
+    let retired = svm.get_account(&slab).unwrap();
+    let (retired_config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&retired.data).unwrap();
+    let retired_profile =
+        percolator_prog::state::read_asset_oracle_profile(&retired.data, 1).unwrap();
+    assert_eq!(
+        retired_config.backing_trade_fee_policy_count, 0,
+        "retirement hides the policy from the active global count"
+    );
+    assert_eq!(retired_profile.backing_trade_fee_bps_long, 77);
+    assert_eq!(
+        retired_profile.backing_trade_fee_insurance_share_bps_long,
+        5_000
+    );
+    assert!(percolator_accounting::all_secondary_assets_retired(&retired.data).unwrap());
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("the clean active count remains handoff-compatible");
+
+    let backing_provider = Pubkey::new_unique();
+    let oracle_provider = Pubkey::new_unique();
+    svm.warp_to_slot(102);
+    let mut activate_data = vec![0u8]; // IX_PROXY_ADMIN
+    activate_data.extend_from_slice(
+        &PIx::UpdateAssetLifecycle {
+            action: 0,
+            asset_index: 1,
+            now_slot: 102,
+            initial_price: 1_000_000,
+            insurance_authority: controller.to_bytes(),
+            insurance_operator: controller.to_bytes(),
+            backing_bucket_authority: backing_provider.to_bytes(),
+            oracle_authority: oracle_provider.to_bytes(),
+        }
+        .encode(),
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: activate_data,
+        },
+    )
+    .expect("governance activates the retired slot through the constrained controller");
+
+    let activated = svm.get_account(&slab).unwrap();
+    let (activated_config, activated_group) =
+        percolator_prog::state::read_market(&activated.data).unwrap();
+    let activated_profile =
+        percolator_prog::state::read_asset_oracle_profile(&activated.data, 1).unwrap();
+    assert_eq!(
+        activated_group.assets[1].lifecycle,
+        percolator::AssetLifecycleV16::Active
+    );
+    assert_eq!(activated_config.marketauth, controller.to_bytes());
+    assert_eq!(
+        activated_config.backing_trade_fee_policy_count, 0,
+        "activation must not revive the pinned market-global batch gate"
+    );
+    assert_eq!(activated_profile.backing_trade_fee_bps_long, 0);
+    assert_eq!(activated_profile.backing_trade_fee_bps_short, 0);
+    assert_eq!(
+        activated_profile.backing_trade_fee_insurance_share_bps_long,
+        0
+    );
+    assert_eq!(
+        activated_profile.backing_trade_fee_insurance_share_bps_short,
+        0
+    );
+    assert_eq!(
+        activated_profile.insurance_authority,
+        controller.to_bytes()
+    );
+    assert_eq!(activated_profile.insurance_operator, controller.to_bytes());
+    assert_eq!(
+        activated_profile.backing_bucket_authority,
+        backing_provider.to_bytes()
+    );
+    assert_eq!(activated_profile.oracle_authority, oracle_provider.to_bytes());
+    assert_eq!(
+        activated_config.trade_fee_base_bps, 3,
+        "activation sanitization cannot change ordinary trade fees"
+    );
+}
+
 // PUBLIC LOF: Percolator's market-authority handoff also rewrites every asset-0 role that still
 // equals the outgoing market authority. A permissionless creator is initially the backing provider,
 // so donating a backed market to the stateless controller used to rewrite the provider to the

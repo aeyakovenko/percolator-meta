@@ -477,6 +477,21 @@ fn restart_asset_index(data: &[u8]) -> Result<Option<usize>, ProgramError> {
     ]))))
 }
 
+fn activation_asset_index(data: &[u8]) -> Result<Option<u16>, ProgramError> {
+    if data.first().copied() != Some(PERC_IX_UPDATE_ASSET_LIFECYCLE)
+        || data.get(1).copied() != Some(ASSET_ACTION_ACTIVATE)
+    {
+        return Ok(None);
+    }
+    if data.len() != UPDATE_ASSET_LIFECYCLE_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let index = data
+        .get(2..4)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    Ok(Some(u16::from_le_bytes([index[0], index[1]])))
+}
+
 pub fn process_instruction<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -534,6 +549,7 @@ fn process_proxy_admin<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
     validate_admin_instruction_data(data, controller.key)?;
+    let activated_asset = activation_asset_index(data)?;
     let bump = controller_bump(
         program_id,
         governance,
@@ -592,7 +608,43 @@ fn process_proxy_admin<'a>(
         },
         &cpi_accounts,
         &[&seeds],
-    )
+    )?;
+
+    // Retiring a Percolator slot removes its backing policies from the active
+    // global count but deliberately preserves the per-asset profile. Reactivation
+    // restores that hidden state. Clear both domains before this transaction can
+    // commit so a predecessor creator cannot revive the pinned global batch gate.
+    if let Some(asset_index) = activated_asset {
+        let first_domain = asset_index
+            .checked_mul(2)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let second_domain = first_domain
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        for domain in [first_domain, second_domain] {
+            let mut clear_data = alloc::vec![PERC_IX_UPDATE_BACKING_FEE_POLICY];
+            clear_data.extend_from_slice(&domain.to_le_bytes());
+            clear_data.extend_from_slice(&0u16.to_le_bytes()); // fee_bps
+            clear_data.extend_from_slice(&0u16.to_le_bytes()); // insurance_share_bps
+            invoke_signed(
+                &Instruction {
+                    program_id: *percolator_program.key,
+                    accounts: alloc::vec![
+                        AccountMeta::new_readonly(*controller.key, true),
+                        AccountMeta::new(*market.key, false),
+                    ],
+                    data: clear_data,
+                },
+                &[
+                    controller.clone(),
+                    market.clone(),
+                    percolator_program.clone(),
+                ],
+                &[&seeds],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_reclaim_token_accounts(
