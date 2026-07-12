@@ -38181,28 +38181,31 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     }
 
     let size_q = (percolator::POS_SCALE / 10) as i128;
-    for signed_size in [size_q, -size_q] {
-        send(
-            &mut svm,
-            &[&payer, &trader_a, &trader_b],
-            pix(
-                vec![
-                    AccountMeta::new(trader_a.pubkey(), true),
-                    AccountMeta::new(trader_b.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(portfolio_a, false),
-                    AccountMeta::new(portfolio_b, false),
-                ],
-                PIx::TradeNoCpi {
-                    asset_index: 1,
-                    size_q: signed_size,
-                    exec_price: 1_000_000,
-                    fee_bps: 0,
-                },
-            ),
-        )
-        .expect("round-trip public trade creates protocol insurance fees");
-    }
+    let trade_round_trip = |svm: &mut LiteSVM| {
+        for signed_size in [size_q, -size_q] {
+            send(
+                svm,
+                &[&payer, &trader_a, &trader_b],
+                pix(
+                    vec![
+                        AccountMeta::new(trader_a.pubkey(), true),
+                        AccountMeta::new(trader_b.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio_a, false),
+                        AccountMeta::new(portfolio_b, false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index: 1,
+                        size_q: signed_size,
+                        exec_price: 1_000_000,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+            .expect("round-trip public trade creates protocol insurance fees");
+        }
+    };
+    trade_round_trip(&mut svm);
     let fee_insurance = percolator_accounting::read_asset_insurance_remaining(
         &svm.get_account(&market).unwrap().data,
         1,
@@ -38449,8 +38452,8 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     assert_eq!(cleaned_profile.insurance_authority, controller.to_bytes());
     assert_eq!(
         cleaned_profile.insurance_operator,
-        shutdown_operator.to_bytes(),
-        "only the instruction-scoped operator rotates during cleanup"
+        controller.to_bytes(),
+        "cleanup restores the reusable controller role only after the full withdrawal"
     );
     assert_eq!(
         percolator_accounting::read_asset_insurance_remaining(
@@ -38460,8 +38463,112 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         .unwrap(),
         0
     );
-    send(&mut svm, &[&payer, &governance], retire(111))
-        .expect("the empty secondary asset retires without resolving the whole market");
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::RestartAssetOracle {
+                asset_index: 1,
+                now_slot: 111,
+                initial_price: 1_000_000,
+            }
+            .encode(),
+        ),
+    )
+    .expect("governance restarts the cleaned secondary market");
+    let restarted_profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(restarted_profile.insurance_authority, controller.to_bytes());
+    assert_eq!(
+        restarted_profile.insurance_operator,
+        controller.to_bytes(),
+        "the pinned restart preserves the restored constrained operator"
+    );
+
+    trade_round_trip(&mut svm);
+    let second_fee_insurance = percolator_accounting::read_asset_insurance_remaining(
+        &svm.get_account(&market).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        second_fee_insurance, fee_insurance,
+        "the restarted market accrues a second real fee balance"
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 1,
+                now_slot: 111,
+                initial_price: 0,
+                insurance_authority: [0u8; 32],
+                insurance_operator: [0u8; 32],
+                backing_bucket_authority: [0u8; 32],
+                oracle_authority: [0u8; 32],
+            }
+            .encode(),
+        ),
+    )
+    .expect("shut down the restarted fee-bearing asset");
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 122;
+    svm.set_sysvar(&clock);
+
+    let second_fallback = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &second_fallback,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let market_before_second_cleanup = svm.get_account(&market).unwrap();
+    let vault_before_second_cleanup = svm.get_account(&percolator_vault).unwrap();
+    let mut external_shape = fallback_cleanup(governance_destination, second_fallback);
+    external_shape.accounts.pop();
+    assert!(
+        send(&mut svm, &[&payer], external_shape).is_err(),
+        "controller insurance cannot be reclassified as an external provider return"
+    );
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_second_cleanup
+    );
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_second_cleanup
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        fallback_cleanup(governance_destination, second_fallback),
+    )
+    .expect("the restarted controller insurance remains permissionlessly returnable");
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
+        (fee_insurance + second_fee_insurance) as u64
+    );
+    assert!(
+        svm.get_account(&second_fallback)
+            .map_or(true, |account| account.lamports == 0),
+        "the second one-shot fallback also closes atomically"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        0
+    );
+    send(&mut svm, &[&payer, &governance], retire(122))
+        .expect("the restarted secondary asset retires without resolving the whole market");
 
     let mut recovered_trader_principal = 0u128;
     for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
@@ -38500,7 +38607,7 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     assert_eq!(
         recovered_trader_principal + token_amount(&svm, &governance_destination) as u128,
         2_000_000,
-        "the cleanup moves only the 120 fee atoms and preserves all remaining trader capital"
+        "both cleanup cycles move only fee atoms and preserve all remaining trader capital"
     );
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }

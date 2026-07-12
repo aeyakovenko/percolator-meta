@@ -261,10 +261,12 @@ remains. Protocol insurance or token dust already held there stays in controller
 fixed terminal reclaim. Fee insurance whose recorded authority and operator are both the controller
 uses the same destination. Its fixed cleanup first rotates only the local operator to an
 asset-scoped instruction-only PDA, which makes Percolator itself enforce the delayed shutdown and
-empty-asset checks. A healthy canonical controller account retains the complete balance. If that
-account is permanently frozen, an empty replacement may instead forward the exact amount to a clean
-governance-owned account and close atomically; a caller cannot redirect or fragment it. While live,
-no return can bypass Percolator's delayed secondary-asset shutdown override.
+empty-asset checks. Only after Percolator withdraws the complete balance does the same atomic call
+restore the controller operator, so a later oracle restart does not inherit the one-shot role. A
+healthy canonical controller account retains the complete balance. If that account is permanently
+frozen, an empty replacement may instead forward the exact amount to a clean governance-owned
+account and close atomically; a caller cannot redirect or fragment it. While live, no return can
+bypass Percolator's delayed secondary-asset shutdown override.
 
 Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
 run. The resolved companions require the whole market to be resolved and empty, derive every amount

@@ -1122,6 +1122,19 @@ fn process_return_shutdown_insurance<'a>(
         ],
         &[&seeds],
     )?;
+    if controller_owned {
+        // RestartAssetOracle preserves local roles. Restore the controller only
+        // after the delayed full withdrawal so a later lifecycle can use this
+        // same constrained cleanup path instead of inheriting the one-shot PDA.
+        rotate_asset_role_to_controller(
+            controller,
+            market,
+            percolator_program,
+            &seeds,
+            asset_index,
+            ASSET_AUTH_INSURANCE_OPERATOR,
+        )?;
+    }
     if controller_return == Some(ControllerInsuranceReturn::Retain) {
         Ok(())
     } else {

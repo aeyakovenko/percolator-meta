@@ -2,6 +2,30 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - restart preserved a one-shot insurance operator and blocked later retirement (surface A/C)
+
+Controller-owned secondary insurance cleanup temporarily installed an instruction-scoped PDA as
+the local insurance operator to force Percolator's delayed market-authority shutdown path. The
+withdrawal emptied the first fee balance but left that PDA installed. Pinned
+`RestartAssetOracle` intentionally preserves all asset roles, so a legitimate governance restart
+carried the one-shot operator into the next active lifecycle. Public round-trip trades could then
+recreate fee insurance, but the controller no longer classified it as controller-owned and neither
+public cleanup account shape could return it. One 120-atom fee cycle permanently blocked secondary
+retirement unless governance resolved the entire market.
+
+The clean-room LiteSVM regression runs two complete lifecycles against the real pinned Percolator
+SBF. It creates fees through funded public trades, matures shutdown, returns the exact balance via a
+clean fallback because the canonical transit is permanently frozen, restarts the oracle, recreates
+the same fee balance, and repeats shutdown, cleanup, and retirement. It verifies both cleanup
+account shapes, both one-shot transit closures, and exact conservation of all trader collateral and
+the two 120-atom fee balances.
+
+FIX: after Percolator accepts the delayed full insurance withdrawal, the controller atomically
+restores itself as local operator before retaining or forwarding the withdrawn tokens. The restore
+runs only after the slab-derived balance reaches zero and any later forwarding failure rolls the
+whole transaction back. It adds no instruction, signer, destination, amount, or reusable external
+authority and preserves Percolator's shutdown delay by construction.
+
 ## Tick - stale donated-market operator could skim later trade fees (surface A/C)
 
 An empty creator market could donate `marketauth` to the controller while preserving an unrelated
