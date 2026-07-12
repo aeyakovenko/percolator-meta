@@ -397,8 +397,24 @@ fn set_position_principal(svm: &mut LiteSVM, key: &Pubkey, principal: u64) {
     account.data[72..80].copy_from_slice(&principal.to_le_bytes());
     svm.set_account(*key, account).unwrap();
 }
-// Mock percolator PortfolioAccount at the pinned offsets: market_group@16, owner@116, crystallized@196,
-// spent@212, received@228. market_group is the trusted-Pyth scope portfolio-flow cohorts enforce.
+fn initialize_portfolio_header(
+    data: &mut [u8],
+    key: &Pubkey,
+    market: &Pubkey,
+    owner: &Pubkey,
+) {
+    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
+    data[8..10].copy_from_slice(&16u16.to_le_bytes());
+    data[10] = 2;
+    data[16..48].copy_from_slice(market.as_ref());
+    data[48..80].copy_from_slice(key.as_ref());
+    data[80..112].copy_from_slice(owner.as_ref());
+    data[112..114].copy_from_slice(&1u16.to_le_bytes());
+    data[114..116].copy_from_slice(&17u16.to_le_bytes());
+    data[116..148].copy_from_slice(owner.as_ref());
+}
+
+// Mock Percolator PortfolioAccount at the pinned provenance/counter offsets.
 fn set_portfolio(
     svm: &mut LiteSVM,
     key: &Pubkey,
@@ -409,11 +425,7 @@ fn set_portfolio(
     crystallized: u128,
 ) {
     let mut data = vec![0u8; 512];
-    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
-    data[8..10].copy_from_slice(&16u16.to_le_bytes());
-    data[10] = 2;
-    data[16..48].copy_from_slice(market.as_ref());
-    data[116..148].copy_from_slice(owner.as_ref());
+    initialize_portfolio_header(&mut data, key, market, owner);
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[228..244].copy_from_slice(&received.to_le_bytes());
     svm.set_account(
@@ -441,11 +453,7 @@ fn set_portfolio_full(
     spent: u128,
 ) {
     let mut data = vec![0u8; 512];
-    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
-    data[8..10].copy_from_slice(&16u16.to_le_bytes());
-    data[10] = 2;
-    data[16..48].copy_from_slice(market.as_ref());
-    data[116..148].copy_from_slice(owner.as_ref());
+    initialize_portfolio_header(&mut data, key, market, owner);
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[212..228].copy_from_slice(&spent.to_le_bytes());
     data[228..244].copy_from_slice(&received.to_le_bytes());
@@ -474,11 +482,7 @@ fn set_portfolio_funding(
     short_received: u128,
 ) {
     let mut data = vec![0u8; 512];
-    data[..8].copy_from_slice(&0x5045_5243_5631_3600u64.to_le_bytes());
-    data[8..10].copy_from_slice(&16u16.to_le_bytes());
-    data[10] = 2;
-    data[16..48].copy_from_slice(market.as_ref());
-    data[116..148].copy_from_slice(owner.as_ref());
+    initialize_portfolio_header(&mut data, key, market, owner);
     data[244..260].copy_from_slice(&long_paid.to_le_bytes());
     data[260..276].copy_from_slice(&long_received.to_le_bytes());
     data[276..292].copy_from_slice(&short_paid.to_le_bytes());
@@ -3352,6 +3356,38 @@ fn stake_pda_for_cohort(env: &Env, owner: &Pubkey, linked: &Pubkey, cohort: u8) 
     .0
 }
 
+fn portfolio_market(svm: &LiteSVM, env: &Env, portfolio: &Pubkey) -> Pubkey {
+    svm.get_account(portfolio)
+        .and_then(|account| {
+            account
+                .data
+                .get(16..48)
+                .map(|bytes| Pubkey::new_from_array(bytes.try_into().unwrap()))
+        })
+        .filter(|market| *market != Pubkey::default())
+        .unwrap_or(env.market)
+}
+
+fn portfolio_archive_pda(
+    svm: &LiteSVM,
+    env: &Env,
+    owner: &Pubkey,
+    portfolio: &Pubkey,
+) -> Pubkey {
+    let market = portfolio_market(svm, env, portfolio);
+    Pubkey::find_program_address(
+        &[
+            b"rd_portfolio_archive",
+            env.stub_perc.as_ref(),
+            market.as_ref(),
+            owner.as_ref(),
+            portfolio.as_ref(),
+        ],
+        &rd_id(),
+    )
+    .0
+}
+
 fn stakes_for_link(svm: &LiteSVM, env: &Env, owner: &Pubkey, linked: &Pubkey) -> Vec<Pubkey> {
     [
         COHORT_INSURANCE,
@@ -3429,6 +3465,12 @@ fn register(
         AccountMeta::new(stake, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
     ];
+    if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        accounts.push(AccountMeta::new_readonly(
+            portfolio_archive_pda(svm, env, &owner.pubkey(), linked),
+            false,
+        ));
+    }
     if svm.get_account(&env.rd_config).unwrap().data.len() == 823 {
         let legacy_owner_stake = Pubkey::find_program_address(
             &[b"rd_stake", env.rd_config.as_ref(), owner.pubkey().as_ref()],
@@ -3479,17 +3521,25 @@ fn crystallize_as(
         [] => registered_stake_for_claim(svm, env, owner, None).0,
         _ => panic!("ambiguous reward family; pass the cohort explicitly"),
     };
+    let cohort = svm.get_account(&stake).unwrap().data[193];
+    let mut accounts = vec![
+        AccountMeta::new(cranker.pubkey(), true),
+        AccountMeta::new(env.rd_config, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new_readonly(*linked, false),
+    ];
+    if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        accounts.push(AccountMeta::new_readonly(
+            portfolio_archive_pda(svm, env, owner, linked),
+            false,
+        ));
+    }
     send(
         svm,
         payer,
         &[Instruction {
             program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(cranker.pubkey(), true),
-                AccountMeta::new(env.rd_config, false),
-                AccountMeta::new(stake, false),
-                AccountMeta::new_readonly(*linked, false),
-            ],
+            accounts,
             data: vec![2u8],
         }],
         &[cranker],
@@ -3515,17 +3565,24 @@ fn crystallize_cohort(
     cohort: u8,
 ) -> Result<(), String> {
     let stake = stake_pda_for_cohort(env, owner, linked, cohort);
+    let mut accounts = vec![
+        AccountMeta::new(cranker.pubkey(), true),
+        AccountMeta::new(env.rd_config, false),
+        AccountMeta::new(stake, false),
+        AccountMeta::new_readonly(*linked, false),
+    ];
+    if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        accounts.push(AccountMeta::new_readonly(
+            portfolio_archive_pda(svm, env, owner, linked),
+            false,
+        ));
+    }
     send(
         svm,
         payer,
         &[Instruction {
             program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(cranker.pubkey(), true),
-                AccountMeta::new(env.rd_config, false),
-                AccountMeta::new(stake, false),
-                AccountMeta::new_readonly(*linked, false),
-            ],
+            accounts,
             data: vec![2u8],
         }],
         &[cranker],
@@ -3548,9 +3605,8 @@ fn freeze(svm: &mut LiteSVM, payer: &Keypair, env: &Env) -> Result<(), String> {
         &[],
     )
 }
-// claim: insurance/backing append the live subledger position (for the live-share cap); LP/trader append
-// the live portfolio (for the residual live cap). Funding-payer claims are frozen-counter only and do not
-// require the Percolator portfolio at claim time; extra accounts are ignored.
+// claim: insurance/backing append the live subledger position; LP/trader append the live portfolio and
+// cumulative archive. Funding-payer claims are frozen-counter only and require no trailing account.
 // `cranker` is the claim trigger (first account, must sign). Share-value cohorts (insurance/backing)
 // require it to be the stake owner (finding KM); portfolio-flow cohorts accept any cranker while their live
 // witness exists, and require the owner only for terminal dematerialized-witness recovery. The helper takes the
@@ -3574,7 +3630,20 @@ fn claim_as(
         AccountMeta::new(*recipient_ata, false),
         AccountMeta::new_readonly(spl_token::ID, false),
     ];
-    accounts.push(AccountMeta::new_readonly(claim_linked, false));
+    let cohort = svm.get_account(&stake).unwrap().data[193];
+    match cohort {
+        COHORT_INSURANCE | COHORT_BACKING => {
+            accounts.push(AccountMeta::new_readonly(claim_linked, false));
+        }
+        COHORT_LP | COHORT_TRADER => {
+            accounts.push(AccountMeta::new_readonly(claim_linked, false));
+            accounts.push(AccountMeta::new_readonly(
+                portfolio_archive_pda(svm, env, owner, &claim_linked),
+                false,
+            ));
+        }
+        _ => {}
+    }
     send(
         svm,
         payer,
@@ -3643,15 +3712,27 @@ fn claim_cohort(
     cohort: u8,
 ) -> Result<(), String> {
     let stake = stake_pda_for_cohort(env, &owner.pubkey(), linked, cohort);
-    let accounts = vec![
+    let mut accounts = vec![
         AccountMeta::new(owner.pubkey(), true),
         AccountMeta::new_readonly(env.rd_config, false),
         AccountMeta::new(stake, false),
         AccountMeta::new(env.vault, false),
         AccountMeta::new(*recipient_ata, false),
         AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(*linked, false),
     ];
+    match cohort {
+        COHORT_INSURANCE | COHORT_BACKING => {
+            accounts.push(AccountMeta::new_readonly(*linked, false));
+        }
+        COHORT_LP | COHORT_TRADER => {
+            accounts.push(AccountMeta::new_readonly(*linked, false));
+            accounts.push(AccountMeta::new_readonly(
+                portfolio_archive_pda(svm, env, &owner.pubkey(), linked),
+                false,
+            ));
+        }
+        _ => {}
+    }
     send(
         svm,
         payer,
@@ -4522,6 +4603,45 @@ fn lamport_dust_cannot_lock_frozen_lp_or_trader_reward() {
 
     let lp_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
     let trader_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &trader.pubkey());
+    let fake_archive = Pubkey::new_unique();
+    svm.set_account(
+        fake_archive,
+        Account {
+            lamports: 1,
+            data: Vec::new(),
+            owner: solana_sdk::system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let lp_stake = stake_pda_for_cohort(&env, &lp.pubkey(), &lp_pf, COHORT_LP);
+    let stake_before_fake_archive = svm.get_account(&lp_stake).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &payer,
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(env.rd_config, false),
+                    AccountMeta::new(lp_stake, false),
+                    AccountMeta::new(env.vault, false),
+                    AccountMeta::new(lp_ata, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(lp_pf, false),
+                    AccountMeta::new_readonly(fake_archive, false),
+                ],
+                data: vec![5u8],
+            }],
+            &[],
+        )
+        .is_err(),
+        "an unrelated empty account cannot select the pre-archive claim fallback"
+    );
+    assert_eq!(svm.get_account(&lp_stake).unwrap(), stake_before_fake_archive);
+    assert_eq!(token_amount(&svm, &lp_ata), 0);
     claim_as(
         &mut svm,
         &payer,
@@ -7505,6 +7625,7 @@ fn exercise_historical_frozen_stake_claim(linked_seed: bool, label: &str) {
     freeze(&mut svm, &payer, &env).expect("freeze denominators");
 
     let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    let archive = portfolio_archive_pda(&svm, &env, &lp.pubkey(), &portfolio);
     let claim_ix = Instruction {
         program_id: rd_id(),
         accounts: vec![
@@ -7515,6 +7636,7 @@ fn exercise_historical_frozen_stake_claim(linked_seed: bool, label: &str) {
             AccountMeta::new(recipient, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(portfolio, false),
+            AccountMeta::new_readonly(archive, false),
         ],
         data: vec![5u8],
     };
@@ -9011,6 +9133,7 @@ fn claim_cannot_be_redirected_delegated_or_paid_from_a_decoy_vault() {
     let rd_config = env.rd_config;
     let coin_mint = env.coin_mint;
     let real_vault = env.vault;
+    let archive = portfolio_archive_pda(&svm, &env, &lp.pubkey(), &pf);
     let mut raw_claim = |svm: &mut LiteSVM,
                          cranker: &Keypair,
                          vault: Pubkey,
@@ -9029,6 +9152,7 @@ fn claim_cannot_be_redirected_delegated_or_paid_from_a_decoy_vault() {
                     AccountMeta::new(recipient_ata, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
+                    AccountMeta::new_readonly(archive, false),
                 ],
                 data: vec![5u8],
             }],
@@ -9141,6 +9265,7 @@ fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
     freeze(&mut svm, &payer, &env).expect("freeze");
     let stake = stake_pda(&env, &lp.pubkey(), &pf);
     let ata = create_token_account(&mut svm, &payer, &env.coin_mint, &lp.pubkey());
+    let archive = portfolio_archive_pda(&svm, &env, &lp.pubkey(), &pf);
 
     // Build a claim with arbitrary accounts in the config/stake slots (LP cohort -> no position appended).
     let claim_with =
@@ -9158,6 +9283,7 @@ fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
                         AccountMeta::new(ata, false),
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
+                        AccountMeta::new_readonly(archive, false),
                     ],
                     data: vec![5u8],
                 }],
@@ -11327,6 +11453,19 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
             &rd_id(),
         )
         .0;
+        let account = svm.get_account(pf).unwrap();
+        let market = Pubkey::new_from_array(account.data[16..48].try_into().unwrap());
+        let archive = Pubkey::find_program_address(
+            &[
+                b"rd_portfolio_archive",
+                stub_perc.as_ref(),
+                market.as_ref(),
+                owner.pubkey().as_ref(),
+                pf.as_ref(),
+            ],
+            &rd_id(),
+        )
+        .0;
         send(
             svm,
             &payer,
@@ -11340,6 +11479,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
                     AccountMeta::new_readonly(*pf, false),
                     AccountMeta::new(stake, false),
                     AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                    AccountMeta::new_readonly(archive, false),
                 ],
                 data: vec![1u8, COHORT_LP],
             }],

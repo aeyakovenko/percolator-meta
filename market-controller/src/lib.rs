@@ -39,6 +39,8 @@ const SUBLEDGER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("Sub1edger1111111111111111111111111111111111");
 const TWAP_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("TwapBuyBurn11111111111111111111111111111111");
+const RESIDUAL_DISTRIBUTOR_PROGRAM_ID: Pubkey =
+    solana_program::pubkey!("Res1dua1Distr1butor111111111111111111111111");
 const SQUADS_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf");
 const TWAP_CONFIG_SEED: &[u8] = b"twap_config";
@@ -66,6 +68,7 @@ const IX_CLOSE_RESOLVED_PORTFOLIO: u8 = 11;
 
 const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_CLOSE_PORTFOLIO: u8 = 8;
+const RESIDUAL_IX_ARCHIVE_PORTFOLIO: u8 = 7;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
@@ -1736,14 +1739,16 @@ fn process_return_resolved_asset0_backing<'a>(
 }
 
 // close_resolved_portfolio accounts:
-// [governance, controller_pda, market(w), portfolio(w), percolator_program]
+// [governance, controller_pda, market(w), portfolio(w), percolator_program,
+//  payer(s,w)?, portfolio_archive(w)?, residual_distributor?, system?]
 //
 // Anyone can ask the controller to exercise Percolator's terminal marketauth
 // override. Percolator itself requires a resolved market and a genuinely empty
 // portfolio, deregisters the materialized account, and returns only its rent to
-// the market slab. Residual rewards bind to the dematerialized key and frozen
-// recipient, so historical counters cannot become a gate on insurance/backing
-// exits. There is no caller-selected amount or destination.
+// the market slab. A portfolio with nonzero monotonic reward telemetry must use
+// the extended shape: the fixed residual distributor checked-adds those counters
+// to its canonical read-only archive before the close CPI. Both writes roll back
+// if either program rejects. There is no caller-selected amount or destination.
 fn process_close_resolved_portfolio<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1758,6 +1763,16 @@ fn process_close_resolved_portfolio<'a>(
     let market = next_account_info(iter)?;
     let portfolio = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    let archive_tail = if let Some(payer) = iter.next() {
+        Some((
+            payer,
+            next_account_info(iter)?,
+            next_account_info(iter)?,
+            next_account_info(iter)?,
+        ))
+    } else {
+        None
+    };
     if iter.next().is_some() || !market.is_writable || !portfolio.is_writable {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -1768,6 +1783,20 @@ fn process_close_resolved_portfolio<'a>(
         market,
         percolator_program,
     )?;
+    let snapshot = {
+        let portfolio_data = portfolio.try_borrow_data()?;
+        percolator_accounting::read_portfolio_reward_snapshot(
+            &portfolio_data,
+            &portfolio.key.to_bytes(),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+    if snapshot.market_group != market.key.to_bytes() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if snapshot.has_reward_telemetry() && archive_tail.is_none() {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
     let bump_seed = [bump];
     let seeds = signer_seeds(
         governance.key,
@@ -1775,6 +1804,60 @@ fn process_close_resolved_portfolio<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    if let Some((payer, archive, residual_program, system)) = archive_tail {
+        if !payer.is_signer
+            || !payer.is_writable
+            || !archive.is_writable
+            || *residual_program.key != RESIDUAL_DISTRIBUTOR_PROGRAM_ID
+            || !residual_program.executable
+            || *system.key != solana_program::system_program::ID
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let owner = Pubkey::new_from_array(snapshot.owner);
+        let expected_archive = Pubkey::find_program_address(
+            &[
+                b"rd_portfolio_archive",
+                percolator_program.key.as_ref(),
+                market.key.as_ref(),
+                owner.as_ref(),
+                portfolio.key.as_ref(),
+            ],
+            &RESIDUAL_DISTRIBUTOR_PROGRAM_ID,
+        )
+        .0;
+        if *archive.key != expected_archive {
+            return Err(ProgramError::InvalidSeeds);
+        }
+        invoke_signed(
+            &Instruction {
+                program_id: *residual_program.key,
+                accounts: vec![
+                    AccountMeta::new(*payer.key, true),
+                    AccountMeta::new_readonly(*controller.key, true),
+                    AccountMeta::new_readonly(*governance.key, false),
+                    AccountMeta::new(*archive.key, false),
+                    AccountMeta::new_readonly(*market.key, false),
+                    AccountMeta::new_readonly(*portfolio.key, false),
+                    AccountMeta::new_readonly(*percolator_program.key, false),
+                    AccountMeta::new_readonly(*system.key, false),
+                ],
+                data: vec![RESIDUAL_IX_ARCHIVE_PORTFOLIO],
+            },
+            &[
+                payer.clone(),
+                controller.clone(),
+                governance.clone(),
+                archive.clone(),
+                market.clone(),
+                portfolio.clone(),
+                percolator_program.clone(),
+                system.clone(),
+                residual_program.clone(),
+            ],
+            &[&seeds],
+        )?;
+    }
     invoke_signed(
         &Instruction {
             program_id: *percolator_program.key,
