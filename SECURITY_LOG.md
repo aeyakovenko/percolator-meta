@@ -13244,3 +13244,23 @@ role rotation or value CPI. The read-only accounting view uses `max(Clock.slot, 
 exact inclusive boundary used by Percolator; layout canaries bind both wrapper offsets to the Cargo-pinned
 program type. This adds no signer, authority, destination, amount selector, or admin surface. Direct calls by
 upstream Percolator role holders remain covered by percolator-prog issue #207 and require an upstream fix.
+
+## Tick - skipped priority bids could suppress TWAP buyback burn (surface C)
+
+TWAP's nominal budget walk preflighted each bid at its own reduced ratio before the final uniform price was
+known. A higher-rate bid whose own integer lot did not fit was skipped. If a lower marginal then consumed the
+complete budget, the final-price remainder pass had no free USD with which to reconsider that priority bid,
+even when a bidder-safe pair existed at the final price. A zero-fee public bidder could repeat that shape to
+reduce every configured buyback without selling COIN or spending collateral.
+
+A retained real-SBF LiteSVM regression funds a two-unit round, submits a `10 COIN / 3 USD` priority bid and a
+`4 / 2` marginal bid, and executes permissionlessly. At the final `4 / 2` price, the valid priority `3 / 1`
+pair and marginal `2 / 1` pair spend the same two USD and buy five COIN. The old SBF refunded the priority bid,
+spent both USD on the marginal, and burned only four. The fixed test claims both allocations and drains every
+escrow exactly.
+
+FIX: when ordinary remainder allocation still leaves a higher-ranked bid absent, execute performs one bounded
+final-price priority replay. It reserves one exact marginal lot, reprices eligible bids from best to worst, and
+adopts the replay only if it improves `(USD spent, COIN bought)` lexicographically. Existing cascade coverage
+keeps the 32-bid path below 500k CU and rechecks every bidder limit, DAO reserve, payout, refund, and escrow
+conservation invariant. This adds no signer, authority, destination, bid slot, custody path, or admin surface.

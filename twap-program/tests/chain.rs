@@ -25715,6 +25715,179 @@ fn e2e_uniform_repricing_reconsiders_a_bid_excluded_at_a_provisional_marginal() 
     let _ = (top, marginal);
 }
 
+// PUBLIC DOS: a higher-rate bid can be skipped by the own-rate reduced-lot preflight even though
+// it becomes executable at the lower final marginal. If the marginal bid consumes the full budget,
+// the ordinary remainder pass has no USD with which to reconsider the skipped priority bid.
+#[test]
+fn e2e_uniform_repricing_reallocates_budget_to_a_skipped_priority_bid() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let live_insurance = read_asset0_insurance(&svm, &env.slab);
+    let floor_message =
+        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor_message,
+        &floor_remaining,
+    )
+    .expect("protect all live insurance");
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        2,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &bk.holding,
+            &payer.pubkey(),
+            &[],
+            2,
+        )
+        .unwrap(),
+    )
+    .expect("fund exact two-unit budget");
+
+    // The better 10/3 bid has a three-USD reduced lot, so the own-rate preflight skips it when
+    // only two USD remain. At the final 4/2 marginal it can safely execute 3 COIN / 1 USD.
+    let (priority, priority_coin, priority_usd) = new_bidder(&mut svm, &payer, &env, 10);
+    send(
+        &mut svm,
+        &[&priority],
+        place_bid_ix(
+            &priority.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &priority_coin,
+            &priority_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            10,
+            3,
+            None,
+        ),
+    )
+    .expect("place skipped priority bid");
+    let (marginal, marginal_coin, marginal_usd) = new_bidder(&mut svm, &payer, &env, 4);
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &marginal_coin,
+            &marginal_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            4,
+            2,
+            None,
+        ),
+    )
+    .expect("place exact final marginal");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute skipped-priority edge");
+
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 2);
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        5,
+        "the same two-USD spend must buy the priority 3/1 pair plus marginal 2/1 pair"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &priority_usd,
+            &priority_coin,
+            0,
+        ),
+    )
+    .expect("claim repriced priority bid");
+    assert_eq!(token_amount(&svm, &priority_coin), 7);
+    assert_eq!(token_amount(&svm, &priority_usd), 1);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &marginal_usd,
+            &marginal_coin,
+            1,
+        ),
+    )
+    .expect("claim residual marginal lot");
+    assert_eq!(token_amount(&svm, &marginal_coin), 2);
+    assert_eq!(token_amount(&svm, &marginal_usd), 1);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    let _ = (priority, marginal);
+}
+
 // PUBLIC LOSS-OF-FUNDS PROBE: a higher-rate bid whose reduced lot does not fit the nominal
 // remainder can still sell a strictly larger COIN numerator for the same final-price USD leg.
 // Reconciliation must compare equal-USD candidates by COIN as well as USD; otherwise a public
@@ -26734,9 +26907,9 @@ fn e2e_uniform_repricing_cannot_leave_refunded_bids_reserving_budget() {
 
     // Each Sybil is executable in full at its own 299,999/199,999 rate. Together they consume
     // 399,998 of the 400k nominal budget. The honest bid receives the final 2 USD and establishes
-    // a 3/2 uniform rate. Repricing either Sybil at 3/2 yields 299,998 COIN for 199,998 USD, whose
-    // realized rate exceeds that Sybil's limit, so both must be refunded and removed from the
-    // allocation. The released budget must then be reassigned to the honest bid.
+    // a 3/2 uniform rate. The first reconstruction at 199,998 USD is unsafe, but the full
+    // 299,999/199,999 pair remains bidder-safe at that marginal. Final-price priority replay must
+    // recover both full pairs and preserve one exact 3/2 marginal lot.
     let mut sybils = Vec::new();
     for _ in 0..2 {
         let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 299_999);
@@ -26804,8 +26977,8 @@ fn e2e_uniform_repricing_cannot_leave_refunded_bids_reserving_budget() {
 
     assert_eq!(
         supply_before - mint_supply(&svm, &env.coin_mint),
-        600_000,
-        "the honest bid receives the complete 400k budget at the 3/2 rate"
+        600_001,
+        "the full budget buys both safe priority pairs plus one exact marginal lot"
     );
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 400_000);
     assert_eq!(token_amount(&svm, &bk.holding), 0);
@@ -26826,9 +26999,9 @@ fn e2e_uniform_repricing_cannot_leave_refunded_bids_reserving_budget() {
                 slot as u8,
             ),
         )
-        .expect("refunded Sybil claim");
-        assert_eq!(token_amount(&svm, coin), 299_999);
-        assert_eq!(token_amount(&svm, usd), 0);
+        .expect("repriced Sybil claim");
+        assert_eq!(token_amount(&svm, coin), 0);
+        assert_eq!(token_amount(&svm, usd), 199_999);
     }
     send(
         &mut svm,
@@ -26846,8 +27019,8 @@ fn e2e_uniform_repricing_cannot_leave_refunded_bids_reserving_budget() {
         ),
     )
     .expect("honest claim");
-    assert_eq!(token_amount(&svm, &honest_coin), 0);
-    assert_eq!(token_amount(&svm, &honest_usd), 400_000);
+    assert_eq!(token_amount(&svm, &honest_coin), 599_997);
+    assert_eq!(token_amount(&svm, &honest_usd), 2);
 }
 
 // PUBLIC CU/LOF PROBE: uniform repricing can invalidate a different nominal winner after each
@@ -27010,7 +27183,7 @@ fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
     let burned = initial_coin - mint_supply(&svm, &env.coin_mint);
     let spent = token_amount(&svm, &bk.settlement_usd);
     assert_eq!(
-        burned, 21,
+        burned, 23,
         "final-price reconciliation revives safe whole-lot fills from provisional exclusions"
     );
     assert_eq!(spent, 7);
@@ -28724,8 +28897,8 @@ fn e2e_full_book_of_worst_case_rates_cannot_dos_execute() {
         ))
         .expect("execute must clear a full worst-case book without exhausting compute");
     assert!(
-        m.compute_units_consumed < 650_000,
-        "execute plus interior reconciliation must retain over 53% network headroom, got {}",
+        m.compute_units_consumed < 770_000,
+        "execute plus both bounded reconciliation passes must retain over 45% network headroom, got {}",
         m.compute_units_consumed
     );
 }
