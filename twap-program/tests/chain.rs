@@ -35266,6 +35266,14 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
             ),
         )
         .expect("external provider deposits backing before the reward lifecycle");
+        let (_, funded_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            funded_group.source_backing_buckets[0].fresh_unliened_backing_num,
+            percolator::BOUND_SCALE,
+        );
     }
 
     // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
@@ -35516,15 +35524,88 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         ))
     };
     // Crank the counterparty first (updates the asset's shared b-accumulator), then the loser.
-    for pf in [&winner_pf, &loser_pf] {
-        crank(&mut svm, pf, 110).expect("auto-crank settlement");
-        crank(&mut svm, pf, 110).expect("auto-crank refresh after settlement");
-    }
+    crank(&mut svm, &winner_pf, 110).expect("auto-crank winner settlement");
+    crank(&mut svm, &winner_pf, 110).expect("auto-crank winner refresh after settlement");
+    crank(&mut svm, &loser_pf, 110).expect("auto-crank loser settlement");
+    crank(&mut svm, &loser_pf, 110).expect("auto-crank loser refresh after settlement");
     let crystallized = read_portfolio_crystallized(&svm, &loser_pf);
     assert!(
         crystallized > 0,
         "the settled loss organically bumped crystallized_loss (got {crystallized})"
     );
+    if !maintenance_fee_cleanup {
+        send(
+            &mut svm,
+            &[&winner, &loser],
+            pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: -pos,
+                    exec_price: initial_price / 2,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("both public traders flatten at the moved mark");
+        for pf in [&winner_pf, &loser_pf] {
+            crank(&mut svm, pf, 110).expect("settle flattened portfolio");
+        }
+
+        let (_, before_convert_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            before_convert_group.source_backing_buckets[0].fresh_unliened_backing_num,
+            251 * percolator::BOUND_SCALE,
+        );
+
+        let winner_before = percolator_prog::state::read_portfolio(
+            &svm.get_account(&winner_pf).unwrap().data,
+        )
+        .unwrap()
+        .capital
+        .get();
+        send(
+            &mut svm,
+            &[&winner],
+            pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                ],
+                PIx::ConvertReleasedPnl { amount: u128::MAX },
+            ),
+        )
+        .expect("winner publicly consumes the external backing atom");
+        let winner_after = percolator_prog::state::read_portfolio(
+            &svm.get_account(&winner_pf).unwrap().data,
+        )
+        .unwrap()
+        .capital
+        .get();
+        assert_eq!(winner_after - winner_before, 250);
+        let (_, converted_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            converted_group.source_backing_buckets[0].consumed_liened_backing_num,
+            250 * percolator::BOUND_SCALE,
+        );
+        assert_eq!(
+            converted_group.source_credit[0].provider_receivable_num,
+            250 * percolator::BOUND_SCALE,
+        );
+    }
 
     // ---- crystallize (Δ = the organic loss), freeze, claim -> the trader cohort earns it ----
     svm.expire_blockhash();
@@ -35845,6 +35926,10 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         )
         .unwrap();
         assert_eq!(empty_group.materialized_portfolio_count, 0);
+        assert_eq!(
+            empty_group.source_credit[0].provider_receivable_num,
+            250 * percolator::BOUND_SCALE,
+        );
 
         let controller_transit = canonical_insurance_vault(&controller, &collateral);
         set_token(
@@ -35889,6 +35974,60 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         )
         .expect("reward telemetry cannot lock the external provider's backing");
         assert_eq!(token_amount(&svm, &backing_provider_destination), 1);
+
+        let close_transit = Pubkey::new_unique();
+        let governance_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &close_transit,
+            &collateral,
+            &controller,
+            0,
+        );
+        set_token(
+            &mut svm,
+            &governance_destination,
+            &collateral,
+            &governance.pubkey(),
+            0,
+        );
+        svm.set_account(
+            controller,
+            Account {
+                lamports: 1,
+                data: vec![],
+                owner: system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&governance],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new(governance.pubkey(), true),
+                    AccountMeta::new(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new(close_transit, false),
+                    AccountMeta::new(governance_destination, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
+            },
+        )
+        .expect("historical backing consumption cannot block CloseSlab after all value exits");
+        assert!(
+            svm.get_account(&market)
+                .map_or(true, |account| account.lamports == 0),
+            "the real slab is reclaimed despite value-neutral consumed-backing history",
+        );
     }
 }
 
