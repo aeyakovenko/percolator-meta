@@ -8047,8 +8047,11 @@ fn e2e_funded_creator_must_exit_before_donation_and_cannot_skim_later_fees() {
     assert_eq!(token_amount(&svm, &creator_token), amount);
 }
 
+// PUBLIC VALUE-LEAK PROBE: preserving a distinct backing provider during market donation is safe
+// only if the key cannot collect backing fees before putting capital at risk. Exercise the pinned
+// trade path with a live backing-fee policy and an empty bucket, then attempt a real withdrawal.
 #[test]
-fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
+fn e2e_market_donation_preserves_backing_without_a_zero_capital_fee_claim() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -8087,6 +8090,25 @@ fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
     send(&mut svm, &[&payer, &creator, &provider], rotate_backing)
         .expect("creator delegates backing to a distinct external provider");
 
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            data: percolator_prog::ix::Instruction::UpdateBackingFeePolicy {
+                domain: 0,
+                fee_bps: 100,
+                insurance_share_bps: 0,
+            }
+            .encode(),
+        },
+    )
+    .expect("creator enables a visible long-domain backing fee");
+
     let controller = controller_pda(&governance, &slab, &perc_id());
     let donate_market = Instruction {
         program_id: controller_id(),
@@ -8113,6 +8135,156 @@ fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
         provider.pubkey().to_bytes(),
         "the fixed handoff cannot select or overwrite an unrelated provider"
     );
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let trader_a = Keypair::new();
+    let trader_b = Keypair::new();
+    let portfolio_a = Pubkey::new_unique();
+    let portfolio_b = Pubkey::new_unique();
+    for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
+        svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                percolator_prog::ix::Instruction::InitPortfolio,
+            ),
+        )
+        .expect("initialize post-donation trader portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &trader.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                percolator_prog::ix::Instruction::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("fund post-donation trader portfolio");
+    }
+
+    let size_q = (percolator::POS_SCALE / 10) as i128;
+    for signed_size in [size_q, -size_q] {
+        send(
+            &mut svm,
+            &[&payer, &trader_a, &trader_b],
+            pix(
+                vec![
+                    AccountMeta::new(trader_a.pubkey(), true),
+                    AccountMeta::new(trader_b.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio_a, false),
+                    AccountMeta::new(portfolio_b, false),
+                ],
+                percolator_prog::ix::Instruction::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: signed_size,
+                    exec_price: 1_000_000,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("ordinary public trade remains live without external backing");
+    }
+
+    let backing_after_trades = percolator_accounting::read_asset_backing_balances(
+        &svm.get_account(&slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert!(backing_after_trades.iter().all(|balance| {
+        balance.principal_atoms == 0 && balance.earnings_atoms == 0
+    }));
+
+    let provider_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral_mint,
+        &provider.pubkey(),
+        0,
+    );
+    let backing_ledger = Pubkey::new_unique();
+    svm.set_account(
+        backing_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::backing_domain_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let market_before_withdraw = svm.get_account(&slab).unwrap();
+    let vault_before_withdraw = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &provider],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(provider.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(backing_ledger, false),
+                    AccountMeta::new(provider_destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: percolator_prog::ix::Instruction::WithdrawBackingBucketEarnings {
+                    domain: 0,
+                    amount: 1,
+                }
+                .encode(),
+            },
+        )
+        .is_err(),
+        "a preserved backing key with no capital cannot withdraw user-paid value"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before_withdraw);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), vault_before_withdraw);
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
 }
 
 // PUBLIC LOF/DOS: Percolator's market-authority handoff updates only asset-0 roles.

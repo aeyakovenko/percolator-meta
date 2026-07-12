@@ -2,6 +2,23 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - zero-capital backing keys cannot collect trade fees (surface A/C; coverage only)
+
+Market donation intentionally preserves a distinct asset-0 backing provider while it rejects an
+unfunded external insurance operator. That asymmetry is safe only if the backing key earns from
+capital actually liened at risk, rather than merely from remaining named in the asset profile.
+
+A fresh real-SBF LiteSVM probe rotates an empty asset-0 backing role to an external provider,
+enables a 1% backing-fee policy, donates market lifecycle control to the constrained controller,
+and executes two funded public round-trip trades. Both backing domains retain exactly zero
+principal and zero earnings. The provider's direct attempt to withdraw one earnings atom rejects
+atomically, leaving the slab, vault, and destination unchanged.
+
+VERDICT: BLOCKED by construction in pinned Percolator: backing fees are charged only on a positive
+new source-lien delta, so a named key with no deposited capacity has no claim. This closes the
+previously source-audited but Meta-level unpinned assumption behind preserving external backing.
+No production code or security PR.
+
 ## Tick - restart revived a zero-capital legacy fee operator (surface A/C)
 
 Predecessor controller activation and donation paths could leave matched external insurance roles on
