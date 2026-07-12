@@ -3311,6 +3311,53 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
         unix_timestamp: 111,
         ..Clock::default()
     });
+    let attacker = Pubkey::new_unique();
+    let forbidden_retire = proxy(
+        percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 2, // ASSET_ACTION_RETIRE
+            asset_index: 0,
+            now_slot: 111,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        },
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            forbidden_retire,
+        )
+        .is_err(),
+        "controller governance cannot retire asset 0 to make its custody replaceable"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), shutdown_market);
+
+    let forbidden_reactivate = proxy(
+        percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 0, // ASSET_ACTION_ACTIVATE
+            asset_index: 0,
+            now_slot: 111,
+            initial_price: 1_000_000,
+            insurance_authority: attacker.to_bytes(),
+            insurance_operator: attacker.to_bytes(),
+            backing_bucket_authority: attacker.to_bytes(),
+            oracle_authority: attacker.to_bytes(),
+        },
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            forbidden_reactivate,
+        )
+        .is_err(),
+        "controller governance cannot overwrite asset-0 custody during recovery"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), shutdown_market);
+
     let restart = percolator_prog::ix::Instruction::RestartAssetOracle {
         asset_index: 0,
         now_slot: 111,
