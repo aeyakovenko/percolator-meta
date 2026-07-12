@@ -49,9 +49,11 @@ capital's own tenure.
   portfolio and returns its rent only to the slab. Historical reward counters cannot hold insurance
   or backing exits hostage: after any terminal dematerialization, any cranker can pay that LP/trader
   allocation from the frozen snapshot only to its bound recipient; lamports donated to the closed,
-  zero-data witness cannot disable that recovery. Donating a creator-owned market
-  preserves funded outgoing asset-0 insurance roles and the recorded backing provider; the handoff
-  cannot collapse that capital into the controller or select another provider. `asset_admin` must
+  zero-data witness cannot disable that recovery. Before donating a creator-owned market, its raw
+  outgoing asset-0 insurance provider must withdraw any nonzero balance. The empty insurance roles
+  then migrate to the controller, while the recorded backing provider remains unchanged. This keeps
+  a former provider from withdrawing its principal yet retaining a claim on later trade fees.
+  `asset_admin` must
   migrate to the controller even on an empty market, unless read-only canonical Subledger or TWAP
   state proves that its fixed-cleanup PDA already owns admin and both insurance roles. This prevents
   a cold delegated admin from funding one atom after handoff and blocking terminal close. Insurance
@@ -305,11 +307,11 @@ custody first returns to the canonical pool, whose only backing action is invoki
 cleanup. A failed domain CPI rolls back every earlier transfer and the authority change.
 
 Permissionless market donation transfers lifecycle control, not funded creator capital. If the
-outgoing market authority still owns nonzero asset-0 insurance, the controller atomically restores
-that exact insurance authority/operator after accepting `marketauth`, just as it preserves the
-recorded backing provider. A funded handoff that restores an outgoing insurance role or nonzero
-backing bucket is rejected unless `asset_admin` migrates to the controller. The only non-migrating
-exception requires the existing handoff to include canonical current-layout Subledger or TWAP state
+outgoing raw market authority still owns nonzero asset-0 insurance, donation rejects atomically; the
+creator withdraws first, then the unchanged permissionless handoff migrates both empty insurance
+roles to the controller. The recorded backing provider remains unchanged. A handoff that preserves
+a nonzero backing bucket is rejected unless `asset_admin` migrates to the controller. The only
+non-migrating exception requires the existing handoff to include canonical current-layout Subledger or TWAP state
 bound to this exact market and Percolator program; both insurance roles must name the same constrained
 PDA. An arbitrary delegated admin is rejected even while empty because it could fund after handoff.
 The insurance authority and operator must also match before handoff and belong to the outgoing

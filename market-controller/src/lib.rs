@@ -2080,11 +2080,12 @@ fn process_grant_genesis_pool<'a>(
 // it does not migrate secondary asset_admin roles. Accept only an asset-0-only market
 // or one whose secondary slots are all fully retired, with direct permissionless asset
 // append disabled; controller-governed secondary assets can then be activated after
-// the handoff. If the outgoing key owns funded
-// asset-0 insurance or is the recorded backing provider, restore only those same roles
-// so donating lifecycle control cannot donate segregated capital too. asset_admin must
-// migrate to this controller unless canonical current-layout Subledger/TWAP state proves
-// that its constrained PDA already owns admin and both insurance roles.
+// the handoff. Funded asset-0 insurance owned by the outgoing raw key must exit before
+// donation; otherwise that key could withdraw its principal after handoff yet retain a
+// perpetual claim on later trade fees. Preserve only the recorded backing provider.
+// asset_admin must migrate to this controller unless canonical current-layout
+// Subledger/TWAP state proves that its constrained PDA already owns admin and both
+// insurance roles.
 // A later genesis-pool grant requires the external insurance balance to exit first.
 fn process_accept_market_authority<'a>(
     program_id: &Pubkey,
@@ -2111,7 +2112,7 @@ fn process_accept_market_authority<'a>(
         market,
         percolator_program,
     )?;
-    let (restore_insurance_authority, restore_insurance_operator, restore_outgoing_backing) = {
+    let restore_outgoing_backing = {
         let market_data = market.try_borrow_data()?;
         if !percolator_accounting::all_secondary_assets_retired(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
@@ -2137,8 +2138,12 @@ fn process_accept_market_authority<'a>(
         if insurance_authority != insurance_operator {
             return Err(ProgramError::InvalidAccountData);
         }
-        let restore_insurance_authority = has_insurance && insurance_authority == current_bytes;
-        let restore_insurance_operator = has_insurance && insurance_operator == current_bytes;
+        // UpdateAuthority migrates empty outgoing insurance roles to this controller. A funded
+        // outgoing provider must exit first: restoring it here would let it remove all principal
+        // after handoff while retaining the withdrawal key for fees paid by future traders.
+        if has_insurance && insurance_authority == current_bytes {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let backing_authority =
             percolator_accounting::read_asset_backing_authority(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
@@ -2171,11 +2176,7 @@ fn process_accept_market_authority<'a>(
                 return Err(ProgramError::InvalidAccountData);
             }
         }
-        (
-            restore_insurance_authority,
-            restore_insurance_operator,
-            restore_outgoing_backing,
-        )
+        restore_outgoing_backing
     };
     let mut ix_data = vec![PERC_IX_UPDATE_AUTHORITY];
     ix_data.extend_from_slice(controller.key.as_ref());
@@ -2205,17 +2206,10 @@ fn process_accept_market_authority<'a>(
         &[&seeds],
     )?;
 
-    for (kind, restore) in [
-        (ASSET_AUTH_INSURANCE, restore_insurance_authority),
-        (ASSET_AUTH_INSURANCE_OPERATOR, restore_insurance_operator),
-        (ASSET_AUTH_BACKING_BUCKET, restore_outgoing_backing),
-    ] {
-        if !restore {
-            continue;
-        }
+    if restore_outgoing_backing {
         let mut restore_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
         restore_data.extend_from_slice(&0u16.to_le_bytes());
-        restore_data.push(kind);
+        restore_data.push(ASSET_AUTH_BACKING_BUCKET);
         restore_data.extend_from_slice(current.key.as_ref());
         invoke_signed(
             &Instruction {
