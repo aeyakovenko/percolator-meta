@@ -650,15 +650,23 @@ fn validate_provider_return_token_accounts(
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControllerInsuranceReturn {
+    Retain,
+    ForwardToGovernance,
+}
+
 fn validate_controller_insurance_transit(
     controller: &AccountInfo,
+    governance: &AccountInfo,
     transit: &AccountInfo,
     destination: &AccountInfo,
-) -> ProgramResult {
-    if transit.key != destination.key || transit.owner != &spl_token::ID {
+) -> Result<ControllerInsuranceReturn, ProgramError> {
+    if transit.owner != &spl_token::ID || destination.owner != &spl_token::ID {
         return Err(ProgramError::IllegalOwner);
     }
     let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
+    let destination_state = spl_token::state::Account::unpack(&destination.try_borrow_data()?)?;
     let canonical_transit = Pubkey::find_program_address(
         &[
             controller.key.as_ref(),
@@ -669,7 +677,6 @@ fn validate_controller_insurance_transit(
     )
     .0;
     if transit_state.state != spl_token::state::AccountState::Initialized
-        || *transit.key != canonical_transit
         || transit_state.owner != *controller.key
         || transit_state.delegate.is_some()
         || transit_state.delegated_amount != 0
@@ -677,7 +684,28 @@ fn validate_controller_insurance_transit(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(())
+    if transit.key == destination.key {
+        if *transit.key != canonical_transit {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        return Ok(ControllerInsuranceReturn::Retain);
+    }
+    // A permanently frozen canonical ATA cannot receive protocol insurance and
+    // would otherwise keep the asset or slab live forever. A replaceable transit
+    // is safe only as a one-shot: it starts empty, forwards the exact slab-derived
+    // amount to governance, and closes atomically below. This prevents a public
+    // cranker from fragmenting controller custody across arbitrary token accounts.
+    if transit_state.amount != 0
+        || destination_state.state != spl_token::state::AccountState::Initialized
+        || destination_state.owner != *governance.key
+        || destination_state.mint != transit_state.mint
+        || destination_state.delegate.is_some()
+        || destination_state.delegated_amount != 0
+        || destination_state.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(ControllerInsuranceReturn::ForwardToGovernance)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -910,9 +938,12 @@ fn process_return_shutdown_backing<'a>(
 // override. The amount is the complete asset-local balance read from the pinned
 // slab, and both tokens and transit rent go only to a clean account owned by the
 // recorded insurance authority. Controller-owned protocol insurance is retained
-// in the canonical controller transit. Before that withdrawal, this instruction
-// atomically moves the local operator to a dedicated instruction-only PDA, forcing
-// Percolator to apply its own market-authority shutdown delay and empty-asset checks.
+// in the canonical controller transit when it is usable. A clean empty replacement
+// may instead forward the exact amount to a clean governance-owned account and
+// close atomically, so a permanently frozen canonical ATA cannot block retirement
+// or fragment protocol custody. Before that withdrawal, this instruction atomically
+// moves the local operator to a dedicated instruction-only PDA, forcing Percolator
+// to apply its own market-authority shutdown delay and empty-asset checks.
 fn process_return_shutdown_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -991,12 +1022,13 @@ fn process_return_shutdown_insurance<'a>(
         }
         (Pubkey::new_from_array(authority), amount, controller_owned)
     };
-    if controller_owned {
-        validate_controller_insurance_transit(
+    let controller_return = if controller_owned {
+        Some(validate_controller_insurance_transit(
             controller,
+            governance,
             controller_transit,
             provider_destination,
-        )?;
+        )?)
     } else {
         if shutdown_operator.is_some() {
             return Err(ProgramError::InvalidAccountData);
@@ -1007,7 +1039,8 @@ fn process_return_shutdown_insurance<'a>(
             controller_transit,
             provider_destination,
         )?;
-    }
+        None
+    };
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -1089,7 +1122,7 @@ fn process_return_shutdown_insurance<'a>(
         ],
         &[&seeds],
     )?;
-    if controller_owned {
+    if controller_return == Some(ControllerInsuranceReturn::Retain) {
         Ok(())
     } else {
         let return_amount = u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
@@ -1149,7 +1182,8 @@ fn rotate_asset_role_to_controller<'a>(
 // slab, and forwards it to a clean account owned by the outgoing authority. This includes
 // asset 0 only when the controller still holds its asset-admin rotation key.
 // Controller-owned protocol insurance stays in the canonical controller ATA for
-// the existing terminal governance reclaim. Any failed operation rolls back.
+// the existing terminal governance reclaim, or uses the same one-shot governance
+// fallback when that canonical account is unusable. Any failed operation rolls back.
 fn process_return_resolved_asset_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1222,12 +1256,13 @@ fn process_return_resolved_asset_insurance<'a>(
         }
         (Pubkey::new_from_array(authority), amount, controller_owned)
     };
-    if controller_owned {
-        validate_controller_insurance_transit(
+    let controller_return = if controller_owned {
+        Some(validate_controller_insurance_transit(
             controller,
+            governance,
             controller_transit,
             provider_destination,
-        )?;
+        )?)
     } else {
         validate_provider_return_token_accounts(
             controller,
@@ -1235,7 +1270,8 @@ fn process_return_resolved_asset_insurance<'a>(
             controller_transit,
             provider_destination,
         )?;
-    }
+        None
+    };
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -1284,7 +1320,7 @@ fn process_return_resolved_asset_insurance<'a>(
         ],
         &[&seeds],
     )?;
-    if controller_owned {
+    if controller_return == Some(ControllerInsuranceReturn::Retain) {
         Ok(())
     } else {
         let return_amount = u64::try_from(amount).map_err(|_| ProgramError::ArithmeticOverflow)?;

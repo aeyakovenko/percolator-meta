@@ -2,6 +2,30 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - frozen controller ATA could block protocol-insurance cleanup (surface A/C)
+
+The fixed provider-return paths already tolerated a collateral issuer permanently freezing a
+canonical token account, but the newest controller-owned insurance path required the canonical
+controller ATA. A freeze-authority holder could freeze that empty ATA, revoke the freeze key, and
+leave asset-local fee insurance with no valid withdrawal destination. The balance then prevented a
+secondary asset from retiring after its shutdown delay; the same hard pin blocked terminal cleanup
+after whole-market resolution.
+
+Clean-room LiteSVM regressions exercise both public branches against the pinned Percolator SBF. One
+creates secondary fee insurance through real round-trip trades and matures the governed shutdown;
+the other publicly donates asset-0 insurance and resolves the stale market. Each permanently freezes
+the canonical controller ATA, proves that path fails byte-atomically, and completes cleanup through
+a fresh controller-owned transit. Attacker-owned destinations and preloaded replacement transits
+reject without changing the slab or vault. The accepted fallback pays only a clean account owned by
+the governance key, closes in the same transaction, and preserves every trader collateral atom.
+
+FIX: canonical retention remains unchanged. For controller-owned insurance only, shutdown and
+resolved cleanup may alternatively use an empty clean controller transit plus a clean
+governance-owned destination of the same mint. The amount is still the complete slab-derived
+asset-local balance, and the replacement is forwarded and closed atomically. A public caller gains
+no amount, provider, user-principal, reusable signer, or attacker recipient surface and cannot split
+protocol custody across fallback accounts.
+
 ## Tick - controller-owned secondary fee insurance could block asset retirement (surface A/C)
 
 Secondary activation may intentionally bind both insurance roles to the constrained controller.

@@ -7555,8 +7555,9 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
 // stale resolution, but CloseSlab still requires that insurance to be empty. The fixed recovery
 // must retain protocol insurance in the canonical controller ATA for terminal governance reclaim
 // without exposing a caller-selected destination.
-#[test]
-fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance() {
+fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance(
+    freeze_canonical_transit: bool,
+) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -7573,7 +7574,13 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
     svm.airdrop(&governance.pubkey(), 1_000_000_000)
         .unwrap();
     let mint_authority = Keypair::new();
-    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let freeze_authority = Keypair::new();
+    let collateral_mint = create_real_mint_with_freeze_authority(
+        &mut svm,
+        &payer,
+        &mint_authority.pubkey(),
+        &freeze_authority.pubkey(),
+    );
     let slab = Pubkey::new_unique();
     svm.set_account(
         slab,
@@ -7784,24 +7791,123 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
     assert_eq!(token_amount(&svm, &percolator_vault), vault_before_redirect);
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
 
-    send(
+    let governance_destination = Pubkey::new_unique();
+    set_token(
         &mut svm,
-        &[&payer],
-        controller_return_resolved_asset_insurance_ix(
-            &governance.pubkey(),
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    let close_transit = if freeze_canonical_transit {
+        let freeze = spl_token::instruction::freeze_account(
+            &spl_token::ID,
+            &controller_transit,
+            &collateral_mint,
+            &freeze_authority.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let revoke = spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &collateral_mint,
+            None,
+            spl_token::instruction::AuthorityType::FreezeAccount,
+            &freeze_authority.pubkey(),
+            &[],
+        )
+        .unwrap();
+        svm.expire_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[freeze, revoke],
+            Some(&payer.pubkey()),
+            &[&payer, &freeze_authority],
+            svm.latest_blockhash(),
+        ))
+        .expect("issuer permanently freezes the canonical resolved transit");
+
+        let market_before_frozen = svm.get_account(&slab).unwrap();
+        let vault_before_frozen = svm.get_account(&percolator_vault).unwrap();
+        assert!(
+            send(
+                &mut svm,
+                &[&payer],
+                controller_return_resolved_asset_insurance_ix(
+                    &governance.pubkey(),
+                    &controller,
+                    &slab,
+                    &controller_transit,
+                    &controller_transit,
+                    &percolator_vault,
+                    &vault_authority,
+                    &insurance_ledger,
+                    &perc_id(),
+                    0,
+                ),
+            )
+            .is_err(),
+            "the frozen canonical account cannot receive resolved insurance"
+        );
+        assert_eq!(svm.get_account(&slab).unwrap(), market_before_frozen);
+        assert_eq!(
+            svm.get_account(&percolator_vault).unwrap(),
+            vault_before_frozen
+        );
+
+        let fallback_transit = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &fallback_transit,
+            &collateral_mint,
             &controller,
-            &slab,
-            &controller_transit,
-            &controller_transit,
-            &percolator_vault,
-            &vault_authority,
-            &insurance_ledger,
-            &perc_id(),
             0,
-        ),
-    )
-    .expect("public cleanup recovers protocol insurance to the controller ATA");
-    assert_eq!(token_amount(&svm, &controller_transit), 1);
+        );
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset_insurance_ix(
+                &governance.pubkey(),
+                &controller,
+                &slab,
+                &governance_destination,
+                &fallback_transit,
+                &percolator_vault,
+                &vault_authority,
+                &insurance_ledger,
+                &perc_id(),
+                0,
+            ),
+        )
+        .expect("public cleanup forwards through a one-shot resolved fallback");
+        assert!(
+            svm.get_account(&fallback_transit)
+                .map_or(true, |account| account.lamports == 0),
+            "resolved fallback closes atomically"
+        );
+        let close_transit = Pubkey::new_unique();
+        set_token(&mut svm, &close_transit, &collateral_mint, &controller, 0);
+        close_transit
+    } else {
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset_insurance_ix(
+                &governance.pubkey(),
+                &controller,
+                &slab,
+                &controller_transit,
+                &controller_transit,
+                &percolator_vault,
+                &vault_authority,
+                &insurance_ledger,
+                &perc_id(),
+                0,
+            ),
+        )
+        .expect("public cleanup recovers protocol insurance to the controller ATA");
+        assert_eq!(token_amount(&svm, &controller_transit), 1);
+        controller_transit
+    };
     assert_eq!(
         percolator_accounting::read_asset_insurance_remaining(
             &svm.get_account(&slab).unwrap().data,
@@ -7822,14 +7928,6 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
         },
     )
     .unwrap();
-    let governance_destination = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &governance_destination,
-        &collateral_mint,
-        &governance.pubkey(),
-        0,
-    );
     send(
         &mut svm,
         &[&payer, &governance],
@@ -7841,7 +7939,7 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(vault_authority, false),
                 AccountMeta::new(percolator_vault, false),
-                AccountMeta::new(controller_transit, false),
+                AccountMeta::new(close_transit, false),
                 AccountMeta::new(governance_destination, false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
@@ -7857,6 +7955,16 @@ fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance()
             .map_or(true, |account| account.lamports == 0),
         "terminal reclaim closes the slab"
     );
+}
+
+#[test]
+fn e2e_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance() {
+    assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance(false);
+}
+
+#[test]
+fn e2e_frozen_controller_transit_cannot_strand_resolved_protocol_insurance() {
+    assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insurance(true);
 }
 
 // PUBLIC DOS: a user can materialize an empty portfolio and disappear. Percolator deliberately
@@ -10901,6 +11009,42 @@ fn create_real_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> P
         ),
         spl_token::instruction::initialize_mint(&spl_token::ID, &mint.pubkey(), authority, None, 6)
             .unwrap(),
+    ];
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[payer, &mint],
+        bh,
+    ))
+    .unwrap();
+    mint.pubkey()
+}
+
+fn create_real_mint_with_freeze_authority(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    authority: &Pubkey,
+    freeze_authority: &Pubkey,
+) -> Pubkey {
+    let mint = Keypair::new();
+    let rent = svm.minimum_balance_for_rent_exemption(82);
+    let ixs = [
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            rent,
+            82,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_mint(
+            &spl_token::ID,
+            &mint.pubkey(),
+            authority,
+            Some(freeze_authority),
+            6,
+        )
+        .unwrap(),
     ];
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -37662,7 +37806,13 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     let governance = Keypair::new();
     svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
     let mint_authority = Keypair::new();
-    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let freeze_authority = Keypair::new();
+    let collateral_mint = create_real_mint_with_freeze_authority(
+        &mut svm,
+        &payer,
+        &mint_authority.pubkey(),
+        &freeze_authority.pubkey(),
+    );
     let market = Pubkey::new_unique();
     svm.set_account(
         market,
@@ -37962,13 +38112,112 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     clock.slot = 111;
     svm.set_sysvar(&clock);
 
+    let freeze_canonical = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &controller_transit,
+        &collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke_freeze = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &collateral_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[freeze_canonical, revoke_freeze],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    ))
+    .expect("issuer permanently freezes the canonical controller transit");
+
+    let fallback_transit = Pubkey::new_unique();
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &fallback_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+    let fallback_cleanup = |destination: Pubkey, transit: Pubkey| {
+        let mut ix = controller_return_shutdown_insurance_ix(
+            &governance.pubkey(),
+            &controller,
+            &market,
+            &destination,
+            &transit,
+            &percolator_vault,
+            &vault_authority,
+            &insurance_ledger,
+            &perc_id(),
+            1,
+        );
+        ix.accounts
+            .push(AccountMeta::new_readonly(shutdown_operator, false));
+        ix
+    };
+
     let portfolio_a_before_cleanup = svm.get_account(&portfolio_a).unwrap();
     let portfolio_b_before_cleanup = svm.get_account(&portfolio_b).unwrap();
-    send(&mut svm, &[&payer], fixed_cleanup())
-        .expect("permissionless fixed cleanup retains protocol fees in controller custody");
+    assert!(
+        send(&mut svm, &[&payer], fixed_cleanup()).is_err(),
+        "the permanently frozen canonical controller account is unusable"
+    );
+    let preloaded_fallback = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &preloaded_fallback,
+        &collateral_mint,
+        &controller,
+        1,
+    );
+    let market_before_preloaded = svm.get_account(&market).unwrap();
+    let vault_before_preloaded = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            fallback_cleanup(governance_destination, preloaded_fallback),
+        )
+        .is_err(),
+        "a preloaded fallback cannot fragment controller custody"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_preloaded);
     assert_eq!(
-        token_amount(&svm, &controller_transit),
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_preloaded
+    );
+    assert_eq!(token_amount(&svm, &preloaded_fallback), 1);
+
+    send(
+        &mut svm,
+        &[&payer],
+        fallback_cleanup(governance_destination, fallback_transit),
+    )
+    .expect("permissionless fixed cleanup uses a clean controller transit");
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
         fee_insurance as u64
+    );
+    assert!(
+        svm.get_account(&fallback_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "the one-shot fallback cannot fragment protocol custody"
     );
     assert_eq!(
         svm.get_account(&portfolio_a).unwrap(),
@@ -38035,7 +38284,7 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         recovered_trader_principal += token_amount(&svm, &destination) as u128;
     }
     assert_eq!(
-        recovered_trader_principal + token_amount(&svm, &controller_transit) as u128,
+        recovered_trader_principal + token_amount(&svm, &governance_destination) as u128,
         2_000_000,
         "the cleanup moves only the 120 fee atoms and preserves all remaining trader capital"
     );
