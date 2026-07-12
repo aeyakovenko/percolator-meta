@@ -3446,6 +3446,328 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
 }
 
+// PUBLIC VALUE LEAK: deployed predecessor markets may retain a raw external insurance provider.
+// Once that provider exits during recovery, restart must not preserve its zero-capital fee key.
+#[test]
+fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let provider = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&provider.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8];
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("initialize controller market");
+
+    // Upgrade fixture: this exact matched external role state was publicly creatable through
+    // predecessor controller activation/donation paths. New entry is blocked by the preceding fixes.
+    let mut legacy_market = svm.get_account(&market).unwrap();
+    let mut legacy_profile =
+        percolator_prog::state::read_asset_oracle_profile(&legacy_market.data, 0).unwrap();
+    legacy_profile.insurance_authority = provider.pubkey().to_bytes();
+    legacy_profile.insurance_operator = provider.pubkey().to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(
+        &mut legacy_market.data,
+        0,
+        &legacy_profile,
+    )
+    .unwrap();
+    svm.set_account(market, legacy_market).unwrap();
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let principal = 100u64;
+    let provider_token = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_token,
+        &collateral_mint,
+        &provider.pubkey(),
+        principal,
+    );
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpInsuranceDomain {
+                domain: 0,
+                amount: principal as u128,
+            },
+        ),
+    )
+    .expect("legacy provider deposits insurance through the public API");
+
+    let proxy = |percolator_instruction: PIx| {
+        let mut data = vec![0u8];
+        data.extend_from_slice(&percolator_instruction.encode());
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: principal as u128,
+            },
+        ),
+    )
+    .expect("provider removes every principal atom before recovery");
+    assert_eq!(token_amount(&svm, &provider_token), principal);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        0
+    );
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(PIx::ConfigurePermissionlessResolve {
+            stale_slots: 1_000,
+            force_close_delay_slots: 5,
+        }),
+    )
+    .expect("governance configures the public shutdown lifecycle");
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 110;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(PIx::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 0,
+            now_slot: 110,
+            initial_price: 0,
+            insurance_authority: [0u8; 32],
+            insurance_operator: [0u8; 32],
+            backing_bucket_authority: [0u8; 32],
+            oracle_authority: [0u8; 32],
+        }),
+    )
+    .expect("governance moves the legacy asset into recovery");
+
+    clock.slot = 111;
+    svm.set_sysvar(&clock);
+    let market_before_restart = svm.get_account(&market).unwrap();
+    if send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(PIx::RestartAssetOracle {
+            asset_index: 0,
+            now_slot: 111,
+            initial_price: 1_000_000,
+        }),
+    )
+    .is_ok()
+    {
+        let restarted_profile = percolator_prog::state::read_asset_oracle_profile(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        assert_eq!(restarted_profile.insurance_authority, provider.pubkey().to_bytes());
+        assert_eq!(restarted_profile.insurance_operator, provider.pubkey().to_bytes());
+
+        let portfolio_len =
+            percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+        let trader_a = Keypair::new();
+        let trader_b = Keypair::new();
+        let portfolio_a = Pubkey::new_unique();
+        let portfolio_b = Pubkey::new_unique();
+        for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
+            svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+            svm.set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; portfolio_len],
+                    owner: perc_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            send(
+                &mut svm,
+                &[&payer, trader],
+                pix(
+                    vec![
+                        AccountMeta::new(trader.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("initialize post-restart trader");
+            let source = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &source,
+                &collateral_mint,
+                &trader.pubkey(),
+                1_000_000,
+            );
+            send(
+                &mut svm,
+                &[&payer, trader],
+                pix(
+                    vec![
+                        AccountMeta::new(trader.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit { amount: 1_000_000 },
+                ),
+            )
+            .expect("fund post-restart trader");
+        }
+        let size_q = (percolator::POS_SCALE / 10) as i128;
+        for signed_size in [size_q, -size_q] {
+            send(
+                &mut svm,
+                &[&payer, &trader_a, &trader_b],
+                pix(
+                    vec![
+                        AccountMeta::new(trader_a.pubkey(), true),
+                        AccountMeta::new(trader_b.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio_a, false),
+                        AccountMeta::new(portfolio_b, false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index: 0,
+                        size_q: signed_size,
+                        exec_price: 1_000_000,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+            .expect("post-restart public round trip creates new fee insurance");
+        }
+        let fee = percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        assert_eq!(fee, 120);
+        send(
+            &mut svm,
+            &[&payer, &provider],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(provider.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(provider_token, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::WithdrawInsuranceAsset {
+                    asset_index: 0,
+                    amount: fee,
+                },
+            ),
+        )
+        .expect("zero-capital legacy operator skims post-restart fees");
+        assert_eq!(token_amount(&svm, &provider_token), principal + 120);
+        panic!("restart preserved a zero-capital external fee operator");
+    }
+
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_restart);
+}
+
 // TransactionMessage carrying the twap IX_ACCEPT_OPERATOR. account_keys (grouped:
 // signer first, then writable non-signers, then readonly non-signers):
 // [squads_vault(ro-signer), market_slab(w), config(w), twap_authority, percolator_program, twap_program].

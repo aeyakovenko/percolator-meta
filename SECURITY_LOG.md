@@ -2,6 +2,26 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - restart revived a zero-capital legacy fee operator (surface A/C)
+
+Predecessor controller activation and donation paths could leave matched external insurance roles on
+an otherwise controller-governed asset. The external provider could publicly deposit and withdraw all
+principal, governance could shut down and restart the empty asset, and pinned
+`RestartAssetOracle` preserved that zero-capital key as the live operator. Two ordinary public trades
+then generated 120 fee atoms that the stale key could withdraw despite risking no capital in the new
+lifecycle.
+
+The clean-room LiteSVM regression starts from the exact predecessor-compatible role layout, performs
+the provider's public deposit and full exit, then executes governed shutdown and restart against the
+real pinned Percolator SBF. On the vulnerable controller it completes a funded public trade round trip
+and proves the stale key withdraws the complete 120-atom fee balance.
+
+FIX: the constrained governance proxy now forwards `RestartAssetOracle` only when both selected-asset
+insurance roles already equal the controller PDA. Existing controller-owned restart remains unchanged.
+Legacy external-role assets can still complete provider-bound recovery and retire, but must activate a
+fresh controller-insured slot instead of carrying an unfunded fee recipient into a new lifecycle. The
+guard adds no signer, destination, amount, role mutation, or value-moving instruction.
+
 ## Tick - restart preserved a one-shot insurance operator and blocked later retirement (surface A/C)
 
 Controller-owned secondary insurance cleanup temporarily installed an instruction-scoped PDA as
