@@ -176,14 +176,19 @@ const IX_RETURN_FINALIZED_POSITION: u8 = 12;
 // custody so a live owner recovery cannot commit without consuming the complete
 // position that authorized it.
 const IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
+// Permissionless predecessor-market recovery. The canonical current-layout
+// insurance pool signs two hardcoded zero-only Percolator policy updates; callers
+// cannot select a fee, authority, amount, or destination.
+const IX_CLEAR_BACKING_FEE_POLICIES: u8 = 14;
 
-// Percolator CPI tags (verified against the pinned v16 program, percolator-prog 624b13d).
+// Percolator CPI tags (verified against the pinned v16 program, percolator-prog 7eea209).
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 // tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
 // insurance-operator-gated, during-Live insurance withdraw that REPLACED the removed asset-0 tag-23
 // WithdrawInsuranceLimited (reconcile, finding JX/JS). The percolator caps `amount` to the available
 // insurance; the subledger's own per-owner owed computation is the depositor-principal cap on top.
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
+const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const ASSET_AUTH_ADMIN: u8 = 0;
 const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance)
@@ -951,6 +956,9 @@ pub fn process_instruction(
         }
         IX_INSURANCE_WITHDRAW_FULL => {
             process_insurance_withdraw_full(program_id, accounts, &mut data)
+        }
+        IX_CLEAR_BACKING_FEE_POLICIES => {
+            process_clear_backing_fee_policies(program_id, accounts, &mut data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -2385,6 +2393,94 @@ fn process_accept_operator(
             },
             &[
                 asset_admin.clone(),
+                pool_account.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+// clear_backing_fee_policies accounts: [pool, market_slab(w), percolator_program]
+// data: none
+//
+// Pinned Percolator rejects every atomic batch while either asset-0 backing-fee
+// policy is active. A predecessor creator can configure those policies before the
+// canonical pool receives insurance custody; after marketauth moves to the Meta
+// controller, only this pool can clear them. Keep recovery permissionless and
+// value-neutral: both domain updates are hardcoded to zero and commit atomically.
+fn process_clear_backing_fee_policies(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let pool_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if pool_account.data_len() < POOL_SIZE
+        || !market_slab.is_writable
+        || market_slab.owner != percolator_program.key
+        || !percolator_program.executable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    if !pool.is_insurance()
+        || pool.asset_id != 0
+        || pool.policy != POLICY_PRINCIPAL
+        || pool.domain != DOMAIN_INSURANCE
+        || *market_slab.key != pool.market_slab
+        || *percolator_program.key != pool.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
+    {
+        let market_data = market_slab.try_borrow_data()?;
+        let pool_key = pool_account.key.to_bytes();
+        if percolator_accounting::read_asset_admin(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != pool_key
+            || percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != pool_key
+            || percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != pool_key
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+
+    for domain in 0u16..=1 {
+        let mut ix_data = vec![PERC_IX_UPDATE_BACKING_FEE_POLICY];
+        ix_data.extend_from_slice(&domain.to_le_bytes());
+        ix_data.extend_from_slice(&0u16.to_le_bytes()); // fee_bps
+        ix_data.extend_from_slice(&0u16.to_le_bytes()); // insurance_share_bps
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*pool_account.key, true),
+                    AccountMeta::new(*market_slab.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
                 pool_account.clone(),
                 market_slab.clone(),
                 percolator_program.clone(),

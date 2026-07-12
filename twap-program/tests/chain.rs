@@ -6490,6 +6490,327 @@ fn e2e_market_donation_rejects_a_raw_creator_batch_gate() {
     assert_eq!(clean_config.backing_trade_fee_policy_count, 0);
 }
 
+// PUBLIC POSITION DOS: a predecessor creator can arm Percolator's market-global batch gate before
+// granting canonical Subledger custody. The controller accepts that constrained-custody migration,
+// but it cannot clear the policy because Percolator authorizes the pool (asset-0 insurance authority),
+// not marketauth. The pool needs an exact-zero, permissionless recovery instruction so no admin or
+// recipient-bearing surface is added and the same atomic user batch becomes live again.
+#[test]
+fn e2e_subledger_custody_can_clear_an_inherited_batch_gate() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    for domain in 0..=1 {
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                ],
+                PIx::UpdateBackingFeePolicy {
+                    domain,
+                    fee_bps: 77,
+                    insurance_share_bps: 5_000,
+                },
+            ),
+        )
+        .expect("creator arms a pinned batch-gating policy");
+    }
+
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut init_pool_data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    init_pool_data.extend_from_slice(&0u64.to_le_bytes());
+    init_pool_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut init_pool_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(percolator_vault, false),
+                AccountMeta::new_readonly(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_auth, false),
+                AccountMeta::new_readonly(coin_mint, false),
+            ],
+            data: init_pool_data,
+        },
+    )
+    .expect("initialize the canonical current-layout genesis pool");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![7u8], // IX_ACCEPT_OPERATOR
+        },
+    )
+    .expect("creator grants all asset-0 insurance roles to the canonical pool");
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(pool, false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("controller accepts the canonical constrained-custody migration");
+    let inherited = svm.get_account(&slab).unwrap();
+    let (inherited_config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&inherited.data).unwrap();
+    assert_eq!(inherited_config.marketauth, controller.to_bytes());
+    assert_eq!(inherited_config.backing_trade_fee_policy_count, 2);
+
+    let mut controller_clear_data = vec![0u8]; // IX_PROXY_ADMIN
+    controller_clear_data.extend_from_slice(
+        &PIx::UpdateBackingFeePolicy {
+            domain: 0,
+            fee_bps: 0,
+            insurance_share_bps: 0,
+        }
+        .encode(),
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: controller_clear_data,
+            },
+        )
+        .is_err(),
+        "marketauth cannot impersonate the pool-owned insurance authority"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), inherited);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let alice = Keypair::new();
+    let bob = Keypair::new();
+    let alice_portfolio = Pubkey::new_unique();
+    let bob_portfolio = Pubkey::new_unique();
+    for (owner, portfolio) in [(&alice, alice_portfolio), (&bob, bob_portfolio)] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a real pinned portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            2_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 2_000_000 },
+            ),
+        )
+        .expect("fund a real pinned portfolio");
+    }
+
+    let batch = pix(
+        vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(alice_portfolio, false),
+            AccountMeta::new(bob_portfolio, false),
+        ],
+        PIx::BatchTradeNoCpi {
+            legs: vec![percolator_prog::ix::BatchTradeLeg {
+                asset_index: 0,
+                size_q: percolator::POS_SCALE as i128,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            }],
+        },
+    );
+    assert!(
+        send(&mut svm, &[&payer, &alice, &bob], batch.clone()).is_err(),
+        "the inherited policy blocks the real pinned batch interface"
+    );
+    let vault_before_clear = token_amount(&svm, &percolator_vault);
+    let market_before_clear = svm.get_account(&slab).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(pool, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![14u8, 1u8],
+            },
+        )
+        .is_err(),
+        "a caller cannot append a policy selector or value"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap(),
+        market_before_clear,
+        "malformed recovery is byte-atomic"
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![14u8], // IX_CLEAR_BACKING_FEE_POLICIES
+        },
+    )
+    .expect("any cranker clears both inherited policies through canonical pool custody");
+    assert_eq!(
+        token_amount(&svm, &percolator_vault),
+        vault_before_clear,
+        "zero-only policy recovery cannot move collateral"
+    );
+    let cleared = svm.get_account(&slab).unwrap();
+    let (cleared_config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&cleared.data).unwrap();
+    assert_eq!(cleared_config.backing_trade_fee_policy_count, 0);
+    assert_eq!(cleared_config.backing_trade_fee_bps_long, 0);
+    assert_eq!(cleared_config.backing_trade_fee_bps_short, 0);
+    assert_eq!(
+        cleared_config.backing_trade_fee_insurance_share_bps_long,
+        0
+    );
+    assert_eq!(
+        cleared_config.backing_trade_fee_insurance_share_bps_short,
+        0
+    );
+    assert_eq!(
+        cleared_config.trade_fee_base_bps, 3,
+        "recovery cannot change the ordinary trade fee"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_admin(&cleared.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&cleared.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&cleared.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+
+    send(&mut svm, &[&payer, &alice, &bob], batch)
+        .expect("the exact blocked batch succeeds after fixed zero-only recovery");
+}
+
 // PUBLIC LOF: Percolator's market-authority handoff also rewrites every asset-0 role that still
 // equals the outgoing market authority. A permissionless creator is initially the backing provider,
 // so donating a backed market to the stateless controller used to rewrite the provider to the

@@ -13661,3 +13661,27 @@ FIX: raw creator/controller custody must have a zero global backing-fee policy c
 donation. Canonical current-layout Subledger/TWAP custody remains the narrow migration exception because
 those fixed programs expose the zero-only recovery route. The change adds no signer, authority, recipient,
 amount, token CPI, or value-moving surface and cannot move insurance, backing, collateral, or reward coins.
+
+## Tick - Subledger custody had no route to clear an inherited global batch gate (surface A/C)
+
+The canonical-custody exception above was incomplete for Subledger. Pinned Percolator authorizes
+`UpdateBackingFeePolicy` with the asset's insurance authority, not marketauth. A raw creator could
+activate both asset-0 policies, grant all asset-0 custody roles to a canonical current-layout pool,
+and then donate marketauth to the Meta controller. The handoff accepted that attested predecessor
+state, but the controller could not clear it and Subledger exposed no policy instruction. Both pinned
+batch interfaces therefore remained disabled until a separate governance/TWAP custody migration.
+
+The retained real-SBF LiteSVM regression constructs that sequence only through public instructions.
+It proves the controller's zero update fails under pool-owned insurance authority, initializes and
+funds two real portfolios, and proves the pinned batch rejects while the inherited count is two. It
+then invokes the new permissionless Subledger recovery, checks both policy domains and insurance
+splits are zero, verifies the ordinary trade fee and all custody roles are unchanged, verifies the
+shared collateral vault is unchanged, and executes the identical batch successfully. A payload-bearing
+variant rejects byte-atomically, proving callers cannot smuggle a policy selector or value.
+
+FIX: current-layout principal-policy asset-0 pools expose one hardcoded recovery instruction. It
+requires the pool's canonical market/program PDA binding and verifies that the same pool currently
+owns asset admin, insurance authority, and insurance operator. It atomically signs exactly two
+`UpdateBackingFeePolicy` CPIs, for domains 0 and 1 with both values fixed to zero. The instruction has
+no signer gate, caller-selected policy, authority, amount, recipient, token account, or token CPI, so
+it restores public batch liveness without adding a path to insurance, backing, collateral, or rewards.
