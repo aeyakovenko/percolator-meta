@@ -275,7 +275,8 @@ struct Pool {
     /// `amount * total_shares / insurance_balance` shares (1:1 for the first); a
     /// withdraw redeems `shares * insurance_balance / total_shares`. Floor remainders
     /// leave unowned reserve shares here so an exiting holder cannot transfer that
-    /// value to whoever exits last. The reserve resets once no principal remains.
+    /// value to whoever exits last. Principal pools reset at zero principal;
+    /// empty with-surplus epochs normalize reserve pricing for later deposits.
     total_shares: u128,
     /// Distributed COIN mint whose genesis-vote config may lock this pool's positions.
     /// Own-vault pools store Pubkey::default().
@@ -827,6 +828,27 @@ fn rate_safe_pool_share_burn(
     Ok(core::cmp::min(shares_retired, maximum_burn))
 }
 
+fn pool_total_shares_after_exit(
+    policy: u8,
+    outstanding_after: u64,
+    priced_balance_after: u64,
+    total_shares: u128,
+    shares_burned: u128,
+) -> Result<u128, ProgramError> {
+    if outstanding_after == 0 {
+        return match policy {
+            POLICY_PRINCIPAL => Ok(0),
+            POLICY_WITH_SURPLUS => (priced_balance_after as u128)
+                .checked_mul(VIRTUAL_SHARES)
+                .ok_or(ProgramError::ArithmeticOverflow),
+            _ => Err(ProgramError::InvalidAccountData),
+        };
+    }
+    total_shares
+        .checked_sub(shares_burned)
+        .ok_or(ProgramError::InvalidAccountData)
+}
+
 /// Reject a deposit before transfer when its shares lose more than one atom to entry rounding at
 /// the post-deposit price. The virtual offset intentionally absorbs bounded rounding dust, but it
 /// must not make an accepted position materially under-valued before it takes any market risk.
@@ -1367,13 +1389,13 @@ fn process_withdraw(
     // A zero-payout exit still retires the position so an impaired/empty pool
     // cannot be replayed to distort other depositors' outstanding accounting.
     pool.outstanding_principal = outstanding_after;
-    pool.total_shares = if outstanding_after == 0 {
-        0
-    } else {
-        pool.total_shares
-            .checked_sub(pool_shares_to_burn)
-            .ok_or(ProgramError::InvalidAccountData)?
-    };
+    pool.total_shares = pool_total_shares_after_exit(
+        pool.policy,
+        outstanding_after,
+        balance_after,
+        pool.total_shares,
+        pool_shares_to_burn,
+    )?;
     position.shares = 0;
     position.withdrawn = true;
     position.withdrawn_amount = paid;
@@ -2177,18 +2199,19 @@ fn process_insurance_withdraw_impl(
     position.principal -= amount;
     // The position retires its nominal shares. The pool burns only the rate-safe
     // subset; the difference is unowned reserve that keeps floor dust out of a
-    // later holder's redemption. With no principal left, all pricing shares reset.
+    // later holder's redemption. Empty principal pools reset for terminal custody;
+    // with-surplus pools normalize reserve pricing for future deposit epochs.
     position.shares = position
         .shares
         .checked_sub(shares_to_retire)
         .ok_or(ProgramError::InvalidAccountData)?;
-    pool.total_shares = if outstanding_after == 0 {
-        0
-    } else {
-        pool.total_shares
-            .checked_sub(pool_shares_to_burn)
-            .ok_or(ProgramError::InvalidAccountData)?
-    };
+    pool.total_shares = pool_total_shares_after_exit(
+        pool.policy,
+        outstanding_after,
+        priced_balance_after,
+        pool.total_shares,
+        pool_shares_to_burn,
+    )?;
     // Historical telemetry must not become a custody gate. A position can cycle
     // the finite token supply enough times for cumulative withdrawals to exceed
     // u64 even though every individual balance and principal remains valid. A
@@ -2826,6 +2849,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn empty_with_surplus_epoch_normalizes_reserve_for_minimum_reentry() {
+        let reserve_balance = 2u64;
+        let reserve_shares = pool_total_shares_after_exit(
+            POLICY_WITH_SURPLUS,
+            0,
+            reserve_balance,
+            1_006_623,
+            0,
+        )
+        .unwrap();
+        assert_eq!(reserve_shares, reserve_balance as u128 * VIRTUAL_SHARES);
+        let new_shares = mint_shares(1, reserve_shares, reserve_balance).unwrap();
+        require_bounded_share_rounding(1, new_shares, reserve_shares, reserve_balance).unwrap();
+        assert_eq!(new_shares, VIRTUAL_SHARES);
+        assert_eq!(redeem_shares(new_shares, 3, reserve_shares + new_shares).unwrap(), 1);
+
+        assert_eq!(
+            pool_total_shares_after_exit(POLICY_PRINCIPAL, 0, reserve_balance, 9_999, 1)
+                .unwrap(),
+            0,
+            "principal pools retain their zero-claim terminal attestation",
+        );
     }
 
     #[test]
