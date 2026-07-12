@@ -6405,6 +6405,91 @@ fn init_creator_owned_market(
         .expect("permissionless creator initializes a real market");
 }
 
+// PUBLIC POSITION DOS PROBE: a raw creator can activate pinned Percolator's market-global
+// backing-fee batch gate before donating market authority. The permissionless controller handoff
+// must not make that unsafe policy durable under timelocked governance. Canonical Subledger/TWAP
+// custody remains a separately attested predecessor-migration path.
+#[test]
+fn e2e_market_donation_rejects_a_raw_creator_batch_gate() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let creator = Keypair::new();
+    svm.airdrop(&creator.pubkey(), 1_000_000_000).unwrap();
+    let governance = Pubkey::new_unique();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab = Pubkey::new_unique();
+    init_creator_owned_market(&mut svm, &payer, &creator, &collateral_mint, &slab);
+
+    let set_policy = |fee_bps, insurance_share_bps| {
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            PIx::UpdateBackingFeePolicy {
+                domain: 0,
+                fee_bps,
+                insurance_share_bps,
+            },
+        )
+    };
+    send(&mut svm, &[&payer, &creator], set_policy(77, 5_000))
+        .expect("raw creator enables the pinned global batch gate");
+    let armed_market = svm.get_account(&slab).unwrap();
+    let (armed_config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&armed_market.data).unwrap();
+    assert_eq!(armed_config.backing_trade_fee_policy_count, 1);
+    assert_eq!(
+        percolator_accounting::read_backing_fee_policy_count(&armed_market.data).unwrap(),
+        1,
+        "the Meta accounting view must match the real pinned wrapper"
+    );
+
+    let controller = controller_pda(&governance, &slab, &perc_id());
+    let donate_market = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+    };
+    assert!(
+        send(&mut svm, &[&payer, &creator], donate_market.clone()).is_err(),
+        "a raw creator cannot lock an active batch gate under the controller"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap(),
+        armed_market,
+        "rejected handoff is byte-atomic"
+    );
+
+    send(&mut svm, &[&payer, &creator], set_policy(0, 0))
+        .expect("the outgoing creator clears its own unsafe policy");
+    send(&mut svm, &[&payer, &creator], donate_market)
+        .expect("the clean creator market remains permissionlessly handoffable");
+    let clean_market = svm.get_account(&slab).unwrap();
+    let (clean_config, _, _, _) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&clean_market.data).unwrap();
+    assert_eq!(clean_config.marketauth, controller.to_bytes());
+    assert_eq!(clean_config.backing_trade_fee_policy_count, 0);
+}
+
 // PUBLIC LOF: Percolator's market-authority handoff also rewrites every asset-0 role that still
 // equals the outgoing market authority. A permissionless creator is initially the backing provider,
 // so donating a backed market to the stateless controller used to rewrite the provider to the

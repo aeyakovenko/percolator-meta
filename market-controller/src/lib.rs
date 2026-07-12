@@ -2360,7 +2360,9 @@ fn process_accept_market_authority<'a>(
         // UpdateAuthority migrates asset_admin only while it still equals the outgoing
         // market authority. The only safe non-migrating admins are this repository's
         // canonical Subledger/TWAP PDAs, whose fixed terminal wrappers can sign cleanup.
-        if asset_admin != current_bytes && asset_admin != controller.key.to_bytes() {
+        let constrained_custody =
+            asset_admin != current_bytes && asset_admin != controller.key.to_bytes();
+        if constrained_custody {
             validate_constrained_custody_admin(
                 governance,
                 market,
@@ -2382,6 +2384,18 @@ fn process_accept_market_authority<'a>(
             {
                 return Err(ProgramError::InvalidAccountData);
             }
+        }
+        // Pinned Percolator routes every atomic batch through incompatible backing-fee
+        // accounting while any policy is active. A raw creator can clear its own policy
+        // before donation; accepting it would instead lock the gate under timelocked
+        // governance. Canonical Subledger/TWAP custody remains a predecessor-migration
+        // exception because its fixed zero-only wrapper is the recovery path.
+        if !constrained_custody
+            && percolator_accounting::read_backing_fee_policy_count(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != 0
+        {
+            return Err(ProgramError::InvalidAccountData);
         }
         restore_outgoing_backing
     };

@@ -142,8 +142,10 @@ The workspace pins `percolator-prog` to commit
 
 That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
 active. Both governance wrappers therefore reject nonzero backing policies but preserve exact-zero
-updates to clear predecessor state; ordinary trade fees remain configurable. Backing fees can be
-re-enabled only after batch-safe accounting is merged on top of this exact security line.
+updates to clear predecessor state; ordinary trade fees remain configurable. Permissionless market
+donation also rejects an active raw-creator policy, while attested Subledger/TWAP predecessor custody
+retains the zero-only migration path. Backing fees can be re-enabled only after batch-safe accounting
+is merged on top of this exact security line.
 
 ## Genesis
 

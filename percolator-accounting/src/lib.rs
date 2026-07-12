@@ -21,6 +21,9 @@ pub const PERMISSIONLESS_MARKET_INIT_FEE_OFFSET: usize = HEADER_LEN + 112;
 // Pinned `WrapperConfigV16` global stale-resolution fields relative to the account.
 pub const PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET: usize = HEADER_LEN + 136;
 pub const LAST_GOOD_ORACLE_SLOT_OFFSET: usize = HEADER_LEN + 152;
+// The pinned wrapper's final 24 bytes are the global backing-policy count,
+// three u16 policy fields, matcher sequence, and reserved padding.
+pub const BACKING_FEE_POLICY_COUNT_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN - 24;
 // Pinned `WrapperConfigV16::free_market_slot_count` relative to the account.
 // The wrapper config starts after the 16-byte account header; this field follows
 // its authority/mint, fee, resolve, insurance-withdraw, and oracle-policy prefix.
@@ -249,6 +252,13 @@ pub fn read_maintenance_fee_per_slot(data: &[u8]) -> Result<u128, ReadError> {
 pub fn read_permissionless_market_init_fee(data: &[u8]) -> Result<u128, ReadError> {
     validate_market(data)?;
     read_u128(data, PERMISSIONLESS_MARKET_INIT_FEE_OFFSET)
+}
+
+/// Returns the pinned wrapper's market-global active backing-fee policy count.
+/// Any nonzero value selects Percolator's batch backing-accounting path.
+pub fn read_backing_fee_policy_count(data: &[u8]) -> Result<u16, ReadError> {
+    validate_market(data)?;
+    read_u16(data, BACKING_FEE_POLICY_COUNT_OFFSET)
 }
 
 /// Returns whether Percolator's whole-market stale resolution is permissionless now.
@@ -511,6 +521,20 @@ mod tests {
         market[10] = KIND_PORTFOLIO;
         assert_eq!(
             read_maintenance_fee_per_slot(&market),
+            Err(ReadError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn backing_fee_policy_count_uses_the_pinned_wrapper_offset() {
+        let mut market = market_with_stale_slots(0, 0, 0);
+        market[BACKING_FEE_POLICY_COUNT_OFFSET..BACKING_FEE_POLICY_COUNT_OFFSET + 2]
+            .copy_from_slice(&7u16.to_le_bytes());
+        assert_eq!(read_backing_fee_policy_count(&market), Ok(7));
+
+        market[10] = KIND_PORTFOLIO;
+        assert_eq!(
+            read_backing_fee_policy_count(&market),
             Err(ReadError::InvalidHeader)
         );
     }

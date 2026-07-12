@@ -13639,3 +13639,25 @@ FIX: every insurance exit now verifies that the canonical pool PDA is the live a
 operator before changing principal, including when no token CPI is needed. Positive and zero-payout exits
 therefore share the same custody precondition. The change adds no signer, authority, destination, amount,
 token CPI, or admin surface and cannot move insurance, backing, collateral, or reward coins.
+
+## Tick - raw market donation could preserve the pinned global batch gate (surface A/C)
+
+Pinned Percolator selects its incompatible batch backing-accounting path whenever the market-global
+backing-fee policy count is nonzero. Meta's governance wrappers already reject activating that state,
+but a raw market creator could enable a policy first and then permissionlessly donate market authority
+to the controller. The handoff preserved the active count while moving the creator's immediate clear
+authority under governance. A cross-margined user whose healthy exit requires final-state-only execution
+could therefore remain blocked until a timelocked zero-policy transaction executed.
+
+The retained real-binary LiteSVM regression initializes a creator-owned market, activates a 77-bps
+policy through the public Percolator API, and attempts the public Meta handoff. The old controller accepts
+it. The fixed controller rejects byte-atomically, lets the outgoing creator clear the policy, and then
+accepts the same market. Its pinned accounting reader is checked against the real wrapper state. The
+existing final-state-only batch regression independently proves that a nonzero count blocks the required
+atomic rotation, and the Squads/TWAP restart lifecycle proves attested predecessor custody remains
+migratable with historical policies.
+
+FIX: raw creator/controller custody must have a zero global backing-fee policy count before market
+donation. Canonical current-layout Subledger/TWAP custody remains the narrow migration exception because
+those fixed programs expose the zero-only recovery route. The change adds no signer, authority, recipient,
+amount, token CPI, or value-moving surface and cannot move insurance, backing, collateral, or reward coins.
