@@ -2570,6 +2570,68 @@ fn splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor() 
     assert_eq!(alice_total + bob_total + reserve, impaired as u64, "payouts plus reserve conserve the impaired insurance");
 }
 
+// The share-redemption policy has a different partial-exit path from the principal policy above:
+// every chunk retires proportional position shares, while the pool burns only enough shares to keep
+// its post-exit exchange rate from increasing. Exercise that branch repeatedly so a splitter cannot
+// turn per-chunk floor remainders into value taken from the depositor who remains in the pool.
+#[test]
+fn with_surplus_split_exit_cannot_capture_a_codepositors_rounding() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, amount)
+        .expect("alice deposits");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, amount)
+        .expect("bob deposits");
+
+    let impaired = 1_000_001u64;
+    impair_market(&mut env, impaired as u128);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, impaired),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    for chunk in [400_000u64, 300_000, 300_000] {
+        env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, chunk)
+            .expect("split share exit remains live");
+    }
+    let alice_total = env.token_amount(&alice_ata);
+    assert!(
+        alice_total <= 500_000,
+        "split redemption cannot exceed Alice's floored half, got {alice_total}"
+    );
+
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, amount)
+        .expect("the remaining depositor exits");
+    let bob_total = env.token_amount(&bob_ata);
+    let reserve = env.token_amount(&env.perc_vault);
+    assert!(
+        bob_total >= alice_total,
+        "Alice's split exit cannot drain Bob: alice={alice_total}, bob={bob_total}"
+    );
+    assert_eq!(reserve, 1, "the whole-atom rounding reserve remains unowned");
+    assert_eq!(
+        alice_total + bob_total + reserve,
+        impaired,
+        "all impaired insurance remains with depositors or protocol reserve"
+    );
+    assert_eq!(env.pool_outstanding(), 0, "both principal claims retire");
+}
+
 // OVER-WITHDRAW DRAIN (principal-only cap, per-depositor): insurance_withdraw caps the amount to
 // `amount <= position.principal && amount <= pool.outstanding` (lib.rs:1054). This pins the END-TO-END
 // invariant that a depositor can never pull more than their own recorded principal. DOUBLY-DEFENDED:
