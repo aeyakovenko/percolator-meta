@@ -2503,6 +2503,88 @@ fn allow_list_accepts_a_listed_extra_market_and_still_rejects_an_off_list_market
     .expect("the primary market still counts");
 }
 
+// UPGRADE LIVENESS: the market-index binding appended byte 211 to portfolio stakes. The preceding
+// public binary created 211-byte stakes while already accepting every configured extra market. An
+// extra-market stake must therefore derive its historical market from its authenticated live/archive
+// identity after upgrade; treating every predecessor as index 0 strands crystallize and claim.
+#[test]
+fn pre_market_index_extra_market_stake_crystallizes_and_claims_after_upgrade() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let extra_market = Pubkey::new_unique();
+    let env = setup_with_extra_markets(&mut svm, &payer, 1_000_000, &[extra_market]);
+
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_slot(&mut svm, 100);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &extra_market,
+        &owner.pubkey(),
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_LP,
+    )
+    .expect("the pre-upgrade public API accepts an extra-market stake");
+
+    let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_LP);
+    let mut predecessor = svm.get_account(&stake).unwrap();
+    assert_eq!(
+        predecessor.data.len(),
+        212,
+        "current fixture has the appended market index"
+    );
+    assert_eq!(
+        predecessor.data[211], 1,
+        "the extra market is allow-list index one"
+    );
+    predecessor.data.truncate(211);
+    svm.set_account(stake, predecessor).unwrap();
+
+    set_slot(&mut svm, 1_500);
+    set_portfolio(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &extra_market,
+        &owner.pubkey(),
+        12_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+        .expect("the upgraded program derives the predecessor's extra market");
+    assert_eq!(
+        svm.get_account(&stake).unwrap().data.len(),
+        211,
+        "compatibility does not require reallocating deployed stake state"
+    );
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze the predecessor contribution");
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    claim_cohort(
+        &mut svm, &payer, &env, &owner, &recipient, &portfolio, COHORT_LP,
+    )
+    .expect("the upgraded program pays the predecessor's frozen extra-market reward");
+    assert_eq!(
+        token_amount(&svm, &recipient),
+        400_000,
+        "the sole LP receives its cohort"
+    );
+}
+
 // DoS/HYGIENE PROBE (allow-list init bounds, sweep tick D): the extra-market tail is `count: u8` + count keys.
 // init must bound count to MAX_EXTRA_MARKETS (=9) and reject a default or primary-duplicate extra — else a
 // malformed list could over-read or admit a junk/aliased market into the trusted scope.

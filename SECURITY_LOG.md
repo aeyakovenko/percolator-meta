@@ -13530,3 +13530,22 @@ registration and counter reads require that exact read-only PDA. Registration re
 existing stakes ignore every later live generation and use only their canonical archive. The marker has
 no close path, token account, amount, beneficiary, signer, custody CPI, or authority mutation, and it
 cannot move user insurance, backing, collateral, or Subledger principal.
+
+## Tick - pre-index extra-market stakes could not crystallize after upgrade (surface C/D)
+
+The public binary immediately before immutable market indexing already allowed portfolio-flow stakes
+for configured extra markets, but serialized only 211 bytes and therefore stored no market index. The
+upgraded deserializer treated the absent byte as index zero. A legitimate extra-market stake then paired
+its extra-market portfolio and marker with the primary market, so public crystallization failed with
+`InvalidSeeds` and its fixed COIN allocation could never reach freeze or claim.
+
+The retained real-SBF LiteSVM regression registers through the public extra-market API, converts only
+the appended byte to the exact predecessor layout, advances authenticated residual counters, and proves
+the upgraded crystallize, freeze, and claim lifecycle pays the sole LP its complete cohort. The legacy
+stake remains 211 bytes, so compatibility does not depend on reallocating deployed state.
+
+FIX: current 212-byte stakes retain the strict stored allow-list index. Only predecessor stakes recover
+their immutable market from the same authenticated live portfolio or canonical cumulative archive that
+registration used, with exact Percolator program, owner, portfolio, market allow-list, and archive PDA
+checks. The change adds no signer, authority, token account, destination, amount selector, custody CPI,
+or principal-moving surface; it restores access only to already allocated COIN rewards.

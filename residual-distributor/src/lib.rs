@@ -1266,6 +1266,61 @@ fn portfolio_totals(
     archive.totals_with_live(None)
 }
 
+fn portfolio_market_for_stake(
+    program_id: &Pubkey,
+    config: &Config,
+    stake_data_len: usize,
+    stake: &Stake,
+    portfolio: &AccountInfo,
+    archive_account: &AccountInfo,
+) -> Result<Pubkey, ProgramError> {
+    if stake_data_len >= STAKE_SIZE {
+        return config
+            .market_at(stake.portfolio_market_index)
+            .ok_or(ProgramError::InvalidAccountData);
+    }
+
+    // The immediately preceding public layout already supported extra markets but had no byte in
+    // which to persist their index. Recover that immutable identity from the same authenticated
+    // witnesses registration used, without weakening the indexed path for current stakes.
+    if portfolio.data_len() != 0 && *portfolio.owner == config.percolator_program {
+        if let Ok(live) = percolator_accounting::read_portfolio_reward_snapshot(
+            &portfolio.try_borrow_data()?,
+            &portfolio.key.to_bytes(),
+        ) {
+            let market = Pubkey::new_from_array(live.market_group);
+            if live.owner == stake.owner.to_bytes() && config.market_allowed(&market) {
+                return Ok(market);
+            }
+        }
+    }
+
+    if archive_account.data_len() == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if archive_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let archive = PortfolioArchive::deserialize(&archive_account.try_borrow_data()?)?;
+    if archive.percolator_program != config.percolator_program
+        || archive.owner != stake.owner
+        || archive.portfolio != *portfolio.key
+        || !config.market_allowed(&archive.market)
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let (expected, _) = portfolio_archive_address(
+        &archive.percolator_program,
+        &archive.market,
+        &archive.owner,
+        &archive.portfolio,
+    );
+    if *archive_account.key != expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(archive.market)
+}
+
 fn config_seeds<'a>(coin_mint: &'a Pubkey) -> [&'a [u8]; 2] {
     [b"rd_config", coin_mint.as_ref()]
 }
@@ -2105,6 +2160,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     } else {
         false
     };
+    let stake_data_len = stake_account.data_len();
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidAccountData);
@@ -2194,24 +2250,23 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
             // crystallized_loss - spent since register.
-            let portfolio_market = config
-                .market_at(stake.portfolio_market_index)
-                .ok_or(ProgramError::InvalidAccountData)?;
-            let retired = market_is_retired(
+            let (portfolio_archive, retired_market) =
+                portfolio_context.ok_or(ProgramError::NotEnoughAccountKeys)?;
+            let portfolio_market = portfolio_market_for_stake(
+                program_id,
                 &config,
-                &portfolio_market,
-                portfolio_context
-                    .map(|(_, retired_market)| retired_market)
-                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
+                stake_data_len,
+                &stake,
+                backing_ledger,
+                portfolio_archive,
             )?;
+            let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
             let totals = portfolio_totals(
                 program_id,
                 &config,
                 &stake.owner,
                 backing_ledger,
-                portfolio_context
-                    .map(|(archive, _)| archive)
-                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
+                portfolio_archive,
                 Some(&portfolio_market),
                 retired,
             )?;
@@ -2256,24 +2311,23 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // Funding-payer cohort: points = raw delta of paid funding since register. No age multiplier:
             // funding accumulators already represent settled payment volume, and late payments should not
             // inherit early registration tenure.
-            let portfolio_market = config
-                .market_at(stake.portfolio_market_index)
-                .ok_or(ProgramError::InvalidAccountData)?;
-            let retired = market_is_retired(
+            let (portfolio_archive, retired_market) =
+                portfolio_context.ok_or(ProgramError::NotEnoughAccountKeys)?;
+            let portfolio_market = portfolio_market_for_stake(
+                program_id,
                 &config,
-                &portfolio_market,
-                portfolio_context
-                    .map(|(_, retired_market)| retired_market)
-                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
+                stake_data_len,
+                &stake,
+                backing_ledger,
+                portfolio_archive,
             )?;
+            let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
             let totals = portfolio_totals(
                 program_id,
                 &config,
                 &stake.owner,
                 backing_ledger,
-                portfolio_context
-                    .map(|(archive, _)| archive)
-                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
+                portfolio_archive,
                 Some(&portfolio_market),
                 retired,
             )?;
@@ -2436,6 +2490,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if *vault.key != config.vault {
         return Err(ProgramError::InvalidAccountData); // only the bound funded vault — no decoy
     }
+    let stake_data_len = stake_account.data_len();
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidAccountData);
@@ -2574,9 +2629,14 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let dematerialized = portfolio.data_len() == 0
                 && (*portfolio.owner == solana_program::system_program::ID
                     || *portfolio.owner == config.percolator_program);
-            let portfolio_market = config
-                .market_at(stake.portfolio_market_index)
-                .ok_or(ProgramError::InvalidAccountData)?;
+            let portfolio_market = portfolio_market_for_stake(
+                program_id,
+                &config,
+                stake_data_len,
+                &stake,
+                portfolio,
+                portfolio_archive,
+            )?;
             let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
             if (dematerialized || retired) && portfolio_archive.data_len() == 0 {
                 if *portfolio_archive.owner != solana_program::system_program::ID
