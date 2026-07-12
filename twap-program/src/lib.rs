@@ -4244,6 +4244,54 @@ mod tests {
     }
 
     #[test]
+    fn integer_pair_solver_matches_exhaustive_oracle_for_all_small_inputs() {
+        for marginal_coin in 1u128..=16 {
+            for marginal_usd in 1u128..=16 {
+                let marginal_gcd = gcd_u64(marginal_coin as u64, marginal_usd as u64);
+                for bid_coin in 1u128..=16 {
+                    for bid_usd in 1u128..=16 {
+                        if cmp_bid(marginal_coin, marginal_usd, bid_coin, bid_usd)
+                            == core::cmp::Ordering::Greater
+                        {
+                            continue;
+                        }
+                        let bid_gcd = gcd_u64(bid_coin as u64, bid_usd as u64);
+                        for remaining_usd in 1u128..=32 {
+                            let actual = max_executable_integer_pair(
+                                remaining_usd,
+                                marginal_coin,
+                                marginal_usd,
+                                bid_coin,
+                                bid_usd,
+                                bid_gcd,
+                                marginal_gcd,
+                            )
+                            .unwrap();
+                            let max_usd = core::cmp::min(remaining_usd, bid_usd);
+                            let mut expected = None;
+                            for coin in 1..=bid_coin {
+                                let usd = coin * marginal_usd / marginal_coin;
+                                if usd == 0
+                                    || usd > max_usd
+                                    || cmp_bid(coin, usd, bid_coin, bid_usd)
+                                        == core::cmp::Ordering::Greater
+                                {
+                                    continue;
+                                }
+                                consider_larger_pair(&mut expected, Some((coin, usd)));
+                            }
+                            assert_eq!(
+                                actual, expected,
+                                "marginal={marginal_coin}/{marginal_usd}, bid={bid_coin}/{bid_usd}, remaining={remaining_usd}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn wide_product_is_exact_at_u128_boundaries() {
         assert_eq!(wide_product(u128::MAX, u128::MAX), (u128::MAX - 1, 1));
         assert_eq!(wide_product(u128::MAX, 2), (1, u128::MAX - 1));
