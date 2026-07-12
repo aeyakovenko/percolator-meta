@@ -2949,6 +2949,13 @@ fn perc_so() -> String {
 }
 
 fn controller_init_market_data(max_assets: u16) -> Vec<u8> {
+    controller_init_market_data_with_maintenance(max_assets, 0)
+}
+
+fn controller_init_market_data_with_maintenance(
+    max_assets: u16,
+    maintenance_fee_per_slot: u128,
+) -> Vec<u8> {
     percolator_prog::ix::Instruction::InitMarket {
         max_portfolio_assets: max_assets,
         h_min: 0,
@@ -2971,7 +2978,7 @@ fn controller_init_market_data(max_assets: u16) -> Vec<u8> {
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 1,
         public_b_chunk_atoms: 1,
-        maintenance_fee_per_slot: 0,
+        maintenance_fee_per_slot,
     }
     .encode()
 }
@@ -5964,7 +5971,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     // PUBLIC LOF PROBE: this pool promises share-value redemption. Handing it to TWAP would let
     // permissionless auctions remove protocol surplus from the same balance and socialize that
     // pull across user shares (the full genesis regression reproduced a 1M -> 733,333 haircut).
-    // Only a principal-policy pool may cross the custody boundary.
+    // A with-surplus pool may cross only after every owner share has exited.
     let twap_init = init_config_ix(
         &payer.pubkey(),
         &coin_mint,
@@ -6015,7 +6022,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
             &handoff_remaining,
         )
         .is_err(),
-        "a with-surplus pool cannot enter protocol-surplus TWAP custody"
+        "a live with-surplus owner claim cannot enter protocol-surplus TWAP custody"
     );
     assert_eq!(token_amount(&svm, &perc_vault), amount);
 
@@ -11878,6 +11885,498 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         governance_after - governance_before,
         controller_before + market_before + vault_before + transit_before,
         "controller prefund, slab rent, vault rent, and transit rent are all reclaimed"
+    );
+}
+
+// PUBLIC LIFECYCLE DOS: a supported WITH_SURPLUS pool can finish every owner
+// exit and then receive protocol insurance from a public maintenance crank. If
+// the market resolves before custody reaches TWAP, the pool has no owner claim
+// that can redeem the late fee and CloseSlab cannot consume it. The existing
+// principal-free handoff and terminal return must remain available without ever
+// admitting a live depositor balance.
+#[test]
+fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    let create_ix = multisig_create_v2_ix(
+        &squads,
+        &treasury,
+        &multisig,
+        &create_key.pubkey(),
+        &payer.pubkey(),
+        Some(&dao.pubkey()),
+        1,
+        &[(dao.pubkey(), PERM_ALL)],
+        TIMELOCK_1_WEEK_SECS,
+    );
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create_ix],
+        Some(&payer.pubkey()),
+        &[&payer, &create_key],
+        svm.latest_blockhash(),
+    ))
+    .expect("initialize the real Squads controller");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let coin_mint_authority = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let controller = controller_pda(&squads_vault, &market, &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data_with_maintenance(1, 1));
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller market init");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &market,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
+    let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_WITH_SURPLUS);
+    append_test_genesis_schedule(&mut pool_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(percolator_vault, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_authority, false),
+                AccountMeta::new_readonly(coin_mint, false),
+            ],
+            data: pool_data,
+        },
+    )
+    .expect("initialize the supported with-surplus pool");
+
+    let grant =
+        build_controller_grant_pool_message(&squads_vault, &controller, &pool, &market, &perc_id());
+    let grant_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        1,
+        &grant,
+        &grant_remaining,
+    )
+    .expect("Squads grants asset-0 custody to the share pool");
+
+    let owner = Keypair::new();
+    svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    let owner_token = Pubkey::new_unique();
+    let pool_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &owner_token,
+        &collateral_mint,
+        &owner.pubkey(),
+        1,
+    );
+    set_token(&mut svm, &pool_holding, &collateral_mint, &pool, 0);
+    let position = sub_position_pda(&pool, &owner.pubkey());
+    let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &owner],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(owner_token, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("owner deposits one live base unit");
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &coin_mint,
+            &market,
+            &multisig,
+            &dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize the bound TWAP config");
+    let twap_config = twap_config_pda(&market, &multisig, &coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_config.as_ref()], &twap_id()).0;
+    let handoff = build_subledger_handoff_to_twap_message(
+        &squads_vault,
+        &pool,
+        &market,
+        &twap_config,
+        &twap_authority,
+        &perc_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new(twap_config, false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    let live_market = svm.get_account(&market).unwrap();
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            2,
+            &handoff,
+            &handoff_remaining,
+        )
+        .is_err(),
+        "with-surplus custody cannot cross into TWAP while one owner atom remains"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), live_market);
+
+    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &owner],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(owner_token, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: withdraw_data,
+        },
+    )
+    .expect("the last owner exits before protocol fees arrive");
+    assert_eq!(token_amount(&svm, &owner_token), 1);
+    assert_eq!(read_asset0_insurance(&svm, &market), 0);
+
+    let configure_resolve = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market,
+        &perc_id(),
+        &PIx::ConfigurePermissionlessResolve {
+            stale_slots: 10,
+            force_close_delay_slots: 1,
+        }
+        .encode(),
+    );
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        3,
+        &configure_resolve,
+        &controller_remaining,
+    )
+    .expect("configure permissionless stale resolution");
+
+    let fee_payer = Keypair::new();
+    svm.airdrop(&fee_payer.pubkey(), 1_000_000_000).unwrap();
+    let fee_portfolio = Keypair::new();
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    send(
+        &mut svm,
+        &[&fee_payer, &fee_portfolio],
+        solana_sdk::system_instruction::create_account(
+            &fee_payer.pubkey(),
+            &fee_portfolio.pubkey(),
+            portfolio_rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public user creates a portfolio");
+    send(
+        &mut svm,
+        &[&fee_payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(fee_payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fee_portfolio.pubkey(), false),
+            ],
+            PIx::InitPortfolio,
+        ),
+    )
+    .expect("public user initializes the portfolio");
+    let fee_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &fee_source,
+        &collateral_mint,
+        &fee_payer.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&fee_payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(fee_payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(fee_portfolio.pubkey(), false),
+                AccountMeta::new(fee_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Deposit { amount: 1 },
+        ),
+    )
+    .expect("public user funds one maintenance-fee atom");
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 101;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new(market, false),
+                AccountMeta::new(fee_portfolio.pubkey(), false),
+            ],
+            PIx::SyncMaintenanceFee { now_slot: 101 },
+        ),
+    )
+    .expect("any cranker converts the abandoned atom into protocol insurance");
+    assert!(
+        svm.get_account(&fee_portfolio.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "the fee-paying portfolio leaves no terminal blocker"
+    );
+    assert_eq!(read_asset0_insurance(&svm, &market), 1);
+
+    clock.slot = 110;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(market, false)],
+            data: PIx::ResolveStalePermissionless { now_slot: 110 }.encode(),
+        },
+    )
+    .expect("an unaffiliated cranker resolves the stale market");
+
+    let twap_transit = canonical_insurance_vault(&twap_authority, &collateral_mint);
+    let controller_transit = canonical_insurance_vault(&controller, &collateral_mint);
+    let governance_destination = Pubkey::new_unique();
+    set_token(&mut svm, &twap_transit, &collateral_mint, &twap_authority, 0);
+    set_token(&mut svm, &controller_transit, &collateral_mint, &controller, 0);
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &squads_vault,
+        0,
+    );
+    let close = build_controller_close_and_reclaim_message(
+        &squads_vault,
+        &controller,
+        &market,
+        &percolator_vault,
+        &vault_authority,
+        &controller_transit,
+        &governance_destination,
+    );
+    let close_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new(percolator_vault, false),
+        AccountMeta::new(controller_transit, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            4,
+            &close,
+            &close_remaining,
+        )
+        .is_err(),
+        "the late protocol atom blocks CloseSlab before fixed custody recovery"
+    );
+
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        5,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("the empty share pool hands only protocol custody to TWAP");
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_resolved_protocol_insurance_ix(
+            &twap_config,
+            &twap_authority,
+            &pool,
+            &market,
+            &twap_transit,
+            &controller_transit,
+            &percolator_vault,
+            &vault_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker moves the exact unowned fee into controller custody");
+    assert_eq!(read_asset0_insurance(&svm, &market), 0);
+    assert_eq!(token_amount(&svm, &controller_transit), 1);
+
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        6,
+        &close,
+        &close_remaining,
+    )
+    .expect("terminal recovery unblocks real CloseSlab");
+    assert_eq!(token_amount(&svm, &governance_destination), 1);
+    assert!(
+        svm.get_account(&market)
+            .map_or(true, |account| account.lamports == 0)
     );
 }
 
