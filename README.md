@@ -184,7 +184,8 @@ re-enabled only after batch-safe accounting is merged on top of this exact secur
    principal in the TWAP floor. An atomic live owner exit creates a one-use permit for any cranker to
    re-handoff that same pool to that same config; the crank replaces only the exited principal
    component. Retained insurance stays protected and exited principal no longer strands fee surplus.
-   Ordinary deposits and partial exits remain closed while TWAP holds custody.
+   Ordinary deposits and direct exits, including fully impaired or zero-rounded exits, remain
+   closed while TWAP holds custody; those exits use the atomic return/redeem/re-handoff path.
 
 ## Continuous Rewards
 

@@ -14729,6 +14729,117 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
         "handoff must atomically protect the pool's live outstanding principal"
     );
 
+    // Fresh zero-payout custody probe: a total venue loss can reduce live insurance to zero while
+    // TWAP still owns the insurance roles. The ordinary Subledger withdrawal must remain closed in
+    // that state too. Otherwise its `owed == 0` branch skips the Percolator CPI that normally proves
+    // pool operator custody, retires principal behind TWAP's back, and leaves the imported floor
+    // permanently overstated until another governed custody round-trip.
+    let healthy_slab = svm.get_account(&slab).unwrap();
+    let mut wiped_slab = healthy_slab.clone();
+    wiped_slab.data[twap_program::INSURANCE_OFFSET..twap_program::INSURANCE_OFFSET + 16]
+        .copy_from_slice(&0u128.to_le_bytes());
+    svm.set_account(slab, wiped_slab).unwrap();
+    let pool_before_zero_payout = svm.get_account(&pool).unwrap();
+    let position_before_zero_payout = svm.get_account(&position).unwrap();
+    let config_before_zero_payout = svm.get_account(&twap_cfg).unwrap();
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[withdraw(1)],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            bh,
+        ))
+        .is_err(),
+        "a zero-payout withdrawal must not bypass TWAP custody and desynchronize its floor"
+    );
+    assert_eq!(svm.get_account(&pool).unwrap(), pool_before_zero_payout);
+    assert_eq!(
+        svm.get_account(&position).unwrap(),
+        position_before_zero_payout
+    );
+
+    let mut atomic_zero_exit = twap_return_to_subledger_ix(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    atomic_zero_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
+    atomic_zero_exit.accounts[3] = AccountMeta::new(pool, false);
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new_readonly(alice.pubkey(), true));
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new(position, false));
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new(alice_ata, false));
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new(holding, false));
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new(perc_vault, false));
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new_readonly(vault_authority, false));
+    atomic_zero_exit
+        .accounts
+        .push(AccountMeta::new_readonly(spl_token::ID, false));
+    send(&mut svm, &[&payer, &alice], atomic_zero_exit)
+        .expect("the fixed TWAP path retires a fully impaired owner without governance");
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "the atomic exit retires every lost principal atom"
+    );
+    assert_eq!(
+        svm.get_account(&position).unwrap().data[88],
+        1,
+        "the fully impaired position is terminal"
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ],
+            data: vec![8u8], // IX_HANDOFF_TO_TWAP
+        },
+    )
+    .expect("any cranker re-hands custody after the zero-payout owner exit");
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        0,
+        "re-handoff removes the fully impaired owner's exited floor component"
+    );
+
+    // Restore the pre-probe snapshot so the original multi-stage recovery scenario
+    // continues independently below.
+    svm.set_account(slab, healthy_slab).unwrap();
+    svm.set_account(pool, pool_before_zero_payout).unwrap();
+    svm.set_account(position, position_before_zero_payout)
+        .unwrap();
+    svm.set_account(twap_cfg, config_before_zero_payout)
+        .unwrap();
+
     // Accrue fee surplus while TWAP has custody, then protect a separate protocol buffer above
     // depositor principal. Recovery must later subtract only principal that actually exited; it
     // must neither leave that exited principal in the floor nor unlock this retained buffer.

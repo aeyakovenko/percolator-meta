@@ -13617,3 +13617,25 @@ and independently updates the ordinary trade fee without moving insurance. The u
 fix is not a descendant of this repo's Percolator security pin, so advancing the dependency would drop
 later liquidation, oracle, OI, and collected-fee fixes. This compatibility guard adds no signer,
 account, authority, recipient, amount, token CPI, or user-value surface.
+
+## Tick - zero-payout Subledger exits bypassed TWAP custody accounting (surface A/C)
+
+Subledger relied on a successful Percolator withdrawal CPI to prove that its bound pool still held
+the asset-0 insurance-operator role. A fully impaired or floor-rounded withdrawal computes a zero
+payout and intentionally skips that CPI, but previously still retired owner principal and pool shares.
+After the pool-to-TWAP handoff, an owner could therefore call the ordinary public withdrawal directly,
+mutate Subledger accounting behind TWAP's back, and leave TWAP's protected principal floor overstated.
+This could suppress later fee-surplus auctions until another custody round-trip; it could not redirect
+or withdraw another user's funds.
+
+The retained real-binary LiteSVM regression hands a funded principal pool to TWAP through a timelocked
+Squads execution, applies the fully impaired loss boundary, and calls the owner-signed ordinary exit.
+The old Subledger binary accepts it and desynchronizes the floor. The fixed binary rejects byte-atomically,
+then proves the same owner can permissionlessly use TWAP's fixed return/full-exit path and any cranker can
+re-handoff custody with a zero live-principal floor. The existing pinned-Percolator liquidation regression
+independently produces the same fully impaired state through public trade, oracle, and crank instructions.
+
+FIX: every insurance exit now verifies that the canonical pool PDA is the live asset-0 insurance
+operator before changing principal, including when no token CPI is needed. Positive and zero-payout exits
+therefore share the same custody precondition. The change adds no signer, authority, destination, amount,
+token CPI, or admin surface and cannot move insurance, backing, collateral, or reward coins.

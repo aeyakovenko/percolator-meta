@@ -1995,6 +1995,21 @@ fn process_insurance_withdraw_impl(
     if *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key) {
         return Err(ProgramError::InvalidSeeds);
     }
+    // A positive payout proves pool custody again when Percolator accepts the
+    // pool-signed withdrawal CPI below. A fully impaired or floor-rounded exit
+    // skips that CPI, so enforce the same custody precondition explicitly. This
+    // keeps ordinary withdrawals closed while TWAP owns the insurance roles and
+    // forces every such exit through TWAP's atomic return/withdraw/re-handoff path,
+    // which is what updates its protected principal floor.
+    if percolator_accounting::read_asset_insurance_operator(
+        &market_slab.try_borrow_data()?,
+        0,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?
+        != pool_account.key.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // The holding account must be a token account for `mint` owned by the pool PDA
     // (the real percolator handler requires the withdraw dest to be the operator).
     let holding_state = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
