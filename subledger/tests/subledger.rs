@@ -777,10 +777,10 @@ fn with_surplus_policy_returns_yield_pro_rata() {
     // surplus, so shares ∝ principal). alice ~150*60/100 = 90, minus 1 unit of virtual-offset dust.
     env.send(&[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)], &[&alice]).unwrap();
     assert_eq!(env.token_amount(&alice_ata), 89, "alice gets principal + surplus share (1 dust to the inflation offset)");
-    // bob now: ~60.
+    // Bob receives his own floored claim; Alice's remainder cannot accrue to him.
     env.send(&[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)], &[&bob]).unwrap();
-    assert_eq!(env.token_amount(&bob_ata), 60, "bob gets the rest");
-    assert_eq!(env.token_amount(&vault), 1, "1 unit of dust retained by the virtual-offset (inflation defense)");
+    assert_eq!(env.token_amount(&bob_ata), 59, "bob gets his floored surplus share without prior-exit dust");
+    assert_eq!(env.token_amount(&vault), 2, "both floor remainders stay in the protocol pool");
 }
 
 // TENURE-FAIRNESS (finding HT): the branch claims (lib.rs) POLICY_WITH_SURPLUS is SHARE-based so a
@@ -812,9 +812,10 @@ fn with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
     // give her only 300*100/200 = 150, letting the late bob capture 50 of her surplus.)
     env.send(&[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)], &[&alice]).unwrap();
     assert_eq!(env.token_amount(&alice_ata), 199, "alice keeps her full pre-bob surplus (1 dust to the inflation offset); the late bob cannot capture it");
-    // Bob gets only his principal (no surplus capture) — the 1 dust went to the virtual offset, NOT bob.
+    // Bob cannot absorb Alice's floor remainder by exiting last.
     env.send(&[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)], &[&bob]).unwrap();
-    assert_eq!(env.token_amount(&bob_ata), 100, "the late depositor redeems only its own-tenure surplus (none here)");
+    assert_eq!(env.token_amount(&bob_ata), 99, "the late depositor redeems its own floored claim without prior-exit dust");
+    assert_eq!(env.token_amount(&vault), 2, "both floor remainders stay in the protocol pool");
 }
 
 // FIRST-DEPOSITOR INFLATION ATTACK (finding HU): an own-vault pool's vault is a plain SPL token
