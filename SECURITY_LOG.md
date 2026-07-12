@@ -13574,3 +13574,22 @@ controller previously wrote for the same Percolator program and market key. It c
 reuses the latter without mutation. Governance signature, controller derivation, token destinations,
 Percolator's resolved-empty `CloseSlab`, and all value forwarding remain unchanged. The marker has no close
 or reset path and continues to retire reward eligibility for every later generation.
+
+## Tick - backing fee policy could globally disable atomic position exits (surface C/D)
+
+Pinned Percolator rejects `BatchTradeNoCpi` and `BatchTradeCpi` whenever any backing-fee policy is
+active, even when the batch does not touch that fee domain. Both Meta governance wrappers exposed the
+policy setter. A normal cross-margined user can require final-state-only execution: in the retained
+LiteSVM probe, a fully collateralized portfolio can hold either one 80-lot leg, but the first
+standalone rotation leg fails initial margin while the two-leg final state is healthy. The old
+controller accepts a 77-bps policy, after which the only atomic exit fails against the real pinned SBF
+with `Custom(9)`.
+
+FIX: controller proxy validation and the post-handoff TWAP setter reject every nonzero backing fee or
+insurance split while retaining exact-zero updates. The controller regression proves the rejected
+policy is byte-atomic and the final-state-only batch succeeds. The Squads-to-TWAP regression starts
+from an exact predecessor market with two active policies, rejects reactivation, clears both policies,
+and independently updates the ordinary trade fee without moving insurance. The upstream batch-safe
+fix is not a descendant of this repo's Percolator security pin, so advancing the dependency would drop
+later liquidation, oracle, OI, and collected-fee fixes. This compatibility guard adds no signer,
+account, authority, recipient, amount, token CPI, or user-value surface.

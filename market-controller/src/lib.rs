@@ -78,12 +78,14 @@ const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
+const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_ACTION_ACTIVATE: u8 = 0;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
+const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
 const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
 const ACTIVATE_INSURANCE_OPERATOR_OFFSET: usize = 52;
@@ -422,6 +424,20 @@ fn admin_tag_allowed(tag: u8) -> bool {
 }
 
 fn validate_admin_instruction_data(data: &[u8], controller: &Pubkey) -> ProgramResult {
+    if data.first().copied() == Some(PERC_IX_UPDATE_BACKING_FEE_POLICY) {
+        if data.len() != UPDATE_BACKING_FEE_POLICY_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let fee_bps = u16::from_le_bytes([data[3], data[4]]);
+        let insurance_share_bps = u16::from_le_bytes([data[5], data[6]]);
+        // The pinned Percolator rejects every atomic batch while any backing fee is active.
+        // Preserve zero updates so governance can recover predecessor markets without exposing
+        // the market-global batch gate through this controller.
+        if fee_bps != 0 || insurance_share_bps != 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        return Ok(());
+    }
     if data.first().copied() != Some(PERC_IX_UPDATE_ASSET_LIFECYCLE)
         || data.get(1).copied() != Some(ASSET_ACTION_ACTIVATE)
     {
@@ -2641,6 +2657,32 @@ mod tests {
         assert_eq!(
             validate_admin_instruction_data(&lifecycle_transition, &controller),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn backing_fee_policy_allows_only_the_zero_recovery_wire() {
+        let controller = Pubkey::new_unique();
+        let policy = |fee_bps: u16, insurance_share_bps: u16| {
+            let mut data = vec![PERC_IX_UPDATE_BACKING_FEE_POLICY];
+            data.extend_from_slice(&3u16.to_le_bytes());
+            data.extend_from_slice(&fee_bps.to_le_bytes());
+            data.extend_from_slice(&insurance_share_bps.to_le_bytes());
+            data
+        };
+
+        assert_eq!(validate_admin_instruction_data(&policy(0, 0), &controller), Ok(()));
+        for rejected in [policy(1, 0), policy(1, 5_000), policy(0, 1)] {
+            assert_eq!(
+                validate_admin_instruction_data(&rejected, &controller),
+                Err(ProgramError::InvalidInstructionData)
+            );
+        }
+        let mut malformed = policy(0, 0);
+        malformed.pop();
+        assert_eq!(
+            validate_admin_instruction_data(&malformed, &controller),
+            Err(ProgramError::InvalidInstructionData)
         );
     }
 

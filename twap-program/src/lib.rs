@@ -1800,8 +1800,9 @@ fn process_donate_insurance(
 //       short_fee(u16) || short_insurance_share(u16)
 //
 // Percolator gates these three policy updates on insurance_authority, which is the
-// constrained TWAP PDA after handoff. This instruction exposes exactly those fee
-// setters and accepts no token account or amount-bearing withdrawal instruction.
+// constrained TWAP PDA after handoff. The pinned program globally rejects atomic
+// batches while any backing fee is active, so only zero backing updates are exposed
+// until that accounting is batch-safe. Zero updates preserve predecessor recovery.
 fn process_set_market_fees(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1815,6 +1816,9 @@ fn process_set_market_fees(
     let long_insurance = u16::from_le_bytes(data[10..12].try_into().unwrap());
     let short_fee = u16::from_le_bytes(data[12..14].try_into().unwrap());
     let short_insurance = u16::from_le_bytes(data[14..16].try_into().unwrap());
+    if long_fee != 0 || long_insurance != 0 || short_fee != 0 || short_insurance != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
