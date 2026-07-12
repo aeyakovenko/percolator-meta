@@ -3732,6 +3732,105 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             }
         }
 
+        // A higher-ranked bid can be absent from the nominal walk when its own reduced lot does
+        // not fit, even though it is executable at the lower final marginal. If the existing
+        // winners consume the full budget, the remainder pass above cannot reconsider that bid.
+        // Replay final-price allocations in priority order while reserving one exact marginal lot;
+        // adopt the bounded alternative only when it spends more USD, or spends the same USD for
+        // more COIN. This preserves the chosen marginal and cannot displace it with a better bid.
+        if has_stable {
+            let marginal_rank = stable_marginal_rank.ok_or(ProgramError::InvalidAccountData)?;
+            let skipped_priority_rank = idx[..marginal_rank]
+                .iter()
+                .position(|&i| stable_allocations[i].is_none());
+            if let Some(replay_start_rank) = skipped_priority_rank {
+                let marginal_slot = idx[marginal_rank];
+                let mo = slot_off(marginal_slot);
+                let cm = book_rd_u128(&d, mo + SL_COIN);
+                let um = book_rd_u128(&d, mo + SL_USDC);
+                let marginal_gcd = gcd_u64(cm as u64, um as u64);
+                let marginal_lot_usd = um / marginal_gcd as u128;
+                let mut replay_allocations = stable_allocations.clone();
+                let mut replay_coin = total_coin;
+                let mut replay_usd = total_usd;
+                for &i in &idx[replay_start_rank..n] {
+                    if let Some((coin_i, usd_i)) = replay_allocations[i].take() {
+                        replay_coin = replay_coin
+                            .checked_sub(coin_i)
+                            .ok_or(ProgramError::ArithmeticOverflow)?;
+                        replay_usd = replay_usd
+                            .checked_sub(usd_i)
+                            .ok_or(ProgramError::ArithmeticOverflow)?;
+                    }
+                }
+                let mut replay_remaining = budget
+                    .checked_sub(replay_usd)
+                    .ok_or(ProgramError::ArithmeticOverflow)?;
+                let mut replay_has_marginal = false;
+
+                for (suffix_rank, &i) in idx[replay_start_rank..n].iter().enumerate() {
+                    let rank = replay_start_rank + suffix_rank;
+                    let o = slot_off(i);
+                    let c = book_rd_u128(&d, o + SL_COIN);
+                    let u = book_rd_u128(&d, o + SL_USDC);
+                    if rank > marginal_rank
+                        && cmp_bid(c, u, cm, um) != core::cmp::Ordering::Equal
+                    {
+                        continue;
+                    }
+                    let allocation_budget = if rank < marginal_rank {
+                        replay_remaining.saturating_sub(marginal_lot_usd)
+                    } else {
+                        replay_remaining
+                    };
+                    if allocation_budget == 0 {
+                        continue;
+                    }
+                    if bid_gcd[i] == 0 {
+                        bid_gcd[i] = gcd_u64(c as u64, u as u64);
+                    }
+                    let Some((coin_i, usd_i)) = max_executable_integer_pair(
+                        allocation_budget,
+                        cm,
+                        um,
+                        c,
+                        u,
+                        bid_gcd[i],
+                        marginal_gcd,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if usd_i > replay_remaining {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                    replay_allocations[i] = Some((coin_i, usd_i));
+                    replay_coin = replay_coin
+                        .checked_add(coin_i)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    replay_usd = replay_usd
+                        .checked_add(usd_i)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    replay_remaining -= usd_i;
+                    if cmp_bid(c, u, cm, um) == core::cmp::Ordering::Equal {
+                        replay_has_marginal = true;
+                    }
+                    if replay_remaining == 0 {
+                        break;
+                    }
+                }
+
+                if replay_has_marginal
+                    && (replay_usd > total_usd
+                        || (replay_usd == total_usd && replay_coin > total_coin))
+                {
+                    stable_allocations = replay_allocations;
+                    total_coin = replay_coin;
+                    total_usd = replay_usd;
+                }
+            }
+        }
+
         if has_stable {
             // d) Commit the stable uniform-price result. Every unfilled or excluded bid receives
             //    its complete COIN refund; only executable pairs contribute to settlement totals.
