@@ -13483,3 +13483,25 @@ governance can alter only fee routing shares. The retained real-binary regressio
 valid zero-fee market cannot substitute for the portfolio's provenance market and that the real
 nonzero-fee market creates no stake or portfolio mutation. The paired zero-fee organic-loss and full
 genesis-to-45-day-buyback lifecycles pass. Capital cohorts and all custody/value paths are unchanged.
+
+## Tick - atomic same-key rematerialization could strand archived rewards (surface C/D)
+
+Pinned Percolator's terminal `ClosePortfolio` zeroes and drains a portfolio account but leaves it
+program-owned until transaction completion. Its public `InitPortfolio` requires the incoming owner,
+not the portfolio key, to sign. An unrelated user could therefore append a second instruction to the
+controller's archive-and-close transaction, initialize the transient zero-data key in another live
+market, and make the original stake's next archive-backed crystallization reject on the foreign owner
+or market. Keeping that new portfolio live made the original fixed reward allocation unreachable.
+
+The retained LiteSVM regression uses the pinned binary and only public instructions. It creates two
+real markets, records real long-paid funding, resolves the first, and submits controller cleanup plus
+foreign-market `InitPortfolio` atomically without the victim portfolio key signing. The old residual
+binary accepts the rematerialization and then fails the sole payer's crystallize with `IllegalOwner`.
+The fixed chain reads the completed original archive, freezes the epoch, and pays all 100 COIN.
+
+FIX: portfolio-flow stakes append one byte binding the immutable index of their registration market in
+the epoch allow-list; every prior field offset is unchanged. Crystallize and LP/trader claim derive the
+one canonical archive from that index. A live generation is added only when its authenticated owner and
+market match the binding; once a controller archive exists, a foreign generation at the same key is a
+separate identity and cannot replace or block it. The change adds no signer, authority, token account,
+destination, amount selector, custody CPI, or principal-moving surface.

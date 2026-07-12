@@ -37604,6 +37604,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
 // PUBLIC REWARD LOF: Percolator deliberately excludes monotonic reward telemetry from its
 // empty-portfolio predicate. A permissionless resolved-market cleanup must therefore preserve the
 // final counters before it dematerializes the only authenticated witness a reward epoch can read.
+// An unrelated caller must also be unable to append a foreign InitPortfolio in the same transaction
+// and make that later account generation block the completed original archive.
 #[test]
 fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     use percolator_prog::ix::Instruction as PIx;
@@ -37695,6 +37697,62 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         ),
     )
     .expect("initialize the public funding market");
+
+    // An unrelated public user controls a second live market. The attack below never signs with
+    // the victim portfolio key; it attempts to reuse the transient program-owned zero-data account
+    // left by terminal cleanup in the same transaction.
+    let reinitializer = Keypair::new();
+    let foreign_market = Keypair::new();
+    svm.airdrop(&reinitializer.pubkey(), 1_000_000_000)
+        .unwrap();
+    send(
+        &mut svm,
+        &[&payer, &foreign_market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &foreign_market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public attacker allocates a second market");
+    send(
+        &mut svm,
+        &[&payer, &reinitializer],
+        pix(
+            vec![
+                AccountMeta::new(reinitializer.pubkey(), true),
+                AccountMeta::new(foreign_market.pubkey(), false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 1_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 10_000,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("public attacker initializes a second live market");
     send(
         &mut svm,
         &[&payer, &admin],
@@ -38123,30 +38181,42 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         &long_owner.pubkey(),
         &long_portfolio.pubkey(),
     );
-    send(
-        &mut svm,
-        &[&payer],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), false),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market_key, false),
-                AccountMeta::new(long_portfolio.pubkey(), false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(archive, false),
-                AccountMeta::new_readonly(rd_id(), false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
-            data: vec![11u8],
-        },
-    )
-    .expect("public cleanup archives counters before closing the portfolio");
+    let cleanup = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new(long_portfolio.pubkey(), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(archive, false),
+            AccountMeta::new_readonly(rd_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![11u8],
+    };
+    let foreign_reinit = pix(
+        vec![
+            AccountMeta::new(reinitializer.pubkey(), true),
+            AccountMeta::new(foreign_market.pubkey(), false),
+            AccountMeta::new(long_portfolio.pubkey(), false),
+        ],
+        PIx::InitPortfolio,
+    );
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[cleanup, foreign_reinit],
+        Some(&payer.pubkey()),
+        &[&payer, &reinitializer],
+        bh,
+    ))
+    .expect("public cleanup followed by unsigned same-key rematerialization");
     assert!(
         svm.get_account(&long_portfolio.pubkey())
-            .map_or(true, |account| account.lamports == 0),
-        "the paid portfolio is dematerialized"
+            .is_some_and(|account| account.owner == perc_id() && !account.data.is_empty()),
+        "the attacker rematerialized the victim key without its signature"
     );
     assert_eq!(svm.get_account(&archive).unwrap().owner, rd_id());
 

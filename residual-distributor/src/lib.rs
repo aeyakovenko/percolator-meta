@@ -96,11 +96,12 @@ const CONFIG_EXTRA_INSURANCE_POOLS_OFF: usize = CONFIG_EPOCH_TAIL_OFF + 50;
 const CONFIG_EXTRA_BACKING_POOLS_OFF: usize =
     CONFIG_EXTRA_INSURANCE_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const CONFIG_SIZE: usize = CONFIG_EXTRA_BACKING_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
-const STAKE_SIZE: usize = 211; // +1 claimed flag (self-service)
+const LEGACY_STAKE_SIZE: usize = 211;
+const STAKE_SIZE: usize = 212; // +1 immutable portfolio-market index
 const PORTFOLIO_ARCHIVE_SIZE: usize = 264;
-                               // Capital + portfolio-flow cohorts. Insurance/backing reward base-unit principal;
-                               // LP/trader reward residual counters; optional funding-payer rewards the sum of
-                               // Percolator funding-paid counters. See tests/offsets.rs.
+// Capital + portfolio-flow cohorts. Insurance/backing reward base-unit principal;
+// LP/trader reward residual counters; optional funding-payer rewards the sum of
+// Percolator funding-paid counters. See tests/offsets.rs.
 const COHORT_INSURANCE: u8 = 0;
 const COHORT_BACKING: u8 = 1;
 const COHORT_LP: u8 = 2;
@@ -741,6 +742,25 @@ impl Config {
         let count = core::cmp::min(self.extra_market_count as usize, self.extra_markets.len());
         self.extra_markets[..count].contains(m)
     }
+    fn market_index(&self, market: &Pubkey) -> Option<u8> {
+        if *market == self.market_group && *market != Pubkey::default() {
+            return Some(0);
+        }
+        let count = core::cmp::min(self.extra_market_count as usize, self.extra_markets.len());
+        self.extra_markets[..count]
+            .iter()
+            .position(|candidate| candidate == market)
+            .and_then(|index| u8::try_from(index + 1).ok())
+    }
+    fn market_at(&self, index: u8) -> Option<Pubkey> {
+        if index == 0 {
+            return (self.market_group != Pubkey::default()).then_some(self.market_group);
+        }
+        let extra = usize::from(index - 1);
+        let count = core::cmp::min(self.extra_market_count as usize, self.extra_markets.len());
+        (extra < count && self.extra_markets[extra] != Pubkey::default())
+            .then_some(self.extra_markets[extra])
+    }
     fn pool_allowed(&self, cohort: u8, pool: &Pubkey) -> bool {
         if *pool == Pubkey::default() {
             return false;
@@ -999,10 +1019,14 @@ struct Stake {
     // Self-service claim: set true when this stake's COIN share has been paid, so it can't be
     // double-claimed.
     claimed: bool,
+    // Portfolio cohorts bind the immutable index of their registration market in Config's allow-list.
+    // Capital cohorts leave this zero. The binding prevents a same-transaction Percolator account
+    // rematerialization from selecting another market's archive or blocking the original one.
+    portfolio_market_index: u8,
 }
 impl Stake {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
-        if d.len() < STAKE_SIZE || d[..8] != STAKE_DISC {
+        if d.len() < LEGACY_STAKE_SIZE || d[..8] != STAKE_DISC {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Stake {
@@ -1018,6 +1042,9 @@ impl Stake {
             cohort: d[193],
             eligible_accum: u128::from_le_bytes(d[194..210].try_into().unwrap()),
             claimed: d[210] != 0,
+            // Historical stakes predate multi-market terminal archives and therefore use the
+            // primary market. Appending this byte preserves every existing field offset.
+            portfolio_market_index: d.get(211).copied().unwrap_or(0),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -1034,6 +1061,9 @@ impl Stake {
         d[193] = self.cohort;
         d[194..210].copy_from_slice(&self.eligible_accum.to_le_bytes());
         d[210] = self.claimed as u8;
+        if let Some(index) = d.get_mut(211) {
+            *index = self.portfolio_market_index;
+        }
     }
 }
 
@@ -1138,7 +1168,42 @@ fn portfolio_totals(
     owner: &Pubkey,
     portfolio: &AccountInfo,
     archive_account: &AccountInfo,
+    bound_market: Option<&Pubkey>,
 ) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
+    if let Some(market) = bound_market {
+        if !config.market_allowed(market) {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let (archive, _, exists) = archive_for_identity(
+            program_id,
+            archive_account,
+            &config.percolator_program,
+            market,
+            owner,
+            portfolio.key,
+        )?;
+
+        if portfolio.data_len() != 0 && *portfolio.owner == config.percolator_program {
+            let live = percolator_accounting::read_portfolio_reward_snapshot(
+                &portfolio.try_borrow_data()?,
+                &portfolio.key.to_bytes(),
+            )
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+            if live.owner == owner.to_bytes() && live.market_group == market.to_bytes() {
+                return archive.totals_with_live(Some(&live));
+            }
+        }
+
+        // A controller archive is a complete terminal snapshot. Percolator leaves the just-closed
+        // key program-owned until transaction completion, so an unrelated signer can immediately
+        // initialize that key for another live market without the key signing. That later identity
+        // must neither replace this stake's archive nor make the original archive unreadable.
+        if exists {
+            return archive.totals_with_live(None);
+        }
+        return Err(ProgramError::InvalidAccountData);
+    }
+
     if portfolio.data_len() != 0 {
         if *portfolio.owner != config.percolator_program {
             return Err(ProgramError::IllegalOwner);
@@ -1883,7 +1948,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     }
     // `snap` is the register-time counter snapshot: 0 for capital cohorts (insurance/backing),
     // and the relevant portfolio-flow counter for portfolio cohorts (delta measured at crystallize).
-    let snap: u128 = match cohort {
+    let (snap, portfolio_market_index): (u128, u8) = match cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
             // Capital cohort: `linked` is a subledger Position in this cohort's pool.
             if *linked.owner != config.subledger_program {
@@ -1900,7 +1965,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             if !config.pool_allowed(cohort, &pk(&data, SUB_POS_POOL)) {
                 return Err(ProgramError::IllegalOwner);
             }
-            0
+            (0, 0)
         }
         _ => {
             // Include cumulative terminal archives in the start snapshot. A portfolio address can be
@@ -1913,11 +1978,16 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 portfolio_context
                     .map(|(archive, _)| archive)
                     .ok_or(ProgramError::NotEnoughAccountKeys)?,
+                None,
             )?;
+            let portfolio_market_key = Pubkey::new_from_array(totals.market_group);
+            let portfolio_market_index = config
+                .market_index(&portfolio_market_key)
+                .ok_or(ProgramError::IllegalOwner)?;
             let portfolio_market = portfolio_context
                 .map(|(_, market)| market)
                 .ok_or(ProgramError::NotEnoughAccountKeys)?;
-            if *portfolio_market.key != Pubkey::new_from_array(totals.market_group)
+            if *portfolio_market.key != portfolio_market_key
                 || portfolio_market.owner != &config.percolator_program
                 || portfolio_market.executable
                 || percolator_accounting::read_maintenance_fee_per_slot(
@@ -1931,18 +2001,16 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 // crystallized. Zero-fee market binding makes that loss path unreachable.
                 return Err(ProgramError::InvalidAccountData);
             }
-            match cohort {
+            let counter = match cohort {
                 COHORT_LP | COHORT_TRADER => residual_counter(
                     cohort,
                     totals.residual_received,
                     totals.residual_crystallized_loss,
                     totals.residual_spent_principal,
                 ),
-                _ => funding_payer_counter(
-                    totals.funding_long_paid,
-                    totals.funding_short_paid,
-                ),
-            }
+                _ => funding_payer_counter(totals.funding_long_paid, totals.funding_short_paid),
+            };
+            (counter, portfolio_market_index)
         }
     };
     let start_slot = now;
@@ -1976,6 +2044,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         cohort,
         eligible_accum: 0,
         claimed: false,
+        portfolio_market_index,
     }
     .serialize(&mut stake_account.try_borrow_mut_data()?);
     Ok(())
@@ -2096,12 +2165,16 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
             // crystallized_loss - spent since register.
+            let portfolio_market = config
+                .market_at(stake.portfolio_market_index)
+                .ok_or(ProgramError::InvalidAccountData)?;
             let totals = portfolio_totals(
                 program_id,
                 &config,
                 &stake.owner,
                 backing_ledger,
                 portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                Some(&portfolio_market),
             )?;
             let spent = totals.residual_spent_principal;
             let counter = residual_counter(
@@ -2144,17 +2217,19 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // Funding-payer cohort: points = raw delta of paid funding since register. No age multiplier:
             // funding accumulators already represent settled payment volume, and late payments should not
             // inherit early registration tenure.
+            let portfolio_market = config
+                .market_at(stake.portfolio_market_index)
+                .ok_or(ProgramError::InvalidAccountData)?;
             let totals = portfolio_totals(
                 program_id,
                 &config,
                 &stake.owner,
                 backing_ledger,
                 portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                Some(&portfolio_market),
             )?;
-            let counter = funding_payer_counter(
-                totals.funding_long_paid,
-                totals.funding_short_paid,
-            );
+            let counter =
+                funding_payer_counter(totals.funding_long_paid, totals.funding_short_paid);
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let new_pts = net_delta;
             replace_cohort_points(
@@ -2465,12 +2540,16 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 // remain sufficient. Controller cleanup now always supplies an archive instead.
                 points_to_amount(cohort_supply, stake.points, frozen_denom)
             } else {
+                let portfolio_market = config
+                    .market_at(stake.portfolio_market_index)
+                    .ok_or(ProgramError::InvalidAccountData)?;
                 let totals = portfolio_totals(
                     program_id,
                     &config,
                     &stake.owner,
                     portfolio,
                     portfolio_archive,
+                    Some(&portfolio_market),
                 )?;
                 let spent = totals.residual_spent_principal;
                 let live_net = residual_counter(
