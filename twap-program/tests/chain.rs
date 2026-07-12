@@ -31358,6 +31358,191 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
     assert_eq!(token_amount(&svm, &bidder_account), 1_000_000);
 }
 
+// SAME-MINT SHARED CUSTODY: books permit the bidder COIN escrow and parked USD
+// settlement account to be the same book-authority-owned SPL account. Exercise mixed fills and
+// reverse claim order to prove that the merged custody cannot lose either bidder's refund.
+#[test]
+fn e2e_same_mint_shared_escrow_conserves_every_claim() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff_with_mint_mode(&mut svm, &payer, true);
+    assert_eq!(env.coin_mint, env.collateral_mint);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let shared_escrow = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &shared_escrow,
+        &env.coin_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+    let init = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &shared_escrow,
+        &shared_escrow,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        0,
+        1,
+        10,
+        0,
+        0,
+        None,
+    );
+    let init_remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(shared_escrow, false),
+        AccountMeta::new_readonly(shared_escrow, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &init,
+        &init_remaining,
+    )
+    .expect("initialize same-mint shared custody");
+
+    let make_bidder = |svm: &mut LiteSVM| {
+        let bidder = Keypair::new();
+        svm.airdrop(&bidder.pubkey(), 1_000_000_000).unwrap();
+        let account = coin_ata_of(&bidder.pubkey(), &env.coin_mint);
+        set_token(svm, &account, &env.coin_mint, &bidder.pubkey(), 0);
+        mint_coin(
+            svm,
+            &payer,
+            &env.coin_mint,
+            &env.coin_mint_authority,
+            &account,
+            300_000,
+        );
+        (bidder, account)
+    };
+    let (better, better_account) = make_bidder(&mut svm);
+    let (marginal, marginal_account) = make_bidder(&mut svm);
+
+    send(
+        &mut svm,
+        &[&better],
+        place_bid_ix(
+            &better.pubkey(),
+            &env.twap_cfg,
+            &book,
+            &book_escrow,
+            &shared_escrow,
+            &better_account,
+            &better_account,
+            &env.coin_mint,
+            &env.collateral_mint,
+            300_000,
+            200_000,
+            None,
+        ),
+    )
+    .expect("place better same-mint bid");
+    send(
+        &mut svm,
+        &[&marginal],
+        place_bid_ix(
+            &marginal.pubkey(),
+            &env.twap_cfg,
+            &book,
+            &book_escrow,
+            &shared_escrow,
+            &marginal_account,
+            &marginal_account,
+            &env.coin_mint,
+            &env.collateral_mint,
+            300_000,
+            300_000,
+            None,
+        ),
+    )
+    .expect("place marginal same-mint bid");
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let round_end = u64::from_le_bytes(
+        svm.get_account(&book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &book,
+            &holding,
+            &shared_escrow,
+            &book_escrow,
+            &shared_escrow,
+            None,
+        ),
+    )
+    .expect("settle shared custody");
+    assert_eq!(supply_before - mint_supply(&svm, &env.coin_mint), 400_000);
+    assert_eq!(token_amount(&svm, &shared_escrow), 600_000);
+    assert_eq!(token_amount(&svm, &holding), 0);
+
+    for (slot, account) in [(1, marginal_account), (0, better_account)] {
+        send(
+            &mut svm,
+            &[&payer],
+            claim_ix(
+                &payer.pubkey(),
+                &env.twap_cfg,
+                &book,
+                &book_escrow,
+                &shared_escrow,
+                &shared_escrow,
+                &account,
+                &account,
+                slot,
+            ),
+        )
+        .expect("claim shared-custody bid");
+        assert_eq!(token_amount(&svm, &account), 300_000);
+    }
+    assert_eq!(token_amount(&svm, &shared_escrow), 0);
+}
+
 // FINDING AS AT INIT (self-loop sink set at CREATION, not just by set_coin_sink): a book can be born in
 // SEND mode with a coin_sink already chosen. init_book must reject coin_sink == coin_escrow exactly like
 // set_coin_sink does — otherwise execute's SEND would transfer the shared escrow to itself (escrow ->
