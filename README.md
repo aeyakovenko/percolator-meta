@@ -328,8 +328,9 @@ pool-controlled insurance. Percolator's market-authority update does not migrate
 drain-only, or recovering. Once those slots are empty and retired, the same permissionless handoff
 succeeds only if direct permissionless asset append is disabled. The controller proxy cannot enable
 that mode because a direct activator becomes an external `asset_admin`. New multi-asset deployments
-use permissionless controller initialization followed by governance-approved asset activation, which
-still assigns external insurance, backing, and oracle roles while keeping lifecycle admin constrained.
+use permissionless controller initialization followed by governance-approved asset activation. Both
+insurance roles stay on the constrained controller, while external backing and oracle providers remain
+independently selectable. This prevents an unfunded raw key from collecting user-paid trade fees.
 The same constrained proxy can restart an empty recovering asset through Percolator's value-neutral
 restart instruction; it cannot choose a recipient or move insurance/backing while doing so.
 Here, empty means every Percolator position, funding, loss, spent-budget, backing, and reservation

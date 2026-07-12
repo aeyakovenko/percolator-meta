@@ -6734,11 +6734,11 @@ fn e2e_twap_handoff_rejects_a_mismatched_market_controller() {
     assert_eq!(token_amount(&svm, &env.perc_vault), 0);
 }
 
-// PUBLIC LOF: secondary-asset activation names the deposit authority and withdrawal operator
-// independently. The governance controller must not let governance retain the withdrawal key
-// while inviting an external provider to fund the asset's insurance balance.
+// PUBLIC VALUE LEAK: secondary activation must not install any raw external insurance operator.
+// Split roles let governance steal a provider deposit; equal but unfunded roles let the external
+// key collect trade fees before risking capital. Backing and oracle providers remain independent.
 #[test]
-fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
+fn e2e_controller_activation_cannot_install_an_external_insurance_withdrawal_key() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -6847,6 +6847,104 @@ fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
         0,
     );
 
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let trader_a = Keypair::new();
+    let trader_b = Keypair::new();
+    let portfolio_a = Pubkey::new_unique();
+    let portfolio_b = Pubkey::new_unique();
+    for (trader, portfolio) in [(&trader_a, portfolio_a), (&trader_b, portfolio_b)] {
+        svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                percolator_prog::ix::Instruction::InitPortfolio,
+            ),
+        )
+        .expect("initialize trader portfolio before secondary activation");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &trader.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, trader],
+            pix(
+                vec![
+                    AccountMeta::new(trader.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                percolator_prog::ix::Instruction::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("fund trader portfolio before secondary activation");
+    }
+    let size_q = (percolator::POS_SCALE / 10) as i128;
+    let trade_round_trip = |svm: &mut LiteSVM| {
+        for signed_size in [size_q, -size_q] {
+            send(
+                svm,
+                &[&payer, &trader_a, &trader_b],
+                pix(
+                    vec![
+                        AccountMeta::new(trader_a.pubkey(), true),
+                        AccountMeta::new(trader_b.pubkey(), true),
+                        AccountMeta::new(slab, false),
+                        AccountMeta::new(portfolio_a, false),
+                        AccountMeta::new(portfolio_b, false),
+                    ],
+                    percolator_prog::ix::Instruction::TradeNoCpi {
+                        asset_index: 1,
+                        size_q: signed_size,
+                        exec_price: 1_000_000,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+            .expect("public round trip creates secondary insurance fees");
+        }
+    };
+    let provider_withdraw = |amount: u128| Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(provider_token, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+            asset_index: 1,
+            amount,
+        }
+        .encode(),
+    };
+
     let market_before_unsafe_activation = svm.get_account(&slab).unwrap();
     let unsafe_activation = proxy_activation(provider.pubkey(), governance.pubkey());
     if send(&mut svm, &[&payer, &governance], unsafe_activation).is_ok() {
@@ -6894,80 +6992,91 @@ fn e2e_controller_cannot_split_external_insurance_from_its_withdrawal_key() {
         "rejected activation is atomic"
     );
 
-    send(
+    if send(
         &mut svm,
         &[&payer, &governance],
         proxy_activation(provider.pubkey(), provider.pubkey()),
     )
-    .expect("provider-controlled insurance roles remain available");
-    let activated_market = svm.get_account(&slab).unwrap();
-    assert_eq!(
-        percolator_accounting::read_asset_insurance_authority(&activated_market.data, 1).unwrap(),
-        provider.pubkey().to_bytes()
-    );
-    assert_eq!(
-        percolator_accounting::read_asset_insurance_operator(&activated_market.data, 1).unwrap(),
-        provider.pubkey().to_bytes()
-    );
-
-    let top_up = Instruction {
-        program_id: perc_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(provider.pubkey(), true),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(provider_token, false),
-            AccountMeta::new(percolator_vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
-            domain: 2,
-            amount: insurance_amount as u128,
-        }
-        .encode(),
-    };
-    send(&mut svm, &[&payer, &provider], top_up).expect("provider funds its own insurance role");
-
-    let withdraw = |operator: Pubkey, destination: Pubkey| Instruction {
-        program_id: perc_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(operator, true),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(destination, false),
-            AccountMeta::new(percolator_vault, false),
-            AccountMeta::new_readonly(vault_authority, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        data: percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
-            asset_index: 1,
-            amount: insurance_amount as u128,
-        }
-        .encode(),
-    };
-    let market_before_governance_withdraw = svm.get_account(&slab).unwrap();
-    assert!(
+    .is_ok()
+    {
+        trade_round_trip(&mut svm);
+        let leaked_fee = percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            1,
+        )
+        .unwrap();
+        assert_eq!(leaked_fee, 120);
         send(
             &mut svm,
-            &[&payer, &governance],
-            withdraw(governance.pubkey(), governance_token),
+            &[&payer, &provider],
+            provider_withdraw(leaked_fee),
         )
-        .is_err(),
-        "governance cannot withdraw provider-controlled insurance"
-    );
+        .expect("unfunded external operator withdraws fees paid by public traders");
+        assert_eq!(
+            token_amount(&svm, &provider_token),
+            insurance_amount + leaked_fee as u64
+        );
+        panic!("controller activation installed a zero-capital fee withdrawal key");
+    }
     assert_eq!(
         svm.get_account(&slab).unwrap(),
-        market_before_governance_withdraw
+        market_before_unsafe_activation,
+        "rejected equal-role activation is atomic"
     );
-    assert_eq!(token_amount(&svm, &governance_token), 0);
-    assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
 
     send(
         &mut svm,
-        &[&payer, &provider],
-        withdraw(provider.pubkey(), provider_token),
+        &[&payer, &governance],
+        proxy_activation(controller, controller),
     )
-    .expect("provider retains its complete withdrawal path");
+    .expect("controller-owned insurance permits external backing and oracle providers");
+    let activated_market = svm.get_account(&slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&activated_market.data, 1).unwrap(),
+        controller.to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&activated_market.data, 1).unwrap(),
+        controller.to_bytes()
+    );
+
+    // Ordinary public trades still create insurance fees, but the external backing/oracle provider
+    // has no withdrawal key for them.
+    trade_round_trip(&mut svm);
+    let unfunded_fee = percolator_accounting::read_asset_insurance_remaining(
+        &svm.get_account(&slab).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert_eq!(unfunded_fee, 120);
+    let market_before_provider_withdraw = svm.get_account(&slab).unwrap();
+    let vault_before_provider_withdraw = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &provider],
+            provider_withdraw(unfunded_fee),
+        )
+        .is_err(),
+        "external backing/oracle provider cannot withdraw protocol fees"
+    );
+    assert_eq!(
+        svm.get_account(&slab).unwrap(),
+        market_before_provider_withdraw
+    );
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_provider_withdraw
+    );
     assert_eq!(token_amount(&svm, &provider_token), insurance_amount);
-    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        unfunded_fee
+    );
 }
 
 // PUBLIC LOF/DOS: market donation migrates only asset-0 roles still equal to the outgoing market
@@ -9761,15 +9870,31 @@ fn e2e_controller_freezes_shutdown_returns_when_stale_resolution_matures() {
                 asset_index: 1,
                 now_slot: 100,
                 initial_price: 1_000_000,
-                insurance_authority: provider.pubkey().to_bytes(),
-                insurance_operator: provider.pubkey().to_bytes(),
+                insurance_authority: controller.to_bytes(),
+                insurance_operator: controller.to_bytes(),
                 backing_bucket_authority: provider.pubkey().to_bytes(),
                 oracle_authority: provider.pubkey().to_bytes(),
             }
             .encode(),
         ),
     )
-    .expect("governance activates an externally backed secondary asset");
+    .expect("governance activates controller insurance with external backing");
+
+    // Upgrade-compatibility fixture: predecessor controller binaries allowed matched external
+    // insurance roles. New activation rejects this state, but deployed markets still need the
+    // fixed shutdown/resolution return paths tested below.
+    let mut legacy_market = svm.get_account(&slab).unwrap();
+    let mut legacy_profile =
+        percolator_prog::state::read_asset_oracle_profile(&legacy_market.data, 1).unwrap();
+    legacy_profile.insurance_authority = provider.pubkey().to_bytes();
+    legacy_profile.insurance_operator = provider.pubkey().to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(
+        &mut legacy_market.data,
+        1,
+        &legacy_profile,
+    )
+    .unwrap();
+    svm.set_account(slab, legacy_market).unwrap();
 
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -10340,8 +10465,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
             asset_index: 1,
             now_slot: 100,
             initial_price: 1_000_000,
-            insurance_authority: backing_provider.pubkey().to_bytes(),
-            insurance_operator: backing_provider.pubkey().to_bytes(),
+            insurance_authority: controller.to_bytes(),
+            insurance_operator: controller.to_bytes(),
             backing_bucket_authority: backing_provider.pubkey().to_bytes(),
             oracle_authority: backing_provider.pubkey().to_bytes(),
         }
@@ -10357,7 +10482,23 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &activate,
         &controller_remaining,
     )
-    .expect("controller activates externally backed asset");
+    .expect("controller activates protocol insurance with external backing");
+
+    // Upgrade-compatibility fixture for markets activated by predecessor controller binaries.
+    // The current activation path below is tested separately to reject raw external insurance,
+    // while these legacy roles retain their fixed provider-bound cleanup.
+    let mut legacy_market = svm.get_account(&slab).unwrap();
+    let mut legacy_profile =
+        percolator_prog::state::read_asset_oracle_profile(&legacy_market.data, 1).unwrap();
+    legacy_profile.insurance_authority = backing_provider.pubkey().to_bytes();
+    legacy_profile.insurance_operator = backing_provider.pubkey().to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(
+        &mut legacy_market.data,
+        1,
+        &legacy_profile,
+    )
+    .unwrap();
+    svm.set_account(slab, legacy_market).unwrap();
     let activated_slab = svm.get_account(&slab).unwrap();
     assert_eq!(
         percolator_accounting::read_asset_insurance_authority(&activated_slab.data, 1).unwrap(),
@@ -37821,8 +37962,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             asset_index: 1,
             now_slot: svm.get_sysvar::<Clock>().slot,
             initial_price: 1_000_000,
-            insurance_authority: backing_provider.pubkey().to_bytes(),
-            insurance_operator: backing_provider.pubkey().to_bytes(),
+            insurance_authority: controller.to_bytes(),
+            insurance_operator: controller.to_bytes(),
             backing_bucket_authority: backing_provider.pubkey().to_bytes(),
             oracle_authority: backing_provider.pubkey().to_bytes(),
         }
