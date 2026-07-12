@@ -13449,9 +13449,10 @@ The retained pinned-Percolator LiteSVM regression creates a real funding-enabled
 instructions, registers a 100% funding-payer epoch, opens a real long/short pair, moves the authenticated
 EWMA mark, records nonzero long-paid funding, flattens, donates lifecycle authority, and lets unrelated
 callers resolve and pay the long. It proves the legacy five-account cleanup rejects atomically, then
-uses the extended public cleanup to archive and close in one transaction. Post-close crystallization,
-freeze, and claim pay the sole payer all 100 COIN. The full genesis-to-45-day-buyback lifecycle and all
-91 distributor LiteSVM tests also pass.
+uses the extended public cleanup to archive and close in one transaction. It closes the remaining
+portfolio, returns terminal backing dust only to its recorded provider, closes the original slab, then
+crystallizes through the retirement marker. Freeze and claim pay the sole payer all 100 COIN. The full
+genesis-to-45-day-buyback lifecycle and all 91 distributor LiteSVM tests also pass.
 
 FIX: a shared pinned-layout parser authenticates portfolio provenance and reward counters. Nonzero
 reward telemetry requires the controller to CPI a fixed residual-distributor instruction before
@@ -13505,3 +13506,27 @@ one canonical archive from that index. A live generation is added only when its 
 market match the binding; once a controller archive exists, a foreign generation at the same key is a
 separate identity and cannot replace or block it. The change adds no signer, authority, token account,
 destination, amount selector, custody CPI, or principal-moving surface.
+
+## Tick - retired slab key reuse bypassed the reward market allow-list (surface C/D)
+
+Pinned Percolator's terminal `CloseSlab` zeroes and drains the slab but leaves the account assigned to
+Percolator. Its public `InitMarket` requires only the new admin to sign, so an unrelated caller could
+reinitialize the retired key in a later transaction. A reward epoch that had selected the original key
+then treated the attacker-controlled replacement as the same allow-listed market and admitted a new
+portfolio-flow stake. Because the market allow-list is the trust boundary for publicly generated
+residual and funding counters, this reopened the fixed COIN allocation to free farming.
+
+The retained real-binary LiteSVM regression selects a permissionlessly initialized controller market in
+a 100% funding-payer epoch, runs real resolved portfolio cleanup and terminal `CloseSlab`, then directly
+reinitializes the same slab under an unrelated authority and creates a replacement portfolio without the
+slab key signing. The old residual binary accepts the attacker's stake. The fixed chain rejects it even
+though pinned Percolator still accepts the replacement market. The regression also prefunds the marker
+PDA, proves a failed close rolls marker creation back, and proves successful governed close adopts the
+prefund without requiring a lamport balance on the Squads vault.
+
+FIX: terminal controller close uses rent already reclaimed from `CloseSlab` to create a permanent PDA
+scoped to the Percolator program and market key, then forwards the remaining rent. Portfolio-flow
+registration and counter reads require that exact read-only PDA. Registration rejects a retired market;
+existing stakes ignore every later live generation and use only their canonical archive. The marker has
+no close path, token account, amount, beneficiary, signer, custody CPI, or authority mutation, and it
+cannot move user insurance, backing, collateral, or Subledger principal.

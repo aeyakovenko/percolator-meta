@@ -76,6 +76,9 @@ const STAKE_DISC: [u8; 8] = *b"RDSTAKE1";
 const PORTFOLIO_ARCHIVE_DISC: [u8; 8] = *b"RDARCH01";
 const PORTFOLIO_ARCHIVE_SEED: &[u8] = b"rd_portfolio_archive";
 const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
+const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
+const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
+const RETIRED_MARKET_SIZE: usize = 72;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 // Up to this many ADDITIONAL allow-listed markets beyond the primary `market_group` (finding IL+): the
@@ -1138,28 +1141,43 @@ fn archive_for_identity(
     Ok((archive, bump, true))
 }
 
-fn archive_key_matches_allowed_market(
+fn retired_market_address(percolator_program: &Pubkey, market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            RETIRED_MARKET_SEED,
+            percolator_program.as_ref(),
+            market.as_ref(),
+        ],
+        &MARKET_CONTROLLER_PROGRAM_ID,
+    )
+    .0
+}
+
+fn market_is_retired(
     config: &Config,
-    archive_key: &Pubkey,
-    owner: &Pubkey,
-    portfolio: &Pubkey,
-) -> bool {
-    let matches_market = |market: &Pubkey| {
-        *market != Pubkey::default()
-            && portfolio_archive_address(
-                &config.percolator_program,
-                market,
-                owner,
-                portfolio,
-            )
-            .0
-                == *archive_key
-    };
-    if matches_market(&config.market_group) {
-        return true;
+    market: &Pubkey,
+    marker: &AccountInfo,
+) -> Result<bool, ProgramError> {
+    if *marker.key != retired_market_address(&config.percolator_program, market) {
+        return Err(ProgramError::InvalidSeeds);
     }
-    let count = core::cmp::min(config.extra_market_count as usize, config.extra_markets.len());
-    config.extra_markets[..count].iter().any(matches_market)
+    if marker.data_len() == 0 {
+        if *marker.owner != solana_program::system_program::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        return Ok(false);
+    }
+    if *marker.owner != MARKET_CONTROLLER_PROGRAM_ID || marker.data_len() != RETIRED_MARKET_SIZE {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let data = marker.try_borrow_data()?;
+    if data[..8] != RETIRED_MARKET_DISC
+        || data[8..40] != config.percolator_program.to_bytes()
+        || data[40..72] != market.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(true)
 }
 
 fn portfolio_totals(
@@ -1169,6 +1187,7 @@ fn portfolio_totals(
     portfolio: &AccountInfo,
     archive_account: &AccountInfo,
     bound_market: Option<&Pubkey>,
+    retired: bool,
 ) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
     if let Some(market) = bound_market {
         if !config.market_allowed(market) {
@@ -1183,7 +1202,7 @@ fn portfolio_totals(
             portfolio.key,
         )?;
 
-        if portfolio.data_len() != 0 && *portfolio.owner == config.percolator_program {
+        if !retired && portfolio.data_len() != 0 && *portfolio.owner == config.percolator_program {
             let live = percolator_accounting::read_portfolio_reward_snapshot(
                 &portfolio.try_borrow_data()?,
                 &portfolio.key.to_bytes(),
@@ -1194,10 +1213,8 @@ fn portfolio_totals(
             }
         }
 
-        // A controller archive is a complete terminal snapshot. Percolator leaves the just-closed
-        // key program-owned until transaction completion, so an unrelated signer can immediately
-        // initialize that key for another live market without the key signing. That later identity
-        // must neither replace this stake's archive nor make the original archive unreadable.
+        // A controller archive is a complete terminal snapshot. A retired-market marker also makes
+        // every later Percolator generation under the same slab key ineligible by construction.
         if exists {
             return archive.totals_with_live(None);
         }
@@ -1836,7 +1853,8 @@ fn init_reward_epoch(
 }
 
 // register_start accounts: [payer(s,w), config, owner, recipient, linked, stake(pda,w), system,
-//   portfolio_archive?, portfolio_market?, legacy_owner_stake?, legacy_linked_stake?]
+//   portfolio_archive?, portfolio_market?, retired_market_marker?,
+//   legacy_owner_stake?, legacy_linked_stake?]
 //   portfolio cohorts: linked = Percolator portfolio, archive = its canonical cumulative telemetry PDA,
 //   and portfolio_market = its immutable-fee Percolator market account;
 //   capital cohorts: linked = subledger position.
@@ -1855,7 +1873,11 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let stake_account = next_account_info(iter)?;
     let system = next_account_info(iter)?;
     let portfolio_context = if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
-        Some((next_account_info(iter)?, next_account_info(iter)?))
+        Some((
+            next_account_info(iter)?,
+            next_account_info(iter)?,
+            next_account_info(iter)?,
+        ))
     } else {
         None
     };
@@ -1976,16 +1998,17 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 owner.key,
                 linked,
                 portfolio_context
-                    .map(|(archive, _)| archive)
+                    .map(|(archive, _, _)| archive)
                     .ok_or(ProgramError::NotEnoughAccountKeys)?,
                 None,
+                false,
             )?;
             let portfolio_market_key = Pubkey::new_from_array(totals.market_group);
             let portfolio_market_index = config
                 .market_index(&portfolio_market_key)
                 .ok_or(ProgramError::IllegalOwner)?;
             let portfolio_market = portfolio_context
-                .map(|(_, market)| market)
+                .map(|(_, market, _)| market)
                 .ok_or(ProgramError::NotEnoughAccountKeys)?;
             if *portfolio_market.key != portfolio_market_key
                 || portfolio_market.owner != &config.percolator_program
@@ -1999,6 +2022,12 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 // A nonzero immutable maintenance fee lets an unsigned Percolator sync
                 // dematerialize an otherwise-empty portfolio before its counters are
                 // crystallized. Zero-fee market binding makes that loss path unreachable.
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let retired_market = portfolio_context
+                .map(|(_, _, retired_market)| retired_market)
+                .ok_or(ProgramError::NotEnoughAccountKeys)?;
+            if market_is_retired(&config, &portfolio_market_key, retired_market)? {
                 return Err(ProgramError::InvalidAccountData);
             }
             let counter = match cohort {
@@ -2051,7 +2080,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 }
 
 // crystallize accounts: [cranker(s), config(w), stake(w), backing_ledger,
-//   portfolio_archive (portfolio cohorts only)]
+//   portfolio_archive, retired_market_marker (portfolio cohorts only)]
 fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
@@ -2080,11 +2109,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidAccountData);
     }
-    let portfolio_archive = if matches!(
+    let portfolio_context = if matches!(
         stake.cohort,
         COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER
     ) {
-        Some(next_account_info(iter)?)
+        Some((next_account_info(iter)?, next_account_info(iter)?))
     } else {
         None
     };
@@ -2168,13 +2197,23 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let portfolio_market = config
                 .market_at(stake.portfolio_market_index)
                 .ok_or(ProgramError::InvalidAccountData)?;
+            let retired = market_is_retired(
+                &config,
+                &portfolio_market,
+                portfolio_context
+                    .map(|(_, retired_market)| retired_market)
+                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
             let totals = portfolio_totals(
                 program_id,
                 &config,
                 &stake.owner,
                 backing_ledger,
-                portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                portfolio_context
+                    .map(|(archive, _)| archive)
+                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
                 Some(&portfolio_market),
+                retired,
             )?;
             let spent = totals.residual_spent_principal;
             let counter = residual_counter(
@@ -2220,13 +2259,23 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let portfolio_market = config
                 .market_at(stake.portfolio_market_index)
                 .ok_or(ProgramError::InvalidAccountData)?;
+            let retired = market_is_retired(
+                &config,
+                &portfolio_market,
+                portfolio_context
+                    .map(|(_, retired_market)| retired_market)
+                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
             let totals = portfolio_totals(
                 program_id,
                 &config,
                 &stake.owner,
                 backing_ledger,
-                portfolio_archive.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                portfolio_context
+                    .map(|(archive, _)| archive)
+                    .ok_or(ProgramError::NotEnoughAccountKeys)?,
                 Some(&portfolio_market),
+                retired,
             )?;
             let counter =
                 funding_payer_counter(totals.funding_long_paid, totals.funding_short_paid);
@@ -2345,7 +2394,8 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 
 // claim accounts: [cranker(s), config, stake(w), vault(w), recipient_ata(w), token_program]
 //   insurance/backing cohorts append one more: the subledger position (for the live HE cap).
-//   LP/trader cohorts append two more: the Percolator portfolio and canonical cumulative archive.
+//   LP/trader cohorts append three more: the Percolator portfolio, canonical cumulative archive,
+//   and exact read-only retired-market marker PDA.
 //   A pre-archive direct Percolator maintenance close retains the historical frozen fallback.
 //
 // PERMISSIONLESS self-service claim (replaces the cranker-assembled seal for the portfolio
@@ -2514,6 +2564,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             // Residual cohorts: live-cap the frozen points against a post-crystallize net drop.
             let portfolio = next_account_info(iter)?;
             let portfolio_archive = next_account_info(iter)?;
+            let retired_market = next_account_info(iter)?;
             if iter.next().is_some() {
                 return Err(ProgramError::InvalidInstructionData);
             }
@@ -2523,14 +2574,20 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let dematerialized = portfolio.data_len() == 0
                 && (*portfolio.owner == solana_program::system_program::ID
                     || *portfolio.owner == config.percolator_program);
-            if dematerialized && portfolio_archive.data_len() == 0 {
+            let portfolio_market = config
+                .market_at(stake.portfolio_market_index)
+                .ok_or(ProgramError::InvalidAccountData)?;
+            let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
+            if (dematerialized || retired) && portfolio_archive.data_len() == 0 {
                 if *portfolio_archive.owner != solana_program::system_program::ID
-                    || !archive_key_matches_allowed_market(
-                        &config,
-                        portfolio_archive.key,
-                        &stake.owner,
-                        portfolio.key,
-                    )
+                    || *portfolio_archive.key
+                        != portfolio_archive_address(
+                            &config.percolator_program,
+                            &portfolio_market,
+                            &stake.owner,
+                            portfolio.key,
+                        )
+                        .0
                 {
                     return Err(ProgramError::InvalidSeeds);
                 }
@@ -2540,9 +2597,6 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 // remain sufficient. Controller cleanup now always supplies an archive instead.
                 points_to_amount(cohort_supply, stake.points, frozen_denom)
             } else {
-                let portfolio_market = config
-                    .market_at(stake.portfolio_market_index)
-                    .ok_or(ProgramError::InvalidAccountData)?;
                 let totals = portfolio_totals(
                     program_id,
                     &config,
@@ -2550,6 +2604,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                     portfolio,
                     portfolio_archive,
                     Some(&portfolio_market),
+                    retired,
                 )?;
                 let spent = totals.residual_spent_principal;
                 let live_net = residual_counter(

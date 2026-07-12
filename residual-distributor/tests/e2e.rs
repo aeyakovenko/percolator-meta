@@ -3409,6 +3409,18 @@ fn portfolio_archive_pda(
     .0
 }
 
+fn retired_market_pda(percolator_program: &Pubkey, market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"retired-market",
+            percolator_program.as_ref(),
+            market.as_ref(),
+        ],
+        &solana_sdk::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9"),
+    )
+    .0
+}
+
 fn stakes_for_link(svm: &LiteSVM, env: &Env, owner: &Pubkey, linked: &Pubkey) -> Vec<Pubkey> {
     [
         COHORT_INSURANCE,
@@ -3494,6 +3506,10 @@ fn register(
             false,
         ));
         accounts.push(AccountMeta::new_readonly(market, false));
+        accounts.push(AccountMeta::new_readonly(
+            retired_market_pda(&env.stub_perc, &market),
+            false,
+        ));
     }
     if svm.get_account(&env.rd_config).unwrap().data.len() == 823 {
         let legacy_owner_stake = Pubkey::find_program_address(
@@ -3553,8 +3569,13 @@ fn crystallize_as(
         AccountMeta::new_readonly(*linked, false),
     ];
     if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        let market = portfolio_market(svm, env, linked);
         accounts.push(AccountMeta::new_readonly(
             portfolio_archive_pda(svm, env, owner, linked),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(
+            retired_market_pda(&env.stub_perc, &market),
             false,
         ));
     }
@@ -3596,8 +3617,13 @@ fn crystallize_cohort(
         AccountMeta::new_readonly(*linked, false),
     ];
     if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        let market = portfolio_market(svm, env, linked);
         accounts.push(AccountMeta::new_readonly(
             portfolio_archive_pda(svm, env, owner, linked),
+            false,
+        ));
+        accounts.push(AccountMeta::new_readonly(
+            retired_market_pda(&env.stub_perc, &market),
             false,
         ));
     }
@@ -3660,9 +3686,14 @@ fn claim_as(
             accounts.push(AccountMeta::new_readonly(claim_linked, false));
         }
         COHORT_LP | COHORT_TRADER => {
+            let market = portfolio_market(svm, env, &claim_linked);
             accounts.push(AccountMeta::new_readonly(claim_linked, false));
             accounts.push(AccountMeta::new_readonly(
                 portfolio_archive_pda(svm, env, owner, &claim_linked),
+                false,
+            ));
+            accounts.push(AccountMeta::new_readonly(
+                retired_market_pda(&env.stub_perc, &market),
                 false,
             ));
         }
@@ -3749,9 +3780,14 @@ fn claim_cohort(
             accounts.push(AccountMeta::new_readonly(*linked, false));
         }
         COHORT_LP | COHORT_TRADER => {
+            let market = portfolio_market(svm, env, linked);
             accounts.push(AccountMeta::new_readonly(*linked, false));
             accounts.push(AccountMeta::new_readonly(
                 portfolio_archive_pda(svm, env, &owner.pubkey(), linked),
+                false,
+            ));
+            accounts.push(AccountMeta::new_readonly(
+                retired_market_pda(&env.stub_perc, &market),
                 false,
             ));
         }
@@ -7661,6 +7697,10 @@ fn exercise_historical_frozen_stake_claim(linked_seed: bool, label: &str) {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(portfolio, false),
             AccountMeta::new_readonly(archive, false),
+            AccountMeta::new_readonly(
+                retired_market_pda(&env.stub_perc, &env.market),
+                false,
+            ),
         ],
         data: vec![5u8],
     };
@@ -9177,6 +9217,10 @@ fn claim_cannot_be_redirected_delegated_or_paid_from_a_decoy_vault() {
                     AccountMeta::new_readonly(spl_token::ID, false),
                     AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
                     AccountMeta::new_readonly(archive, false),
+                    AccountMeta::new_readonly(
+                        retired_market_pda(&env.stub_perc, &env.market),
+                        false,
+                    ),
                 ],
                 data: vec![5u8],
             }],
@@ -9308,6 +9352,10 @@ fn claim_rejects_same_program_type_confusion_config_and_stake_discriminators() {
                         AccountMeta::new_readonly(spl_token::ID, false),
                         AccountMeta::new_readonly(pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
                         AccountMeta::new_readonly(archive, false),
+                        AccountMeta::new_readonly(
+                            retired_market_pda(&env.stub_perc, &env.market),
+                            false,
+                        ),
                     ],
                     data: vec![5u8],
                 }],
@@ -11506,6 +11554,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
                     AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                     AccountMeta::new_readonly(archive, false),
                     AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(retired_market_pda(&stub_perc, &market), false),
                 ],
                 data: vec![1u8, COHORT_LP],
             }],
