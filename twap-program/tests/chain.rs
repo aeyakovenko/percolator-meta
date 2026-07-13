@@ -21546,6 +21546,254 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
     );
 }
 
+// PUBLIC TERMINAL DOS REGRESSION: an exact tie can survive the bootstrap forever when
+// both voters disappear. Resolution ends the code/market risk they backed, so a fixed
+// public return must still recover each deposit to its recorded owner and unblock slab
+// retirement; genesis finalization is not a custody precondition once the market is
+// resolved and empty.
+#[test]
+fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let (dist_a, vote_a) =
+        register_proposal(&mut svm, &payer, &env, 1, &Pubkey::new_unique(), 100);
+    let (dist_b, vote_b) =
+        register_proposal(&mut svm, &payer, &env, 2, &Pubkey::new_unique(), 100);
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+
+    let deposit = |svm: &mut LiteSVM, owner: &Keypair| -> (Pubkey, Pubkey) {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let source = Pubkey::new_unique();
+        set_token(svm, &source, &env.collateral_mint, &owner.pubkey(), 1);
+        let destination = Pubkey::new_unique();
+        set_token(
+            svm,
+            &destination,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        let position = sub_position_pda(&env.pool, &owner.pubkey());
+        let mut data = vec![4u8];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        send(
+            svm,
+            &[&payer, owner],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data,
+            },
+        )
+        .expect("one-unit genesis deposit");
+        (position, destination)
+    };
+    let vote = |svm: &mut LiteSVM, owner: &Keypair, position: Pubkey, proposal: Pubkey| {
+        let ballot = Pubkey::find_program_address(
+            &[
+                b"gv_ballot",
+                env.gv_config.as_ref(),
+                owner.pubkey().as_ref(),
+            ],
+            &gv_id_e2e(),
+        )
+        .0;
+        send(
+            svm,
+            &[&payer, owner],
+            Instruction {
+                program_id: gv_id_e2e(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.gv_config, false),
+                    AccountMeta::new(ballot, false),
+                    AccountMeta::new(proposal, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new_readonly(env.pool, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(sub_id(), false),
+                ],
+                data: vec![3u8, 1u8],
+            },
+        )
+        .expect("back competing proposal");
+    };
+    let trigger = |svm: &mut LiteSVM, proposal: Pubkey, distribution: Pubkey| {
+        send(
+            svm,
+            &[&payer],
+            Instruction {
+                program_id: gv_id_e2e(),
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(env.gv_config, false),
+                    AccountMeta::new(proposal, false),
+                    AccountMeta::new_readonly(dist_id_e2e(), false),
+                    AccountMeta::new(env.dist_config, false),
+                    AccountMeta::new(distribution, false),
+                    AccountMeta::new_readonly(env.pool, false),
+                ],
+                data: vec![4u8],
+            },
+        )
+    };
+
+    let voter_a = Keypair::new();
+    let voter_b = Keypair::new();
+    let (position_a, destination_a) = deposit(&mut svm, &voter_a);
+    let (position_b, destination_b) = deposit(&mut svm, &voter_b);
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot += 16;
+    svm.set_sysvar(&clock);
+    vote(&mut svm, &voter_a, position_a, vote_a);
+    vote(&mut svm, &voter_b, position_b, vote_b);
+    advance_to_test_bootstrap_end(&mut svm);
+    assert!(trigger(&mut svm, vote_a, dist_a).is_err());
+    assert!(trigger(&mut svm, vote_b, dist_b).is_err());
+
+    let resolve = build_direct_resolve_message(&env.squads_vault, &env.slab, &perc_id());
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &resolve,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+    )
+    .expect("governance resolves the otherwise empty market");
+
+    let terminal_return = |owner: Pubkey,
+                           position: Pubkey,
+                           destination: Pubkey,
+                           genesis_witness: Pubkey| Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(owner, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(destination, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(env.gv_config, false),
+            AccountMeta::new_readonly(genesis_witness, false),
+            AccountMeta::new_readonly(gv_id_e2e(), false),
+        ],
+        data: vec![12u8],
+    };
+    let config_before_returns = svm.get_account(&env.gv_config).unwrap();
+    let proposal_a_before_returns = svm.get_account(&vote_a).unwrap();
+    let proposal_b_before_returns = svm.get_account(&vote_b).unwrap();
+    send(
+        &mut svm,
+        &[&payer],
+        terminal_return(voter_a.pubkey(), position_a, destination_a, vote_a),
+    )
+    .expect("a tied absent voter cannot strand their owner-bound deposit");
+    send(
+        &mut svm,
+        &[&payer],
+        terminal_return(
+            voter_b.pubkey(),
+            position_b,
+            destination_b,
+            system_program::ID,
+        ),
+    )
+    .expect("the second tied absent voter cannot block terminal cleanup");
+    assert_eq!(token_amount(&svm, &destination_a), 1);
+    assert_eq!(token_amount(&svm, &destination_b), 1);
+    assert_eq!(svm.get_account(&env.gv_config).unwrap(), config_before_returns);
+    assert_eq!(svm.get_account(&vote_a).unwrap(), proposal_a_before_returns);
+    assert_eq!(svm.get_account(&vote_b).unwrap(), proposal_b_before_returns);
+    assert!(
+        trigger(&mut svm, vote_a, dist_a).is_err(),
+        "terminal returns cannot turn tied historical votes into an A capture"
+    );
+    assert!(
+        trigger(&mut svm, vote_b, dist_b).is_err(),
+        "terminal returns cannot turn tied historical votes into a B capture"
+    );
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+    let close = build_direct_close_slab_message(
+        &env.squads_vault,
+        &env.slab,
+        &env.perc_vault,
+        &vault_authority,
+        &governance_destination,
+        &perc_id(),
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &close,
+        &[
+            AccountMeta::new(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new(governance_destination, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+    )
+    .expect("permissionless owner returns remove the final CloseSlab blocker");
+}
+
 // ATTACK/DESIGN PROBE (exit recomputes quorum — "those who stay decide"): quorum is
 // total_voted_principal*2 > LIVE pool outstanding. A non-voter's capital counts AGAINST quorum
 // only while it stays in the pool; when they EXIT, outstanding shrinks and a voter who was below
@@ -43058,24 +43306,13 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(pool_po
         send(&mut svm, &[&payer], amount_injection).is_err(),
         "the fixed terminal return accepts no caller-selected amount"
     );
-    assert!(
-        send(
-            &mut svm,
-            &[&payer],
-            terminal_return(unexecuted_proposal, owner_destination),
-        )
-        .is_err(),
-        "an unexecuted proposal cannot authorize terminal retirement"
-    );
-    assert_eq!(token_amount(&svm, &attacker_destination), 0);
-    assert_eq!(token_amount(&svm, &owner_destination), 0);
-
     send(
         &mut svm,
         &[&payer],
-        terminal_return(winner, owner_destination),
+        terminal_return(unexecuted_proposal, owner_destination),
     )
-    .expect("any cranker returns the full loss-adjusted atom to a clean owner account");
+    .expect("terminal custody depends on the elapsed bootstrap, not proposal outcome");
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
     assert_eq!(token_amount(&svm, &owner_destination), 1);
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
     let pool = svm.get_account(&env.pool).unwrap();

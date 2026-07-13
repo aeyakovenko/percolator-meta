@@ -13766,3 +13766,27 @@ outer instruction returns. Controller activation already requires the controller
 insurance authority and operator, so Percolator authenticates both follow-up CPIs. Any failure rolls
 back all three CPIs. This adds no instruction tag, account, signer, authority selector, recipient,
 amount, token account, or token CPI and cannot move insurance, backing, collateral, or reward coins.
+
+## Tick - absent tied genesis voters could block terminal market cleanup (surface C/D)
+
+Genesis Vote closes new support at the bootstrap deadline and correctly requires a strict weighted
+majority. Retraction remains owner-signed so nobody can erase another depositor's vote. If equal-weight
+voters backed competing proposals and disappeared, however, neither proposal could execute and neither
+lock could be retracted. Subledger's only permissionless owner return required an executed proposal,
+so even after governance resolved an otherwise empty market, the two owner-bound insurance atoms and
+the market slab remained permanently live.
+
+The retained real-SBF LiteSVM regression deposits one base unit from each of two users, gives them equal
+age, backs competing full-supply proposals, proves both triggers reject at the deadline, resolves the
+pinned Percolator market through Squads, and returns both deposits without either owner signature. It
+then closes the drained slab. Separate controls reject the attestation before the exact configured
+deadline and reject a same-program but noncanonical Subledger pool. Existing principal and with-surplus
+terminal-return tests continue to reject redirected, delegated, poisoned, and amount-bearing payouts.
+
+FIX: Genesis Vote exposes a read-only attestation for its canonical schedule-bound config and exact
+configured Subledger pool at or after bootstrap end. Subledger consumes it only after independently
+proving the bound market is resolved and empty. The old proposal account remains an inert compatibility
+slot. The return still has no amount or beneficiary, pays only the complete loss-adjusted position into
+a clean account owned by its recorded depositor, and mutates no ballot or Genesis COIN state. A strict
+tie may leave the points distribution unsealed, but it cannot lock user collateral or prevent terminal
+market cleanup.

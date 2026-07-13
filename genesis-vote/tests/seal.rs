@@ -664,6 +664,50 @@ fn trigger_rejects_before_configured_bootstrap_delay_elapsed() {
 }
 
 #[test]
+fn terminal_attestation_requires_elapsed_schedule_and_canonical_subledger_pool() {
+    let mut env = Env::new();
+    let attest = |config: Pubkey, pool: Pubkey| Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(config, false),
+            AccountMeta::new_readonly(pool, false),
+        ],
+        data: vec![6u8],
+    };
+
+    env.set_slot(TEST_BOOTSTRAP_START_SLOT + TEST_BOOTSTRAP_DELAY_SLOTS - 1);
+    assert!(
+        env.send(&[attest(env.gv_config, env.sub_pool)], &[])
+            .is_err(),
+        "terminal custody cannot bypass the committed bootstrap deadline"
+    );
+
+    let foreign_pool = Pubkey::new_unique();
+    let mut foreign_data = vec![0u8; 192];
+    foreign_data[..8].copy_from_slice(b"SUBPOOL1");
+    env.svm
+        .set_account(
+            foreign_pool,
+            solana_sdk::account::Account {
+                lamports: 1_000_000,
+                data: foreign_data,
+                owner: env.sub_pid,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.set_slot(TEST_BOOTSTRAP_START_SLOT + TEST_BOOTSTRAP_DELAY_SLOTS);
+    assert!(
+        env.send(&[attest(env.gv_config, foreign_pool)], &[])
+            .is_err(),
+        "a same-program foreign pool cannot satisfy terminal finality"
+    );
+    env.send(&[attest(env.gv_config, env.sub_pool)], &[])
+        .expect("the canonical pool attests at the exact bootstrap end");
+}
+
+#[test]
 fn init_config_schedule_cannot_be_first_writer_shortened_or_started_early() {
     let intended_delay = 100u64;
     let intended_start = 1_000u64;

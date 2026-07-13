@@ -150,7 +150,7 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const GENESIS_VOTE_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("GenesisVote11111111111111111111111111111111");
-const GENESIS_IX_ASSERT_EXECUTED: u8 = 5;
+const GENESIS_IX_ASSERT_BOOTSTRAP_ENDED: u8 = 6;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
@@ -194,7 +194,7 @@ const IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 // Read-only CPI attestation for a permissionless resolved custody return. Keeping
 // this check in the subledger supports every pool layout without duplicating it in TWAP.
 const IX_ASSERT_PRINCIPAL: u8 = 11;
-// Permissionless terminal return for an absent finalized-genesis depositor. It
+// Permissionless terminal return for an absent genesis depositor. It
 // retires the complete position and can pay only a clean token account owned by
 // that depositor.
 const IX_RETURN_FINALIZED_POSITION: u8 = 12;
@@ -635,7 +635,7 @@ struct Position {
     /// Set by the pool's vote_authority while a genesis vote is live on this
     /// position. Blocks insurance-withdraw until the vote is retracted.
     vote_locked: bool,
-    /// A permissionless finalized-genesis return consumed the position. In this
+    /// A permissionless terminal genesis return consumed the position. In this
     /// state `withdrawn_amount` stores the principal still at risk immediately
     /// before that return, so a cranker cannot erase its capital reward.
     terminal_returned: bool,
@@ -2322,14 +2322,16 @@ fn process_insurance_withdraw_full(
 
 // return_finalized_position accounts: [owner, pool(w), position(w), owner_ata(w),
 //   holding(w), market_slab(w), percolator_vault(w), vault_authority,
-//   percolator_program, token_program, genesis_config, executed_proposal,
+//   percolator_program, token_program, genesis_config, genesis_witness,
 //   genesis_vote_program]
 // data: none
 //
-// Once genesis is irreversibly sealed and its real market is resolved and empty,
-// anyone may retire an absent depositor's complete position. The instruction has
-// no amount and accepts only a clean token account owned by the depositor, so
-// neither a cranker nor governance can capture or partially manipulate the payout.
+// Once the immutable bootstrap deadline has elapsed and its real market is resolved
+// and empty, anyone may retire an absent depositor's complete position. The witness
+// account is retained for instruction compatibility but grants no authority. The
+// instruction has no amount and accepts only a clean token account owned by the
+// depositor, so neither a cranker nor governance can capture or partially manipulate
+// the payout.
 fn process_return_finalized_position(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2442,7 +2444,7 @@ fn process_insurance_withdraw_impl(
     }
 
     if terminal {
-        let (genesis_config, executed_proposal, genesis_program) =
+        let (genesis_config, _genesis_witness, genesis_program) =
             genesis_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
         if pool_account.data_len() < POOL_SIZE
             || position_account.data_len() < POSITION_SIZE
@@ -2469,21 +2471,22 @@ fn process_insurance_withdraw_impl(
                 return Err(ProgramError::InvalidAccountData);
             }
         }
-        // The genesis program owns this state and attests it read-only. A
-        // successful trigger marks executed in the same transaction that seals
-        // distribution, so this cannot observe a half-finalized outcome.
+        // The genesis program owns this state and attests the immutable deadline
+        // plus canonical pool binding read-only. Market finality is proved above,
+        // so custody recovery cannot depend on an absent voter breaking a tie or
+        // otherwise producing an executed distribution proposal.
         invoke(
             &Instruction {
                 program_id: *genesis_program.key,
                 accounts: vec![
                     AccountMeta::new_readonly(*genesis_config.key, false),
-                    AccountMeta::new_readonly(*executed_proposal.key, false),
+                    AccountMeta::new_readonly(*pool_account.key, false),
                 ],
-                data: vec![GENESIS_IX_ASSERT_EXECUTED],
+                data: vec![GENESIS_IX_ASSERT_BOOTSTRAP_ENDED],
             },
             &[
                 genesis_config.clone(),
-                executed_proposal.clone(),
+                pool_account.clone(),
                 genesis_program.clone(),
             ],
         )?;
@@ -2770,8 +2773,9 @@ fn process_insurance_withdraw_impl(
     if position.principal == 0 {
         position.withdrawn = true;
         if terminal {
-            // The executed proposal proves the ballot has no remaining
-            // governance effect; do not leave a stale lock on retired capital.
+            // Terminal market finality ends the deposit's risk period; do not
+            // leave a stale lock on retired capital. Historical vote tallies remain
+            // read-only evidence of the risk taken during bootstrap.
             position.vote_locked = false;
             position.terminal_returned = true;
             position.terminal_return_slot = Some(core::cmp::min(
