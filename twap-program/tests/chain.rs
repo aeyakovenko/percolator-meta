@@ -41621,6 +41621,35 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     .expect("a second owner exits while the pool holds returned custody");
     assert_eq!(token_amount(&svm, &depositor_ata), interleaved_exit);
 
+    // Resolution can race the external re-handoff crank after these owner exits. The
+    // established pending permit must remain usable in resolved mode; otherwise this ordinary
+    // governance lifecycle transition would leave custody on the pool until another DAO action.
+    let resolve = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &resolve,
+        &resolve_remaining,
+    )
+    .expect("controller resolves between owner exits and public re-handoff");
+
     let permissionless_rehandoff = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -41654,32 +41683,6 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     );
     assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_replayed_exit);
     assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_replayed_exit);
-
-    let resolve = build_controller_proxy_message(
-        &env.squads_vault,
-        &controller,
-        &env.slab,
-        &perc_id(),
-        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
-    );
-    let resolve_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        7,
-        &resolve,
-        &resolve_remaining,
-    )
-    .expect("controller resolves the empty market");
 
     let twap_transit = canonical_insurance_vault(&twap_authority, &env.collateral_mint);
     let controller_transit = canonical_insurance_vault(&controller, &env.collateral_mint);
