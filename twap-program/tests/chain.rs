@@ -29786,6 +29786,175 @@ fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
     );
 }
 
+// PUBLIC DONATION PROBE: SPL token accounts cannot reject transfers, so an attacker can donate
+// untracked COIN or collateral to either shared book escrow after init. Those atoms have no slot
+// owner. They must not enlarge a bidder's claim, and the residual dust must not stop the last claim
+// from reopening the singleton book or stop a later round from settling and draining normally.
+#[test]
+fn e2e_post_init_escrow_donations_cannot_inflate_claims_or_block_reopen() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let donated_coin = 17;
+    let donated_usd = 23;
+    let coin_source = Pubkey::new_unique();
+    let usd_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &coin_source,
+        &env.coin_mint,
+        &payer.pubkey(),
+        0,
+    );
+    mint_coin(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.coin_mint_authority,
+        &coin_source,
+        donated_coin,
+    );
+    set_token(
+        &mut svm,
+        &usd_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        donated_usd,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &coin_source,
+            &bk.coin_escrow,
+            &payer.pubkey(),
+            &[],
+            donated_coin,
+        )
+        .unwrap(),
+    )
+    .expect("public COIN donation after init");
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &usd_source,
+            &bk.settlement_usd,
+            &payer.pubkey(),
+            &[],
+            donated_usd,
+        )
+        .unwrap(),
+    )
+    .expect("public collateral donation after init");
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    for (round, amount) in [(0u8, 100_000u64), (1u8, 50_000u64)] {
+        let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, amount);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_ata,
+                &usd_ata,
+                &env.coin_mint,
+                &env.collateral_mint,
+                amount as u128,
+                amount as u128,
+                None,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("round {round} bid after donated dust: {e}"));
+        assert_eq!(
+            token_amount(&svm, &bk.coin_escrow),
+            donated_coin + amount,
+            "only the donated dust and current bid are escrowed"
+        );
+
+        let round_end = {
+            let book = svm.get_account(&bk.book).unwrap();
+            u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&cranker],
+            execute_ix(
+                &cranker.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                None,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("round {round} execute with donated dust: {e}"));
+        assert_eq!(
+            token_amount(&svm, &bk.settlement_usd),
+            donated_usd + amount,
+            "settlement includes dust but records only the bidder's exact proceeds"
+        );
+        assert_eq!(
+            token_amount(&svm, &bk.coin_escrow),
+            donated_coin,
+            "sold COIN is burned without consuming unowned dust"
+        );
+
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &usd_ata,
+                &coin_ata,
+                0,
+            ),
+        )
+        .unwrap_or_else(|e| panic!("round {round} claim with donated dust: {e}"));
+        assert_eq!(
+            token_amount(&svm, &usd_ata),
+            amount,
+            "the bidder cannot claim donated collateral"
+        );
+        assert_eq!(
+            token_amount(&svm, &bk.settlement_usd),
+            donated_usd,
+            "unowned collateral dust remains isolated after the claim"
+        );
+        assert_eq!(
+            token_amount(&svm, &bk.coin_escrow),
+            donated_coin,
+            "unowned COIN dust remains isolated after the claim"
+        );
+    }
+}
+
 // DIV-BY-ZERO BRICK (reserve_den == 0, permanent auction DOS): the reserve is a fraction reserve_num/
 // reserve_den, and execute's eligibility filter calls cmp_rate(c, u, reserve_num, reserve_den), which uses
 // REAL division (an/ad, bn/bd) — NOT cross-multiplication. A stored reserve_den == 0 would make every
