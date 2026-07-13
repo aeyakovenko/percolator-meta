@@ -123,7 +123,8 @@ capital's own tenure.
   that principal tranche atomically, so a temporary depositor cannot redirect another owner's
   long/short loss protection by withdrawing. TWAP surplus rounds use the same reservation-aware
   planner: auction and savings pulls leave the ratcheted floor at the canonical 50/50 domain split
-  instead of consuming one side's principal behind an aggregate floor.
+  instead of consuming one side's principal behind an aggregate floor. A zero-surplus round also
+  repairs the exact imbalance left by a predecessor TWAP deployment without moving net value.
   Any final whole-atom remainder stays protocol insurance. Governance still cannot redirect a
   depositor's withdrawal.
 

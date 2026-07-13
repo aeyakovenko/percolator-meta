@@ -22523,6 +22523,94 @@ fn permissionless_surplus_pull_preserves_insurance_floor_in_both_domains() {
     assert_eq!(token_amount(&svm, &bk.holding), 400_000);
 }
 
+// UPGRADE LOF: the predecessor TWAP already ratcheted the aggregate floor after its
+// long-first pull, so an upgraded instance has no fresh surplus with which to enter the
+// balancing path. A zero-surplus public round must repair that exact legacy allocation.
+#[test]
+fn upgraded_twap_repairs_legacy_domain_imbalance_without_new_surplus() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let first_round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, first_round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("derive the predecessor round's aggregate and token state");
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), 1_100_000);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), 1_100_000);
+
+    // Exact domain output of the predecessor binary for this public round. Aggregate
+    // insurance, floor, vault custody, holding, and every other slab field are unchanged.
+    let mut market = svm.get_account(&env.slab).unwrap();
+    let (config, mut group) = percolator_prog::state::read_market(&market.data).unwrap();
+    group.insurance_domain_budget[0] = 350_000;
+    group.insurance_domain_budget[1] = 750_000;
+    percolator_prog::state::write_market(&mut market.data, &config, &group).unwrap();
+    svm.set_account(env.slab, market).unwrap();
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        [350_000, 750_000],
+    );
+    let holding_before = token_amount(&svm, &bk.holding);
+    let vault_before = token_amount(&svm, &env.perc_vault);
+
+    let second_round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, second_round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("the upgraded permissionless round repairs the legacy floor");
+
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), 1_100_000);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), 1_100_000);
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        [550_000, 550_000],
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), holding_before);
+    assert_eq!(token_amount(&svm, &env.perc_vault), vault_before);
+}
+
 // A bidder with a funded COIN source account and an empty collateral USD destination.
 // A bidder's canonical COIN ATA — the auction's pinned refund target (matches the program's
 // bidder_coin_ata). Reuses the ATA derivation (= associated-token-address).

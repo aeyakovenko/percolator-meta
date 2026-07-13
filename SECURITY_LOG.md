@@ -19,6 +19,12 @@ donation, floor setup, auction-book initialization, and permissionless TWAP roun
 auction budget and `1,100,000` aggregate floor. The existing 80/10/10 savings regression now additionally
 requires `[525,000, 525,000]`, with unchanged auction, savings, vault, and floor amounts.
 
+An upgrade regression preserves the exact aggregate, token, and domain state left by that predecessor
+round, then runs the upgraded binary with no new surplus. The planner supports a zero-net withdrawal and
+redeposit, so any public execute repairs `[350,000, 750,000]` to `[550,000, 550,000]` without changing the
+floor, holding, Percolator vault, or aggregate insurance. Existing deployments do not depend on future fees
+to recover the invariant.
+
 FIX: a shared pure accounting planner models Percolator's exact long-first withdrawal order, per-domain
 reservation floors, and global capacity. TWAP combines auction and savings into one planned gross
 withdrawal, atomically tops up the exact domain amounts needed for the ratcheted floor's canonical 50/50
