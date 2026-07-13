@@ -1354,7 +1354,7 @@ fn run_complete_public_insurance_loss(
     high_capital: u64,
     domain_tranche: u64,
     expected_remaining: u128,
-) {
+) -> Vec<(Keypair, Pubkey)> {
     let position_q = 1_000_000_000_000i128;
     let pnl_atoms_per_price = position_q.unsigned_abs() / percolator::POS_SCALE;
     let insurance_before = asset_insurance_remaining(env, 0);
@@ -1364,7 +1364,7 @@ fn run_complete_public_insurance_loss(
         0,
     );
 
-    let (low_long, low_long_portfolio, _low_short, low_short_portfolio) =
+    let (low_long, low_long_portfolio, low_short, low_short_portfolio) =
         open_public_pair(env, position_q, low_entry, low_capital);
     let high_target = low_entry
         .checked_add(
@@ -1383,7 +1383,7 @@ fn run_complete_public_insurance_loss(
     clear_stale_public_winner(env, &low_long, low_long_portfolio, *slot);
 
     advance_public_mark(env, oracle, observer_portfolio, slot, high_entry, 100);
-    let (_high_long, high_long_portfolio, high_short, high_short_portfolio) =
+    let (high_long, high_long_portfolio, high_short, high_short_portfolio) =
         open_public_pair(env, position_q, high_entry, high_capital);
     let terminal_low = low_entry;
     let long_loss = pnl_atoms_per_price
@@ -1401,6 +1401,13 @@ fn run_complete_public_insurance_loss(
         expected_remaining,
     );
     clear_stale_public_winner(env, &high_short, high_short_portfolio, *slot);
+
+    vec![
+        (low_long, low_long_portfolio),
+        (low_short, low_short_portfolio),
+        (high_long, high_long_portfolio),
+        (high_short, high_short_portfolio),
+    ]
 }
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
@@ -2569,6 +2576,194 @@ fn public_repeated_total_losses_cannot_exhaust_the_insurance_share_namespace() {
         (successful_dust_recapitalizations as u128 + 1) * 1_000_000,
     );
     assert_eq!(asset_insurance_remaining(&env, 0), 201);
+}
+
+// PUBLIC LOF: the first partial exit from an obsolete share generation pays zero and lazily
+// normalizes the position. That normalization must not make a second exit look like a historical
+// shareless position, which would let the impaired owner claim a later depositor's recapitalization.
+// The loss below is produced by the pinned Percolator binary through authenticated marks, public
+// trades, and permissionless liquidation/reset cranks.
+#[test]
+fn stale_generation_partial_exit_cannot_replay_as_a_historical_position() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64.checked_mul(high_entry).unwrap();
+    let domain_tranche = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let impaired_principal = domain_tranche.checked_mul(2).unwrap();
+    let (impaired_owner, impaired_ata) = new_depositor(&mut env, impaired_principal);
+    let pool = env.pool;
+    let impaired_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &impaired_owner,
+        &impaired_ata,
+        &impaired_holding,
+        impaired_principal,
+    )
+    .expect("fund the loss-bearing generation");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let mut slot = 100;
+    let mut loss_portfolios = run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        0,
+    );
+    assert_eq!(asset_insurance_remaining(&env, 0), 0);
+
+    let recapitalization = 1_000_000u64;
+    let (new_owner, new_ata) = new_depositor(&mut env, recapitalization);
+    let new_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&new_owner, &new_ata, &new_holding, recapitalization)
+        .expect("a new owner recapitalizes the fully impaired pool");
+    assert_eq!(asset_insurance_remaining(&env, 0), recapitalization as u128);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("the authenticated authority resolves the completed public loss epoch");
+    loss_portfolios.push((observer, observer_portfolio));
+    for (owner, portfolio) in loss_portfolios {
+        let payer = clone_kp(&env.payer);
+        let destination = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+        let mut last_resolved = None;
+        let mut last_close = None;
+        for _ in 0..512 {
+            last_resolved = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(env.vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    data: PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    }
+                    .encode(),
+                }],
+                &[&owner],
+            ));
+            last_close = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    data: PIx::ClosePortfolio.encode(),
+                }],
+                &[&owner],
+            ));
+            if last_close.as_ref().is_some_and(Result::is_ok) {
+                break;
+            }
+        }
+        assert!(
+            env.svm
+                .get_account(&portfolio)
+                .map_or(true, |account| account.lamports == 0),
+            "resolved public portfolio must not remain a withdrawal gate: close_resolved={last_resolved:?}, close={last_close:?}",
+        );
+    }
+    assert_ne!(
+        env.position_share_generation(&impaired_owner.pubkey()),
+        env.pool_share_generation(),
+    );
+
+    env.insurance_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &impaired_holding,
+        &impaired_owner,
+        1,
+    )
+    .expect("the first stale partial exit retires one lost principal atom at zero payout");
+    assert_eq!(env.token_amount(&impaired_ata), 0);
+    assert_eq!(env.position_shares(&impaired_owner.pubkey()), 0);
+    assert_eq!(
+        env.position_share_generation(&impaired_owner.pubkey()),
+        env.pool_share_generation(),
+    );
+
+    env.insurance_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &impaired_holding,
+        &impaired_owner,
+        impaired_principal - 1,
+    )
+    .expect("the remainder of the impaired position retires at zero payout");
+    assert_eq!(
+        env.token_amount(&impaired_ata),
+        0,
+        "normalization cannot turn an obsolete zero-share position into a pro-rata legacy claim",
+    );
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        recapitalization as u128,
+        "the new owner's recapitalization remains segregated",
+    );
+
+    env.insurance_withdraw(
+        &new_owner,
+        &new_ata,
+        &new_holding,
+        &new_owner,
+        recapitalization,
+    )
+    .expect("the current-generation owner recovers the recapitalization");
+    assert_eq!(env.token_amount(&new_ata), recapitalization);
 }
 
 // PUBLIC DEPOSIT-LIVENESS PROBE: a one-atom residual prevents the exact-loss generation reset.

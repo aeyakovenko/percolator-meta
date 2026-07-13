@@ -2389,11 +2389,16 @@ fn process_insurance_withdraw_impl(
                     virtual_shares,
                 )?,
             )
-        } else {
+        } else if !share_accounting {
             // Historical principal positions predate share accounting. Preserve
             // their owner-bound pro-rata exit instead of turning an upgrade into
             // a custody lock.
             payout(pool.policy, insurance, pool.outstanding_principal, amount)?
+        } else {
+            // Current-layout positions can legitimately have zero shares after a
+            // fully impaired generation reset or a lazy scale-down. They have no
+            // claim on later recapitalization and must never enter the legacy path.
+            0
         }
     };
     let outstanding_after = pool
