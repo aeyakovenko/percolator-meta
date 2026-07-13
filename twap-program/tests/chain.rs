@@ -41591,6 +41591,36 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     .expect("owner atomically releases live custody and fully exits without the DAO");
     assert_eq!(token_amount(&svm, &exiting_ata), exiting_principal);
 
+    // Custody is now back at the canonical pool until a public cranker re-hands it
+    // to TWAP. A second owner may use that interval to make an ordinary partial
+    // exit. The later re-handoff must derive the aggregate live principal from the
+    // pool instead of subtracting only the owner consumed by the atomic return.
+    let interleaved_exit = 4u64;
+    let mut interleaved_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    interleaved_withdraw_data.extend_from_slice(&interleaved_exit.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: interleaved_withdraw_data,
+        },
+    )
+    .expect("a second owner exits while the pool holds returned custody");
+    assert_eq!(token_amount(&svm, &depositor_ata), interleaved_exit);
+
     let permissionless_rehandoff = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -41606,8 +41636,9 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     };
     send(&mut svm, &[&payer], permissionless_rehandoff.clone())
         .expect("any cranker resumes established TWAP custody after the owner exit");
-    let remaining_principal = principal;
-    let retained_floor = retained_floor - exiting_principal as u128;
+    let remaining_principal = principal - interleaved_exit;
+    let retained_floor =
+        retained_floor - exiting_principal as u128 - interleaved_exit as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
     let market_before_replayed_exit = svm.get_account(&env.slab).unwrap();
