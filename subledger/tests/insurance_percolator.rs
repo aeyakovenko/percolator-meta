@@ -1327,6 +1327,7 @@ fn create_and_register_proposal(env: &mut Env, ve: &VoteEnv, id: u64, dest: &Pub
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(ve.dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -2905,6 +2906,7 @@ fn partial_proposal_cannot_be_registered_or_mutated_after_registration() {
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -4057,6 +4059,7 @@ fn register_rejects_foreign_distribution_proposal() {
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(foreign_proposal, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(ve.dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -4709,6 +4712,7 @@ fn only_the_proposal_creator_can_register_it() {
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(dist_config, false),
         ],
         data: vec![2u8],
     };

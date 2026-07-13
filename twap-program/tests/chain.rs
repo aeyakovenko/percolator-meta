@@ -16386,6 +16386,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -18206,6 +18207,7 @@ fn register_proposal(
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(env.dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -25357,6 +25359,7 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -30926,6 +30929,7 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(env.dist_config, false),
         ],
         data: vec![2u8],
     };
@@ -30941,9 +30945,9 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
         "failed registration cannot leave a stale vote target"
     );
 
-    // Fill the declared shape before registration. The remaining 25 COIN atoms
-    // are intentionally unallocated and follow the existing terminal burn rule.
-    send(&mut svm, &[&payer], append_entry(attacker_dest, 25)).expect("fill proposal capacity");
+    // Fill both the declared shape and the complete fixed supply before registration.
+    send(&mut svm, &[&payer], append_entry(attacker_dest, 50))
+        .expect("fill proposal capacity and supply");
     send(&mut svm, &[&payer], register).expect("full proposal becomes votable");
 
     // alice deposits + holds for weight + backs the proposal (meets quorum + majority alone).
@@ -31024,10 +31028,10 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
     ))
     .expect("vote");
 
-    // Another 25-atom entry would remain inside the supply cap, but the full
-    // declared shape makes mutation impossible after voters approve it.
+    // The full declared shape and exact supply total make mutation impossible
+    // after voters approve it.
     assert!(
-        send(&mut svm, &[&payer], append_entry(Pubkey::new_unique(), 25)).is_err(),
+        send(&mut svm, &[&payer], append_entry(Pubkey::new_unique(), 1)).is_err(),
         "a registered proposal has no append capacity left"
     );
 

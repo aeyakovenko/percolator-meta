@@ -74,8 +74,10 @@ const DIST_PROPOSAL_DISC: [u8; 8] = *b"DISTPRP1";
 pub const DIST_PROPOSAL_CAPACITY_OFF: usize = 80;
 pub const DIST_PROPOSAL_ENTRY_COUNT_OFF: usize = 84;
 pub const DIST_PROPOSAL_TOTAL_AMOUNT_OFF: usize = 88;
-// Distribution config: disc[8], coin_mint[8..40], vault[40..72], authority[72..104].
+// Distribution config: disc[8], coin_mint[8..40], vault[40..72], authority[72..104],
+// claim_window[104..112], total_supply[112..120].
 const DIST_CONFIG_DISC: [u8; 8] = *b"DISTCFG1";
+const DIST_CONFIG_TOTAL_SUPPLY_OFF: usize = 112;
 // Canonical distribution program (finding IC; the gv dual of residual's HK). init_config must pin the
 // wired distribution_program to THIS id — without it an attacker could deploy a fake "distribution
 // program", craft a config owned by it that passes every byte check (disc/coin/authority), and
@@ -550,7 +552,7 @@ fn init_config<'a>(
 }
 
 // register_proposal accounts: [payer(s,w), config, proposal_vote(pda,w),
-//   distribution_proposal, system]
+//   distribution_proposal, system, distribution_config]
 fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let payer = next_account_info(iter)?;
@@ -558,6 +560,7 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     let proposal_account = next_account_info(iter)?;
     let distribution_proposal = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let distribution_config = next_account_info(iter)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -566,6 +569,21 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         return Err(ProgramError::IllegalOwner);
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let distribution_total_supply = {
+        let dc = distribution_config.try_borrow_data()?;
+        if *distribution_config.key != config.distribution_config
+            || distribution_config.owner != &config.distribution_program
+            || dc.len() < DIST_CONFIG_TOTAL_SUPPLY_OFF + 8
+            || dc[..8] != DIST_CONFIG_DISC
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        u64::from_le_bytes(
+            dc[DIST_CONFIG_TOTAL_SUPPLY_OFF..DIST_CONFIG_TOTAL_SUPPLY_OFF + 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
     // The proposal must be a real distribution proposal owned by the distribution
     // program (so votes can only target genuine distributions).
     if distribution_proposal.owner != &config.distribution_program {
@@ -616,7 +634,10 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
                 .try_into()
                 .unwrap(),
         );
-        if entry_count == 0 || entry_count != capacity {
+        if entry_count == 0
+            || entry_count != capacity
+            || total_amount != distribution_total_supply
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         (entry_count, total_amount)
