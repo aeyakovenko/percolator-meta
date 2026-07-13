@@ -27,6 +27,7 @@ extern crate alloc;
 #[allow(unused_imports)]
 use alloc::format; // required by the entrypoint!/msg! macro in SBF builds
 use alloc::{vec, vec::Vec};
+use percolator_accounting::InsuranceWithdrawalPlan;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     clock::Clock,
@@ -815,15 +816,8 @@ fn wide_mul_div_ceil(a: u128, b: u128, denom: u128) -> Option<u128> {
     quotient.checked_add(u128::from(remainder != 0))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InsuranceWithdrawalPlan {
-    gross_withdrawal: u128,
-    redeposit: [u128; 2],
-}
-
 fn balanced_principal_domains(total: u64) -> [u128; 2] {
-    let long = u128::from(total / 2);
-    [long, u128::from(total) - long]
+    percolator_accounting::balanced_insurance_domains(u128::from(total))
 }
 
 fn insurance_deposit_domain_delta(
@@ -940,22 +934,22 @@ fn insurance_withdrawal_plan(
     let short_debit = payout
         .checked_sub(long_debit)
         .ok_or(ProgramError::InvalidAccountData)?;
-    let (gross_withdrawal, long_redeposit) = if short_debit == 0 {
-        (long_debit, 0)
-    } else {
-        (
-            long_capacity
-                .checked_add(short_debit)
-                .ok_or(ProgramError::ArithmeticOverflow)?,
-            long_capacity
-                .checked_sub(long_debit)
-                .ok_or(ProgramError::InvalidAccountData)?,
-        )
-    };
-    Ok(InsuranceWithdrawalPlan {
-        gross_withdrawal,
-        redeposit: [long_redeposit, 0],
-    })
+    let target_remaining = [
+        balance.domains[0]
+            .remaining_atoms
+            .checked_sub(long_debit)
+            .ok_or(ProgramError::InvalidAccountData)?,
+        balance.domains[1]
+            .remaining_atoms
+            .checked_sub(short_debit)
+            .ok_or(ProgramError::InvalidAccountData)?,
+    ];
+    percolator_accounting::plan_insurance_withdrawal_to_domains(
+        balance,
+        payout,
+        target_remaining,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)
 }
 
 /// `(x + y) mod denom` and `floor((x + y) / denom)` for `x,y < denom`.

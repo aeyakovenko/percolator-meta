@@ -72,6 +72,143 @@ pub struct InsuranceAssetBalance {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsuranceWithdrawalPlan {
+    pub gross_withdrawal: u128,
+    pub redeposit: [u128; 2],
+}
+
+/// The canonical odd-atom split used by Meta insurance principal and floors.
+pub fn balanced_insurance_domains(total: u128) -> [u128; 2] {
+    let long = total / 2;
+    [long, total - long]
+}
+
+/// Plan one asset-wide Percolator withdrawal followed by domain top-ups so the
+/// net payout is `payout` and the two domains finish at `target_remaining`.
+///
+/// The pinned wrapper consumes every withdrawable long-domain atom before it
+/// reaches the short domain. This planner models that exact order, including
+/// per-domain reservation floors and the asset-wide global capacity.
+pub fn plan_insurance_withdrawal_to_domains(
+    balance: InsuranceAssetBalance,
+    payout: u128,
+    target_remaining: [u128; 2],
+) -> Result<InsuranceWithdrawalPlan, ReadError> {
+    let domain_total = balance.domains[0]
+        .remaining_atoms
+        .checked_add(balance.domains[1].remaining_atoms)
+        .ok_or(ReadError::InvalidAccounting)?;
+    let target_total = target_remaining[0]
+        .checked_add(target_remaining[1])
+        .ok_or(ReadError::InvalidAccounting)?;
+    if payout == 0
+        || domain_total != balance.remaining_atoms
+        || payout > balance.remaining_atoms
+        || payout > balance.withdrawable_atoms
+        || target_total
+            != balance
+                .remaining_atoms
+                .checked_sub(payout)
+                .ok_or(ReadError::InvalidAccounting)?
+    {
+        return Err(ReadError::InvalidAccounting);
+    }
+
+    let long_capacity = core::cmp::min(
+        balance.withdrawable_atoms,
+        balance.domains[0].withdrawable_atoms,
+    );
+    let short_capacity = balance
+        .withdrawable_atoms
+        .checked_sub(long_capacity)
+        .ok_or(ReadError::InvalidAccounting)?;
+    if short_capacity > balance.domains[1].withdrawable_atoms {
+        return Err(ReadError::InvalidAccounting);
+    }
+
+    let current_long = balance.domains[0].remaining_atoms;
+    let current_short = balance.domains[1].remaining_atoms;
+    let long_floor = current_long
+        .checked_sub(long_capacity)
+        .ok_or(ReadError::InvalidAccounting)?;
+    let short_floor = current_short
+        .checked_sub(short_capacity)
+        .ok_or(ReadError::InvalidAccounting)?;
+    if target_remaining[0] < long_floor || target_remaining[1] < short_floor {
+        return Err(ReadError::InvalidAccounting);
+    }
+
+    let (gross_withdrawal, redeposit) = if target_remaining[1] >= current_short {
+        let gross = current_long
+            .checked_sub(target_remaining[0])
+            .ok_or(ReadError::InvalidAccounting)?;
+        if gross > long_capacity {
+            return Err(ReadError::InvalidAccounting);
+        }
+        (
+            gross,
+            [
+                0,
+                target_remaining[1]
+                    .checked_sub(current_short)
+                    .ok_or(ReadError::InvalidAccounting)?,
+            ],
+        )
+    } else {
+        let short_debit = current_short
+            .checked_sub(target_remaining[1])
+            .ok_or(ReadError::InvalidAccounting)?;
+        if short_debit > short_capacity {
+            return Err(ReadError::InvalidAccounting);
+        }
+        (
+            long_capacity
+                .checked_add(short_debit)
+                .ok_or(ReadError::InvalidAccounting)?,
+            [
+                target_remaining[0]
+                    .checked_sub(long_floor)
+                    .ok_or(ReadError::InvalidAccounting)?,
+                0,
+            ],
+        )
+    };
+
+    let gross_long = core::cmp::min(gross_withdrawal, long_capacity);
+    let gross_short = gross_withdrawal
+        .checked_sub(gross_long)
+        .ok_or(ReadError::InvalidAccounting)?;
+    let final_long = current_long
+        .checked_sub(gross_long)
+        .and_then(|v| v.checked_add(redeposit[0]))
+        .ok_or(ReadError::InvalidAccounting)?;
+    let final_short = current_short
+        .checked_sub(gross_short)
+        .and_then(|v| v.checked_add(redeposit[1]))
+        .ok_or(ReadError::InvalidAccounting)?;
+    let net = gross_withdrawal
+        .checked_sub(
+            redeposit[0]
+                .checked_add(redeposit[1])
+                .ok_or(ReadError::InvalidAccounting)?,
+        )
+        .ok_or(ReadError::InvalidAccounting)?;
+    if gross_withdrawal == 0
+        || gross_withdrawal > balance.withdrawable_atoms
+        || gross_short > short_capacity
+        || [final_long, final_short] != target_remaining
+        || net != payout
+    {
+        return Err(ReadError::InvalidAccounting);
+    }
+
+    Ok(InsuranceWithdrawalPlan {
+        gross_withdrawal,
+        redeposit,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PortfolioRewardSnapshot {
     pub market_group: [u8; 32],
     pub portfolio: [u8; 32],
@@ -745,6 +882,154 @@ mod tests {
             read_asset_insurance_balance(&market, 0),
             Err(ReadError::InvalidAccounting)
         );
+    }
+
+    fn insurance_balance(
+        remaining: [u128; 2],
+        withdrawable: [u128; 2],
+        total_withdrawable: u128,
+    ) -> InsuranceAssetBalance {
+        InsuranceAssetBalance {
+            domains: [
+                InsuranceDomainBalance {
+                    remaining_atoms: remaining[0],
+                    withdrawable_atoms: withdrawable[0],
+                },
+                InsuranceDomainBalance {
+                    remaining_atoms: remaining[1],
+                    withdrawable_atoms: withdrawable[1],
+                },
+            ],
+            remaining_atoms: remaining[0] + remaining[1],
+            withdrawable_atoms: total_withdrawable,
+        }
+    }
+
+    #[test]
+    fn withdrawal_plan_preserves_a_balanced_floor_across_long_first_debit() {
+        let plan = plan_insurance_withdrawal_to_domains(
+            insurance_balance([750, 750], [750, 750], 1_500),
+            400,
+            [550, 550],
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            InsuranceWithdrawalPlan {
+                gross_withdrawal: 950,
+                redeposit: [550, 0],
+            }
+        );
+    }
+
+    #[test]
+    fn withdrawal_plan_rebalances_either_deficient_domain() {
+        assert_eq!(
+            plan_insurance_withdrawal_to_domains(
+                insurance_balance([350, 850], [350, 850], 1_200),
+                80,
+                [560, 560],
+            )
+            .unwrap(),
+            InsuranceWithdrawalPlan {
+                gross_withdrawal: 640,
+                redeposit: [560, 0],
+            },
+        );
+        assert_eq!(
+            plan_insurance_withdrawal_to_domains(
+                insurance_balance([800, 400], [800, 400], 1_200),
+                80,
+                [560, 560],
+            )
+            .unwrap(),
+            InsuranceWithdrawalPlan {
+                gross_withdrawal: 240,
+                redeposit: [0, 160],
+            },
+        );
+    }
+
+    #[test]
+    fn withdrawal_plan_never_crosses_a_domain_reservation_floor() {
+        assert_eq!(
+            plan_insurance_withdrawal_to_domains(
+                insurance_balance([750, 750], [100, 750], 850),
+                400,
+                [550, 550],
+            ),
+            Err(ReadError::InvalidAccounting),
+        );
+    }
+
+    #[test]
+    fn withdrawal_plan_matches_exhaustive_small_long_first_sequences() {
+        for current_long in 0..=6u128 {
+            for current_short in 0..=6u128 {
+                let total = current_long + current_short;
+                for long_withdrawable in 0..=current_long {
+                    for short_withdrawable in 0..=current_short {
+                        let sum_capacity = long_withdrawable + short_withdrawable;
+                        for total_withdrawable in 0..=sum_capacity {
+                            let balance = insurance_balance(
+                                [current_long, current_short],
+                                [long_withdrawable, short_withdrawable],
+                                total_withdrawable,
+                            );
+                            let long_capacity = core::cmp::min(
+                                total_withdrawable,
+                                long_withdrawable,
+                            );
+                            let short_capacity = total_withdrawable - long_capacity;
+                            for payout in 1..=core::cmp::min(total, total_withdrawable) {
+                                let target_total = total - payout;
+                                for target_long in 0..=target_total {
+                                    let target = [target_long, target_total - target_long];
+                                    let mut reachable = false;
+                                    if short_capacity <= short_withdrawable {
+                                        for gross in 1..=total_withdrawable {
+                                            let gross_long = core::cmp::min(gross, long_capacity);
+                                            let gross_short = gross - gross_long;
+                                            if gross_short > short_capacity
+                                                || gross_long > current_long
+                                                || gross_short > current_short
+                                            {
+                                                continue;
+                                            }
+                                            let after = [
+                                                current_long - gross_long,
+                                                current_short - gross_short,
+                                            ];
+                                            if target[0] < after[0] || target[1] < after[1] {
+                                                continue;
+                                            }
+                                            let redeposit =
+                                                [target[0] - after[0], target[1] - after[1]];
+                                            if redeposit[0]
+                                                .checked_add(redeposit[1])
+                                                .and_then(|v| gross.checked_sub(v))
+                                                == Some(payout)
+                                            {
+                                                reachable = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    let planned = plan_insurance_withdrawal_to_domains(
+                                        balance, payout, target,
+                                    );
+                                    assert_eq!(
+                                        planned.is_ok(),
+                                        reachable,
+                                        "balance={balance:?} payout={payout} target={target:?}",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
