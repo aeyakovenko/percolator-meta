@@ -121,6 +121,11 @@ const DOMAIN_BACKING: u8 = 1;
 
 const U40_MAX: u64 = (1u64 << 40) - 1;
 const MAX_TERMINAL_RETURN_SLOT: u64 = U40_MAX - 1;
+// The existing u40 field carries independent 20-bit counters: exact-loss resets in the low half
+// and lazy ratio-preserving rescalings in the high half. No account layout or authority changes.
+const SHARE_GENERATION_BITS: u32 = 20;
+const SHARE_GENERATION_MASK: u64 = (1u64 << SHARE_GENERATION_BITS) - 1;
+const VIRTUAL_SHARE_SCALE_LIMIT: u64 = 20;
 
 fn decode_u40(bytes: &[u8]) -> u64 {
     let mut encoded = [0u8; 8];
@@ -830,18 +835,53 @@ fn add_mod(x: u128, y: u128, denom: u128) -> (u128, u128) {
 // rounding. The dust the offset diverts (≤ ~1 unit/op) accrues to the never-redeemable virtual shares.
 const VIRTUAL_SHARES: u128 = 1_000_000;
 
-/// Shares minted for `amount`, priced by the pre-deposit `balance` with the virtual offset.
-fn mint_shares(amount: u64, total_shares: u128, balance: u64) -> Result<u128, ProgramError> {
+fn share_generation_parts(encoded: u64) -> Result<(u64, u64), ProgramError> {
+    if encoded > U40_MAX {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok((
+        encoded & SHARE_GENERATION_MASK,
+        encoded >> SHARE_GENERATION_BITS,
+    ))
+}
+
+fn encode_share_generation(reset_generation: u64, scale_epoch: u64) -> Result<u64, ProgramError> {
+    if reset_generation > SHARE_GENERATION_MASK || scale_epoch > SHARE_GENERATION_MASK {
+        return Err(ProgramError::ArithmeticOverflow);
+    }
+    Ok(reset_generation | (scale_epoch << SHARE_GENERATION_BITS))
+}
+
+fn insurance_virtual_shares(encoded_generation: u64) -> Result<u128, ProgramError> {
+    let (_, scale_epoch) = share_generation_parts(encoded_generation)?;
+    if scale_epoch >= VIRTUAL_SHARE_SCALE_LIMIT {
+        return Ok(1);
+    }
+    let divisor = 1u128 << scale_epoch;
+    Ok(VIRTUAL_SHARES.div_ceil(divisor))
+}
+
+fn mint_shares_with_virtual_offset(
+    amount: u64,
+    total_shares: u128,
+    balance: u64,
+    virtual_shares: u128,
+) -> Result<u128, ProgramError> {
     wide_mul_div_floor(
         amount as u128,
         total_shares
-            .checked_add(VIRTUAL_SHARES)
+            .checked_add(virtual_shares)
             .ok_or(ProgramError::ArithmeticOverflow)?,
         (balance as u128)
             .checked_add(1)
             .ok_or(ProgramError::ArithmeticOverflow)?,
     )
     .ok_or(ProgramError::ArithmeticOverflow)
+}
+
+/// Shares minted for `amount`, priced by the pre-deposit `balance` with the virtual offset.
+fn mint_shares(amount: u64, total_shares: u128, balance: u64) -> Result<u128, ProgramError> {
+    mint_shares_with_virtual_offset(amount, total_shares, balance, VIRTUAL_SHARES)
 }
 
 /// A zero priced balance proves every outstanding share has zero token value.
@@ -852,59 +892,149 @@ fn begin_fully_impaired_recapitalization(pool: &mut Pool, priced_balance: u64) -
         return Ok(());
     }
     if pool.outstanding_principal != 0 {
-        pool.share_generation = pool
-            .share_generation
+        let (reset_generation, _) = share_generation_parts(pool.share_generation)?;
+        let reset_generation = reset_generation
             .checked_add(1)
-            .filter(|generation| *generation <= U40_MAX)
             .ok_or(ProgramError::ArithmeticOverflow)?;
+        pool.share_generation = encode_share_generation(reset_generation, 0)?;
     }
     pool.total_shares = 0;
     Ok(())
 }
 
-fn move_position_to_current_share_generation(
-    position: &mut Position,
-    pool: &Pool,
-) -> ProgramResult {
-    if position.share_generation > pool.share_generation {
-        return Err(ProgramError::InvalidAccountData);
+fn rescale_insurance_shares(pool: &mut Pool) -> ProgramResult {
+    let (reset_generation, scale_epoch) = share_generation_parts(pool.share_generation)?;
+    // Pool totals round up while each lazily touched position rounds down. This keeps the sum of
+    // owned shares bounded by the pool and ensures scaling cannot raise a surviving holder's rate.
+    let scaled_total = pool.total_shares.div_ceil(2);
+    if scaled_total == 0 || scaled_total == pool.total_shares {
+        return Err(ProgramError::ArithmeticOverflow);
     }
-    if position.share_generation < pool.share_generation {
-        position.shares = 0;
-        position.share_generation = pool.share_generation;
-    }
+    pool.total_shares = scaled_total;
+    pool.share_generation = encode_share_generation(
+        reset_generation,
+        scale_epoch
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    )?;
     Ok(())
 }
 
-/// Tokens redeemed for `shares`: `shares * (balance + 1) / (total_shares + VIRTUAL_SHARES)` (floor).
-fn redeem_shares(shares: u128, balance: u64, total_shares: u128) -> Result<u64, ProgramError> {
+fn mint_insurance_shares_with_capacity(
+    pool: &mut Pool,
+    amount: u64,
+    balance: u64,
+) -> Result<(u128, u128), ProgramError> {
+    let denominator = (balance as u128)
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let growth_denominator = denominator
+        .checked_add(amount as u128)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // If basis <= MAX*denominator/(denominator+amount), then
+    // basis + floor(amount*basis/denominator) fits u128. Compute that exact threshold once;
+    // subsequent retries are only fixed-width shifts, not attacker-amplified wide divisions.
+    let maximum_basis = wide_mul_div_floor(u128::MAX, denominator, growth_denominator)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let mut rescaled = false;
+    for _ in 0..=u128::BITS {
+        let virtual_shares = insurance_virtual_shares(pool.share_generation)?;
+        let Some(basis) = pool.total_shares.checked_add(virtual_shares) else {
+            rescale_insurance_shares(pool)?;
+            rescaled = true;
+            continue;
+        };
+        if basis <= maximum_basis {
+            // Rounding the pool total up during a capacity rescale protects existing holders.
+            // Round this first post-rescale mint up as well so a minimum deposit retains one atom;
+            // at this scale the possible extra share is itself worth less than one atom.
+            let shares = if rescaled {
+                wide_mul_div_ceil(amount as u128, basis, denominator)
+                    .ok_or(ProgramError::ArithmeticOverflow)?
+            } else {
+                mint_shares_with_virtual_offset(
+                    amount,
+                    pool.total_shares,
+                    balance,
+                    virtual_shares,
+                )?
+            };
+            if pool
+                .total_shares
+                .checked_add(shares)
+                .and_then(|total| total.checked_add(virtual_shares))
+                .is_some()
+            {
+                return Ok((shares, virtual_shares));
+            }
+        }
+        rescale_insurance_shares(pool)?;
+        rescaled = true;
+    }
+    Err(ProgramError::ArithmeticOverflow)
+}
+
+fn move_position_to_current_share_generation(
+    position: &mut Position,
+    pool: &Pool,
+) -> Result<bool, ProgramError> {
+    let (position_reset, position_scale) = share_generation_parts(position.share_generation)?;
+    let (pool_reset, pool_scale) = share_generation_parts(pool.share_generation)?;
+    if position_reset > pool_reset || (position_reset == pool_reset && position_scale > pool_scale) {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let reset_generation_is_current = position_reset == pool_reset;
+    if position_reset < pool_reset {
+        position.shares = 0;
+    } else if position_scale < pool_scale {
+        let shift = pool_scale - position_scale;
+        position.shares = if shift >= u128::BITS as u64 {
+            0
+        } else {
+            position.shares >> shift
+        };
+    }
+    position.share_generation = pool.share_generation;
+    Ok(reset_generation_is_current)
+}
+
+fn redeem_shares_with_virtual_offset(
+    shares: u128,
+    balance: u64,
+    total_shares: u128,
+    virtual_shares: u128,
+) -> Result<u64, ProgramError> {
     let owed = wide_mul_div_floor(
         shares,
         (balance as u128)
             .checked_add(1)
             .ok_or(ProgramError::ArithmeticOverflow)?,
         total_shares
-            .checked_add(VIRTUAL_SHARES)
+            .checked_add(virtual_shares)
             .ok_or(ProgramError::ArithmeticOverflow)?,
     )
     .ok_or(ProgramError::ArithmeticOverflow)?;
     u64::try_from(owed).map_err(|_| ProgramError::ArithmeticOverflow)
 }
 
-/// Burn no more pricing shares than keeps the post-redemption exchange rate from
-/// increasing. Retired shares above this amount become unowned rounding reserve,
-/// preventing a later exiter from collecting earlier holders' floored claims.
-fn rate_safe_pool_share_burn(
+/// Tokens redeemed for `shares`: `shares * (balance + 1) / (total_shares + VIRTUAL_SHARES)` (floor).
+fn redeem_shares(shares: u128, balance: u64, total_shares: u128) -> Result<u64, ProgramError> {
+    redeem_shares_with_virtual_offset(shares, balance, total_shares, VIRTUAL_SHARES)
+}
+
+fn rate_safe_pool_share_burn_with_virtual_offset(
     shares_retired: u128,
     balance_before: u64,
     balance_after: u64,
     total_shares: u128,
+    virtual_shares: u128,
 ) -> Result<u128, ProgramError> {
     if shares_retired > total_shares || balance_after > balance_before {
         return Err(ProgramError::InvalidAccountData);
     }
     let denominator_before = total_shares
-        .checked_add(VIRTUAL_SHARES)
+        .checked_add(virtual_shares)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let numerator_before = (balance_before as u128)
         .checked_add(1)
@@ -922,6 +1052,24 @@ fn rate_safe_pool_share_burn(
         .checked_sub(minimum_denominator_after)
         .ok_or(ProgramError::InvalidAccountData)?;
     Ok(core::cmp::min(shares_retired, maximum_burn))
+}
+
+/// Burn no more pricing shares than keeps the post-redemption exchange rate from
+/// increasing. Retired shares above this amount become unowned rounding reserve,
+/// preventing a later exiter from collecting earlier holders' floored claims.
+fn rate_safe_pool_share_burn(
+    shares_retired: u128,
+    balance_before: u64,
+    balance_after: u64,
+    total_shares: u128,
+) -> Result<u128, ProgramError> {
+    rate_safe_pool_share_burn_with_virtual_offset(
+        shares_retired,
+        balance_before,
+        balance_after,
+        total_shares,
+        VIRTUAL_SHARES,
+    )
 }
 
 fn pool_total_shares_after_exit(
@@ -954,6 +1102,22 @@ fn require_bounded_share_rounding(
     total_shares: u128,
     balance_before: u64,
 ) -> ProgramResult {
+    require_bounded_share_rounding_with_virtual_offset(
+        amount,
+        shares_minted,
+        total_shares,
+        balance_before,
+        VIRTUAL_SHARES,
+    )
+}
+
+fn require_bounded_share_rounding_with_virtual_offset(
+    amount: u64,
+    shares_minted: u128,
+    total_shares: u128,
+    balance_before: u64,
+    virtual_shares: u128,
+) -> ProgramResult {
     if shares_minted == 0 {
         return Err(ProgramError::InvalidArgument);
     }
@@ -963,7 +1127,12 @@ fn require_bounded_share_rounding(
     let post_total_shares = total_shares
         .checked_add(shares_minted)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    let immediate_value = redeem_shares(shares_minted, post_balance, post_total_shares)?;
+    let immediate_value = redeem_shares_with_virtual_offset(
+        shares_minted,
+        post_balance,
+        post_total_shares,
+        virtual_shares,
+    )?;
     if immediate_value == 0 || amount.saturating_sub(immediate_value) > 1 {
         return Err(ProgramError::InvalidArgument);
     }
@@ -1829,15 +1998,17 @@ fn process_insurance_deposit(
         insurance_before
     };
     begin_fully_impaired_recapitalization(&mut pool, priced_balance_before)?;
-    let shares_minted = mint_shares(amount, pool.total_shares, priced_balance_before)?;
+    let (shares_minted, virtual_shares) =
+        mint_insurance_shares_with_capacity(&mut pool, amount, priced_balance_before)?;
     // Inflation/rounding guard (finding HB): a large surplus can make deposits mint zero or very
     // few shares. Reject before transfer unless their immediate value is within one atom of the
     // deposit, so public donations cannot turn entry rounding into material principal loss.
-    require_bounded_share_rounding(
+    require_bounded_share_rounding_with_virtual_offset(
         amount,
         shares_minted,
         pool.total_shares,
         priced_balance_before,
+        virtual_shares,
     )?;
 
     // Position PDA (one per owner per pool).
@@ -2201,10 +2372,12 @@ fn process_insurance_withdraw_impl(
     if share_accounting && position_account.data_len() < POSITION_SIZE {
         return Err(ProgramError::InvalidAccountData);
     }
-    if position.share_generation > pool.share_generation {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let shares_are_current = position.share_generation == pool.share_generation;
+    let shares_are_current = if share_accounting {
+        move_position_to_current_share_generation(&mut position, &pool)?
+    } else {
+        true
+    };
+    let virtual_shares = insurance_virtual_shares(pool.share_generation)?;
     let shares_to_retire = if !share_accounting || position.principal == 0 || !shares_are_current {
         0u128
     } else if amount == position.principal {
@@ -2216,7 +2389,12 @@ fn process_insurance_withdraw_impl(
     let owed = if !shares_are_current {
         0
     } else if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
-        redeem_shares(shares_to_retire, priced_balance, pool.total_shares)?
+        redeem_shares_with_virtual_offset(
+            shares_to_retire,
+            priced_balance,
+            pool.total_shares,
+            virtual_shares,
+        )?
     } else {
         if share_accounting && position.shares != 0 {
             if pool.total_shares == 0 {
@@ -2227,7 +2405,12 @@ fn process_insurance_withdraw_impl(
             // therefore cannot recapitalize an older position at par.
             core::cmp::min(
                 amount,
-                redeem_shares(shares_to_retire, priced_balance, pool.total_shares)?,
+                redeem_shares_with_virtual_offset(
+                    shares_to_retire,
+                    priced_balance,
+                    pool.total_shares,
+                    virtual_shares,
+                )?,
             )
         } else {
             // Historical principal positions predate share accounting. Preserve
@@ -2251,11 +2434,12 @@ fn process_insurance_withdraw_impl(
     let pool_shares_to_burn = if shares_to_retire == 0 {
         0
     } else {
-        rate_safe_pool_share_burn(
+        rate_safe_pool_share_burn_with_virtual_offset(
             shares_to_retire,
             priced_balance,
             priced_balance_after,
             pool.total_shares,
+            virtual_shares,
         )?
     };
 
@@ -2341,6 +2525,10 @@ fn process_insurance_withdraw_impl(
         pool.total_shares,
         pool_shares_to_burn,
     )?;
+    if outstanding_after == 0 {
+        let (reset_generation, _) = share_generation_parts(pool.share_generation)?;
+        pool.share_generation = encode_share_generation(reset_generation, 0)?;
+    }
     // Historical telemetry must not become a custody gate. A position can cycle
     // the finite token supply enough times for cumulative withdrawals to exceed
     // u64 even though every individual balance and principal remains valid. A
@@ -2995,6 +3183,113 @@ mod tests {
         assert_eq!(wide_mul_div_ceil(u128::MAX, u128::MAX, u128::MAX), Some(u128::MAX));
         assert_eq!(wide_mul_div_ceil(u128::MAX, u128::MAX, 1), None);
         assert_eq!(wide_mul_div_ceil(1, 1, 0), None);
+    }
+
+    #[test]
+    fn insurance_share_rescale_preserves_residual_claim_and_deposit_capacity() {
+        let mut pool = historical_pool_fixture();
+        pool.domain = DOMAIN_INSURANCE;
+        pool.policy = POLICY_PRINCIPAL;
+        pool.outstanding_principal = u64::MAX;
+        pool.share_generation = encode_share_generation(7, 0).unwrap();
+        pool.total_shares = (u128::MAX / 4) * 3;
+        let mut position = Position {
+            pool: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            principal: u64::MAX,
+            withdrawn_amount: 0,
+            withdrawn: false,
+            start_slot: 0,
+            vote_locked: false,
+            terminal_returned: false,
+            terminal_return_slot: None,
+            share_generation: pool.share_generation,
+            shares: pool.total_shares,
+        };
+        let old_virtual = insurance_virtual_shares(pool.share_generation).unwrap();
+        let old_claim = redeem_shares_with_virtual_offset(
+            position.shares,
+            1,
+            pool.total_shares,
+            old_virtual,
+        )
+        .unwrap();
+        assert_eq!(old_claim, 1);
+
+        let (minted, new_virtual) =
+            mint_insurance_shares_with_capacity(&mut pool, 1, 1).unwrap();
+        assert_eq!(share_generation_parts(pool.share_generation).unwrap(), (7, 1));
+        move_position_to_current_share_generation(&mut position, &pool).unwrap();
+        assert_eq!(
+            redeem_shares_with_virtual_offset(
+                position.shares,
+                1,
+                pool.total_shares,
+                new_virtual,
+            )
+            .unwrap(),
+            old_claim,
+            "lazy scaling cannot write off the last claimable insurance atom",
+        );
+        require_bounded_share_rounding_with_virtual_offset(
+            1,
+            minted,
+            pool.total_shares,
+            1,
+            new_virtual,
+        )
+        .unwrap();
+        assert!(pool.total_shares.checked_add(minted).is_some());
+    }
+
+    #[test]
+    fn total_impairment_invalidates_every_prior_scale_epoch() {
+        let mut pool = historical_pool_fixture();
+        pool.domain = DOMAIN_INSURANCE;
+        pool.outstanding_principal = 1;
+        pool.share_generation = encode_share_generation(11, 9).unwrap();
+        pool.total_shares = 1u128 << 120;
+        let mut position = Position {
+            pool: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            principal: 1,
+            withdrawn_amount: 0,
+            withdrawn: false,
+            start_slot: 0,
+            vote_locked: false,
+            terminal_returned: false,
+            terminal_return_slot: None,
+            share_generation: pool.share_generation,
+            shares: 1u128 << 119,
+        };
+
+        begin_fully_impaired_recapitalization(&mut pool, 0).unwrap();
+        assert_eq!(share_generation_parts(pool.share_generation).unwrap(), (12, 0));
+        assert_eq!(pool.total_shares, 0);
+        move_position_to_current_share_generation(&mut position, &pool).unwrap();
+        assert_eq!(position.shares, 0);
+    }
+
+    #[test]
+    fn lazy_share_scaling_never_increases_any_position_rate() {
+        for scale_epoch in 0..32u64 {
+            let old_generation = encode_share_generation(3, scale_epoch).unwrap();
+            let new_generation = encode_share_generation(3, scale_epoch + 1).unwrap();
+            let old_virtual = insurance_virtual_shares(old_generation).unwrap();
+            let new_virtual = insurance_virtual_shares(new_generation).unwrap();
+            for total in 2u128..=128 {
+                let new_total = total.div_ceil(2);
+                for shares in 0..=total {
+                    let new_shares = shares / 2;
+                    assert!(
+                        new_shares * (total + old_virtual)
+                            <= shares * (new_total + new_virtual),
+                        "scale={scale_epoch}, total={total}, shares={shares}",
+                    );
+                    assert!(new_shares <= new_total);
+                }
+            }
+        }
     }
 
     #[test]
