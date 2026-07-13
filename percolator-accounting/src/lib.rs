@@ -98,8 +98,7 @@ pub fn plan_insurance_withdrawal_to_domains(
     let target_total = target_remaining[0]
         .checked_add(target_remaining[1])
         .ok_or(ReadError::InvalidAccounting)?;
-    if payout == 0
-        || domain_total != balance.remaining_atoms
+    if domain_total != balance.remaining_atoms
         || payout > balance.remaining_atoms
         || payout > balance.withdrawable_atoms
         || target_total
@@ -190,8 +189,7 @@ pub fn plan_insurance_withdrawal_to_domains(
                 .ok_or(ReadError::InvalidAccounting)?,
         )
         .ok_or(ReadError::InvalidAccounting)?;
-    if gross_withdrawal == 0
-        || gross_withdrawal > balance.withdrawable_atoms
+    if gross_withdrawal > balance.withdrawable_atoms
         || gross_short > short_capacity
         || [final_long, final_short] != target_remaining
         || net != payout
@@ -927,6 +925,31 @@ mod tests {
     }
 
     #[test]
+    fn withdrawal_plan_repairs_domains_without_a_net_payout() {
+        assert_eq!(
+            plan_insurance_withdrawal_to_domains(
+                insurance_balance([350, 750], [350, 750], 1_100),
+                0,
+                [550, 550],
+            )
+            .unwrap(),
+            InsuranceWithdrawalPlan {
+                gross_withdrawal: 550,
+                redeposit: [550, 0],
+            },
+        );
+        assert_eq!(
+            plan_insurance_withdrawal_to_domains(
+                insurance_balance([550, 550], [550, 550], 1_100),
+                0,
+                [550, 550],
+            )
+            .unwrap(),
+            InsuranceWithdrawalPlan::default(),
+        );
+    }
+
+    #[test]
     fn withdrawal_plan_never_crosses_a_domain_reservation_floor() {
         assert_eq!(
             plan_insurance_withdrawal_to_domains(
@@ -957,13 +980,13 @@ mod tests {
                                 long_withdrawable,
                             );
                             let short_capacity = total_withdrawable - long_capacity;
-                            for payout in 1..=core::cmp::min(total, total_withdrawable) {
+                            for payout in 0..=core::cmp::min(total, total_withdrawable) {
                                 let target_total = total - payout;
                                 for target_long in 0..=target_total {
                                     let target = [target_long, target_total - target_long];
                                     let mut reachable = false;
                                     if short_capacity <= short_withdrawable {
-                                        for gross in 1..=total_withdrawable {
+                                        for gross in 0..=total_withdrawable {
                                             let gross_long = core::cmp::min(gross, long_capacity);
                                             let gross_short = gross - gross_long;
                                             if gross_short > short_capacity

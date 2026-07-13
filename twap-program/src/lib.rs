@@ -3442,17 +3442,17 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         .reserved_floor
         .checked_add(retained)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    let withdrawal_plan = if total_pull == 0 {
-        None
+    let withdrawal_plan = if insurance < config.reserved_floor {
+        // An unarmed sentinel or a realized loss leaves no complete floor to rebalance.
+        // Preserve its domain provenance and retain the historical no-op execute path.
+        percolator_accounting::InsuranceWithdrawalPlan::default()
     } else {
-        Some(
-            percolator_accounting::plan_insurance_withdrawal_to_domains(
-                insurance_balance,
-                total_pull,
-                percolator_accounting::balanced_insurance_domains(floor_after),
-            )
-            .map_err(|_| ProgramError::InvalidAccountData)?,
+        percolator_accounting::plan_insurance_withdrawal_to_domains(
+            insurance_balance,
+            total_pull,
+            percolator_accounting::balanced_insurance_domains(floor_after),
         )
+        .map_err(|_| ProgramError::InvalidAccountData)?
     };
 
     // Validate the optional savings destination before either insurance pull. The book holding is
@@ -3483,7 +3483,8 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     // 2) Pull both configured surplus shares through one asset-wide withdrawal, then restore the
     //    exact 50/50 floor with domain top-ups. Percolator consumes long before short, so pulling
     //    only the net amount would silently replace long-domain principal with short-domain surplus.
-    if let Some(plan) = withdrawal_plan {
+    if withdrawal_plan.gross_withdrawal != 0 {
+        let plan = withdrawal_plan;
         if plan.redeposit != [0, 0]
             && percolator_accounting::read_asset_insurance_authority(
                 &market_slab.try_borrow_data()?,
