@@ -22458,6 +22458,61 @@ fn setup_auction(
     }
 }
 
+// PUBLIC LOF: the TWAP floor protects asset-0 insurance in aggregate, but Percolator's
+// asset-wide withdrawal consumes the long domain first. A normal surplus pull must preserve
+// the floor in both domains; otherwise a permissionless round removes one side's principal
+// protection while ratcheting opposite-side surplus into an aggregate floor that cannot repair it.
+#[test]
+fn permissionless_surplus_pull_preserves_insurance_floor_in_both_domains() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        [750_000, 750_000],
+        "the fixed inbound donation starts with balanced principal and surplus",
+    );
+    let round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("permissionless TWAP round pulls the configured surplus share");
+
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), 1_100_000);
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        [550_000, 550_000],
+        "the retained floor must protect the two opposing bankruptcy domains equally",
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 400_000);
+}
+
 // A bidder with a funded COIN source account and an empty collateral USD destination.
 // A bidder's canonical COIN ATA — the auction's pinned refund target (matches the program's
 // bidder_coin_ata). Reuses the ATA derivation (= associated-token-address).
@@ -24399,6 +24454,11 @@ fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
         1_050_000,
         "retained 10% ratcheted into the principal counter"
     );
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        [525_000, 525_000],
+        "auction and savings pulls preserve the ratcheted floor in both domains",
+    );
 
     // The surplus is now exhausted (insurance == floor == 1.05M): a follow-up execute pulls NOTHING —
     // the two-pull split can never cross the floor into the 1M depositor principal.
@@ -24433,6 +24493,10 @@ fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
         token_amount(&svm, &env.perc_vault),
         1_050_000,
         "insurance never crosses the (ratcheted) floor"
+    );
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        [525_000, 525_000],
     );
 }
 
@@ -39131,6 +39195,12 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             read_asset0_insurance(&svm, &env.slab) >= read_reserved_floor(&svm, &env.twap_cfg),
             "permissionless execution cannot cross the ratcheted insurance floor"
         );
+        let floor_after = read_reserved_floor(&svm, &env.twap_cfg);
+        assert_eq!(
+            read_asset_insurance_domains(&svm, &env.slab, 0),
+            percolator_accounting::balanced_insurance_domains(floor_after),
+            "every continuous-reward round protects both bankruptcy domains equally",
+        );
 
         let bidder_usd_before = token_amount(&svm, &bidder_usd);
         send(
@@ -40652,6 +40722,22 @@ fn read_asset_insurance_remaining(svm: &LiteSVM, market: &Pubkey, asset_index: u
         )
         .unwrap()
         .min(group.insurance)
+}
+fn read_asset_insurance_domains(
+    svm: &LiteSVM,
+    market: &Pubkey,
+    asset_index: usize,
+) -> [u128; 2] {
+    let data = svm.get_account(market).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&data).unwrap();
+    let long = asset_index * 2;
+    let short = long + 1;
+    [
+        group.insurance_domain_budget[long]
+            .saturating_sub(group.insurance_domain_spent[long]),
+        group.insurance_domain_budget[short]
+            .saturating_sub(group.insurance_domain_spent[short]),
+    ]
 }
 fn read_asset0_effective_price(svm: &LiteSVM, market: &Pubkey) -> u64 {
     let data = svm.get_account(market).unwrap().data;

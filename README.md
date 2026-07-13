@@ -130,7 +130,9 @@ capital's own tenure.
   down; enough unowned pricing shares remain to prevent a later exit from collecting the remainder.
   Odd atoms are split against the pool-wide 50/50 target instead of per deposit. Live exits reverse
   that principal tranche atomically, so a temporary depositor cannot redirect another owner's
-  long/short loss protection by withdrawing.
+  long/short loss protection by withdrawing. TWAP surplus rounds use the same reservation-aware
+  planner: auction and savings pulls leave the ratcheted floor at the canonical 50/50 domain split
+  instead of consuming one side's principal behind an aggregate floor.
   Any final whole-atom remainder stays protocol insurance. Governance still cannot redirect a
   depositor's withdrawal.
 
@@ -209,7 +211,9 @@ lot. Ordinary integer rounding remains in holding for a later round. A bid that 
 whole-atom pair cannot reserve nominal budget or set the marginal price. If every eligible bid is
 integer-infeasible, the aged book settles for permissionless refunds without spending collateral.
 Insurance deposited for other assets is never counted toward that surplus. Bought COIN can be split
-between burn and a canonical dynamic reward vault. The collateral savings reserve must be distinct
+between burn and a canonical dynamic reward vault. Each surplus pull atomically restores the two
+asset-0 insurance domains to the 50/50 split of the newly ratcheted floor. The collateral savings
+reserve must be distinct
 from the auction holding; an aliased configuration fails atomically before either surplus pull, so
 savings cannot enlarge the buy budget.
 
