@@ -119,6 +119,9 @@ capital's own tenure.
   base unit less than the deposit at the post-deposit price rejects before transfer, so virtual-share
   rounding cannot silently consume material principal. Each exit rounds only that position's claim
   down; enough unowned pricing shares remain to prevent a later exit from collecting the remainder.
+  Odd atoms are split against the pool-wide 50/50 target instead of per deposit. Live exits reverse
+  that principal tranche atomically, so a temporary depositor cannot redirect another owner's
+  long/short loss protection by withdrawing.
   Any final whole-atom remainder stays protocol insurance. Governance still cannot redirect a
   depositor's withdrawal.
 

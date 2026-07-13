@@ -711,7 +711,7 @@ fn gv_vote_cannot_borrow_another_voters_position_to_steal_weight() {
     assert_eq!(support_principal, 1, "only mallory's own 1 atom backs the proposal — no borrowed whale weight");
 }
 
-// insurance_deposit routes funds user -> holding -> percolator insurance vault (TopUpInsurance, pool-signed).
+// insurance_deposit routes funds user -> holding -> Percolator's domain budgets (pool-signed).
 // The transit `holding` must be a pool-PDA-owned token account for the pool mint. A holding the depositor
 // controls would let the user->holding leg land funds in an attacker account before the (failing) TopUp; the
 // deposit now validates it up front (matching insurance_withdraw), so a non-pool holding is refused outright.
@@ -2059,6 +2059,196 @@ fn principal_pool_late_deposit_does_not_socialize_an_earlier_loss() {
     }
 }
 
+// PUBLIC LOF: Percolator's asset-wide insurance withdrawal consumes the long domain first.
+// Without a Subledger-side compensating redeposit, a temporary depositor can round-trip
+// principal and move another depositor's live protection into the short domain at negligible
+// cost. The remaining capital must keep the same long/short risk allocation.
+#[test]
+fn depositor_round_trip_cannot_reassign_another_owners_insurance_domain() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    env.svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_insurance_pool();
+
+    let domains = |env: &Env| {
+        let (_, group) = percolator_prog::state::read_market(
+            &env.svm.get_account(&env.slab).unwrap().data,
+        )
+        .unwrap();
+        [
+            group.insurance_domain_budget[0] - group.insurance_domain_spent[0],
+            group.insurance_domain_budget[1] - group.insurance_domain_spent[1],
+        ]
+    };
+
+    let victim_principal = 4u64;
+    let (victim, victim_ata) = new_depositor(&mut env, victim_principal);
+    let pool = env.pool;
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &victim,
+        &victim_ata,
+        &victim_holding,
+        victim_principal,
+    )
+    .expect("victim funds balanced live insurance");
+    assert_eq!(domains(&env), [2, 2]);
+
+    let attacker_principal = victim_principal;
+    let (attacker, attacker_ata) = new_depositor(&mut env, attacker_principal);
+    let attacker_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &attacker,
+        &attacker_ata,
+        &attacker_holding,
+        attacker_principal,
+    )
+    .expect("attacker temporarily doubles the fund");
+    env.insurance_withdraw(
+        &attacker,
+        &attacker_ata,
+        &attacker_holding,
+        &attacker,
+        attacker_principal,
+    )
+    .expect("attacker exits while the market is live and healthy");
+
+    assert!(
+        env.token_amount(&attacker_ata) >= attacker_principal - 1,
+        "the domain-moving round trip costs at most the existing share-floor atom",
+    );
+    assert_eq!(env.read_position(&victim.pubkey()).0, victim_principal);
+    assert_eq!(env.pool_outstanding(), victim_principal);
+    assert_eq!(
+        domains(&env),
+        [2, 2],
+        "one depositor's exit cannot reassign another owner's live insurance protection",
+    );
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
+    let short_portfolio = create_percolator_portfolio(&mut env, &short, 200);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (2 * percolator::POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open a public long/short pair after the attempted domain move");
+    env.warp_slot(101);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 1_000,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("move the mark against the undercapitalized short");
+    public_percolator_crank(&mut env, long_portfolio, 101, true)
+        .expect("crank the winning side");
+    env.warp_slot(102);
+    public_percolator_crank(&mut env, long_portfolio, 102, true)
+        .expect("refresh the winning side");
+    env.warp_slot(103);
+    for _ in 0..2 {
+        public_percolator_crank(&mut env, short_portfolio, 103, true)
+            .expect("permissionless liquidation consumes the preserved domain");
+    }
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        2,
+        "the victim's preserved two-atom domain absorbs the public loss",
+    );
+}
+
+#[test]
+fn one_atom_deposits_balance_globally_and_a_round_trip_cannot_move_the_remainder() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let domains = |env: &Env| {
+        let (_, group) = percolator_prog::state::read_market(
+            &env.svm.get_account(&env.slab).unwrap().data,
+        )
+        .unwrap();
+        [
+            group.insurance_domain_budget[0] - group.insurance_domain_spent[0],
+            group.insurance_domain_budget[1] - group.insurance_domain_spent[1],
+        ]
+    };
+    let pool = env.pool;
+
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, 1)
+        .expect("first one-atom deposit");
+    assert_eq!(domains(&env), [0, 1]);
+
+    let (attacker, attacker_ata) = new_depositor(&mut env, 1);
+    let attacker_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, 1)
+        .expect("second one-atom deposit");
+    assert_eq!(
+        domains(&env),
+        [1, 1],
+        "rounding is global to the pool, not repeated in one domain per caller",
+    );
+
+    env.insurance_withdraw(&attacker, &attacker_ata, &attacker_holding, &attacker, 1)
+        .expect("second depositor exits");
+    assert_eq!(domains(&env), [0, 1]);
+    assert_eq!(env.token_amount(&attacker_ata), 1);
+    assert_eq!(env.read_position(&victim.pubkey()).0, 1);
+}
+
 // CROSS-ASSET EXIT DOS: the market header's `insurance` is global, while tag-57 debits
 // only asset 0. If asset 0 is impaired and an external asset keeps the global total above
 // outstanding principal, a global quote asks Percolator for more than asset 0 owns and the
@@ -3225,8 +3415,8 @@ fn impaired_exit_order_cannot_transfer_rounding_value_to_the_last_depositor() {
     }
     assert_eq!(
         asset_insurance_remaining(&env, 0),
-        3,
-        "the public liquidation spends one atom from its funded domain",
+        2,
+        "the public liquidation spends the two atoms in its balanced funded domain",
     );
 
     // Resolve and remove both public portfolios so the real Percolator withdrawal gate is clear.
@@ -3295,7 +3485,7 @@ fn impaired_exit_order_cannot_transfer_rounding_value_to_the_last_depositor() {
     assert_eq!(env.token_amount(&victim_ata), 0);
     assert_eq!(
         env.token_amount(&attacker_ata),
-        2,
+        1,
         "last-exit ordering cannot transfer the victim's rounded claim to the attacker",
     );
     assert_eq!(

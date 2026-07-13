@@ -2,6 +2,33 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - public insurance exit could reassign another depositor's loss domain (surface B/C)
+
+Percolator splits each ordinary insurance top-up independently, rounding every odd remainder into
+the short domain, while its asset-wide withdrawal consumes the long domain first. Subledger priced
+each owner's aggregate claim correctly but inherited both call-local rules. Repeated one-atom genesis
+deposits therefore funded only short, and a temporary depositor could enter and exit without losing
+principal while changing a victim's live allocation from `[2, 2]` to `[0, 4]`. A later public
+short-side loss could no longer consume the two atoms originally assigned to protect that side, so a
+winning counterparty's value was forfeited while nominal insurance remained in the other domain.
+
+The clean-room LiteSVM regression uses the real pinned Percolator SBF and Subledger SBF. It has a
+victim deposit four atoms, gives an attacker the same public deposit/full-exit round trip, and then
+opens a real long/short pair, moves the authenticated mark, and runs permissionless cranks and
+liquidation. The vulnerable binary changed the domains to `[0, 4]`; the fixed binary keeps `[2, 2]`
+and the subsequent loss consumes the intended two-atom domain. A second red/green probe uses two
+separate one-atom deposits: the old binary produced `[0, 2]`, while the fixed pool produces `[1, 1]`
+and reverses the second depositor's exit back to `[0, 1]`.
+
+FIX: deposits use authority-gated domain top-ups against the aggregate pool principal, making odd-atom
+rounding global and exactly 50/50 within one atom. Live exits reverse that aggregate principal tranche;
+earned surplus follows residual domain balances. The implementation derives Percolator's exact
+reservation-aware capacities, withdraws only far enough through the long-first waterfall to reach the
+required short debit, and atomically re-credits excess long value before paying the owner. Resolved
+exits retain the direct path because future side risk is gone and live domain top-ups are disabled.
+The pool PDA is the only transient custodian. No instruction, signer, recipient, authority setter,
+admin role, destination, or caller-selected value path was added.
+
 ## Tick - public terminal returns could fragment protocol custody (surface A/C)
 
 Controller-owned secondary insurance cleanup could retain real trade fees in the canonical
