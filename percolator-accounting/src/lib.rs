@@ -3,7 +3,8 @@
 use core::mem::{offset_of, size_of};
 use percolator::{
     BackingBucketV16Account, EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount,
-    PortfolioAccountV16Account, ProvenanceHeaderV16Account, V16ConfigAccount, BOUND_SCALE,
+    InsuranceCreditReservationV16Account, PortfolioAccountV16Account,
+    ProvenanceHeaderV16Account, V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -52,6 +53,19 @@ pub enum ReadError {
 pub struct BackingDomainBalance {
     pub principal_atoms: u128,
     pub earnings_atoms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsuranceDomainBalance {
+    pub remaining_atoms: u128,
+    pub withdrawable_atoms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsuranceAssetBalance {
+    pub domains: [InsuranceDomainBalance; 2],
+    pub remaining_atoms: u128,
+    pub withdrawable_atoms: u128,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -311,6 +325,19 @@ pub fn market_is_resolved_and_empty(data: &[u8]) -> Result<bool, ReadError> {
     Ok(mode == 1 && c_tot == 0 && portfolios == 0)
 }
 
+/// Returns whether the market is in Percolator's live mode.
+pub fn market_is_live(data: &[u8]) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    let mode = data
+        .get(MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, mode))
+        .copied()
+        .ok_or(ReadError::Truncated)?;
+    if mode > 1 {
+        return Err(ReadError::InvalidAccounting);
+    }
+    Ok(mode == 0)
+}
+
 /// Returns the withdrawable principal and provider earnings for both domains of one
 /// asset. Principal is stored as `BOUND_SCALE` numerators by the engine; deposits and
 /// withdrawal deltas are atom-exact, so a non-integral value is invalid accounting.
@@ -395,48 +422,179 @@ pub fn read_asset_admin(data: &[u8], asset_index: usize) -> Result<[u8; 32], Rea
     )
 }
 
-/// Returns the insurance attributed to one asset's long and short domains.
+/// Returns the insurance attributed to one asset's long and short domains, including
+/// the amount Percolator currently permits an asset-wide withdrawal to consume.
 ///
-/// This mirrors Percolator's `market_insurance_remaining_view`: each domain contributes
-/// `budget - spent`, and the sum is capped by the market-wide insurance balance. It does
-/// not subtract temporary source-credit reservations; Percolator's withdrawal CPI still
-/// enforces those, so an active reservation delays an exit instead of crystallizing it as
-/// a depositor loss.
-pub fn read_asset_insurance_remaining(data: &[u8], asset_index: usize) -> Result<u128, ReadError> {
+/// The capacity calculation mirrors `domain_insurance_withdraw_capacity` and
+/// `market_insurance_withdraw_capacity_view` in the pinned wrapper/engine. Keeping the
+/// reservation floor visible lets a caller atomically preserve domain allocation without
+/// attempting to move insurance already committed to a source claim.
+pub fn read_asset_insurance_balance(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<InsuranceAssetBalance, ReadError> {
     validate_market(data)?;
     validate_asset(data, asset_index)?;
 
     let engine = asset_engine_offset(asset_index)?;
-    let long_budget = read_u128(
+    let insurance = read_u128(data, INSURANCE_OFFSET)?;
+    let vault = read_u128(
         data,
-        engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_budget_long),
+        MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, vault),
     )?;
-    let short_budget = read_u128(
+    let globally_reserved = read_u128(
         data,
-        engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_budget_short),
+        MARKET_GROUP_OFFSET
+            + offset_of!(
+                MarketGroupV16HeaderAccount,
+                source_insurance_credit_reserved_total_atoms
+            ),
     )?;
-    let long_spent = read_u128(
-        data,
-        engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_long),
-    )?;
-    let short_spent = read_u128(
-        data,
-        engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_short),
-    )?;
-    let remaining = long_budget
-        .checked_sub(long_spent)
-        .and_then(|long| {
-            short_budget
-                .checked_sub(short_spent)
-                .and_then(|short| long.checked_add(short))
+    let global_available = insurance.saturating_sub(globally_reserved).min(vault);
+
+    let read_domain = |budget_offset: usize,
+                       spent_offset: usize,
+                       reservation_offset: usize|
+     -> Result<InsuranceDomainBalance, ReadError> {
+        let budget = read_u128(data, engine + budget_offset)?;
+        let spent = read_u128(data, engine + spent_offset)?;
+        let remaining = budget
+            .checked_sub(spent)
+            .ok_or(ReadError::InvalidAccounting)?;
+        let reserved_num = read_u128(
+            data,
+            engine
+                + reservation_offset
+                + offset_of!(
+                    InsuranceCreditReservationV16Account,
+                    insurance_credit_reserved_num
+                ),
+        )?;
+        let reserved_atoms = (reserved_num / BOUND_SCALE)
+            .checked_add(u128::from(reserved_num % BOUND_SCALE != 0))
+            .ok_or(ReadError::InvalidAccounting)?;
+        Ok(InsuranceDomainBalance {
+            remaining_atoms: remaining,
+            withdrawable_atoms: remaining
+                .saturating_sub(reserved_atoms)
+                .min(global_available),
         })
+    };
+
+    let domains = [
+        read_domain(
+            offset_of!(EngineAssetSlotV16Account, insurance_domain_budget_long),
+            offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_long),
+            offset_of!(EngineAssetSlotV16Account, insurance_reservation_long),
+        )?,
+        read_domain(
+            offset_of!(EngineAssetSlotV16Account, insurance_domain_budget_short),
+            offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_short),
+            offset_of!(EngineAssetSlotV16Account, insurance_reservation_short),
+        )?,
+    ];
+    let remaining = domains[0]
+        .remaining_atoms
+        .checked_add(domains[1].remaining_atoms)
         .ok_or(ReadError::InvalidAccounting)?;
-    Ok(remaining.min(read_u128(data, INSURANCE_OFFSET)?))
+    let withdrawable = domains[0]
+        .withdrawable_atoms
+        .checked_add(domains[1].withdrawable_atoms)
+        .ok_or(ReadError::InvalidAccounting)?
+        .min(global_available);
+    Ok(InsuranceAssetBalance {
+        domains,
+        remaining_atoms: remaining.min(insurance),
+        withdrawable_atoms: withdrawable,
+    })
+}
+
+/// Returns the live insurance attributed to one asset's two domains.
+pub fn read_asset_insurance_remaining(data: &[u8], asset_index: usize) -> Result<u128, ReadError> {
+    Ok(read_asset_insurance_balance(data, asset_index)?.remaining_atoms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_u128_at(data: &mut [u8], offset: usize, value: u128) {
+        data[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn market_with_insurance_capacity() -> Vec<u8> {
+        let engine = asset_engine_offset(0).unwrap();
+        let mut data = vec![0u8; engine + size_of::<EngineAssetSlotV16Account>()];
+        data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
+        data[8..10].copy_from_slice(&VERSION.to_le_bytes());
+        data[10] = KIND_MARKET;
+
+        let header = MARKET_GROUP_OFFSET;
+        let config = header + offset_of!(MarketGroupV16HeaderAccount, config);
+        data[config + offset_of!(V16ConfigAccount, max_market_slots)
+            ..config + offset_of!(V16ConfigAccount, max_market_slots) + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        data[header + offset_of!(MarketGroupV16HeaderAccount, asset_slot_capacity)
+            ..header + offset_of!(MarketGroupV16HeaderAccount, asset_slot_capacity) + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+
+        write_u128_at(&mut data, INSURANCE_OFFSET, 400);
+        write_u128_at(
+            &mut data,
+            header + offset_of!(MarketGroupV16HeaderAccount, vault),
+            350,
+        );
+        write_u128_at(
+            &mut data,
+            header
+                + offset_of!(
+                    MarketGroupV16HeaderAccount,
+                    source_insurance_credit_reserved_total_atoms
+                ),
+            20,
+        );
+        write_u128_at(
+            &mut data,
+            engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_budget_long),
+            200,
+        );
+        write_u128_at(
+            &mut data,
+            engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_long),
+            20,
+        );
+        write_u128_at(
+            &mut data,
+            engine
+                + offset_of!(EngineAssetSlotV16Account, insurance_reservation_long)
+                + offset_of!(
+                    InsuranceCreditReservationV16Account,
+                    insurance_credit_reserved_num
+                ),
+            10 * BOUND_SCALE + 1,
+        );
+        write_u128_at(
+            &mut data,
+            engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_budget_short),
+            300,
+        );
+        write_u128_at(
+            &mut data,
+            engine + offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_short),
+            100,
+        );
+        write_u128_at(
+            &mut data,
+            engine
+                + offset_of!(EngineAssetSlotV16Account, insurance_reservation_short)
+                + offset_of!(
+                    InsuranceCreditReservationV16Account,
+                    insurance_credit_reserved_num
+                ),
+            50 * BOUND_SCALE,
+        );
+        data
+    }
 
     fn portfolio_with_reward_snapshot(
         market: [u8; 32],
@@ -512,6 +670,56 @@ mod tests {
         assert_eq!(
             read_maintenance_fee_per_slot(&market),
             Err(ReadError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn insurance_capacity_uses_pinned_domain_reservation_and_global_offsets() {
+        let mut market = market_with_insurance_capacity();
+        assert_eq!(
+            read_asset_insurance_balance(&market, 0),
+            Ok(InsuranceAssetBalance {
+                domains: [
+                    InsuranceDomainBalance {
+                        remaining_atoms: 180,
+                        withdrawable_atoms: 169,
+                    },
+                    InsuranceDomainBalance {
+                        remaining_atoms: 200,
+                        withdrawable_atoms: 150,
+                    },
+                ],
+                remaining_atoms: 380,
+                withdrawable_atoms: 319,
+            })
+        );
+
+        write_u128_at(
+            &mut market,
+            MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, vault),
+            250,
+        );
+        assert_eq!(
+            read_asset_insurance_balance(&market, 0)
+                .unwrap()
+                .withdrawable_atoms,
+            250,
+            "the asset-wide view applies the pinned global vault cap after summing domains",
+        );
+    }
+
+    #[test]
+    fn insurance_capacity_rejects_spent_above_a_domain_budget() {
+        let mut market = market_with_insurance_capacity();
+        write_u128_at(
+            &mut market,
+            asset_engine_offset(0).unwrap()
+                + offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_long),
+            201,
+        );
+        assert_eq!(
+            read_asset_insurance_balance(&market, 0),
+            Err(ReadError::InvalidAccounting)
         );
     }
 
