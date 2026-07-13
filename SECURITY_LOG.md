@@ -13790,3 +13790,31 @@ slot. The return still has no amount or beneficiary, pays only the complete loss
 a clean account owned by its recorded depositor, and mutates no ballot or Genesis COIN state. A strict
 tie may leave the points distribution unsealed, but it cannot lock user collateral or prevent terminal
 market cleanup.
+
+## Tick - replacement market generations could inflate original reward archives (surface C/D)
+
+The permanent retired-market marker rejected new reward stakes and made existing stakes ignore a live
+same-key replacement portfolio, but controller portfolio cleanup did not read that marker. Pinned
+Percolator permits a closed slab key to be initialized again and permits a zero-lamport, zero-data
+Percolator portfolio account to be revived by refunding its rent. A public attacker could therefore
+recreate the allow-listed market, owner, and portfolio identity, configure its own funding mark, make
+the registered side pay funding, donate market authority to the controller, resolve permissionlessly,
+and ask the controller to archive the replacement telemetry under the original archive PDA. An original
+zero-counter stake could then crystallize the attacker-made points and dilute or capture fixed reward
+COIN. The path could not debit insurance, backing, portfolio collateral, or another token account.
+
+The retained real-SBF LiteSVM regression retires an original controller market and marker, reinitializes
+that exact slab and both exact portfolio keys, opens and flattens a real long/short trade, records real
+long-paid funding, performs the public controller handoff and stale resolution, and closes both users.
+It proves the old cleanup appends the replacement counter, then proves the fixed cleanup rejects the old
+account shape, leaves the original archive absent, prevents crystallization, returns all funding-rounding
+backing to its recorded provider, and closes the replacement slab without changing the marker. The
+original-generation archive lifecycle remains independently green.
+
+FIX: every telemetry-bearing controller cleanup now requires the exact canonical retired-marker PDA.
+The controller shares one marker parser with terminal slab cleanup. While the marker is still an empty
+system account, cleanup atomically archives the authenticated original-generation counters before
+Percolator closes the portfolio. Once the exact controller-owned marker exists, cleanup skips the archive
+CPI but still closes an empty resolved replacement portfolio, so later generations cannot influence old
+rewards or become a cleanup DoS. Omitting, substituting, or corrupting the marker rejects atomically. The
+change adds no authority, recipient, amount, token account, token CPI, or user-fund movement surface.

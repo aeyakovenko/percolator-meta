@@ -140,6 +140,36 @@ pub fn retired_market_address(
     )
 }
 
+fn retired_market_marker_state(
+    program_id: &Pubkey,
+    retired_market: &AccountInfo<'_>,
+    percolator_program: &Pubkey,
+    market: &Pubkey,
+    system_program: &Pubkey,
+) -> Result<(bool, u8), ProgramError> {
+    let (expected_retired_market, bump) = retired_market_address(percolator_program, market);
+    if *retired_market.key != expected_retired_market {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let marker_exists = if retired_market.owner == system_program && retired_market.data_len() == 0
+    {
+        false
+    } else if retired_market.owner == program_id && retired_market.data_len() == RETIRED_MARKET_SIZE
+    {
+        let marker = retired_market.try_borrow_data()?;
+        if marker[..8] != RETIRED_MARKET_DISC
+            || marker[8..40] != percolator_program.to_bytes()
+            || marker[40..72] != market.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        true
+    } else {
+        return Err(ProgramError::InvalidAccountData);
+    };
+    Ok((marker_exists, bump))
+}
+
 fn create_pda<'a>(
     payer: &AccountInfo<'a>,
     target: &AccountInfo<'a>,
@@ -1831,15 +1861,19 @@ fn process_return_resolved_asset0_backing<'a>(
 
 // close_resolved_portfolio accounts:
 // [governance, controller_pda, market(w), portfolio(w), percolator_program,
-//  payer(s,w)?, portfolio_archive(w)?, residual_distributor?, system?]
+//  payer(s,w)?, portfolio_archive(w)?, residual_distributor?, system?,
+//  retired_market_marker?]
 //
 // Anyone can ask the controller to exercise Percolator's terminal marketauth
 // override. Percolator itself requires a resolved market and a genuinely empty
 // portfolio, deregisters the materialized account, and returns only its rent to
 // the market slab. A portfolio with nonzero monotonic reward telemetry must use
 // the extended shape: the fixed residual distributor checked-adds those counters
-// to its canonical read-only archive before the close CPI. Both writes roll back
-// if either program rejects. There is no caller-selected amount or destination.
+// to its canonical read-only archive before the close CPI, but only before this
+// market key's permanent retirement marker exists. Later same-key market
+// generations remain closable, but their ineligible telemetry is never appended
+// to the original archive. Both writes roll back if either program rejects. There
+// is no caller-selected amount or destination.
 fn process_close_resolved_portfolio<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1857,6 +1891,7 @@ fn process_close_resolved_portfolio<'a>(
     let archive_tail = if let Some(payer) = iter.next() {
         Some((
             payer,
+            next_account_info(iter)?,
             next_account_info(iter)?,
             next_account_info(iter)?,
             next_account_info(iter)?,
@@ -1895,7 +1930,7 @@ fn process_close_resolved_portfolio<'a>(
         percolator_program.key,
         &bump_seed,
     );
-    if let Some((payer, archive, residual_program, system)) = archive_tail {
+    if let Some((payer, archive, residual_program, system, retired_market)) = archive_tail {
         if !payer.is_signer
             || !payer.is_writable
             || !archive.is_writable
@@ -1905,6 +1940,13 @@ fn process_close_resolved_portfolio<'a>(
         {
             return Err(ProgramError::InvalidAccountData);
         }
+        let (market_retired, _) = retired_market_marker_state(
+            program_id,
+            retired_market,
+            percolator_program.key,
+            market.key,
+            system.key,
+        )?;
         let owner = Pubkey::new_from_array(snapshot.owner);
         let expected_archive = Pubkey::find_program_address(
             &[
@@ -1920,34 +1962,36 @@ fn process_close_resolved_portfolio<'a>(
         if *archive.key != expected_archive {
             return Err(ProgramError::InvalidSeeds);
         }
-        invoke_signed(
-            &Instruction {
-                program_id: *residual_program.key,
-                accounts: vec![
-                    AccountMeta::new(*payer.key, true),
-                    AccountMeta::new_readonly(*controller.key, true),
-                    AccountMeta::new_readonly(*governance.key, false),
-                    AccountMeta::new(*archive.key, false),
-                    AccountMeta::new_readonly(*market.key, false),
-                    AccountMeta::new_readonly(*portfolio.key, false),
-                    AccountMeta::new_readonly(*percolator_program.key, false),
-                    AccountMeta::new_readonly(*system.key, false),
+        if !market_retired {
+            invoke_signed(
+                &Instruction {
+                    program_id: *residual_program.key,
+                    accounts: vec![
+                        AccountMeta::new(*payer.key, true),
+                        AccountMeta::new_readonly(*controller.key, true),
+                        AccountMeta::new_readonly(*governance.key, false),
+                        AccountMeta::new(*archive.key, false),
+                        AccountMeta::new_readonly(*market.key, false),
+                        AccountMeta::new_readonly(*portfolio.key, false),
+                        AccountMeta::new_readonly(*percolator_program.key, false),
+                        AccountMeta::new_readonly(*system.key, false),
+                    ],
+                    data: vec![RESIDUAL_IX_ARCHIVE_PORTFOLIO],
+                },
+                &[
+                    payer.clone(),
+                    controller.clone(),
+                    governance.clone(),
+                    archive.clone(),
+                    market.clone(),
+                    portfolio.clone(),
+                    percolator_program.clone(),
+                    system.clone(),
+                    residual_program.clone(),
                 ],
-                data: vec![RESIDUAL_IX_ARCHIVE_PORTFOLIO],
-            },
-            &[
-                payer.clone(),
-                controller.clone(),
-                governance.clone(),
-                archive.clone(),
-                market.clone(),
-                portfolio.clone(),
-                percolator_program.clone(),
-                system.clone(),
-                residual_program.clone(),
-            ],
-            &[&seeds],
-        )?;
+                &[&seeds],
+            )?;
+        }
     }
     invoke_signed(
         &Instruction {
@@ -2056,11 +2100,13 @@ fn process_close_market_and_reclaim<'a>(
         &bump_seed,
     );
 
-    let (expected_retired_market, retired_market_bump) =
-        retired_market_address(percolator_program.key, market.key);
-    if *retired_market.key != expected_retired_market {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    let (marker_exists, retired_market_bump) = retired_market_marker_state(
+        program_id,
+        retired_market,
+        percolator_program.key,
+        market.key,
+        system_program.key,
+    )?;
     let retired_market_bump_seed = [retired_market_bump];
     let retired_market_seeds: [&[u8]; 4] = [
         RETIRED_MARKET_SEED,
@@ -2068,25 +2114,6 @@ fn process_close_market_and_reclaim<'a>(
         market.key.as_ref(),
         &retired_market_bump_seed,
     ];
-    let marker_exists = if retired_market.owner == system_program.key
-        && retired_market.data_len() == 0
-    {
-        false
-    } else if retired_market.owner == program_id
-        && retired_market.data_len() == RETIRED_MARKET_SIZE
-    {
-        let marker = retired_market.try_borrow_data()?;
-        if marker[..8] != RETIRED_MARKET_DISC
-            || marker[8..40] != percolator_program.key.to_bytes()
-            || marker[40..72] != market.key.to_bytes()
-        {
-            return Err(ProgramError::InvalidAccountData);
-        }
-        true
-    } else {
-        return Err(ProgramError::InvalidAccountData);
-    };
-
     let mut metas = vec![
         AccountMeta::new(*controller.key, true),
         AccountMeta::new(*market.key, false),

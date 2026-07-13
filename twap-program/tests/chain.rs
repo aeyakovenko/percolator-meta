@@ -9795,8 +9795,10 @@ fn e2e_frozen_controller_transit_cannot_strand_resolved_protocol_insurance() {
 // PUBLIC DOS: a user can materialize an empty portfolio and disappear. Percolator deliberately
 // lets marketauth close empty portfolios after resolution, but marketauth is the controller PDA,
 // so terminal cleanup needs a fixed permissionless wrapper for that exact operation.
+// REAL LOF: after that market key is retired, a replacement generation can revive the same portfolio
+// keys and manufacture funding telemetry. Cleanup must not append it to generation one's archive.
 #[test]
-fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
+fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -9969,6 +9971,20 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         ),
     )
     .expect("attacker materializes an empty portfolio");
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        rd_register_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &attacker.pubkey(),
+            &attacker.pubkey(),
+            &slab,
+            &portfolio.pubkey(),
+            4,
+        ),
+    )
+    .expect("attacker registers a zero-counter stake in the original market generation");
 
     let victim = Keypair::new();
     svm.airdrop(&victim.pubkey(), 10_000_000_000).unwrap();
@@ -10278,18 +10294,18 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
                 maintenance_margin_bps: 10_000,
                 initial_margin_bps: 10_000,
                 max_trading_fee_bps: 10_000,
-                trade_fee_base_bps: 3,
+                trade_fee_base_bps: 0,
                 liquidation_fee_bps: 0,
                 liquidation_fee_cap: 0,
                 min_liquidation_abs: 0,
-                max_price_move_bps_per_slot: 10_000,
+                max_price_move_bps_per_slot: 1_000,
                 max_accrual_dt_slots: 1,
-                max_abs_funding_e9_per_slot: 0,
+                max_abs_funding_e9_per_slot: 10_000,
                 min_funding_lifetime_slots: 1,
                 max_account_b_settlement_chunks: 1,
                 max_bankrupt_close_chunks: 1,
-                max_bankrupt_close_lifetime_slots: 1,
-                public_b_chunk_atoms: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
                 maintenance_fee_per_slot: 0,
             },
         ),
@@ -10301,6 +10317,243 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         market_hijacker.pubkey().to_bytes(),
         "the old allow-list key now names an attacker-controlled market generation",
     );
+
+    // The original stake remains bound to (slab, attacker, portfolio). Recreate those exact public
+    // Percolator keys in generation two and manufacture paid-funding telemetry under an oracle the
+    // attacker controls. A permanent retirement marker must keep this telemetry out of generation
+    // one's cumulative archive, not merely reject a brand-new stake registration.
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            percolator_prog::ix::Instruction::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("replacement creator configures its own funding mark");
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+                stale_slots: 5,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("replacement creator makes terminal resolution permissionless");
+
+    for (account_payer, account) in [
+        (&attacker, &portfolio),
+        (&victim, &victim_portfolio),
+    ] {
+        send(
+            &mut svm,
+            &[account_payer],
+            solana_sdk::system_instruction::transfer(
+                &account_payer.pubkey(),
+                &account.pubkey(),
+                portfolio_rent,
+            ),
+        )
+        .expect("owner refunds rent to the exact retired Percolator portfolio key");
+        send(
+            &mut svm,
+            &[account_payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(account_payer.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(account.pubkey(), false),
+                ],
+                percolator_prog::ix::Instruction::InitPortfolio,
+            ),
+        )
+        .expect("owner initializes a replacement-generation portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &account_payer.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[account_payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(account_payer.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(account.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                percolator_prog::ix::Instruction::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("replacement portfolio receives real collateral");
+    }
+
+    let replacement_size_q = (percolator::POS_SCALE / 10) as i128;
+    send(
+        &mut svm,
+        &[&attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: replacement_size_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("replacement users open balanced funding positions");
+
+    let replacement_crank = |svm: &mut LiteSVM, account: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(account, false),
+                ],
+                percolator_prog::ix::Instruction::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+    let mut replacement_clock = svm.get_sysvar::<Clock>();
+    replacement_clock.slot = 101;
+    replacement_clock.unix_timestamp = 101;
+    svm.set_sysvar(&replacement_clock);
+    send(
+        &mut svm,
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            percolator_prog::ix::Instruction::PushEwmaMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 2_000_000,
+            },
+        ),
+    )
+    .expect("replacement creator makes the registered long pay funding");
+    for slot in [101u64, 102, 103] {
+        replacement_clock.slot = slot;
+        replacement_clock.unix_timestamp = slot as i64;
+        svm.set_sysvar(&replacement_clock);
+        for _ in 0..8 {
+            replacement_crank(&mut svm, portfolio.pubkey(), slot)
+                .expect("replacement long records paid funding");
+            replacement_crank(&mut svm, victim_portfolio.pubkey(), slot)
+                .expect("replacement short records received funding");
+        }
+    }
+    let replacement_paid = read_portfolio_funding_long_paid(&svm, &portfolio.pubkey());
+    assert!(
+        replacement_paid > 0,
+        "the pinned binary must produce real replacement-generation reward telemetry"
+    );
+
+    let replacement_close_price = read_asset0_effective_price(&svm, &slab);
+    send(
+        &mut svm,
+        &[&attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: -replacement_size_q,
+                exec_price: replacement_close_price,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("replacement users flatten the synthetic funding positions");
+    for account in [portfolio.pubkey(), victim_portfolio.pubkey()] {
+        for _ in 0..4 {
+            replacement_crank(&mut svm, account, 103)
+                .expect("replacement portfolio settles flat");
+        }
+    }
+    assert_eq!(read_asset0_oi(&svm, &slab), (0, 0));
+
+    let replacement_insurance = read_asset0_insurance(&svm, &slab);
+    if replacement_insurance > 0 {
+        let creator_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &creator_destination,
+            &collateral_mint,
+            &market_hijacker.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&market_hijacker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(creator_destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                percolator_prog::ix::Instruction::WithdrawInsuranceAsset {
+                    asset_index: 0,
+                    amount: replacement_insurance,
+                },
+            ),
+        )
+        .expect("replacement creator drains only its own protocol fee insurance before handoff");
+    }
 
     let hijack_portfolio = Keypair::new();
     send(
@@ -10384,31 +10637,232 @@ fn e2e_abandoned_empty_portfolio_cannot_block_controller_terminal_close() {
         controller.to_bytes()
     );
 
-    let mut replacement_resolve = vec![0u8]; // IX_PROXY_ADMIN
-    replacement_resolve
-        .extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    replacement_clock.slot = 110;
+    replacement_clock.unix_timestamp = 110;
+    svm.set_sysvar(&replacement_clock);
     send(
         &mut svm,
-        &[&payer, &governance],
+        &[&payer],
         Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new_readonly(perc_id(), false),
-            ],
-            data: replacement_resolve,
+            program_id: perc_id(),
+            accounts: vec![AccountMeta::new(slab, false)],
+            data: percolator_prog::ix::Instruction::ResolveStalePermissionless {
+                now_slot: replacement_clock.slot,
+            }
+            .encode(),
         },
     )
-    .expect("governance resolves the replacement market");
+    .expect("an unaffiliated caller resolves the attacker-configured replacement market");
 
+    replacement_clock.slot = 111;
+    replacement_clock.unix_timestamp = 111;
+    svm.set_sysvar(&replacement_clock);
+
+    let attacker_destination = Pubkey::new_unique();
+    let victim_replacement_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
-        &percolator_vault,
+        &attacker_destination,
         &collateral_mint,
-        &vault_authority,
+        &attacker.pubkey(),
         0,
+    );
+    set_token(
+        &mut svm,
+        &victim_replacement_destination,
+        &collateral_mint,
+        &victim.pubkey(),
+        0,
+    );
+    for (owner, account, destination) in [
+        (
+            attacker.pubkey(),
+            portfolio.pubkey(),
+            attacker_destination,
+        ),
+        (
+            victim.pubkey(),
+            victim_portfolio.pubkey(),
+            victim_replacement_destination,
+        ),
+    ] {
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(account, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                percolator_prog::ix::Instruction::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+        )
+        .expect("public resolved payout empties a replacement portfolio");
+    }
+
+    let replacement_attacker_archive =
+        rd_portfolio_archive_pda(&slab, &attacker.pubkey(), &portfolio.pubkey());
+    let replacement_victim_archive = rd_portfolio_archive_pda(
+        &slab,
+        &victim.pubkey(),
+        &victim_portfolio.pubkey(),
+    );
+    let replacement_before_legacy_cleanup = svm.get_account(&portfolio.pubkey()).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(replacement_attacker_archive, false),
+                    AccountMeta::new_readonly(rd_id(), false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: vec![11u8],
+            },
+        )
+        .is_err(),
+        "omitting the retired-market marker cannot recover the vulnerable archive path"
+    );
+    assert_eq!(
+        svm.get_account(&portfolio.pubkey()).unwrap(),
+        replacement_before_legacy_cleanup,
+        "rejected legacy cleanup leaves the replacement portfolio intact"
+    );
+    for (account, archive) in [
+        (portfolio.pubkey(), replacement_attacker_archive),
+        (victim_portfolio.pubkey(), replacement_victim_archive),
+    ] {
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(account, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(archive, false),
+                    AccountMeta::new_readonly(rd_id(), false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(retired_market, false),
+                ],
+                data: vec![11u8],
+            },
+        )
+        .expect("public controller retires a replacement portfolio with reward telemetry");
+    }
+    assert!(
+        svm.get_account(&replacement_attacker_archive)
+            .is_none_or(|account| account.data.is_empty()),
+        "a retired market generation must not append paid funding to the original archive"
+    );
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            rd_crystallize_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &attacker.pubkey(),
+                &slab,
+                &portfolio.pubkey(),
+                4,
+            ),
+        )
+        .is_err(),
+        "the original zero-counter stake cannot crystallize replacement-generation funding"
+    );
+
+    let replacement_market = svm.get_account(&slab).unwrap();
+    let replacement_backing_provider = Pubkey::new_from_array(
+        percolator_accounting::read_asset_backing_authority(&replacement_market.data, 0).unwrap(),
+    );
+    let replacement_backing_amount = percolator_accounting::read_asset_backing_balances(
+        &replacement_market.data,
+        0,
+    )
+    .unwrap()
+    .iter()
+    .map(|balance| balance.principal_atoms + balance.earnings_atoms)
+    .sum::<u128>();
+    assert!(
+        replacement_backing_amount > 0,
+        "real funding settlement must leave provider-owned backing to return"
+    );
+    let replacement_backing_destination = Pubkey::new_unique();
+    let replacement_backing_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &replacement_backing_destination,
+        &collateral_mint,
+        &replacement_backing_provider,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &replacement_backing_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+    let backing_ledger_rent = svm.minimum_balance_for_rent_exemption(backing_ledger_len);
+    let long_backing_ledger = Keypair::new();
+    let short_backing_ledger = Keypair::new();
+    for ledger in [&long_backing_ledger, &short_backing_ledger] {
+        send(
+            &mut svm,
+            &[&payer, ledger],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &ledger.pubkey(),
+                backing_ledger_rent,
+                backing_ledger_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("a public cranker allocates a temporary Percolator backing ledger");
+    }
+    send(
+        &mut svm,
+        &[&payer],
+        controller_return_resolved_asset0_backing_ix(
+            &governance.pubkey(),
+            &controller,
+            &controller,
+            &slab,
+            &replacement_backing_destination,
+            &replacement_backing_transit,
+            &percolator_vault,
+            &vault_authority,
+            &long_backing_ledger.pubkey(),
+            &short_backing_ledger.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("public cleanup returns replacement backing to its recorded provider");
+    assert_eq!(
+        token_amount(&svm, &replacement_backing_destination) as u128,
+        replacement_backing_amount,
+        "terminal cleanup cannot redirect replacement backing"
     );
     set_token(
         &mut svm,
@@ -39889,6 +40343,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
             AccountMeta::new(archive, false),
             AccountMeta::new_readonly(rd_id(), false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
         ],
         data: vec![11u8],
     };
@@ -39939,6 +40394,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
                 AccountMeta::new(short_archive, false),
                 AccountMeta::new_readonly(rd_id(), false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
             ],
             data: vec![11u8],
         },
@@ -41524,6 +41980,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
                     AccountMeta::new(loser_archive, false),
                     AccountMeta::new_readonly(rd_id(), false),
                     AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
                 ],
                 data: vec![11u8],
             },
@@ -41579,6 +42036,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
                     AccountMeta::new(winner_archive, false),
                     AccountMeta::new_readonly(rd_id(), false),
                     AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
                 ],
                 data: vec![11u8],
             },

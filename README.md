@@ -53,9 +53,10 @@ capital's own tenure.
   Percolator program, market, owner, and portfolio. Reward epochs read archived totals plus any live
   account generation. Each stake also binds that market's immutable allow-list index, so a later
   same-key account generation in another market cannot replace or block the archived identity. Every
-  portfolio-flow registration and counter read supplies the exact retirement marker: registration
-  rejects retired keys, while existing stakes read only their archive after retirement. Reinitializing
-  a closed slab therefore cannot revive its reward eligibility.
+  portfolio-flow registration, counter read, and telemetry-bearing cleanup supplies the exact
+  retirement marker: registration rejects retired keys, existing stakes read only their archive after
+  retirement, and cleanup stops appending telemetry once the marker exists. Reinitializing a closed
+  slab therefore cannot revive or inflate its reward eligibility.
   Terminal cleanup therefore cannot erase an uncrystallized allocation or hold insurance and backing
   exits hostage. Portfolio-flow registration also authenticates the matching market and
   requires its immutable account maintenance fee to be zero, so direct permissionless fee sync cannot
@@ -292,7 +293,9 @@ unaffected. Terminal `CloseSlab` also creates a permanent marker keyed by Percol
 new portfolio-flow stakes reject that retired key, and existing stakes ignore any public reinitialization
 under it. The historical public-maintenance fallback remains claim-only for an already frozen
 stake, even if a third party donates lamports to the closed address. The wrapper accepts no
-amount, token account, or destination and exposes no generic portfolio authority.
+amount, token account, or destination and exposes no generic portfolio authority. Telemetry-bearing
+cleanup requires the exact retirement-marker PDA: before slab retirement it archives the original
+generation, and afterward it closes later generations without mutating that archive.
 
 An absent insurance authority or backing provider cannot block secondary-asset retirement with one
 remaining atom. After Squads shuts the asset down and Percolator's delay and empty-state checks pass,
