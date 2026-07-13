@@ -1353,9 +1353,11 @@ fn run_complete_public_insurance_loss(
     high_entry: u64,
     high_capital: u64,
     domain_tranche: u64,
+    expected_remaining: u128,
 ) {
     let position_q = 1_000_000_000_000i128;
     let pnl_atoms_per_price = position_q.unsigned_abs() / percolator::POS_SCALE;
+    let insurance_before = asset_insurance_remaining(env, 0);
     assert_eq!(effective_price(env), low_entry);
     assert_eq!(
         (domain_tranche as u128 + low_capital as u128) % pnl_atoms_per_price,
@@ -1374,7 +1376,10 @@ fn run_complete_public_insurance_loss(
         .unwrap();
     advance_public_mark(env, oracle, observer_portfolio, slot, high_target, 300);
     liquidate_stale_public_loser(env, low_short_portfolio, *slot);
-    assert_eq!(asset_insurance_remaining(env, 0), domain_tranche as u128);
+    assert_eq!(
+        asset_insurance_remaining(env, 0),
+        insurance_before - domain_tranche as u128,
+    );
     clear_stale_public_winner(env, &low_long, low_long_portfolio, *slot);
 
     advance_public_mark(env, oracle, observer_portfolio, slot, high_entry, 100);
@@ -1384,13 +1389,17 @@ fn run_complete_public_insurance_loss(
     let long_loss = pnl_atoms_per_price
         .checked_mul((high_entry - terminal_low) as u128)
         .unwrap();
+    let second_insurance_loss = long_loss.checked_sub(high_capital as u128).unwrap();
     assert_eq!(
-        long_loss.checked_sub(high_capital as u128).unwrap(),
-        domain_tranche as u128,
+        second_insurance_loss,
+        insurance_before - domain_tranche as u128 - expected_remaining,
     );
     advance_public_mark(env, oracle, observer_portfolio, slot, terminal_low, 400);
     liquidate_stale_public_loser(env, high_long_portfolio, *slot);
-    assert_eq!(asset_insurance_remaining(env, 0), 0);
+    assert_eq!(
+        asset_insurance_remaining(env, 0),
+        expected_remaining,
+    );
     clear_stale_public_winner(env, &high_short, high_short_portfolio, *slot);
 }
 
@@ -2507,6 +2516,7 @@ fn public_repeated_total_losses_cannot_exhaust_the_insurance_share_namespace() {
         high_entry,
         high_capital,
         domain_tranche,
+        0,
     );
     assert_eq!(asset_insurance_remaining(&env, 0), 0);
 
@@ -2522,6 +2532,7 @@ fn public_repeated_total_losses_cannot_exhaust_the_insurance_share_namespace() {
         high_entry,
         high_capital,
         domain_tranche,
+        0,
     );
     assert_eq!(asset_insurance_remaining(&env, 0), 0);
 
@@ -2558,6 +2569,132 @@ fn public_repeated_total_losses_cannot_exhaust_the_insurance_share_namespace() {
         (successful_dust_recapitalizations as u128 + 1) * 1_000_000,
     );
     assert_eq!(asset_insurance_remaining(&env, 0), 201);
+}
+
+// PUBLIC DEPOSIT-LIVENESS PROBE: a one-atom residual prevents the exact-loss generation reset.
+// Repeated real market loss/recapitalization cycles must not amplify the finite share exchange rate
+// until even the minimum deposit overflows. Every loss below is produced by the pinned Percolator
+// binary through authenticated marks, public trades, and permissionless liquidation/reset cranks.
+#[test]
+fn repeated_near_total_public_losses_preserve_one_atom_deposit_liveness() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64.checked_mul(high_entry).unwrap();
+    let domain_tranche = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let tranche = domain_tranche.checked_mul(2).unwrap();
+    let (attacker, attacker_ata) = new_depositor(&mut env, tranche * 2 + 105);
+    let pool = env.pool;
+    let attacker_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+        .expect("fund the first near-total loss cycle");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+
+    let mut slot = 100;
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital + 1,
+        domain_tranche,
+        1,
+    );
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+        .expect("recapitalize the one-atom residual");
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        1,
+    );
+
+    for (deposit, domain) in [(100u64, 50u64), (4u64, 2u64)] {
+        env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, deposit)
+            .expect("recapitalize the one-atom residual at the amplified share price");
+        run_complete_public_insurance_loss(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            100,
+            11_000_000 - domain,
+            1_000,
+            900_000_000 - domain,
+            domain,
+            1,
+        );
+    }
+
+    assert_eq!(asset_insurance_remaining(&env, 0), 1);
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, 1)
+        .expect("a live one-atom pool must retain its minimum public deposit path");
+    assert_eq!(asset_insurance_remaining(&env, 0), 2);
+
+    let scaled_generation = env.pool_share_generation();
+    let reset_generation_mask = (1u64 << 20) - 1;
+    assert_eq!(scaled_generation & reset_generation_mask, 0);
+    assert!(
+        scaled_generation >> 20 > 0,
+        "the public replay must actually enter the lazy share-rescale path",
+    );
+    assert_ne!(
+        env.position_share_generation(&attacker.pubkey()),
+        scaled_generation,
+        "an untouched depositor remains lazy until its next public operation",
+    );
+    let stale_attacker_shares = env.position_shares(&attacker.pubkey());
+    assert_eq!(env.token_amount(&attacker_ata), 1);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, 1)
+        .expect("an existing depositor can normalize lazily and top up");
+    assert_eq!(
+        env.position_share_generation(&attacker.pubkey()),
+        scaled_generation,
+    );
+    assert!(env.position_shares(&attacker.pubkey()) < stale_attacker_shares);
+    assert_eq!(asset_insurance_remaining(&env, 0), 3);
 }
 
 // SHARE-INFLATION FIRST-DEPOSITOR THEFT (finding HB, surface B). The classic ERC4626 attack: a dust first
