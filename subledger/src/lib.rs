@@ -54,7 +54,9 @@ const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // claim surplus that accrued before it joined — and cannot extract early backers' surplus
 // on exit, the soft-veto fairness prerequisite). Pool grows by `total_shares` (u128 @192)
 // and `coin_mint` (Pubkey @208) so the genesis-vote authority is part of the pool namespace.
-// Position grows by `shares` (u128 @104). All cross-program reads (genesis-vote
+// Position grows by `shares` (u128 @104). Reserved bytes hold a pool share
+// generation (u40 @91) and an active-position generation (u40 @99); terminal
+// positions continue to use @99 for their return slot. All cross-program reads (genesis-vote
 // principal@72 / start_slot@89 / outstanding@80) keep their offsets — the new fields are
 // appended, so those programs are unaffected.
 // Historical accounts cannot be reallocated by an upgrade. Keep every deployed
@@ -96,10 +98,14 @@ pub const POS_WITHDRAWN_OFF: usize = 88;
 pub const POS_START_SLOT_OFF: usize = 89;
 pub const POS_TERMINAL_RETURNED_OFF: usize = 98;
 pub const POS_TERMINAL_RETURN_SLOT_OFF: usize = 99;
+// Active positions use the terminal-slot bytes for their share generation. Once
+// terminal_returned is set, those same bytes retain their documented timestamp.
+pub const POS_SHARE_GENERATION_OFF: usize = POS_TERMINAL_RETURN_SLOT_OFF;
 pub const POS_SHARES_OFF: usize = 104; // Position.shares (POLICY_WITH_SURPLUS) — the share-value points source.
                                        // Pool.outstanding_principal — the quorum denominator the genesis-vote reads (finding ID). Exported
                                        // + canaried so a consumer's mirror offset can be cross-pinned, same discipline as the POS_* offsets.
 pub const POOL_OUTSTANDING_PRINCIPAL_OFF: usize = 80;
+pub const POOL_SHARE_GENERATION_OFF: usize = 91;
 pub const POOL_DEPOSIT_DEADLINE_SLOT_OFF: usize = 240;
 pub const POOL_DEPOSIT_WINDOW_SLOTS_OFF: usize = 248;
 pub const POOL_DEPOSIT_START_SLOT_OFF: usize = 256;
@@ -115,6 +121,20 @@ const DOMAIN_BACKING: u8 = 1;
 
 const U40_MAX: u64 = (1u64 << 40) - 1;
 const MAX_TERMINAL_RETURN_SLOT: u64 = U40_MAX - 1;
+
+fn decode_u40(bytes: &[u8]) -> u64 {
+    let mut encoded = [0u8; 8];
+    encoded[..5].copy_from_slice(bytes);
+    u64::from_le_bytes(encoded)
+}
+
+fn encode_u40(value: u64, bytes: &mut [u8]) -> ProgramResult {
+    if value > U40_MAX || bytes.len() != 5 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    bytes.copy_from_slice(&value.to_le_bytes()[..5]);
+    Ok(())
+}
 
 // The SPL Associated Token Account program. Percolator pins each market vault to
 // the single CANONICAL ATA of (vault_authority, mint) — its finding F-VAULT-FRAG.
@@ -269,6 +289,10 @@ struct Pool {
     policy: u8,
     domain: u8, // DOMAIN_INSURANCE | DOMAIN_BACKING
     bump: u8,
+    /// Monotonic generation for priced shares. A fully impaired insurance pool
+    /// advances this before accepting recapitalization, making prior shares
+    /// permanently valueless without iterating depositor accounts.
+    share_generation: u64,
     /// Percolator market slab this insurance pool tops up / withdraws from.
     /// `Pubkey::default()` for own-vault pools.
     market_slab: Pubkey,
@@ -319,6 +343,11 @@ impl Pool {
             policy,
             domain,
             bump: data[89],
+            share_generation: if data.len() >= POOL_SIZE_SHARES {
+                decode_u40(&data[POOL_SHARE_GENERATION_OFF..POOL_SHARE_GENERATION_OFF + 5])
+            } else {
+                0
+            },
             market_slab: if data.len() >= POOL_SIZE_MARKET {
                 Pubkey::new_from_array(data[96..128].try_into().unwrap())
             } else {
@@ -381,7 +410,11 @@ impl Pool {
         data[88] = self.policy;
         data[89] = self.bump;
         data[90] = self.domain;
-        data[91..96].fill(0);
+        if data.len() >= POOL_SIZE_SHARES {
+            encode_u40(self.share_generation, &mut data[91..96])?;
+        } else {
+            data[91..96].fill(0);
+        }
         if data.len() >= POOL_SIZE_MARKET {
             data[96..128].copy_from_slice(self.market_slab.as_ref());
             data[128..160].copy_from_slice(self.percolator_program.as_ref());
@@ -604,6 +637,9 @@ struct Position {
     /// current layout stores `slot + 1` as a five-byte little-endian integer;
     /// zero remains the legacy/no-snapshot sentinel.
     terminal_return_slot: Option<u64>,
+    /// Share generation for an active position. The serialized bytes are reused
+    /// for `terminal_return_slot` after terminal retirement.
+    share_generation: u64,
     /// Shares held for share-value accounting. Insurance deposits mint priced
     /// shares for both payout policies so residual-distributor live caps track
     /// remaining capital; own-vault POLICY_PRINCIPAL deposits keep this at 0.
@@ -626,19 +662,19 @@ impl Position {
         } else {
             0
         };
-        let terminal_return_slot = if data.len() >= POSITION_SIZE {
-            let mut encoded = [0u8; 8];
-            encoded[..5].copy_from_slice(
-                &data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5],
-            );
-            u64::from_le_bytes(encoded).checked_sub(1)
+        let generation_or_terminal_slot = if data.len() >= POSITION_SIZE {
+            decode_u40(&data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5])
+        } else {
+            0
+        };
+        let terminal_return_slot = if terminal_returned == 1 {
+            generation_or_terminal_slot.checked_sub(1)
         } else {
             None
         };
         if withdrawn > 1
             || vote_locked > 1
             || terminal_returned > 1
-            || (terminal_returned == 0 && terminal_return_slot.is_some())
             || (terminal_returned == 1
                 && (withdrawn != 1 || u64::from_le_bytes(data[72..80].try_into().unwrap()) != 0))
         {
@@ -658,6 +694,11 @@ impl Position {
             vote_locked: vote_locked == 1,
             terminal_returned: terminal_returned == 1,
             terminal_return_slot,
+            share_generation: if terminal_returned == 0 {
+                generation_or_terminal_slot
+            } else {
+                0
+            },
             shares: if data.len() >= POSITION_SIZE {
                 u128::from_le_bytes(data[104..120].try_into().unwrap())
             } else {
@@ -686,15 +727,21 @@ impl Position {
                 if !self.terminal_returned && self.terminal_return_slot.is_some() {
                     return Err(ProgramError::InvalidAccountData);
                 }
-                let encoded_slot = match self.terminal_return_slot {
-                    Some(slot) => slot
-                        .checked_add(1)
-                        .filter(|encoded| *encoded <= U40_MAX)
-                        .ok_or(ProgramError::InvalidAccountData)?,
-                    None => 0,
+                let generation_or_terminal_slot = if self.terminal_returned {
+                    match self.terminal_return_slot {
+                        Some(slot) => slot
+                            .checked_add(1)
+                            .filter(|encoded| *encoded <= U40_MAX)
+                            .ok_or(ProgramError::InvalidAccountData)?,
+                        None => 0,
+                    }
+                } else {
+                    self.share_generation
                 };
-                data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5]
-                    .copy_from_slice(&encoded_slot.to_le_bytes()[..5]);
+                encode_u40(
+                    generation_or_terminal_slot,
+                    &mut data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5],
+                )?;
                 data[104..120].copy_from_slice(&self.shares.to_le_bytes());
             } else {
                 data[98..104].fill(0);
@@ -795,6 +842,38 @@ fn mint_shares(amount: u64, total_shares: u128, balance: u64) -> Result<u128, Pr
             .ok_or(ProgramError::ArithmeticOverflow)?,
     )
     .ok_or(ProgramError::ArithmeticOverflow)
+}
+
+/// A zero priced balance proves every outstanding share has zero token value.
+/// Advance the generation before recapitalization so the finite `u128` share
+/// namespace can restart without letting impaired positions claim new capital.
+fn begin_fully_impaired_recapitalization(pool: &mut Pool, priced_balance: u64) -> ProgramResult {
+    if priced_balance != 0 || pool.total_shares == 0 {
+        return Ok(());
+    }
+    if pool.outstanding_principal != 0 {
+        pool.share_generation = pool
+            .share_generation
+            .checked_add(1)
+            .filter(|generation| *generation <= U40_MAX)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+    pool.total_shares = 0;
+    Ok(())
+}
+
+fn move_position_to_current_share_generation(
+    position: &mut Position,
+    pool: &Pool,
+) -> ProgramResult {
+    if position.share_generation > pool.share_generation {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if position.share_generation < pool.share_generation {
+        position.shares = 0;
+        position.share_generation = pool.share_generation;
+    }
+    Ok(())
 }
 
 /// Tokens redeemed for `shares`: `shares * (balance + 1) / (total_shares + VIRTUAL_SHARES)` (floor).
@@ -1120,6 +1199,7 @@ fn process_init_pool(
         policy,
         domain,
         bump,
+        share_generation: 0,
         market_slab: Pubkey::default(),
         percolator_program: Pubkey::default(),
         vote_authority: Pubkey::default(),
@@ -1216,6 +1296,7 @@ fn process_deposit(
             vote_locked: false,
             terminal_returned: false,
             terminal_return_slot: None,
+            share_generation: pool.share_generation,
             shares: 0,
         }
     } else {
@@ -1650,6 +1731,7 @@ fn process_init_insurance_pool(
         policy,
         domain: DOMAIN_INSURANCE,
         bump,
+        share_generation: 0,
         market_slab: *market_slab.key,
         percolator_program: *percolator_program.key,
         vote_authority: *vote_authority.key,
@@ -1746,6 +1828,7 @@ fn process_insurance_deposit(
     } else {
         insurance_before
     };
+    begin_fully_impaired_recapitalization(&mut pool, priced_balance_before)?;
     let shares_minted = mint_shares(amount, pool.total_shares, priced_balance_before)?;
     // Inflation/rounding guard (finding HB): a large surplus can make deposits mint zero or very
     // few shares. Reject before transfer unless their immediate value is within one atom of the
@@ -1789,6 +1872,7 @@ fn process_insurance_deposit(
             vote_locked: false,
             terminal_returned: false,
             terminal_return_slot: None,
+            share_generation: pool.share_generation,
             shares: 0,
         }
     } else {
@@ -1804,6 +1888,7 @@ fn process_insurance_deposit(
         }
         p
     };
+    move_position_to_current_share_generation(&mut position, &pool)?;
 
     // 1) User -> holding (user-signed; the user is moving their own funds).
     invoke(
@@ -2116,7 +2201,11 @@ fn process_insurance_withdraw_impl(
     if share_accounting && position_account.data_len() < POSITION_SIZE {
         return Err(ProgramError::InvalidAccountData);
     }
-    let shares_to_retire = if !share_accounting || position.principal == 0 {
+    if position.share_generation > pool.share_generation {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let shares_are_current = position.share_generation == pool.share_generation;
+    let shares_to_retire = if !share_accounting || position.principal == 0 || !shares_are_current {
         0u128
     } else if amount == position.principal {
         position.shares
@@ -2124,7 +2213,9 @@ fn process_insurance_withdraw_impl(
         wide_mul_div_floor(position.shares, amount as u128, position.principal as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?
     };
-    let owed = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
+    let owed = if !shares_are_current {
+        0
+    } else if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
         redeem_shares(shares_to_retire, priced_balance, pool.total_shares)?
     } else {
         if share_accounting && position.shares != 0 {
@@ -2235,10 +2326,14 @@ fn process_insurance_withdraw_impl(
     // subset; the difference is unowned reserve that keeps floor dust out of a
     // later holder's redemption. Empty principal pools reset for terminal custody;
     // with-surplus pools normalize reserve pricing for future deposit epochs.
-    position.shares = position
-        .shares
-        .checked_sub(shares_to_retire)
-        .ok_or(ProgramError::InvalidAccountData)?;
+    if shares_are_current {
+        position.shares = position
+            .shares
+            .checked_sub(shares_to_retire)
+            .ok_or(ProgramError::InvalidAccountData)?;
+    } else if position.principal == 0 {
+        position.shares = 0;
+    }
     pool.total_shares = pool_total_shares_after_exit(
         pool.policy,
         outstanding_after,
@@ -2754,6 +2849,7 @@ mod tests {
             vote_locked: false,
             terminal_returned: false,
             terminal_return_slot: None,
+            share_generation: 3,
             shares: 0,
         };
         let mut d = vec![0u8; POSITION_SIZE];
@@ -2777,6 +2873,10 @@ mod tests {
             ),
             p.start_slot
         );
+        assert_eq!(
+            decode_u40(&d[POS_SHARE_GENERATION_OFF..POS_SHARE_GENERATION_OFF + 5]),
+            3,
+        );
 
         let terminal = Position {
             pool,
@@ -2788,6 +2888,7 @@ mod tests {
             vote_locked: false,
             terminal_returned: true,
             terminal_return_slot: Some(66),
+            share_generation: 0,
             shares: 0,
         };
         terminal.serialize(&mut d).unwrap();
@@ -3008,6 +3109,7 @@ mod tests {
             policy: POLICY_WITH_SURPLUS,
             domain: DOMAIN_BACKING,
             bump: 254,
+            share_generation: 7,
             market_slab: slab,
             percolator_program: perc,
             vote_authority: Pubkey::new_unique(),
@@ -3054,6 +3156,11 @@ mod tests {
         assert_eq!(d.policy, POLICY_WITH_SURPLUS);
         assert_eq!(d.domain, DOMAIN_BACKING);
         assert_eq!(d.bump, 254);
+        assert_eq!(d.share_generation, 7);
+        assert_eq!(
+            decode_u40(&buf[POOL_SHARE_GENERATION_OFF..POOL_SHARE_GENERATION_OFF + 5]),
+            7,
+        );
         assert_eq!(d.market_slab, slab);
         assert_eq!(d.percolator_program, perc);
         assert_eq!(d.vote_authority, pool.vote_authority);
@@ -3092,6 +3199,7 @@ mod tests {
             vote_locked: true,
             terminal_returned: false,
             terminal_return_slot: None,
+            share_generation: 9,
             shares: 5_555,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
@@ -3103,6 +3211,7 @@ mod tests {
         assert_eq!(dp.start_slot, 4242);
         assert!(dp.vote_locked);
         assert!(!dp.terminal_returned);
+        assert_eq!(dp.share_generation, 9);
         assert_eq!(dp.shares, 5_555);
     }
 
@@ -3115,6 +3224,7 @@ mod tests {
             policy: POLICY_WITH_SURPLUS,
             domain: DOMAIN_BACKING,
             bump: 200,
+            share_generation: 17,
             market_slab: Pubkey::new_unique(),
             percolator_program: Pubkey::new_unique(),
             vote_authority: Pubkey::new_unique(),
@@ -3172,6 +3282,10 @@ mod tests {
             assert_eq!(decoded.domain, pool.domain);
             assert_eq!(decoded.bump, pool.bump);
             assert_eq!(
+                decoded.share_generation,
+                if size >= POOL_SIZE_SHARES { 17 } else { 0 },
+            );
+            assert_eq!(
                 decoded.market_slab,
                 if size >= POOL_SIZE_MARKET {
                     pool.market_slab
@@ -3223,6 +3337,7 @@ mod tests {
             vote_locked: true,
             terminal_returned: false,
             terminal_return_slot: None,
+            share_generation: 21,
             shares: 777,
         };
         for size in [POSITION_SIZE_BASE, POSITION_SIZE_TENURE, POSITION_SIZE] {
@@ -3238,6 +3353,10 @@ mod tests {
             );
             assert_eq!(decoded.vote_locked, size >= POSITION_SIZE_TENURE);
             assert!(!decoded.terminal_returned);
+            assert_eq!(
+                decoded.share_generation,
+                if size >= POSITION_SIZE { 21 } else { 0 }
+            );
             assert_eq!(decoded.shares, if size >= POSITION_SIZE { 777 } else { 0 });
         }
 

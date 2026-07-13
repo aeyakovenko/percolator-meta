@@ -207,4 +207,9 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         subledger_program::POS_TERMINAL_RETURN_SLOT_OFF,
         "Position permissionless terminal-return slot offset"
     );
+    assert_eq!(
+        rd::SUB_POS_SHARE_GENERATION,
+        subledger_program::POS_SHARE_GENERATION_OFF,
+        "Position active share-generation offset"
+    );
 }
