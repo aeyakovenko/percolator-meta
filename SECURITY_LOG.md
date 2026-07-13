@@ -13673,3 +13673,119 @@ and independently updates the ordinary trade fee without moving insurance. The u
 fix is not a descendant of this repo's Percolator security pin, so advancing the dependency would drop
 later liquidation, oracle, OI, and collected-fee fixes. This compatibility guard adds no signer,
 account, authority, recipient, amount, token CPI, or user-value surface.
+
+## Tick - zero-payout Subledger exits bypassed TWAP custody accounting (surface A/C)
+
+Subledger relied on a successful Percolator withdrawal CPI to prove that its bound pool still held
+the asset-0 insurance-operator role. A fully impaired or floor-rounded withdrawal computes a zero
+payout and intentionally skips that CPI, but previously still retired owner principal and pool shares.
+After the pool-to-TWAP handoff, an owner could therefore call the ordinary public withdrawal directly,
+mutate Subledger accounting behind TWAP's back, and leave TWAP's protected principal floor overstated.
+This could suppress later fee-surplus auctions until another custody round-trip; it could not redirect
+or withdraw another user's funds.
+
+The retained real-binary LiteSVM regression hands a funded principal pool to TWAP through a timelocked
+Squads execution, applies the fully impaired loss boundary, and calls the owner-signed ordinary exit.
+The old Subledger binary accepts it and desynchronizes the floor. The fixed binary rejects byte-atomically,
+then proves the same owner can permissionlessly use TWAP's fixed return/full-exit path and any cranker can
+re-handoff custody with a zero live-principal floor. The existing pinned-Percolator liquidation regression
+independently produces the same fully impaired state through public trade, oracle, and crank instructions.
+
+FIX: every insurance exit now verifies that the canonical pool PDA is the live asset-0 insurance
+operator before changing principal, including when no token CPI is needed. Positive and zero-payout exits
+therefore share the same custody precondition. The change adds no signer, authority, destination, amount,
+token CPI, or admin surface and cannot move insurance, backing, collateral, or reward coins.
+
+## Tick - raw market donation could preserve the pinned global batch gate (surface A/C)
+
+Pinned Percolator selects its incompatible batch backing-accounting path whenever the market-global
+backing-fee policy count is nonzero. Meta's governance wrappers already reject activating that state,
+but a raw market creator could enable a policy first and then permissionlessly donate market authority
+to the controller. The handoff preserved the active count while moving the creator's immediate clear
+authority under governance. A cross-margined user whose healthy exit requires final-state-only execution
+could therefore remain blocked until a timelocked zero-policy transaction executed.
+
+The retained real-binary LiteSVM regression initializes a creator-owned market, activates a 77-bps
+policy through the public Percolator API, and attempts the public Meta handoff. The old controller accepts
+it. The fixed controller rejects byte-atomically, lets the outgoing creator clear the policy, and then
+accepts the same market. Its pinned accounting reader is checked against the real wrapper state. The
+existing final-state-only batch regression independently proves that a nonzero count blocks the required
+atomic rotation, and the Squads/TWAP restart lifecycle proves attested predecessor custody remains
+migratable with historical policies.
+
+FIX: raw creator/controller custody must have a zero global backing-fee policy count before market
+donation. Canonical current-layout Subledger/TWAP custody remains the narrow migration exception because
+those fixed programs expose the zero-only recovery route. The change adds no signer, authority, recipient,
+amount, token CPI, or value-moving surface and cannot move insurance, backing, collateral, or reward coins.
+
+## Tick - Subledger custody had no route to clear an inherited global batch gate (surface A/C)
+
+The canonical-custody exception above was incomplete for Subledger. Pinned Percolator authorizes
+`UpdateBackingFeePolicy` with the asset's insurance authority, not marketauth. A raw creator could
+activate both asset-0 policies, grant all asset-0 custody roles to a canonical current-layout pool,
+and then donate marketauth to the Meta controller. The handoff accepted that attested predecessor
+state, but the controller could not clear it and Subledger exposed no policy instruction. Both pinned
+batch interfaces therefore remained disabled until a separate governance/TWAP custody migration.
+
+The retained real-SBF LiteSVM regression constructs that sequence only through public instructions.
+It proves the controller's zero update fails under pool-owned insurance authority, initializes and
+funds two real portfolios, and proves the pinned batch rejects while the inherited count is two. It
+then invokes the new permissionless Subledger recovery, checks both policy domains and insurance
+splits are zero, verifies the ordinary trade fee and all custody roles are unchanged, verifies the
+shared collateral vault is unchanged, and executes the identical batch successfully. A payload-bearing
+variant rejects byte-atomically, proving callers cannot smuggle a policy selector or value.
+
+FIX: current-layout principal-policy asset-0 pools expose one hardcoded recovery instruction. It
+requires the pool's canonical market/program PDA binding and verifies that the same pool currently
+owns asset admin, insurance authority, and insurance operator. It atomically signs exactly two
+`UpdateBackingFeePolicy` CPIs, for domains 0 and 1 with both values fixed to zero. The instruction has
+no signer gate, caller-selected policy, authority, amount, recipient, token account, or token CPI, so
+it restores public batch liveness without adding a path to insurance, backing, collateral, or rewards.
+
+## Tick - retired secondary policy revived the global batch gate on activation (surface A/C)
+
+Pinned Percolator intentionally preserves a retired asset's oracle and backing-fee profile so that
+slot reuse can restore its configuration. Retirement subtracts those policies from the market-global
+active count, however. A raw creator could publicly append asset 1, set a 77-bps backing fee, retire
+the empty slot, and donate a market whose active policy count was zero. A later valid governance
+activation through the Meta controller restored the hidden per-asset policy and incremented the
+global count to one. Both atomic batch interfaces were then disabled even though every controller
+fee setter rejects nonzero policies; recovery required another timelocked zero-policy action.
+
+The retained real-SBF LiteSVM regression executes the complete creator append, fee activation,
+retirement, market donation, and controller activation sequence. It proves the retired market has a
+zero active count while its profile still stores 77/5000, and the old controller commits the later
+activation with count one. The fixed controller activates the same slot, preserves the selected
+insurance, backing, and oracle authorities and ordinary trade fee, but commits with both domain fee
+and split fields plus the global count at zero.
+
+FIX: the already-governed activation proxy records the activated asset index, performs Percolator's
+normal activation, and then signs two hardcoded exact-zero policy updates for that asset before the
+outer instruction returns. Controller activation already requires the controller PDA to be both
+insurance authority and operator, so Percolator authenticates both follow-up CPIs. Any failure rolls
+back all three CPIs. This adds no instruction tag, account, signer, authority selector, recipient,
+amount, token account, or token CPI and cannot move insurance, backing, collateral, or reward coins.
+
+## Tick - absent tied genesis voters could block terminal market cleanup (surface C/D)
+
+Genesis Vote closes new support at the bootstrap deadline and correctly requires a strict weighted
+majority. Retraction remains owner-signed so nobody can erase another depositor's vote. If equal-weight
+voters backed competing proposals and disappeared, however, neither proposal could execute and neither
+lock could be retracted. Subledger's only permissionless owner return required an executed proposal,
+so even after governance resolved an otherwise empty market, the two owner-bound insurance atoms and
+the market slab remained permanently live.
+
+The retained real-SBF LiteSVM regression deposits one base unit from each of two users, gives them equal
+age, backs competing full-supply proposals, proves both triggers reject at the deadline, resolves the
+pinned Percolator market through Squads, and returns both deposits without either owner signature. It
+then closes the drained slab. Separate controls reject the attestation before the exact configured
+deadline and reject a same-program but noncanonical Subledger pool. Existing principal and with-surplus
+terminal-return tests continue to reject redirected, delegated, poisoned, and amount-bearing payouts.
+
+FIX: Genesis Vote exposes a read-only attestation for its canonical schedule-bound config and exact
+configured Subledger pool at or after bootstrap end. Subledger consumes it only after independently
+proving the bound market is resolved and empty. The old proposal account remains an inert compatibility
+slot. The return still has no amount or beneficiary, pays only the complete loss-adjusted position into
+a clean account owned by its recorded depositor, and mutates no ballot or Genesis COIN state. A strict
+tie may leave the points distribution unsealed, but it cannot lock user collateral or prevent terminal
+market cleanup.
