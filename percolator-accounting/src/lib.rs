@@ -531,6 +531,18 @@ pub fn read_asset_backing_authority(
     )
 }
 
+/// Returns the engine-assigned generation identifier for one configured asset slot.
+pub fn read_asset_market_id(data: &[u8], asset_index: usize) -> Result<u64, ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    read_u64(
+        data,
+        asset_engine_offset(asset_index)?
+            + offset_of!(EngineAssetSlotV16Account, asset)
+            + offset_of!(percolator::AssetStateV16Account, market_id),
+    )
+}
+
 /// Returns the insurance withdrawal authority recorded in one pinned-v16 asset profile.
 pub fn read_asset_insurance_authority(
     data: &[u8],
@@ -830,6 +842,17 @@ mod tests {
             read_backing_fee_policy_count(&market),
             Err(ReadError::InvalidHeader)
         );
+    }
+
+    #[test]
+    fn asset_market_id_uses_the_pinned_engine_slot_offset() {
+        let mut market = market_with_insurance_capacity();
+        let offset = asset_engine_offset(0).unwrap()
+            + offset_of!(EngineAssetSlotV16Account, asset)
+            + offset_of!(percolator::AssetStateV16Account, market_id);
+        market[offset..offset + 8].copy_from_slice(&77u64.to_le_bytes());
+        assert_eq!(read_asset_market_id(&market, 0), Ok(77));
+        assert_eq!(read_asset_market_id(&market, 1), Err(ReadError::InvalidAsset));
     }
 
     #[test]

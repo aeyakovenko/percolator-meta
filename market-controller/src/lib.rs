@@ -34,6 +34,7 @@ use solana_program::{
 declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
 const CONTROLLER_SEED: &[u8] = b"market-controller";
+const ASSET_GENERATION_SEED: &[u8] = b"asset-generation";
 const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
@@ -77,17 +78,24 @@ const RESIDUAL_IX_ARCHIVE_PORTFOLIO: u8 = 7;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
+const PERC_IX_CONFIGURE_HYBRID_ORACLE: u8 = 34;
+const PERC_IX_CONFIGURE_EWMA_MARK: u8 = 35;
 const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
+const PERC_IX_CONFIGURE_AUTH_MARK: u8 = 62;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_ACTION_ACTIVATE: u8 = 0;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
+const CONFIGURE_HYBRID_ORACLE_LEN: usize = 156;
+const CONFIGURE_EWMA_MARK_LEN: usize = 35;
+const CONFIGURE_AUTH_MARK_LEN: usize = 19;
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
+const HYBRID_ORACLE_LEG_COUNT_OFFSET: usize = 19;
 const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
 const ACTIVATE_INSURANCE_OPERATOR_OFFSET: usize = 52;
 const ASSET_AUTH_INSURANCE: u8 = 1;
@@ -111,6 +119,24 @@ pub fn controller_address(
             governance.as_ref(),
             market.as_ref(),
             percolator_program.as_ref(),
+        ],
+        &id(),
+    )
+}
+
+/// Read-only witness required when governance targets a non-pristine Percolator asset ID.
+/// The PDA carries no state; its key commits a proposal to one engine generation.
+pub fn asset_generation_witness_address(
+    market: &Pubkey,
+    asset_index: u16,
+    market_id: u64,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            ASSET_GENERATION_SEED,
+            market.as_ref(),
+            &asset_index.to_le_bytes(),
+            &market_id.to_le_bytes(),
         ],
         &id(),
     )
@@ -606,6 +632,54 @@ fn activation_asset_index(data: &[u8]) -> Result<Option<u16>, ProgramError> {
     Ok(Some(u16::from_le_bytes([index[0], index[1]])))
 }
 
+fn generation_bound_asset(data: &[u8]) -> Result<Option<(usize, usize)>, ProgramError> {
+    let (index, native_tail_len) = match data.first().copied() {
+        Some(PERC_IX_CONFIGURE_HYBRID_ORACLE) => {
+            if data.len() != CONFIGURE_HYBRID_ORACLE_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            (
+                data.get(1..3),
+                usize::from(
+                    *data
+                        .get(HYBRID_ORACLE_LEG_COUNT_OFFSET)
+                        .ok_or(ProgramError::InvalidInstructionData)?,
+                ),
+            )
+        }
+        Some(PERC_IX_CONFIGURE_EWMA_MARK) => {
+            if data.len() != CONFIGURE_EWMA_MARK_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            (data.get(1..3), 0)
+        }
+        Some(PERC_IX_UPDATE_ASSET_LIFECYCLE) => {
+            if data.len() != UPDATE_ASSET_LIFECYCLE_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            (data.get(2..4), 0)
+        }
+        Some(PERC_IX_CONFIGURE_AUTH_MARK) => {
+            if data.len() != CONFIGURE_AUTH_MARK_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            (data.get(1..3), 0)
+        }
+        Some(PERC_IX_RESTART_ASSET_ORACLE) => {
+            if data.len() != RESTART_ASSET_ORACLE_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            (data.get(1..3), 0)
+        }
+        _ => return Ok(None),
+    };
+    let index = index.ok_or(ProgramError::InvalidInstructionData)?;
+    Ok(Some((
+        usize::from(u16::from_le_bytes([index[0], index[1]])),
+        native_tail_len,
+    )))
+}
+
 pub fn process_instruction<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -671,6 +745,49 @@ fn process_proxy_admin<'a>(
         market,
         percolator_program,
     )?;
+    let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
+    if let Some((asset_index, native_tail_len)) = generation_bound_asset(data)? {
+        let market_data = market.try_borrow_data()?;
+        match percolator_accounting::read_asset_market_id(&market_data, asset_index) {
+            Ok(market_id) => {
+                let pristine_market_id = u64::try_from(asset_index)
+                    .ok()
+                    .and_then(|index| index.checked_add(1));
+                if pristine_market_id == Some(market_id) {
+                    // The initial generation needs no witness. Rejecting any non-native tail keeps
+                    // an explicitly future-bound proposal from also executing now.
+                    if tail.len() != native_tail_len {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                } else {
+                    let expected_tail_len = native_tail_len
+                        .checked_add(1)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                    if tail.len() != expected_tail_len {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let witness = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
+                    let asset_index = u16::try_from(asset_index)
+                        .map_err(|_| ProgramError::InvalidInstructionData)?;
+                    if witness.is_signer
+                        || witness.is_writable
+                        || *witness.key
+                            != asset_generation_witness_address(
+                                market.key,
+                                asset_index,
+                                market_id,
+                            )
+                            .0
+                    {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                }
+            }
+            Err(percolator_accounting::ReadError::InvalidAsset)
+                if activated_asset == u16::try_from(asset_index).ok() && tail.is_empty() => {}
+            Err(_) => return Err(ProgramError::InvalidAccountData),
+        }
+    }
     if let Some(asset_index) = restart_asset_index(data)? {
         let market_data = market.try_borrow_data()?;
         let controller_key = controller.key.to_bytes();
@@ -685,7 +802,6 @@ fn process_proxy_admin<'a>(
         }
     }
 
-    let tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
     let controller_meta = if controller.is_writable {
         AccountMeta::new(*controller.key, true)
     } else {
@@ -2903,6 +3019,47 @@ mod tests {
     }
 
     #[test]
+    fn generation_binding_covers_every_asset_admin_wire() {
+        let controller = Pubkey::new_unique();
+        let lifecycle = asset_lifecycle_data(1, controller, controller);
+        assert_eq!(generation_bound_asset(&lifecycle), Ok(Some((1, 0))));
+
+        let mut restart = vec![PERC_IX_RESTART_ASSET_ORACLE];
+        restart.extend_from_slice(&7u16.to_le_bytes());
+        restart.extend_from_slice(&100u64.to_le_bytes());
+        restart.extend_from_slice(&1_000_000u64.to_le_bytes());
+        assert_eq!(generation_bound_asset(&restart), Ok(Some((7, 0))));
+
+        let mut ewma = vec![PERC_IX_CONFIGURE_EWMA_MARK];
+        ewma.extend_from_slice(&4u16.to_le_bytes());
+        for value in [100u64, 1_000_000, 1, 0] {
+            ewma.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(ewma.len(), CONFIGURE_EWMA_MARK_LEN);
+        assert_eq!(generation_bound_asset(&ewma), Ok(Some((4, 0))));
+
+        let mut auth = vec![PERC_IX_CONFIGURE_AUTH_MARK];
+        auth.extend_from_slice(&3u16.to_le_bytes());
+        auth.extend_from_slice(&100u64.to_le_bytes());
+        auth.extend_from_slice(&1_000_000u64.to_le_bytes());
+        assert_eq!(auth.len(), CONFIGURE_AUTH_MARK_LEN);
+        assert_eq!(generation_bound_asset(&auth), Ok(Some((3, 0))));
+
+        let mut hybrid = vec![0u8; CONFIGURE_HYBRID_ORACLE_LEN];
+        hybrid[0] = PERC_IX_CONFIGURE_HYBRID_ORACLE;
+        hybrid[1..3].copy_from_slice(&5u16.to_le_bytes());
+        hybrid[HYBRID_ORACLE_LEG_COUNT_OFFSET] = 2;
+        assert_eq!(generation_bound_asset(&hybrid), Ok(Some((5, 2))));
+
+        assert_eq!(generation_bound_asset(&[19]), Ok(None));
+        hybrid.pop();
+        assert_eq!(
+            generation_bound_asset(&hybrid),
+            Err(ProgramError::InvalidInstructionData)
+        );
+    }
+
+    #[test]
     fn controller_pda_binds_governance_market_and_program() {
         let governance = Pubkey::new_unique();
         let market = Pubkey::new_unique();
@@ -2920,5 +3077,17 @@ mod tests {
             controller,
             controller_address(&governance, &market, &Pubkey::new_unique()).0
         );
+    }
+
+    #[test]
+    fn generation_witness_binds_market_slot_and_market_id() {
+        let market = Pubkey::new_unique();
+        let witness = asset_generation_witness_address(&market, 1, 2).0;
+        assert_ne!(
+            witness,
+            asset_generation_witness_address(&Pubkey::new_unique(), 1, 2).0
+        );
+        assert_ne!(witness, asset_generation_witness_address(&market, 2, 2).0);
+        assert_ne!(witness, asset_generation_witness_address(&market, 1, 3).0);
     }
 }

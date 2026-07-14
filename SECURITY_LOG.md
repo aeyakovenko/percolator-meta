@@ -14191,3 +14191,27 @@ must show zero recorded pool principal and no re-handoff in progress. The check 
 value, and adds no signer, administrator, recipient, amount, token account, or withdrawal path. The finding is
 partial because the precise total-loss terminal state is validated structurally rather than reproduced end to end
 through the current one-asset public-loss fixture.
+
+## Tick - stale asset-admin proposals could mutate a restarted generation (surface A, PARTIAL DOS)
+
+Squads commits a controller proposal to a slab key and asset index, but Percolator assigns the slot a
+fresh `market_id` after `RestartAssetOracle` or retired-slot reuse. `DRAIN_ONLY` deliberately carries
+`now_slot = 0`, so an approved proposal for generation A never became stale. Oracle reconfiguration was
+also keyed only by the asset index. The retained real-SBF LiteSVM regression approves a drain and an EWMA
+reconfiguration through the one-week Squads timelock, independently shuts down and restarts the slot as
+generation B, and proves the old controller could apply both actions to B. No collateral moved and
+Percolator permits oracle reconfiguration only while the asset is empty, but the stale actions could
+disable or re-anchor a funded new generation until governance recovered it.
+
+FIX: the read-only accounting crate exposes the pinned engine `market_id`. Canonical pristine slot IDs keep
+their existing wire shape, while every lifecycle, restart, or oracle-configuration proxy whose current
+ID is non-pristine must include a read-only witness PDA derived from the slab, asset index, and current
+`market_id`. The controller validates and removes that final account before the Percolator CPI while
+preserving hybrid oracle feed accounts. Initial generations reject tails beyond the instruction's native
+accounts, so an explicitly future-bound proposal cannot also execute against the current slot. The fixed
+regression proves both stale Squads transactions reject with byte-identical generation-B state and newly
+approved generation-B EWMA, one-feed Pyth hybrid, and lifecycle transactions succeed. The hybrid path
+proves its native feed remains ahead of the stripped witness through real Squads and both SBF programs.
+A second real-SBF lifecycle test covers
+shutdown and retirement after secondary-slot restart. The witness has no data or lamports and adds no
+signer, authority, recipient, token account, CPI, custody state, or value-moving path.

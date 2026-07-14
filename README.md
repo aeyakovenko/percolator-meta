@@ -301,6 +301,12 @@ authority rotation, and backing-bucket movement. External backing providers reta
 asset-local withdrawal path; governance only sets the fee split that sends the configured share
 into insurance. Secondary activation may independently select backing and oracle providers, but its
 insurance authority and operator must be one key so deposit and withdrawal custody cannot diverge.
+Whenever an asset's current Percolator `market_id` differs from its pristine `asset_index + 1`
+identity, every lifecycle, restart, or oracle-configuration proposal must append the read-only
+controller witness derived from the slab, asset index, and current ID; hybrid oracle feed accounts
+precede that witness. Canonical pristine IDs retain the original wire shape. This covers restarted,
+reused, and first-activated slots reached after another slot consumed IDs, without adding state,
+custody, or another signer.
 
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
 cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's

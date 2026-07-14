@@ -5363,6 +5363,49 @@ fn build_controller_proxy_message(
     m
 }
 
+fn build_controller_generation_proxy_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    native_tail: &[Pubkey],
+    generation_witness: &Pubkey,
+    percolator_data: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(0);
+    m.push(1); // market writable
+    m.push(u8::try_from(6 + native_tail.len()).unwrap());
+    m.extend_from_slice(governance.as_ref()); // 0
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(controller.as_ref()); // 2
+    m.extend_from_slice(percolator_program.as_ref()); // 3
+    for account in native_tail {
+        m.extend_from_slice(account.as_ref());
+    }
+    let witness_index = u8::try_from(4 + native_tail.len()).unwrap();
+    m.extend_from_slice(generation_witness.as_ref());
+    let program_index = witness_index.checked_add(1).unwrap();
+    m.extend_from_slice(controller_id().as_ref());
+    m.push(1);
+    m.push(program_index);
+    m.push(u8::try_from(5 + native_tail.len()).unwrap());
+    for index in [0u8, 2, 1, 3] {
+        m.push(index);
+    }
+    for index in 0..native_tail.len() {
+        m.push(u8::try_from(4 + index).unwrap());
+    }
+    m.push(witness_index);
+    let mut data = vec![0u8]; // IX_PROXY_ADMIN
+    data.extend_from_slice(percolator_data);
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 fn build_controller_accept_and_top_up_asset0_backing_message(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -21830,6 +21873,481 @@ fn e2e_approved_old_generation_resolve_cannot_shutdown_reused_market_key() {
         percolator_accounting::market_is_live(&svm.get_account(&market.pubkey()).unwrap().data)
             .unwrap(),
         "rejecting stale governance preserves the replacement market",
+    );
+}
+
+// CROSS-GENERATION ASSET DOS: Squads commits to the slab and asset index, while a successful
+// RestartAssetOracle assigns that slot a fresh Percolator market_id. Approved lifecycle and oracle
+// configuration actions for generation A must not remain executable against generation B.
+#[test]
+fn e2e_approved_old_asset_actions_cannot_mutate_restarted_generation() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    send(
+        &mut svm,
+        &[&payer, &create_key],
+        multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&dao.pubkey()),
+            1,
+            &[(dao.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        ),
+    )
+    .expect("initialize the real Squads governance instance");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the controller-owned market");
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let controller = controller_pda(&squads_vault, &market.pubkey(), &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market.pubkey(), &perc_id()),
+                    false,
+                ),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionlessly initialize the controller-owned market");
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market.pubkey(), false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+
+    let configure = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &PIx::ConfigurePermissionlessResolve {
+            stale_slots: 1_000,
+            force_close_delay_slots: 1,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        1,
+        &configure,
+        &controller_remaining,
+    )
+    .expect("configure the governed restart path");
+
+    let generation_a = percolator_prog::state::read_market(
+        &svm.get_account(&market.pubkey()).unwrap().data,
+    )
+    .unwrap()
+    .1
+    .assets[0]
+    .market_id;
+    let stale_drain = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &PIx::UpdateAssetLifecycle {
+            action: 1,
+            asset_index: 0,
+            now_slot: 0,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    let stale_index = 2u64;
+    let stale_transaction = transaction_pda(&squads, &multisig, stale_index);
+    let stale_proposal = proposal_pda(&squads, &multisig, stale_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &squads,
+            &multisig,
+            &stale_transaction,
+            &dao.pubkey(),
+            &stale_drain,
+        ),
+        proposal_create_ix(
+            &squads,
+            &multisig,
+            &stale_proposal,
+            &dao.pubkey(),
+            stale_index,
+        ),
+        proposal_approve_ix(&squads, &multisig, &stale_proposal, &dao.pubkey()),
+    ] {
+        send(&mut svm, &[&dao], ix).expect("approve the generation-A drain");
+    }
+
+    let stale_oracle = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &PIx::ConfigureEwmaMark {
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: 2_000_000,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        }
+        .encode(),
+    );
+    let stale_oracle_index = 3u64;
+    let stale_oracle_transaction = transaction_pda(&squads, &multisig, stale_oracle_index);
+    let stale_oracle_proposal = proposal_pda(&squads, &multisig, stale_oracle_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &squads,
+            &multisig,
+            &stale_oracle_transaction,
+            &dao.pubkey(),
+            &stale_oracle,
+        ),
+        proposal_create_ix(
+            &squads,
+            &multisig,
+            &stale_oracle_proposal,
+            &dao.pubkey(),
+            stale_oracle_index,
+        ),
+        proposal_approve_ix(
+            &squads,
+            &multisig,
+            &stale_oracle_proposal,
+            &dao.pubkey(),
+        ),
+    ] {
+        send(&mut svm, &[&dao], ix).expect("approve the generation-A oracle config");
+    }
+
+    let shutdown = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &PIx::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 0,
+            now_slot: 100,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        4,
+        &shutdown,
+        &controller_remaining,
+    )
+    .expect("independently shut down generation A");
+    svm.warp_to_slot(101);
+    let restart = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &PIx::RestartAssetOracle {
+            asset_index: 0,
+            now_slot: 101,
+            initial_price: 1_000_000,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        5,
+        &restart,
+        &controller_remaining,
+    )
+    .expect("restart the same slot as generation B");
+
+    let generation_b_before = svm.get_account(&market.pubkey()).unwrap();
+    let (_, group_before) =
+        percolator_prog::state::read_market(&generation_b_before.data).unwrap();
+    assert!(group_before.assets[0].market_id > generation_a);
+    assert_eq!(
+        group_before.assets[0].lifecycle,
+        percolator::AssetLifecycleV16::Active
+    );
+
+    let stale_oracle_execute = vault_transaction_execute_ix(
+        &squads,
+        &multisig,
+        &stale_oracle_proposal,
+        &stale_oracle_transaction,
+        &dao.pubkey(),
+        &controller_remaining,
+    );
+    assert!(
+        send(&mut svm, &[&dao], stale_oracle_execute).is_err(),
+        "a generation-A oracle config must not re-anchor generation B"
+    );
+    assert_eq!(
+        svm.get_account(&market.pubkey()).unwrap(),
+        generation_b_before,
+        "stale oracle rejection preserves all generation-B accounting"
+    );
+
+    let stale_execute = vault_transaction_execute_ix(
+        &squads,
+        &multisig,
+        &stale_proposal,
+        &stale_transaction,
+        &dao.pubkey(),
+        &controller_remaining,
+    );
+    let stale_result = send(&mut svm, &[&dao], stale_execute);
+    assert!(
+        stale_result.is_err(),
+        "a generation-A action must not drain generation B"
+    );
+    assert_eq!(
+        svm.get_account(&market.pubkey()).unwrap(),
+        generation_b_before,
+        "rejection is atomic and preserves all generation-B accounting"
+    );
+
+    let generation_b = group_before.assets[0].market_id;
+    let generation_witness = market_controller_program::asset_generation_witness_address(
+        &market.pubkey(),
+        0,
+        generation_b,
+    )
+    .0;
+    let bound_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market.pubkey(), false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(generation_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let fresh_oracle = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &[],
+        &generation_witness,
+        &PIx::ConfigureEwmaMark {
+            asset_index: 0,
+            now_slot: 101,
+            initial_mark_e6: 1_500_000,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        6,
+        &fresh_oracle,
+        &bound_remaining,
+    )
+    .expect("a generation-B oracle proposal with the witness remains usable");
+    let (_, reconfigured_group) = percolator_prog::state::read_market(
+        &svm.get_account(&market.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(reconfigured_group.assets[0].market_id, generation_b);
+    assert_eq!(reconfigured_group.assets[0].effective_price, 1_500_000);
+
+    // Hybrid configuration carries its native feed accounts before the read-only generation
+    // witness. Exercise that variable tail through real Squads and both SBF programs so the
+    // controller cannot accidentally forward the witness as an oracle or drop the real feed.
+    let feed = Pubkey::new_unique();
+    let feed_id = [0x5au8; 32];
+    let hybrid_clock = svm.get_sysvar::<Clock>();
+    let mut pyth_data = vec![0u8; 134];
+    pyth_data[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
+    pyth_data[40] = 1;
+    pyth_data[41..73].copy_from_slice(&feed_id);
+    pyth_data[73..81].copy_from_slice(&1_750_000i64.to_le_bytes());
+    pyth_data[81..89].copy_from_slice(&1u64.to_le_bytes());
+    pyth_data[89..93].copy_from_slice(&(-6i32).to_le_bytes());
+    let publish_time = hybrid_clock.unix_timestamp + i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    pyth_data[93..101].copy_from_slice(&publish_time.to_le_bytes());
+    svm.set_account(
+        feed,
+        Account {
+            lamports: 1_000_000_000,
+            data: pyth_data,
+            owner: percolator_prog::oracle_v16::PYTH_RECEIVER_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let hybrid = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &[feed],
+        &generation_witness,
+        &PIx::ConfigureHybridOracle {
+            asset_index: 0,
+            now_slot: hybrid_clock.slot,
+            now_unix_ts: hybrid_clock.unix_timestamp,
+            oracle_leg_count: 1,
+            oracle_leg_flags: 0,
+            max_staleness_secs: 60,
+            hybrid_soft_stale_slots: 3,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            invert: 0,
+            unit_scale: 0,
+            conf_filter_bps: 500,
+            oracle_leg_feeds: [feed_id, [0; 32], [0; 32]],
+        }
+        .encode(),
+    );
+    let hybrid_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market.pubkey(), false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(feed, false),
+        AccountMeta::new_readonly(generation_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &hybrid,
+        &hybrid_remaining,
+    )
+    .expect("a generation-bound hybrid proposal preserves its native feed tail");
+    let hybrid_profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market.pubkey()).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(hybrid_profile.oracle_target_price_e6, 1_750_000);
+
+    let fresh_drain = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &[],
+        &generation_witness,
+        &PIx::UpdateAssetLifecycle {
+            action: 1,
+            asset_index: 0,
+            now_slot: 0,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        8,
+        &fresh_drain,
+        &bound_remaining,
+    )
+    .expect("a proposal bound to generation B remains usable");
+    let (_, drained_group) = percolator_prog::state::read_market(
+        &svm.get_account(&market.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(drained_group.assets[0].market_id, generation_b);
+    assert_eq!(
+        drained_group.assets[0].lifecycle,
+        percolator::AssetLifecycleV16::DrainOnly
     );
 }
 
@@ -46375,6 +46893,13 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         controller.to_bytes(),
         "the pinned restart preserves the restored constrained operator"
     );
+    let restarted_market_id = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap()
+    .1
+    .assets[1]
+    .market_id;
 
     trade_round_trip(&mut svm);
     let second_fee_insurance = percolator_accounting::read_asset_insurance_remaining(
@@ -46386,22 +46911,32 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         second_fee_insurance, fee_insurance,
         "the restarted market accrues a second real fee balance"
     );
+    let mut second_shutdown = proxy(
+        PIx::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 1,
+            now_slot: 111,
+            initial_price: 0,
+            insurance_authority: [0u8; 32],
+            insurance_operator: [0u8; 32],
+            backing_bucket_authority: [0u8; 32],
+            oracle_authority: [0u8; 32],
+        }
+        .encode(),
+    );
+    second_shutdown.accounts.push(AccountMeta::new_readonly(
+        market_controller_program::asset_generation_witness_address(
+            &market,
+            1,
+            restarted_market_id,
+        )
+        .0,
+        false,
+    ));
     send(
         &mut svm,
         &[&payer, &governance],
-        proxy(
-            PIx::UpdateAssetLifecycle {
-                action: 3,
-                asset_index: 1,
-                now_slot: 111,
-                initial_price: 0,
-                insurance_authority: [0u8; 32],
-                insurance_operator: [0u8; 32],
-                backing_bucket_authority: [0u8; 32],
-                oracle_authority: [0u8; 32],
-            }
-            .encode(),
-        ),
+        second_shutdown,
     )
     .expect("shut down the restarted fee-bearing asset");
     let mut clock = svm.get_sysvar::<Clock>();
@@ -46455,7 +46990,17 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         .unwrap(),
         0
     );
-    send(&mut svm, &[&payer, &governance], retire(122))
+    let mut second_retire = retire(122);
+    second_retire.accounts.push(AccountMeta::new_readonly(
+        market_controller_program::asset_generation_witness_address(
+            &market,
+            1,
+            restarted_market_id,
+        )
+        .0,
+        false,
+    ));
+    send(&mut svm, &[&payer, &governance], second_retire)
         .expect("the restarted secondary asset retires without resolving the whole market");
 
     let mut recovered_trader_principal = 0u128;
