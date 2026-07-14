@@ -1040,13 +1040,12 @@ fn begin_fully_impaired_recapitalization(pool: &mut Pool, priced_balance: u64) -
     Ok(())
 }
 
-/// Represent a live balance with no owner claims as unowned reserve shares. Without this
-/// normalization, a public donation before the first deposit can make a minimum deposit round to
-/// zero shares and deny entry even though the donor can never recover the reserve.
+/// Represent a live balance with no owner claims as unowned reserve shares. Refresh the complete
+/// reserve even when a prior empty epoch already left unowned shares: a later public donation can
+/// otherwise make a minimum deposit round to zero despite having no owner who can claim it.
 fn normalize_empty_with_surplus_reserve(pool: &mut Pool, priced_balance: u64) -> ProgramResult {
     if pool.policy != POLICY_WITH_SURPLUS
         || pool.outstanding_principal != 0
-        || pool.total_shares != 0
         || priced_balance == 0
     {
         return Ok(());

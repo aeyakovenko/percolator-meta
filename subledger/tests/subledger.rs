@@ -816,6 +816,86 @@ fn with_surplus_rounding_reserve_does_not_block_the_next_minimum_deposit() {
 }
 
 #[test]
+fn public_donation_after_an_empty_epoch_cannot_block_the_next_minimum_deposit() {
+    let mut env = Env::new();
+    let asset_id = 4;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &alice.pubkey(),
+            &alice_ata,
+            &vault,
+            1_000_000,
+        )],
+        &[&alice],
+    )
+    .expect("open first deposit epoch");
+    let auth = clone_kp(&env.mint_authority);
+    mint_to(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &auth,
+        &vault,
+        1,
+    );
+    env.send(
+        &[withdraw_ix(
+            &pool,
+            &alice.pubkey(),
+            &alice_ata,
+            &vault,
+        )],
+        &[&alice],
+    )
+    .expect("close first deposit epoch");
+    assert_eq!(env.token_amount(&vault), 1, "one atom remains as unowned reserve");
+
+    let reserve_donation = 10_000_000u64;
+    let (donor, donor_ata) = new_depositor(&mut env, reserve_donation);
+    let donate = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &donor_ata,
+        &vault,
+        &donor.pubkey(),
+        &[],
+        reserve_donation,
+    )
+    .unwrap();
+    env.send(&[donate], &[&donor])
+        .expect("publicly donate after every owner has exited");
+
+    let reserve = reserve_donation + 1;
+    let (bob, bob_ata) = new_depositor(&mut env, 1);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &bob.pubkey(),
+            &bob_ata,
+            &vault,
+            1,
+        )],
+        &[&bob],
+    )
+    .expect("an empty-epoch donation cannot deny a one-atom deposit");
+    env.send(
+        &[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)],
+        &[&bob],
+    )
+    .expect("minimum depositor exits without acquiring protocol reserve");
+    assert_eq!(env.token_amount(&bob_ata), 1);
+    assert_eq!(env.token_amount(&vault), reserve);
+}
+
+#[test]
 fn with_surplus_preexisting_donation_cannot_block_the_first_minimum_deposit() {
     let mut env = Env::new();
     let asset_id = 4;

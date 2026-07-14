@@ -14071,17 +14071,23 @@ custody to the Genesis pool. A fresh `POLICY_WITH_SURPLUS` pool had zero real sh
 deposit against only the fixed virtual-share offset and the complete preexisting insurance balance. A public
 donation of `1,000,000` atoms made the documented one-atom vote deposit mint zero shares. The rounding guard
 safely rejected before moving principal, but the minimum depositor could not enter during the finite deposit
-window. The same condition was reachable by a direct SPL-token donation to an empty own-vault pool.
+window. The same condition was reachable by a direct SPL-token donation to an empty own-vault pool. A first
+fix normalized only a pool whose share denominator was zero. After one epoch exited with a rounding reserve,
+all remaining shares were again unowned, but a subsequent public donation could still stale that nonzero
+denominator and deny the next minimum deposit.
 
 The retained real-chain LiteSVM regression initializes a permissionless controller market, initializes the
 supported with-surplus Genesis pool, donates through the controller into pinned Percolator, grants custody,
 and performs the one-atom deposit and full owner exit. The old Subledger SBF rejects the deposit with
 `InvalidArgument`. A second real-SBF regression reaches the same state through a public SPL-token transfer to
-an own-vault pool.
+an own-vault pool. A third closes a complete owner epoch, donates `10,000,000` atoms through SPL Token, and
+proves the next one-atom depositor enters, exits, and acquires none of the reserve. The intermediate binary
+with first-deposit-only normalization rejects that deposit with `InvalidArgument`.
 
-FIX: before the first with-surplus mint, a pool with no owner principal or real shares represents its complete
-live balance as unowned reserve shares. The minimum depositor then mints and redeems exactly one atom, while
-the donated reserve remains in protocol custody and cannot be claimed by that depositor. The existing
+FIX: before every empty-epoch with-surplus mint, a pool with no owner principal represents its complete live
+balance as unowned reserve shares. This refresh is valid even when an earlier exit left a nonzero reserve
+denominator, because no owned shares remain. The minimum depositor then mints and redeems exactly one atom,
+while the donated reserve remains in protocol custody and cannot be claimed by that depositor. The existing
 post-exit reserve normalization uses the same invariant. The change adds no instruction, signer,
 administrator, recipient, token account, CPI, authority, or fund-moving path. The finding is partial because
 the donor burns capital, only sub-threshold deposits are denied, and the default Genesis policy is principal
