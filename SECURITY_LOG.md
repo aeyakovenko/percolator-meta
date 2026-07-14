@@ -14063,3 +14063,26 @@ FIX: `trigger` authenticates the canonical Subledger pool's immutable schedule a
 marker remains the transaction-ordering guard for concurrent returns. Retraction and owner-bound principal
 recovery are unchanged. The change adds no instruction, signer, administrator, recipient, amount, token
 account, authority, CPI, or fund-moving path.
+
+## Tick - preexisting reserve could deny minimum with-surplus deposits (surface B, PARTIAL DOS)
+
+The permissionless controller donation path intentionally funds asset-0 insurance before governance grants
+custody to the Genesis pool. A fresh `POLICY_WITH_SURPLUS` pool had zero real shares, so it priced its first
+deposit against only the fixed virtual-share offset and the complete preexisting insurance balance. A public
+donation of `1,000,000` atoms made the documented one-atom vote deposit mint zero shares. The rounding guard
+safely rejected before moving principal, but the minimum depositor could not enter during the finite deposit
+window. The same condition was reachable by a direct SPL-token donation to an empty own-vault pool.
+
+The retained real-chain LiteSVM regression initializes a permissionless controller market, initializes the
+supported with-surplus Genesis pool, donates through the controller into pinned Percolator, grants custody,
+and performs the one-atom deposit and full owner exit. The old Subledger SBF rejects the deposit with
+`InvalidArgument`. A second real-SBF regression reaches the same state through a public SPL-token transfer to
+an own-vault pool.
+
+FIX: before the first with-surplus mint, a pool with no owner principal or real shares represents its complete
+live balance as unowned reserve shares. The minimum depositor then mints and redeems exactly one atom, while
+the donated reserve remains in protocol custody and cannot be claimed by that depositor. The existing
+post-exit reserve normalization uses the same invariant. The change adds no instruction, signer,
+administrator, recipient, token account, CPI, authority, or fund-moving path. The finding is partial because
+the donor burns capital, only sub-threshold deposits are denied, and the default Genesis policy is principal
+only; the supported with-surplus configuration and finite public deposit window are required.

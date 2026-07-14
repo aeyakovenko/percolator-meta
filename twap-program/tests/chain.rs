@@ -6396,6 +6396,240 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     assert_eq!(token_amount(&svm, &perc_vault), 0);
 }
 
+// PUBLIC DEPOSIT DOS: the controller deliberately accepts inbound-only insurance before granting
+// custody to Genesis. Under POLICY_WITH_SURPLUS that pre-existing balance belongs to the protocol,
+// not the first depositor, and must not make the configured one-atom vote deposit round to zero
+// shares. Exercise the real controller -> Percolator -> Subledger chain, then prove the depositor
+// can recover exactly its principal without acquiring the donated reserve.
+#[test]
+fn e2e_public_pregrant_donation_cannot_block_a_minimum_with_surplus_genesis_deposit() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let governance = Keypair::new();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &slab_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller-owned market init");
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &perc_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_INSURANCE,
+    );
+    let vote_auth = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_WITH_SURPLUS);
+    append_test_genesis_schedule(&mut pool_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(perc_vault, false),
+                AccountMeta::new_readonly(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_auth, false),
+                AccountMeta::new_readonly(coin_mint, false),
+            ],
+            data: pool_data,
+        },
+    )
+    .expect("permissionless with-surplus genesis pool init");
+
+    // One whole six-decimal token is enough to make a one-atom deposit mint zero shares against
+    // an otherwise empty pool unless the pre-existing protocol reserve is normalized.
+    let reserve = 1_000_000u64;
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    let controller_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        reserve,
+    );
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &donor],
+        controller_donate_insurance_ix(
+            &donor.pubkey(),
+            &governance.pubkey(),
+            &controller,
+            &slab,
+            &donor_source,
+            &controller_holding,
+            &perc_vault,
+            reserve,
+        ),
+    )
+    .expect("public donor supplies pre-grant protocol insurance");
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: vec![2u8], // IX_GRANT_GENESIS_POOL
+        },
+    )
+    .expect("governance grants the funded controller market to Genesis");
+
+    let alice = Keypair::new();
+    svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
+    let alice_ata = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    let position = sub_position_pda(&pool, &alice.pubkey());
+    set_token(
+        &mut svm,
+        &alice_ata,
+        &collateral_mint,
+        &alice.pubkey(),
+        1,
+    );
+    set_token(&mut svm, &holding, &collateral_mint, &pool, 0);
+    let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &alice],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(alice.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(alice_ata, false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("pre-existing protocol reserve cannot deny the minimum vote deposit");
+    assert_eq!(token_amount(&svm, &alice_ata), 0);
+    assert_eq!(token_amount(&svm, &perc_vault), reserve + 1);
+
+    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &alice],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(alice.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(alice_ata, false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: withdraw_data,
+        },
+    )
+    .expect("minimum depositor exits without acquiring protocol reserve");
+    assert_eq!(token_amount(&svm, &alice_ata), 1);
+    assert_eq!(token_amount(&svm, &perc_vault), reserve);
+}
+
 fn init_creator_owned_market(
     svm: &mut LiteSVM,
     payer: &Keypair,

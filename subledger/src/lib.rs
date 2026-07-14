@@ -1040,6 +1040,25 @@ fn begin_fully_impaired_recapitalization(pool: &mut Pool, priced_balance: u64) -
     Ok(())
 }
 
+/// Represent a live balance with no owner claims as unowned reserve shares. Without this
+/// normalization, a public donation before the first deposit can make a minimum deposit round to
+/// zero shares and deny entry even though the donor can never recover the reserve.
+fn normalize_empty_with_surplus_reserve(pool: &mut Pool, priced_balance: u64) -> ProgramResult {
+    if pool.policy != POLICY_WITH_SURPLUS
+        || pool.outstanding_principal != 0
+        || pool.total_shares != 0
+        || priced_balance == 0
+    {
+        return Ok(());
+    }
+    let (reset_generation, _) = share_generation_parts(pool.share_generation)?;
+    pool.share_generation = encode_share_generation(reset_generation, 0)?;
+    pool.total_shares = (priced_balance as u128)
+        .checked_mul(VIRTUAL_SHARES)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok(())
+}
+
 fn rescale_insurance_shares(pool: &mut Pool) -> ProgramResult {
     let (reset_generation, scale_epoch) = share_generation_parts(pool.share_generation)?;
     // Pool totals round up while each lazily touched position rounds down. This keeps the sum of
@@ -1628,6 +1647,7 @@ fn process_deposit(
     // tenure (matches the insurance path + the documented share model; POLICY_PRINCIPAL mints none).
     let shares_minted = if pool.policy == POLICY_WITH_SURPLUS {
         let balance_before = token_balance(vault)?;
+        normalize_empty_with_surplus_reserve(&mut pool, balance_before)?;
         let s = mint_shares(amount, pool.total_shares, balance_before)?;
         require_bounded_share_rounding(amount, s, pool.total_shares, balance_before)?;
         s
@@ -2142,6 +2162,7 @@ fn process_insurance_deposit(
     } else {
         insurance_before
     };
+    normalize_empty_with_surplus_reserve(&mut pool, priced_balance_before)?;
     begin_fully_impaired_recapitalization(&mut pool, priced_balance_before)?;
     let (shares_minted, virtual_shares) =
         mint_insurance_shares_with_capacity(&mut pool, amount, priced_balance_before)?;
@@ -3779,6 +3800,49 @@ mod tests {
                 .unwrap(),
             0,
             "principal pools retain their zero-claim terminal attestation",
+        );
+    }
+
+    #[test]
+    fn preexisting_reserve_is_normalized_before_the_first_with_surplus_mint() {
+        let reserve_balance = 1_000_000u64;
+        let mut pool = Pool {
+            mint: Pubkey::new_unique(),
+            asset_id: 0,
+            vault: Pubkey::new_unique(),
+            outstanding_principal: 0,
+            policy: POLICY_WITH_SURPLUS,
+            domain: DOMAIN_INSURANCE,
+            bump: 255,
+            share_generation: 0,
+            market_slab: Pubkey::new_unique(),
+            percolator_program: Pubkey::new_unique(),
+            vote_authority: Pubkey::new_unique(),
+            total_shares: 0,
+            coin_mint: Pubkey::new_unique(),
+            deposit_deadline_slot: 2,
+            deposit_window_slots: 1,
+            deposit_start_slot: 0,
+            bootstrap_delay_slots: 2,
+        };
+
+        normalize_empty_with_surplus_reserve(&mut pool, reserve_balance).unwrap();
+        assert_eq!(
+            pool.total_shares,
+            reserve_balance as u128 * VIRTUAL_SHARES
+        );
+        let minted = mint_shares(1, pool.total_shares, reserve_balance).unwrap();
+        require_bounded_share_rounding(1, minted, pool.total_shares, reserve_balance).unwrap();
+        assert_eq!(minted, VIRTUAL_SHARES);
+        assert_eq!(
+            redeem_shares(
+                minted,
+                reserve_balance + 1,
+                pool.total_shares + minted,
+            )
+            .unwrap(),
+            1,
+            "the depositor owns its atom but none of the unowned reserve",
         );
     }
 

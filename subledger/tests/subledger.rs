@@ -815,6 +815,65 @@ fn with_surplus_rounding_reserve_does_not_block_the_next_minimum_deposit() {
     assert_eq!(env.token_amount(&vault), 2, "protocol reserve remains segregated");
 }
 
+#[test]
+fn with_surplus_preexisting_donation_cannot_block_the_first_minimum_deposit() {
+    let mut env = Env::new();
+    let asset_id = 4;
+    let policy_with_surplus = 1u8;
+    let pool = pool_pda(&env.mint, asset_id, policy_with_surplus);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(
+        &[init_pool_ix(
+            &env,
+            &pool,
+            &vault,
+            asset_id,
+            policy_with_surplus,
+        )],
+        &[],
+    )
+    .expect("init with-surplus pool");
+
+    let reserve = 1_000_000u64;
+    let (donor, donor_ata) = new_depositor(&mut env, reserve);
+    let donate = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &donor_ata,
+        &vault,
+        &donor.pubkey(),
+        &[],
+        reserve,
+    )
+    .unwrap();
+    env.send(&[donate], &[&donor])
+        .expect("public SPL-token donation into the empty pool");
+
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &alice.pubkey(),
+            &alice_ata,
+            &vault,
+            1,
+        )],
+        &[&alice],
+    )
+    .expect("pre-existing reserve cannot deny a one-atom first deposit");
+    env.send(
+        &[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)],
+        &[&alice],
+    )
+    .expect("minimum depositor exits");
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(
+        env.token_amount(&vault),
+        reserve,
+        "the public donation remains unowned protocol reserve",
+    );
+}
+
 // TENURE-FAIRNESS (finding HT): the branch claims (lib.rs) POLICY_WITH_SURPLUS is SHARE-based so a
 // LATE depositor cannot claim surplus that accrued before it joined. The INSURANCE path honours that
 // (shares), but the OWN-VAULT path used pro-rata-by-principal, so a late depositor captured a pro-rata
