@@ -33443,6 +33443,38 @@ fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
     let env = setup_handoff(&mut svm, &payer);
     let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
 
+    // Configure a distinct TWAP-owned savings sink. A public recovery must not
+    // alias holding to this account: execute explicitly keeps the auction budget
+    // and savings allocation segregated, and an initialized alias would no longer
+    // qualify for another frozen-account recovery.
+    let savings_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings_sink,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
+    let economics_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &economics,
+        &economics_remaining,
+    )
+    .expect("dao configures the segregated savings sink");
+
     // A prior round may leave protocol-only budget in holding. It is not bidder
     // settlement or reserved insurance principal, and must not keep the live book
     // bound forever once the external issuer permanently freezes it.
@@ -33589,6 +33621,15 @@ fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
         book_before_failed_execute
     );
 
+    assert!(
+        send(&mut svm, &[&cranker], replace_holding(savings_sink)).is_err(),
+        "replacement holding cannot alias the configured savings sink"
+    );
+    assert_eq!(
+        svm.get_account(&bk.book).unwrap(),
+        book_before_failed_execute
+    );
+
     let preloaded_holding = Pubkey::new_unique();
     set_token(
         &mut svm,
@@ -33620,7 +33661,7 @@ fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
     send(
         &mut svm,
         &[&cranker],
-        execute_ix(
+        execute_ix_full(
             &cranker.pubkey(),
             &env,
             &bk.book,
@@ -33628,6 +33669,7 @@ fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
             &bk.settlement_usd,
             &bk.book_escrow,
             &bk.coin_escrow,
+            Some(savings_sink),
             None,
         ),
     )
@@ -33651,6 +33693,7 @@ fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
     assert_eq!(token_amount(&svm, &bidder_usd), 400_000);
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
     assert_eq!(token_amount(&svm, &clean_holding), 0);
+    assert_eq!(token_amount(&svm, &savings_sink), 50_000);
     assert_eq!(token_amount(&svm, &bk.holding), 7);
 }
 

@@ -14130,12 +14130,15 @@ The retained real-Percolator LiteSVM regression commits `400,000` COIN after put
 in holding, freezes holding, revokes freeze authority, and proves failed execution leaves the market, book,
 escrow, and frozen balance unchanged. The old SBF rejects the new instruction. The fixed chain rejects
 cranker-owned and preloaded replacements, binds a clean empty account owned by the existing TWAP authority PDA,
-settles the original bid, pays the exact USD, and leaves the seven already-frozen units untouched.
+rejects the separately configured savings sink as an irreparable holding alias, settles the original bid,
+pays the exact USD, routes the configured savings share, and leaves the seven already-frozen units untouched.
 
 FIX: a permissionless value-neutral instruction can change only `book.holding` while the book is open. It
 requires the old exact binding to be an SPL-frozen collateral account owned by the rederived TWAP authority PDA,
 and the replacement to be an initialized, empty, same-mint SPL account owned solely by that PDA with no delegate
-or close authority. Shared validation now enforces the same replacement shape for settlement and holding.
+or close authority. It also rejects the persisted savings-account key so a public repair cannot merge the two
+collateral buckets and strand execution on a non-frozen alias. Shared validation now enforces the same replacement
+shape for settlement and holding.
 The instruction moves no token, accepts no recipient or amount, and adds no signer, governance privilege, CPI,
 or withdrawal path. Holding contains auctionable protocol surplus only: bidder payouts remain in settlement and
 the monotonic reserved floor remains inside Percolator. The finding is partial because it requires the external
