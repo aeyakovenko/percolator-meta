@@ -183,6 +183,9 @@ const IX_RESTART_ASSET0: u8 = 21;
 // can only replace already-frozen custody while the book is open, and the new
 // empty account remains exclusively owned by the same book-escrow PDA.
 const IX_REPLACE_FROZEN_SETTLEMENT: u8 = 22;
+// Permissionless recovery for an externally frozen canonical auction holding.
+// The replacement remains exclusively owned by the same TWAP authority PDA.
+const IX_REPLACE_FROZEN_HOLDING: u8 = 23;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -556,6 +559,9 @@ pub fn process_instruction(
         IX_RESTART_ASSET0 => process_restart_asset0(program_id, accounts, data),
         IX_REPLACE_FROZEN_SETTLEMENT => {
             process_replace_frozen_settlement(program_id, accounts, data)
+        }
+        IX_REPLACE_FROZEN_HOLDING => {
+            process_replace_frozen_holding(program_id, accounts, data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -3118,21 +3124,39 @@ fn process_replace_frozen_settlement(
     if *book_escrow.key != expected_escrow {
         return Err(ProgramError::InvalidSeeds);
     }
-    if frozen_settlement.owner != &spl_token::ID || replacement_settlement.owner != &spl_token::ID {
+    validate_frozen_custody_replacement(
+        frozen_settlement,
+        replacement_settlement,
+        &expected_escrow,
+        &book.collateral_mint,
+    )?;
+
+    book_account.try_borrow_mut_data()?[BK_SETTLEMENT_USD..BK_SETTLEMENT_USD + 32]
+        .copy_from_slice(replacement_settlement.key.as_ref());
+    Ok(())
+}
+
+fn validate_frozen_custody_replacement(
+    frozen_account: &AccountInfo,
+    replacement_account: &AccountInfo,
+    expected_authority: &Pubkey,
+    expected_mint: &Pubkey,
+) -> ProgramResult {
+    if frozen_account.owner != &spl_token::ID || replacement_account.owner != &spl_token::ID {
         return Err(ProgramError::IllegalOwner);
     }
-    let frozen = spl_token::state::Account::unpack(&frozen_settlement.try_borrow_data()?)?;
+    let frozen = spl_token::state::Account::unpack(&frozen_account.try_borrow_data()?)?;
     if frozen.state != spl_token::state::AccountState::Frozen
-        || frozen.owner != expected_escrow
-        || frozen.mint != book.collateral_mint
+        || frozen.owner != *expected_authority
+        || frozen.mint != *expected_mint
     {
         return Err(ProgramError::InvalidAccountData);
     }
     let replacement =
-        spl_token::state::Account::unpack(&replacement_settlement.try_borrow_data()?)?;
+        spl_token::state::Account::unpack(&replacement_account.try_borrow_data()?)?;
     if replacement.state != spl_token::state::AccountState::Initialized
-        || replacement.owner != expected_escrow
-        || replacement.mint != book.collateral_mint
+        || replacement.owner != *expected_authority
+        || replacement.mint != *expected_mint
         || replacement.amount != 0
         || replacement.delegate.is_some()
         || replacement.delegated_amount != 0
@@ -3140,9 +3164,65 @@ fn process_replace_frozen_settlement(
     {
         return Err(ProgramError::InvalidAccountData);
     }
+    Ok(())
+}
 
-    book_account.try_borrow_mut_data()?[BK_SETTLEMENT_USD..BK_SETTLEMENT_USD + 32]
-        .copy_from_slice(replacement_settlement.key.as_ref());
+// replace_frozen_holding accounts:
+// [config, book(w), twap_authority(pda), frozen_holding, replacement_holding]
+// data: none
+//
+// Holding contains only protocol surplus made available for auction; bidder
+// settlement lives under the separate book-escrow PDA and reserved insurance
+// remains inside Percolator. An external collateral issuer can permanently freeze
+// holding after initialization, so an OPEN book may abandon that unusable custody
+// for a clean empty account controlled by the exact same TWAP authority PDA. The
+// instruction does not move the old protocol balance or accept a beneficiary.
+fn process_replace_frozen_holding(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let twap_authority = next_account_info(iter)?;
+    let frozen_holding = next_account_info(iter)?;
+    let replacement_holding = next_account_info(iter)?;
+    if iter.next().is_some() || !book_account.is_writable {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key
+        || book.state != BOOK_STATE_OPEN
+        || *frozen_holding.key != book.holding
+        || frozen_holding.key == replacement_holding.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let auth_bump = [config.authority_bump];
+    let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
+    let expected_auth = Pubkey::create_program_address(&auth_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *twap_authority.key != expected_auth {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    validate_frozen_custody_replacement(
+        frozen_holding,
+        replacement_holding,
+        &expected_auth,
+        &book.collateral_mint,
+    )?;
+
+    book_account.try_borrow_mut_data()?[BK_HOLDING..BK_HOLDING + 32]
+        .copy_from_slice(replacement_holding.key.as_ref());
     Ok(())
 }
 

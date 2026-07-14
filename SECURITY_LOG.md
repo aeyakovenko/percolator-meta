@@ -14117,3 +14117,26 @@ book-escrow-owned alias is rejected without changing the book. The instruction m
 recipient or amount, and adds no signer, governance privilege, or withdrawal path.
 The finding is partial because it requires the collateral mint's external freeze authority; bidder principal
 was recoverable after the cooldown, while the repeated auction lifecycle was permanently unavailable.
+
+## Tick - frozen canonical holding could permanently disable surplus auctions (surface C, PARTIAL DOS)
+
+The shared-settlement recovery did not cover the book's other immutable collateral account: canonical holding.
+Execute uses holding as the Percolator surplus-withdrawal destination and as the source of every winning USD
+payment. A collateral issuer could freeze it after initialization and revoke freeze authority. Every execute
+then failed atomically, leaving bids owner-cancellable after their cooldown but permanently disabling all later
+buyback rounds. A prior round's unspent protocol budget could also remain frozen there.
+
+The retained real-Percolator LiteSVM regression commits `400,000` COIN after putting seven protocol-only units
+in holding, freezes holding, revokes freeze authority, and proves failed execution leaves the market, book,
+escrow, and frozen balance unchanged. The old SBF rejects the new instruction. The fixed chain rejects
+cranker-owned and preloaded replacements, binds a clean empty account owned by the existing TWAP authority PDA,
+settles the original bid, pays the exact USD, and leaves the seven already-frozen units untouched.
+
+FIX: a permissionless value-neutral instruction can change only `book.holding` while the book is open. It
+requires the old exact binding to be an SPL-frozen collateral account owned by the rederived TWAP authority PDA,
+and the replacement to be an initialized, empty, same-mint SPL account owned solely by that PDA with no delegate
+or close authority. Shared validation now enforces the same replacement shape for settlement and holding.
+The instruction moves no token, accepts no recipient or amount, and adds no signer, governance privilege, CPI,
+or withdrawal path. Holding contains auctionable protocol surplus only: bidder payouts remain in settlement and
+the monotonic reserved floor remains inside Percolator. The finding is partial because it requires the external
+collateral freeze authority; no user deposit or bidder principal becomes withdrawable by another party.

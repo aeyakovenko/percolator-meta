@@ -33353,7 +33353,6 @@ fn e2e_frozen_shared_settlement_can_be_replaced_without_exposing_bidder_funds() 
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
     assert_eq!(token_amount(&svm, &clean_settlement), 0);
 }
-
 // A same-mint book can configure a clean COIN sink owned by the book escrow PDA.
 // Permissionless settlement repair must not make that reward sink bidder custody:
 // claims account only for settlement and refunds, so bought rewards would remain
@@ -33421,6 +33420,240 @@ fn e2e_settlement_replacement_cannot_alias_the_same_mint_coin_sink() {
     );
     assert_eq!(svm.get_account(&bk.book).unwrap(), book_before);
 }
+
+// PARTIAL PUBLIC DOS: the collateral issuer can also freeze the canonical TWAP
+// holding after book initialization. Execute then cannot pull surplus into the
+// auction budget, while the immutable holding binding disables every future
+// round. The holding contains protocol surplus, never bidder-attributed funds, so
+// recovery may abandon frozen custody but can bind only a clean empty account
+// owned by the same TWAP authority PDA.
+#[test]
+fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    // A prior round may leave protocol-only budget in holding. It is not bidder
+    // settlement or reserved insurance principal, and must not keep the live book
+    // bound forever once the external issuer permanently freezes it.
+    set_token(
+        &mut svm,
+        &bk.holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        7,
+    );
+
+    let freeze_authority = Keypair::new();
+    let mut mint_data = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: COption::None,
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::Some(freeze_authority.pubkey()),
+        },
+        &mut mint_data,
+    )
+    .unwrap();
+    svm.set_account(
+        env.collateral_mint,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN),
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let (bidder, bidder_coin, bidder_usd) = new_bidder(&mut svm, &payer, &env, 400_000);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &bidder_coin,
+            &bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            400_000,
+            400_000,
+            None,
+        ),
+    )
+    .expect("bidder commits before the issuer freezes canonical holding");
+
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &bk.holding,
+        &env.collateral_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &env.collateral_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[freeze, revoke],
+        Some(&payer.pubkey()),
+        &[&payer, &freeze_authority],
+        svm.latest_blockhash(),
+    ))
+    .expect("issuer permanently freezes the canonical holding");
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, 111);
+    let book_before_failed_execute = svm.get_account(&bk.book).unwrap();
+    let market_before_failed_execute = svm.get_account(&env.slab).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&cranker],
+            execute_ix(
+                &cranker.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                None,
+            ),
+        )
+        .is_err(),
+        "frozen canonical holding blocks the surplus pull"
+    );
+    assert_eq!(
+        svm.get_account(&bk.book).unwrap(),
+        book_before_failed_execute
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        market_before_failed_execute
+    );
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 400_000);
+    assert_eq!(token_amount(&svm, &bk.holding), 7);
+
+    let replace_holding = |replacement: Pubkey| Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new(bk.book, false),
+            AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new_readonly(bk.holding, false),
+            AccountMeta::new_readonly(replacement, false),
+        ],
+        data: vec![23u8],
+    };
+
+    let attacker_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_holding,
+        &env.collateral_mint,
+        &cranker.pubkey(),
+        0,
+    );
+    assert!(
+        send(&mut svm, &[&cranker], replace_holding(attacker_holding)).is_err(),
+        "replacement custody cannot be owned by the cranker"
+    );
+    assert_eq!(
+        svm.get_account(&bk.book).unwrap(),
+        book_before_failed_execute
+    );
+
+    let preloaded_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &preloaded_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        1,
+    );
+    assert!(
+        send(&mut svm, &[&cranker], replace_holding(preloaded_holding)).is_err(),
+        "replacement cannot merge unrelated value into auction budget"
+    );
+    assert_eq!(
+        svm.get_account(&bk.book).unwrap(),
+        book_before_failed_execute
+    );
+
+    let clean_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &clean_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    send(&mut svm, &[&cranker], replace_holding(clean_holding))
+        .expect("anyone replaces only frozen custody with clean TWAP-owned custody");
+
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &clean_holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("the original bid settles through replacement holding custody");
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &bidder_usd,
+            &bidder_coin,
+            0,
+        ),
+    )
+    .expect("bidder receives the exact settlement and the book reopens");
+    assert_eq!(token_amount(&svm, &bidder_usd), 400_000);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &clean_holding), 0);
+    assert_eq!(token_amount(&svm, &bk.holding), 7);
+}
+
 // ADVERSARIAL CU-DOS (finding AC): the bid ranking is O(N^2) comparisons. When bid-vs-bid used the
 // continued-fraction (Euclidean) cmp_rate over attacker-controlled rates, a full 32-slot book of
 // close, long-continued-fraction (Fibonacci-ratio) bids made execute EXCEED the 1.4M compute budget
