@@ -194,7 +194,8 @@ const IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 // Read-only CPI attestation for a permissionless resolved custody return. Keeping
 // this check in the subledger supports every pool layout without duplicating it in TWAP.
 const IX_ASSERT_PRINCIPAL: u8 = 11;
-// Permissionless terminal return for an absent genesis depositor. It
+// Permissionless terminal return for an absent genesis depositor. Genesis admits
+// it immediately after a seal or after the unsealed trigger phase expires. It
 // retires the complete position and can pay only a clean token account owned by
 // that depositor.
 const IX_RETURN_FINALIZED_POSITION: u8 = 12;
@@ -2326,13 +2327,13 @@ fn process_insurance_withdraw_full(
 //   genesis_proposal(w), genesis_vote_program]
 // data: none
 //
-// Once the immutable bootstrap deadline has elapsed and its real market is resolved
-// and empty, anyone may retire an absent depositor's complete position. Genesis
-// atomically retires that owner's exact live ballot before the capital return, so a
-// refunded vote cannot later count against a smaller live-principal quorum. The
-// instruction has no amount and accepts only a clean token account owned by the
-// depositor, so neither a cranker nor governance can capture or partially manipulate
-// the payout.
+// Once the real market is resolved and empty, anyone may retire an absent
+// depositor's complete position after Genesis proves either a sealed distribution
+// or expiry of its unsealed trigger phase. Genesis closes an unsealed election
+// before atomically retiring the owner's exact live ballot, so refund order cannot
+// choose a winner. The instruction has no amount and accepts only a clean token
+// account owned by the depositor, so neither a cranker nor governance can capture
+// or partially manipulate the payout.
 fn process_return_finalized_position(
     program_id: &Pubkey,
     accounts: &[AccountInfo],

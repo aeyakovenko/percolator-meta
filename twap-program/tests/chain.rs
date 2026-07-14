@@ -71,6 +71,17 @@ fn advance_to_test_bootstrap_end(svm: &mut LiteSVM) {
     }
 }
 
+fn advance_to_test_terminal_refund_start(svm: &mut LiteSVM) {
+    let start = TEST_BOOTSTRAP_START_SLOT
+        + TEST_BOOTSTRAP_DELAY_SLOTS
+        + TEST_GENESIS_DEPOSIT_WINDOW_SLOTS;
+    let mut clock = svm.get_sysvar::<Clock>();
+    if clock.slot < start {
+        clock.slot = start;
+        svm.set_sysvar(&clock);
+    }
+}
+
 fn squads_program_bytes() -> Vec<u8> {
     // Squads v4 fixture (dumped from mainnet) used by the genesis->handoff chain tests.
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -21740,6 +21751,7 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
         ],
         data: vec![12u8],
     };
+    advance_to_test_terminal_refund_start(&mut svm);
     send(
         &mut svm,
         &[&payer],
@@ -22149,8 +22161,9 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
 // PUBLIC TERMINAL DOS REGRESSION: an exact tie can survive the bootstrap forever when
 // both voters disappear. Resolution ends the code/market risk they backed, so a fixed
 // public return must still recover each deposit to its recorded owner and unblock slab
-// retirement. Each returned ballot is atomically removed from the exact tallies, so
-// finalization is not a custody precondition and refunded votes cannot become decisive.
+// retirement. An unsealed election gets one public trigger phase, then the first
+// fallback return closes triggering before any exact tally changes. Refund order
+// therefore cannot select either tied proposal.
 #[test]
 fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     let mut svm =
@@ -22333,6 +22346,30 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     };
     let ballot_a = ballot_for(voter_a.pubkey());
     let ballot_b = ballot_for(voter_b.pubkey());
+    let pool_before_early_refund = svm.get_account(&env.pool).unwrap();
+    let position_before_early_refund = svm.get_account(&position_a).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(
+                voter_a.pubkey(),
+                position_a,
+                destination_a,
+                ballot_a,
+                vote_a,
+            ),
+        )
+        .is_err(),
+        "unsealed refunds wait through the permissionless trigger phase"
+    );
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_early_refund);
+    assert_eq!(
+        svm.get_account(&position_a).unwrap(),
+        position_before_early_refund
+    );
+
+    advance_to_test_terminal_refund_start(&mut svm);
     send(
         &mut svm,
         &[&payer],
@@ -22345,6 +22382,10 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
         ),
     )
     .expect("a tied absent voter cannot strand their owner-bound deposit");
+    assert!(
+        trigger(&mut svm, vote_b, dist_b).is_err(),
+        "a public refund cannot select the opposite tied proposal as the winner"
+    );
     send(
         &mut svm,
         &[&payer],
