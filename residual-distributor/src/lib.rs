@@ -2029,8 +2029,8 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(ProgramError::InvalidInstructionData);
     }
     let now = Clock::get()?.slot;
-    if config.config_kind == CONFIG_KIND_REWARD_EPOCH
-        && (now < config.emission_start_slot || now >= config.emission_end_slot)
+    if (config.config_kind == CONFIG_KIND_REWARD_EPOCH && now < config.emission_start_slot)
+        || now >= config.emission_end_slot
     {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -2163,14 +2163,14 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         return Err(ProgramError::InvalidAccountData); // sealed or frozen -> denominators are final
     }
     let now = Clock::get()?.slot;
-    let post_emission_finalize = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
-        if now < config.emission_start_slot {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        now > config.emission_end_slot
-    } else {
-        false
-    };
+    if config.config_kind == CONFIG_KIND_REWARD_EPOCH && now < config.emission_start_slot {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    // Predecessor configs also commit to an immutable emission end. Treating
+    // their finalize window as continued accrual would let delayed freeze admit
+    // newly registered stakes and post-period portfolio flow. The same
+    // post-emission rules therefore apply to both config generations.
+    let post_emission_finalize = now > config.emission_end_slot;
     let stake_data_len = stake_account.data_len();
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
@@ -2250,11 +2250,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                     return Err(ProgramError::InvalidInstructionData);
                 }
             }
-            let accrual_cutoff = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
-                core::cmp::min(now, config.emission_end_slot)
-            } else {
-                now
-            };
+            let accrual_cutoff = core::cmp::min(now, config.emission_end_slot);
             let (live_principal, crystallized_slot) = match terminal_snapshot {
                 Some((terminal_principal, Some(return_slot))) => {
                     (

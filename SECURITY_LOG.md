@@ -13996,3 +13996,29 @@ The change adds no administrator, recipient, amount, token account, or value-mov
 partial because exploitation required an already approved old action and an execute-capable Squads member.
 It could irreversibly shut down a live replacement, but did not redirect user collateral and Percolator's
 resolved user-recovery lifecycle remained available.
+
+## Tick - predecessor rewards admitted post-emission market flow (surface D, PARTIAL LOF)
+
+The predecessor fixed-distribution instruction stored an immutable emission end and finalize window, but
+only reusable reward-epoch configs enforced that end in registration and crystallization. Until a delayed
+permissionless freeze, a portfolio could therefore register after the nominal period or turn real LP,
+funding-payer, or trader flow created after the period into denominator points. A late participant could
+dilute or capture fixed reward COIN without bearing the intended in-period risk. Current continuous epochs
+already rejected this flow, and neither path could debit or redirect collateral, insurance, or backing.
+
+The retained focused LiteSVM regressions register a predecessor funding stake before the end, create its
+entire paid-funding accumulator afterward, and prove neither that growth nor a new late stake enters the
+denominator. A second probe models a post-end Subledger top-up and clock reset; restoring only the old
+capital cutoff mints `6,000,000` points, while the fixed binary credits zero. The retained full-chain
+regression registers before slot 105, opens a signed position through the pinned Percolator binary, moves
+the authenticated oracle and permissionlessly crystallizes the real loss at slot 110, then freezes and
+claims. With the old distributor SBF the sole stake captured all `1,000,000` COIN; the fixed binary credits
+zero and leaves the vault unchanged. Restoring only the old timing branches reproduces those exact results,
+so both regressions are mutation-sharp.
+
+FIX: predecessor and reusable configs now close registration before their immutable end and share the same
+post-emission rules. LP and funding growth is closed, trader refresh is reduce-only against points already
+earned by the end, and capital tenure is clamped to the end. Existing predecessor stakes remain claimable,
+including zero-point stakes. The change adds no instruction, signer, authority, recipient, token account,
+CPI, or principal movement. The finding is partial because the current genesis and continuous lifecycle use
+the already-safe reusable epoch instruction; only callable predecessor configs had the vulnerable timing.

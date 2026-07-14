@@ -41750,11 +41750,12 @@ fn e2e_ewma_mark_move_is_bounded_by_collected_trade_fees() {
 enum OrganicRewardCleanup {
     None,
     BeforeCrystallize,
+    PostEmissionLoss,
 }
 
 fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCleanup) {
     use percolator_prog::ix::Instruction as PIx;
-    let maintenance_fee_cleanup = cleanup != OrganicRewardCleanup::None;
+    let maintenance_fee_cleanup = cleanup == OrganicRewardCleanup::BeforeCrystallize;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -41979,9 +41980,14 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
         bh,
     ))
     .expect("fund coin vault");
+    let emission_end = if cleanup == OrganicRewardCleanup::PostEmissionLoss {
+        105u64
+    } else {
+        500u64
+    };
     let mut ri = vec![0u8];
     ri.extend_from_slice(&supply.to_le_bytes());
-    ri.extend_from_slice(&500u64.to_le_bytes());
+    ri.extend_from_slice(&emission_end.to_le_bytes());
     ri.extend_from_slice(&0u16.to_le_bytes());
     ri.extend_from_slice(&0u16.to_le_bytes());
     ri.extend_from_slice(&0u16.to_le_bytes()); // ins/back/lp = 0 -> trader 100%
@@ -42491,11 +42497,20 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
         bh,
     ))
     .expect("claim");
-    // sole trader-cohort staker -> the full trader cohort supply (= 100% here), from an ORGANIC real-trade loss.
+    let expected_reward = if cleanup == OrganicRewardCleanup::PostEmissionLoss {
+        0
+    } else {
+        supply
+    };
     assert_eq!(
         token_amount(&svm, &loser_coin),
-        supply,
-        "trader cohort earns the organically-settled residual loss"
+        expected_reward,
+        "only organically-settled loss created inside the immutable emission period earns COIN"
+    );
+    assert_eq!(
+        token_amount(&svm, &rd_vault),
+        supply - expected_reward,
+        "post-period Percolator flow cannot enter the frozen reward denominator"
     );
 
     if !maintenance_fee_cleanup {
@@ -42639,6 +42654,13 @@ fn e2e_organic_pnl_loss_real_trade_feeds_trader_cohort() {
 fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
     run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         OrganicRewardCleanup::BeforeCrystallize,
+    );
+}
+
+#[test]
+fn e2e_legacy_reward_end_excludes_post_period_real_trade_loss() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(
+        OrganicRewardCleanup::PostEmissionLoss,
     );
 }
 
