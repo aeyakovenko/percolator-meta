@@ -21530,7 +21530,7 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
     let (dist_proposal, gv_proposal) =
         register_proposal(&mut svm, &payer, &env, 1, &recipient, 100);
 
-    let deposit = |svm: &mut LiteSVM, who: &Keypair, amt: u64| -> Pubkey {
+    let deposit = |svm: &mut LiteSVM, who: &Keypair, amt: u64| -> (Pubkey, Pubkey, Pubkey) {
         svm.airdrop(&who.pubkey(), 1_000_000_000).unwrap();
         let ata = Pubkey::new_unique();
         set_token(svm, &ata, &env.collateral_mint, &who.pubkey(), amt);
@@ -21564,12 +21564,12 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
             bh,
         ))
         .expect("deposit");
-        position
+        (position, ata, holding)
     };
     let a = Keypair::new();
-    let a_pos = deposit(&mut svm, &a, 500_000);
+    let (a_pos, a_destination, a_holding) = deposit(&mut svm, &a, 500_000);
     let b = Keypair::new();
-    let _b_pos = deposit(&mut svm, &b, 500_000); // outstanding = 1,000,000
+    let (b_pos, b_destination, b_holding) = deposit(&mut svm, &b, 500_000); // outstanding = 1,000,000
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 8;
     svm.set_sysvar::<Clock>(&c);
@@ -21637,6 +21637,152 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
         trigger(&mut svm).is_err(),
         "exactly 50% of capital must NOT meet quorum (strict >)"
     );
+    let a_ballot = Pubkey::find_program_address(
+        &[b"gv_ballot", env.gv_config.as_ref(), a.pubkey().as_ref()],
+        &gv_id_e2e(),
+    )
+    .0;
+    let config_before_direct_retire = svm.get_account(&env.gv_config).unwrap();
+    let proposal_before_direct_retire = svm.get_account(&gv_proposal).unwrap();
+    let ballot_before_direct_retire = svm.get_account(&a_ballot).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: gv_id_e2e(),
+                accounts: vec![
+                    AccountMeta::new_readonly(env.pool, false),
+                    AccountMeta::new(env.gv_config, false),
+                    AccountMeta::new_readonly(a.pubkey(), false),
+                    AccountMeta::new(a_ballot, false),
+                    AccountMeta::new(gv_proposal, false),
+                ],
+                data: vec![7u8],
+            },
+        )
+        .is_err(),
+        "a public caller cannot retire another owner's live ballot"
+    );
+    assert_eq!(
+        svm.get_account(&env.gv_config).unwrap(),
+        config_before_direct_retire
+    );
+    assert_eq!(
+        svm.get_account(&gv_proposal).unwrap(),
+        proposal_before_direct_retire
+    );
+    assert_eq!(
+        svm.get_account(&a_ballot).unwrap(),
+        ballot_before_direct_retire
+    );
+
+    // Resolve the empty market, then use the permissionless absent-owner path to return the only
+    // voter's complete deposit. The remaining live principal belongs to a nonvoter. A historical
+    // ballot must become inert when its risk capital is returned; otherwise its stale 500k tally
+    // clears quorum against the now-500k live denominator and captures the full COIN distribution.
+    let resolve = build_direct_resolve_message(&env.squads_vault, &env.slab, &perc_id());
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &resolve,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+    )
+    .expect("governance resolves the otherwise empty market");
+
+    let ballot_for = |owner: Pubkey| {
+        Pubkey::find_program_address(
+            &[b"gv_ballot", env.gv_config.as_ref(), owner.as_ref()],
+            &gv_id_e2e(),
+        )
+        .0
+    };
+    let terminal_return = |owner: Pubkey,
+                           position: Pubkey,
+                           destination: Pubkey,
+                           holding: Pubkey,
+                           ballot: Pubkey,
+                           proposal: Pubkey| Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(owner, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(destination, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(env.gv_config, false),
+            AccountMeta::new(ballot, false),
+            AccountMeta::new(proposal, false),
+            AccountMeta::new_readonly(gv_id_e2e(), false),
+        ],
+        data: vec![12u8],
+    };
+    send(
+        &mut svm,
+        &[&payer],
+        terminal_return(
+            a.pubkey(),
+            a_pos,
+            a_destination,
+            a_holding,
+            a_ballot,
+            gv_proposal,
+        ),
+    )
+    .expect("permissionless terminal return refunds the only voter");
+    assert_eq!(token_amount(&svm, &a_destination), 500_000);
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&env.pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        500_000,
+        "only the nonvoter remains at risk"
+    );
+    let config = svm.get_account(&env.gv_config).unwrap();
+    assert_eq!(u64::from_le_bytes(config.data[200..208].try_into().unwrap()), 0);
+    assert_eq!(u128::from_le_bytes(config.data[208..224].try_into().unwrap()), 0);
+    let proposal = svm.get_account(&gv_proposal).unwrap();
+    assert_eq!(u128::from_le_bytes(proposal.data[72..88].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()), 0);
+    let ballot = svm.get_account(&a_ballot).unwrap();
+    assert_eq!(
+        Pubkey::new_from_array(ballot.data[40..72].try_into().unwrap()),
+        Pubkey::default(),
+        "the refunded ballot is no longer live"
+    );
+    assert!(
+        trigger(&mut svm).is_err(),
+        "a refunded historical vote must not capture the distribution"
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        terminal_return(
+            b.pubkey(),
+            b_pos,
+            b_destination,
+            b_holding,
+            ballot_for(b.pubkey()),
+            gv_proposal,
+        ),
+    )
+    .expect("an empty canonical ballot cannot block a nonvoter's terminal return");
+    assert_eq!(token_amount(&svm, &b_destination), 500_000);
 }
 
 // ATTACK PROBE (majority strict-inequality / tie deadlock): the winner needs support_weight*2 >
@@ -21993,8 +22139,8 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
 // PUBLIC TERMINAL DOS REGRESSION: an exact tie can survive the bootstrap forever when
 // both voters disappear. Resolution ends the code/market risk they backed, so a fixed
 // public return must still recover each deposit to its recorded owner and unblock slab
-// retirement; genesis finalization is not a custody precondition once the market is
-// resolved and empty.
+// retirement. Each returned ballot is atomically removed from the exact tallies, so
+// finalization is not a custody precondition and refunded votes cannot become decisive.
 #[test]
 fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     let mut svm =
@@ -22144,10 +22290,18 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     )
     .expect("governance resolves the otherwise empty market");
 
+    let ballot_for = |owner: Pubkey| {
+        Pubkey::find_program_address(
+            &[b"gv_ballot", env.gv_config.as_ref(), owner.as_ref()],
+            &gv_id_e2e(),
+        )
+        .0
+    };
     let terminal_return = |owner: Pubkey,
                            position: Pubkey,
                            destination: Pubkey,
-                           genesis_witness: Pubkey| Instruction {
+                           ballot: Pubkey,
+                           proposal: Pubkey| Instruction {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(owner, false),
@@ -22160,19 +22314,25 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
             AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(env.gv_config, false),
-            AccountMeta::new_readonly(genesis_witness, false),
+            AccountMeta::new(env.gv_config, false),
+            AccountMeta::new(ballot, false),
+            AccountMeta::new(proposal, false),
             AccountMeta::new_readonly(gv_id_e2e(), false),
         ],
         data: vec![12u8],
     };
-    let config_before_returns = svm.get_account(&env.gv_config).unwrap();
-    let proposal_a_before_returns = svm.get_account(&vote_a).unwrap();
-    let proposal_b_before_returns = svm.get_account(&vote_b).unwrap();
+    let ballot_a = ballot_for(voter_a.pubkey());
+    let ballot_b = ballot_for(voter_b.pubkey());
     send(
         &mut svm,
         &[&payer],
-        terminal_return(voter_a.pubkey(), position_a, destination_a, vote_a),
+        terminal_return(
+            voter_a.pubkey(),
+            position_a,
+            destination_a,
+            ballot_a,
+            vote_a,
+        ),
     )
     .expect("a tied absent voter cannot strand their owner-bound deposit");
     send(
@@ -22182,15 +22342,28 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
             voter_b.pubkey(),
             position_b,
             destination_b,
-            system_program::ID,
+            ballot_b,
+            vote_b,
         ),
     )
     .expect("the second tied absent voter cannot block terminal cleanup");
     assert_eq!(token_amount(&svm, &destination_a), 1);
     assert_eq!(token_amount(&svm, &destination_b), 1);
-    assert_eq!(svm.get_account(&env.gv_config).unwrap(), config_before_returns);
-    assert_eq!(svm.get_account(&vote_a).unwrap(), proposal_a_before_returns);
-    assert_eq!(svm.get_account(&vote_b).unwrap(), proposal_b_before_returns);
+    let config = svm.get_account(&env.gv_config).unwrap();
+    assert_eq!(u64::from_le_bytes(config.data[200..208].try_into().unwrap()), 0);
+    assert_eq!(u128::from_le_bytes(config.data[208..224].try_into().unwrap()), 0);
+    for proposal in [vote_a, vote_b] {
+        let proposal = svm.get_account(&proposal).unwrap();
+        assert_eq!(u128::from_le_bytes(proposal.data[72..88].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()), 0);
+    }
+    for ballot in [ballot_a, ballot_b] {
+        let ballot = svm.get_account(&ballot).unwrap();
+        assert_eq!(
+            Pubkey::new_from_array(ballot.data[40..72].try_into().unwrap()),
+            Pubkey::default()
+        );
+    }
     assert!(
         trigger(&mut svm, vote_a, dist_a).is_err(),
         "terminal returns cannot turn tied historical votes into an A capture"
@@ -44650,8 +44823,9 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
             AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(env.gv_config, false),
-            AccountMeta::new_readonly(proposal, false),
+            AccountMeta::new(env.gv_config, false),
+            AccountMeta::new(ballot, false),
+            AccountMeta::new(proposal, false),
             AccountMeta::new_readonly(gv_id_e2e(), false),
         ],
         data: vec![12u8],
@@ -44792,12 +44966,36 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         send(&mut svm, &[&payer], amount_injection).is_err(),
         "the fixed terminal return accepts no caller-selected amount"
     );
+
+    let pool_before_wrong_proposal = svm.get_account(&env.pool).unwrap();
+    let position_before_wrong_proposal = svm.get_account(&position).unwrap();
+    let config_before_wrong_proposal = svm.get_account(&env.gv_config).unwrap();
+    let ballot_before_wrong_proposal = svm.get_account(&ballot).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            terminal_return(unexecuted_proposal, owner_destination),
+        )
+        .is_err(),
+        "a cranker cannot retire a live ballot through a substituted proposal"
+    );
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before_wrong_proposal);
+    assert_eq!(
+        svm.get_account(&position).unwrap(),
+        position_before_wrong_proposal
+    );
+    assert_eq!(
+        svm.get_account(&env.gv_config).unwrap(),
+        config_before_wrong_proposal
+    );
+    assert_eq!(svm.get_account(&ballot).unwrap(), ballot_before_wrong_proposal);
     send(
         &mut svm,
         &[&payer],
-        terminal_return(unexecuted_proposal, owner_destination),
+        terminal_return(winner, owner_destination),
     )
-    .expect("terminal custody depends on the elapsed bootstrap, not proposal outcome");
+    .expect("the exact finalized ballot can be retired with its terminal deposit");
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
     assert_eq!(token_amount(&svm, &owner_destination), 1);
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
@@ -44815,6 +45013,17 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     assert_eq!(retired.data[97], 0);
     assert_eq!(retired.data[98], 1);
     assert_eq!(u128::from_le_bytes(retired.data[104..120].try_into().unwrap()), 0);
+    let config = svm.get_account(&env.gv_config).unwrap();
+    assert_eq!(u64::from_le_bytes(config.data[200..208].try_into().unwrap()), 0);
+    assert_eq!(u128::from_le_bytes(config.data[208..224].try_into().unwrap()), 0);
+    let proposal = svm.get_account(&winner).unwrap();
+    assert_eq!(u128::from_le_bytes(proposal.data[72..88].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(proposal.data[88..96].try_into().unwrap()), 0);
+    let retired_ballot = svm.get_account(&ballot).unwrap();
+    assert_eq!(
+        Pubkey::new_from_array(retired_ballot.data[40..72].try_into().unwrap()),
+        Pubkey::default()
+    );
     let terminal_return_slot = svm.get_sysvar::<Clock>().slot;
     assert_eq!(
         terminal_return_slot,

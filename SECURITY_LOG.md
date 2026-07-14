@@ -13817,3 +13817,30 @@ Percolator closes the portfolio. Once the exact controller-owned marker exists, 
 CPI but still closes an empty resolved replacement portfolio, so later generations cannot influence old
 rewards or become a cleanup DoS. Omitting, substituting, or corrupting the marker rejects atomically. The
 change adds no authority, recipient, amount, token account, token CPI, or user-fund movement surface.
+
+## Tick - refunded genesis votes could capture the fixed distribution (surface B/D, REAL LOF)
+
+The permissionless terminal return introduced for absent voters cleared Subledger's position lock and
+reduced the pool's live outstanding principal, but deliberately left the historical Genesis ballot and
+tallies unchanged. Genesis computes quorum from that live principal denominator. A voter holding exactly
+half of the initial capital could therefore fail strict quorum, have its complete deposit returned after
+real market resolution, and then reuse its stale vote against only the nonvoter's remaining capital. The
+same public trigger would seal 100% of the fixed COIN distribution despite the decisive voter no longer
+having capital at risk. This could not redirect or debit collateral, but it was a live reward/governance
+loss of funds and violated the rule that refunded votes become worthless.
+
+The retained real-SBF LiteSVM regression deposits `500,000` units from a voter and `500,000` from a
+nonvoter, proves the vote fails the strict initial quorum, resolves the pinned Percolator market through
+Squads, and permissionlessly returns the voter's full deposit. The old binaries then accept the trigger
+and seal the complete distribution. With the fix, the ballot, proposal support, and global vote tallies
+are zero, the trigger still rejects against the remaining `500,000` units, and the nonvoter can also be
+fully refunded. Separate full-chain paths cover exact ties, both insurance policies, an already sealed
+distribution, wrong-proposal rollback, terminal reward preservation, and final slab closure.
+
+FIX: Subledger's existing resolved-and-empty terminal return now invokes one Genesis instruction signed
+by the exact configured pool PDA. Genesis derives the owner's canonical ballot and subtracts its stored
+weight and principal from the exact recorded proposal and global tallies before clearing it. A canonical
+empty or already retracted ballot is a no-op, so nonvoters cannot block cleanup. Any bad ballot, proposal,
+tally, market, destination, or later token movement rolls back the whole transaction. The new instruction
+can mutate only Genesis counters, accepts no amount or recipient, holds no funds, and cannot be invoked by
+governance or a public caller without passing through Subledger's fixed owner-bound terminal return.

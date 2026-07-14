@@ -102,6 +102,9 @@ const IX_ASSERT_EXECUTED: u8 = 5;
 // elapsed, a resolved market must be able to return owner-bound deposits even
 // when no proposal won (for example, because absent voters left an exact tie).
 const IX_ASSERT_BOOTSTRAP_ENDED: u8 = 6;
+// Atomically retire one ballot when Subledger permissionlessly returns that
+// owner's terminal risk deposit. Only the configured pool PDA can sign this.
+const IX_RETIRE_TERMINAL_BALLOT: u8 = 7;
 
 const VOTE_BACK: u8 = 1;
 const VOTE_RETRACT: u8 = 2;
@@ -358,6 +361,7 @@ pub fn process_instruction<'a>(
         IX_TRIGGER => trigger(program_id, accounts, data),
         IX_ASSERT_EXECUTED => assert_executed(program_id, accounts, data),
         IX_ASSERT_BOOTSTRAP_ENDED => assert_bootstrap_ended(program_id, accounts, data),
+        IX_RETIRE_TERMINAL_BALLOT => retire_terminal_ballot(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -447,6 +451,111 @@ fn assert_bootstrap_ended(
     if Clock::get()?.slot < config.bootstrap_end_slot {
         return Err(ProgramError::InvalidInstructionData);
     }
+    Ok(())
+}
+
+// retire_terminal_ballot accounts:
+// [subledger_pool(s), config(w), owner, ballot(w), proposal_vote(w)]
+// data: none
+//
+// Subledger invokes this in the same transaction that returns an absent owner's
+// complete terminal deposit. The configured pool PDA proves the call came from
+// that fixed return path; no owner signature is needed. A live ballot is removed
+// from both exact tallies before the return can commit, so refunded votes cannot
+// later satisfy quorum. A nonvoter supplies the canonical empty ballot PDA and
+// leaves all Genesis state unchanged.
+fn retire_terminal_ballot(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let sub_pool = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let owner = next_account_info(iter)?;
+    let ballot_account = next_account_info(iter)?;
+    let proposal_account = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !sub_pool.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    validate_config_identity(program_id, config_account.key, &config)?;
+    if *sub_pool.key != config.subledger_pool || sub_pool.owner != &config.subledger_program {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if Clock::get()?.slot < config.bootstrap_end_slot {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let expected_ballot =
+        Pubkey::find_program_address(&ballot_seeds(config_account.key, owner.key), program_id).0;
+    if *ballot_account.key != expected_ballot {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if ballot_account.data_len() == 0 {
+        if ballot_account.owner != &solana_program::system_program::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
+        return Ok(());
+    }
+    if ballot_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut ballot = Ballot::deserialize(&ballot_account.try_borrow_data()?)?;
+    if ballot.owner != *owner.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if !ballot.has_live_ballot() {
+        return Ok(());
+    }
+    if !config_account.is_writable || !ballot_account.is_writable || !proposal_account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if *proposal_account.key != ballot.voted_proposal || proposal_account.owner != program_id {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let mut proposal = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
+    let expected_proposal = Pubkey::find_program_address(
+        &proposal_seeds(config_account.key, &proposal.distribution_proposal),
+        program_id,
+    )
+    .0;
+    if *proposal_account.key != expected_proposal || proposal.config != *config_account.key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    proposal.support_weight = proposal
+        .support_weight
+        .checked_sub(ballot.voted_weight)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    proposal.support_principal = proposal
+        .support_principal
+        .checked_sub(ballot.voted_principal)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    config.total_cast_weight = config
+        .total_cast_weight
+        .checked_sub(ballot.voted_weight)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    config.total_voted_principal = config
+        .total_voted_principal
+        .checked_sub(ballot.voted_principal)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    ballot.voted_proposal = Pubkey::default();
+    ballot.voted_weight = 0;
+    ballot.voted_principal = 0;
+
+    proposal.serialize(&mut proposal_account.try_borrow_mut_data()?);
+    ballot.serialize(&mut ballot_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
 }
 
