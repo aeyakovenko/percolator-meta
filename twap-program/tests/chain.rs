@@ -6477,6 +6477,203 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
+// A TWAP bid is a standing COIN/collateral order rather than a
+// Percolator-position instruction. Exercise it across an asset-0 market generation change and
+// verify that neither side receives terms outside the signed bid or the protected insurance floor.
+#[test]
+fn e2e_standing_auction_bid_across_asset0_restart_conserves_value() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+    let (bidder, coin_source, usd_destination) =
+        new_bidder(&mut svm, &payer, &env, 100_000);
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_source,
+            &usd_destination,
+            &env.coin_mint,
+            &env.collateral_mint,
+            100_000,
+            100_000,
+            None,
+        ),
+    )
+    .expect("place standing bid before shutdown");
+    let old_round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, old_round_end);
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &env.twap_cfg,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &donate_market,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ],
+    )
+    .expect("donate lifecycle authority");
+    let controller_remaining = [
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+    let old_market_id =
+        percolator_prog::state::read_market(&svm.get_account(&env.slab).unwrap().data)
+            .unwrap()
+            .1
+            .assets[0]
+            .market_id;
+    let shutdown = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 0,
+            now_slot: shutdown_slot,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &shutdown,
+        &controller_remaining,
+    )
+    .expect("shut down asset 0");
+
+    svm.warp_to_slot(shutdown_slot + 1);
+    let restart_slot = svm.get_sysvar::<Clock>().slot;
+    let restart = build_twap_restart_asset0_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        restart_slot,
+        1_000_001,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &restart,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("restart asset 0");
+    let new_market_id =
+        percolator_prog::state::read_market(&svm.get_account(&env.slab).unwrap().data)
+            .unwrap()
+            .1
+            .assets[0]
+            .market_id;
+    assert!(new_market_id > old_market_id);
+
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute standing bid after restart");
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &usd_destination,
+            &coin_source,
+            0,
+        ),
+    )
+    .expect("claim exact standing-order consideration");
+
+    assert_eq!(token_amount(&svm, &usd_destination), 100_000);
+    assert_eq!(token_amount(&svm, &coin_source), 0);
+    assert_eq!(mint_supply(&svm, &env.coin_mint), supply_before - 100_000);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), 1_100_000);
+    assert_eq!(read_reserved_floor(&svm, &env.twap_cfg), 1_100_000);
+    assert_eq!(token_amount(&svm, &bk.holding), 300_000);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+}
+
 // PUBLIC VALUE LEAK: donating marketauth must neither absorb creator-funded insurance nor leave
 // its fee operator behind after the principal exits. The creator exits through Percolator first;
 // the unchanged donation can then migrate empty custody to the controller and genesis pool.
