@@ -1053,9 +1053,13 @@ fn normalize_empty_with_surplus_reserve(pool: &mut Pool, priced_balance: u64) ->
     }
     let (reset_generation, _) = share_generation_parts(pool.share_generation)?;
     pool.share_generation = encode_share_generation(reset_generation, 0)?;
-    pool.total_shares = (priced_balance as u128)
-        .checked_mul(VIRTUAL_SHARES)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    pool.total_shares = pool_total_shares_after_exit(
+        pool.policy,
+        pool.outstanding_principal,
+        priced_balance,
+        pool.total_shares,
+        0,
+    )?;
     Ok(())
 }
 
