@@ -641,8 +641,8 @@ struct Position {
     /// before that return, so a cranker cannot erase its capital reward.
     terminal_returned: bool,
     /// Slot when the permissionless terminal return removed the principal. The
-    /// current layout stores `slot + 1` as a five-byte little-endian integer;
-    /// zero remains the legacy/no-snapshot sentinel.
+    /// tenure and current layouts store `slot + 1` as a five-byte little-endian
+    /// integer; zero remains the no-snapshot sentinel.
     terminal_return_slot: Option<u64>,
     /// Share generation for an active position. The serialized bytes are reused
     /// for `terminal_return_slot` after terminal retirement.
@@ -664,12 +664,12 @@ impl Position {
         } else {
             0
         };
-        let terminal_returned = if data.len() >= POSITION_SIZE {
+        let terminal_returned = if data.len() >= POSITION_SIZE_TENURE {
             data[POS_TERMINAL_RETURNED_OFF]
         } else {
             0
         };
-        let generation_or_terminal_slot = if data.len() >= POSITION_SIZE {
+        let generation_or_terminal_slot = if data.len() >= POSITION_SIZE_TENURE {
             decode_u40(&data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5])
         } else {
             0
@@ -701,7 +701,7 @@ impl Position {
             vote_locked: vote_locked == 1,
             terminal_returned: terminal_returned == 1,
             terminal_return_slot,
-            share_generation: if terminal_returned == 0 {
+            share_generation: if terminal_returned == 0 && data.len() >= POSITION_SIZE {
                 generation_or_terminal_slot
             } else {
                 0
@@ -729,29 +729,29 @@ impl Position {
         } else {
             data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
             data[97] = self.vote_locked as u8;
-            if data.len() >= POSITION_SIZE {
-                data[POS_TERMINAL_RETURNED_OFF] = self.terminal_returned as u8;
-                if !self.terminal_returned && self.terminal_return_slot.is_some() {
-                    return Err(ProgramError::InvalidAccountData);
+            data[POS_TERMINAL_RETURNED_OFF] = self.terminal_returned as u8;
+            if !self.terminal_returned && self.terminal_return_slot.is_some() {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            let generation_or_terminal_slot = if self.terminal_returned {
+                match self.terminal_return_slot {
+                    Some(slot) => slot
+                        .checked_add(1)
+                        .filter(|encoded| *encoded <= U40_MAX)
+                        .ok_or(ProgramError::InvalidAccountData)?,
+                    None => 0,
                 }
-                let generation_or_terminal_slot = if self.terminal_returned {
-                    match self.terminal_return_slot {
-                        Some(slot) => slot
-                            .checked_add(1)
-                            .filter(|encoded| *encoded <= U40_MAX)
-                            .ok_or(ProgramError::InvalidAccountData)?,
-                        None => 0,
-                    }
-                } else {
-                    self.share_generation
-                };
-                encode_u40(
-                    generation_or_terminal_slot,
-                    &mut data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5],
-                )?;
-                data[104..120].copy_from_slice(&self.shares.to_le_bytes());
+            } else if data.len() >= POSITION_SIZE {
+                self.share_generation
             } else {
-                data[98..104].fill(0);
+                0
+            };
+            encode_u40(
+                generation_or_terminal_slot,
+                &mut data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5],
+            )?;
+            if data.len() >= POSITION_SIZE {
+                data[104..120].copy_from_slice(&self.shares.to_le_bytes());
             }
         }
         Ok(())
@@ -2480,8 +2480,8 @@ fn process_insurance_withdraw_impl(
     if terminal {
         let (genesis_config, genesis_ballot, genesis_proposal, genesis_program) =
             genesis_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
-        if pool_account.data_len() < POOL_SIZE
-            || position_account.data_len() < POSITION_SIZE
+        if pool_account.data_len() < POOL_SIZE_VOTE
+            || position_account.data_len() < POSITION_SIZE_TENURE
             || pool.domain != DOMAIN_INSURANCE
             || pool.vote_authority != *genesis_config.key
             || *genesis_program.key != GENESIS_VOTE_PROGRAM_ID
@@ -4111,6 +4111,28 @@ mod tests {
                 if size >= POSITION_SIZE { 21 } else { 0 }
             );
             assert_eq!(decoded.shares, if size >= POSITION_SIZE { 777 } else { 0 });
+        }
+
+        let terminal_position = Position {
+            pool: position.pool,
+            owner: position.owner,
+            principal: 0,
+            withdrawn_amount: 55,
+            withdrawn: true,
+            start_slot: 99,
+            vote_locked: false,
+            terminal_returned: true,
+            terminal_return_slot: Some(123),
+            share_generation: 0,
+            shares: 0,
+        };
+        for size in [POSITION_SIZE_TENURE, POSITION_SIZE] {
+            let mut data = vec![0u8; size];
+            terminal_position.serialize(&mut data).unwrap();
+            let decoded = Position::deserialize(&data).unwrap();
+            assert!(decoded.terminal_returned);
+            assert_eq!(decoded.terminal_return_slot, Some(123));
+            assert_eq!(decoded.withdrawn_amount, 55);
         }
 
         for size in [

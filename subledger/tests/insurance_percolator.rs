@@ -4623,7 +4623,6 @@ fn exercise_legacy_genesis_retract(config_size: usize, pool_bound: bool, label: 
             },
         )
         .unwrap();
-
     // Preserve the exact cross-program state an old successful vote created.
     let mut pool_account = env.svm.get_account(&pool).unwrap();
     pool_account.data[160..192].copy_from_slice(legacy_config.as_ref());
@@ -4707,6 +4706,368 @@ fn every_legacy_genesis_ballot_generation_can_retract_and_recover_real_percolato
         (248, true, "248-byte bootstrap-end"),
     ] {
         exercise_legacy_genesis_retract(config_size, pool_bound, label);
+    }
+}
+
+fn exercise_absent_legacy_genesis_terminal_return(
+    config_size: usize,
+    pool_bound: bool,
+    label: &str,
+) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let voted_weight = 7_000_000u64;
+    let (absent_owner, deposit_source) = new_depositor(&mut env, amount);
+    let current_pool = env.pool;
+    let current_holding = create_holding(&mut env, &current_pool);
+    env.insurance_deposit(
+        &absent_owner,
+        &deposit_source,
+        &current_holding,
+        amount,
+    )
+    .expect("deposit through the real Percolator binary");
+
+    // Reconstruct the exact pre-share pool and position generation around the
+    // real deposited principal. This is the state preserved when those program
+    // accounts outlive an upgrade to the current binaries.
+    let legacy_pool = translate_funded_pool_to_legacy(&mut env, &absent_owner.pubkey(), ASSET_ID);
+    let legacy_position = env.position_pda(&absent_owner.pubkey());
+    let holding = create_holding(&mut env, &legacy_pool);
+    let payer = clone_kp(&env.payer);
+    let destination = create_token_account(
+        &mut env.svm,
+        &payer,
+        &env.mint,
+        &absent_owner.pubkey(),
+    );
+
+    let (legacy_config, legacy_config_bump) = if pool_bound {
+        Pubkey::find_program_address(
+            &[b"gv_config", env.coin_mint.as_ref(), legacy_pool.as_ref()],
+            &gv_id(),
+        )
+    } else {
+        Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id())
+    };
+    let distribution_config = Pubkey::new_unique();
+    let distribution_proposal = Pubkey::new_unique();
+    let legacy_proposal = Pubkey::find_program_address(
+        &[
+            b"gv_proposal",
+            legacy_config.as_ref(),
+            distribution_proposal.as_ref(),
+        ],
+        &gv_id(),
+    )
+    .0;
+    let legacy_ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            legacy_config.as_ref(),
+            absent_owner.pubkey().as_ref(),
+        ],
+        &gv_id(),
+    )
+    .0;
+
+    let mut config_data = vec![0u8; config_size];
+    config_data[..8].copy_from_slice(b"GVCONFG1");
+    config_data[8..40].copy_from_slice(env.coin_mint.as_ref());
+    config_data[40..72].copy_from_slice(dist_id().as_ref());
+    config_data[72..104].copy_from_slice(distribution_config.as_ref());
+    config_data[104..136].copy_from_slice(sub_id().as_ref());
+    config_data[136..168].copy_from_slice(legacy_pool.as_ref());
+    config_data[200..208].copy_from_slice(&amount.to_le_bytes());
+    if config_size == 232 {
+        config_data[208..216].copy_from_slice(&voted_weight.to_le_bytes());
+        config_data[216..224].copy_from_slice(&amount.to_le_bytes());
+        config_data[224] = legacy_config_bump;
+    } else {
+        config_data[208..224].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        config_data[224..232].copy_from_slice(&amount.to_le_bytes());
+        config_data[232] = legacy_config_bump;
+        if config_size == 248 {
+            config_data[233..241].copy_from_slice(&38_880_000u64.to_le_bytes());
+        }
+    }
+    env.svm
+        .set_account(
+            legacy_config,
+            Account {
+                lamports: 1_000_000_000,
+                data: config_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ballot_size = if config_size == 232 { 112 } else { 120 };
+    let contribution_end = if config_size == 232 { 88 } else { 96 };
+    let mut ballot_data = vec![0u8; ballot_size];
+    ballot_data[..8].copy_from_slice(b"GVBALOT1");
+    ballot_data[8..40].copy_from_slice(absent_owner.pubkey().as_ref());
+    ballot_data[40..72].copy_from_slice(legacy_proposal.as_ref());
+    if config_size == 232 {
+        ballot_data[72..80].copy_from_slice(&voted_weight.to_le_bytes());
+        ballot_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    } else {
+        ballot_data[72..88].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        ballot_data[88..96].copy_from_slice(&amount.to_le_bytes());
+    }
+    env.svm
+        .set_account(
+            legacy_ballot,
+            Account {
+                lamports: 1_000_000_000,
+                data: ballot_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let proposal_size = if config_size == 232 { 104 } else { 112 };
+    let executed_offset = if config_size == 232 { 88 } else { 96 };
+    let mut proposal_data = vec![0u8; proposal_size];
+    proposal_data[..8].copy_from_slice(b"GVPROPV1");
+    proposal_data[8..40].copy_from_slice(legacy_config.as_ref());
+    proposal_data[40..72].copy_from_slice(distribution_proposal.as_ref());
+    if config_size == 232 {
+        proposal_data[72..80].copy_from_slice(&voted_weight.to_le_bytes());
+        proposal_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    } else {
+        proposal_data[72..88].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        proposal_data[88..96].copy_from_slice(&amount.to_le_bytes());
+    }
+    proposal_data[executed_offset] = 1;
+    env.svm
+        .set_account(
+            legacy_proposal,
+            Account {
+                lamports: 1_000_000_000,
+                data: proposal_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let wrong_distribution_proposal = Pubkey::new_unique();
+    let wrong_legacy_proposal = Pubkey::find_program_address(
+        &[
+            b"gv_proposal",
+            legacy_config.as_ref(),
+            wrong_distribution_proposal.as_ref(),
+        ],
+        &gv_id(),
+    )
+    .0;
+    let mut wrong_proposal_data = env.svm.get_account(&legacy_proposal).unwrap().data;
+    wrong_proposal_data[40..72].copy_from_slice(wrong_distribution_proposal.as_ref());
+    env.svm
+        .set_account(
+            wrong_legacy_proposal,
+            Account {
+                lamports: 1_000_000_000,
+                data: wrong_proposal_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let mut pool_account = env.svm.get_account(&legacy_pool).unwrap();
+    pool_account.data[160..192].copy_from_slice(legacy_config.as_ref());
+    let pre_share_layout = config_size == 232;
+    if pre_share_layout {
+        pool_account.data.truncate(192);
+    }
+    env.svm.set_account(legacy_pool, pool_account).unwrap();
+    let mut position_account = env.svm.get_account(&legacy_position).unwrap();
+    position_account.data[97] = 1;
+    if pre_share_layout {
+        position_account.data.truncate(104);
+    }
+    env.svm
+        .set_account(legacy_position, position_account)
+        .unwrap();
+
+    let terminal_return = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(absent_owner.pubkey(), false),
+            AccountMeta::new(legacy_pool, false),
+            AccountMeta::new(legacy_position, false),
+            AccountMeta::new(destination, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(legacy_config, false),
+            AccountMeta::new(legacy_ballot, false),
+            AccountMeta::new(legacy_proposal, false),
+            AccountMeta::new_readonly(gv_id(), false),
+        ],
+        data: vec![12u8],
+    };
+    let state_before_finality = (
+        env.svm.get_account(&legacy_pool).unwrap(),
+        env.svm.get_account(&legacy_position).unwrap(),
+        env.svm.get_account(&legacy_ballot).unwrap(),
+    );
+    assert!(
+        env.send(
+            &[Instruction {
+                program_id: gv_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(legacy_pool, false),
+                    AccountMeta::new(legacy_config, false),
+                    AccountMeta::new_readonly(absent_owner.pubkey(), false),
+                    AccountMeta::new(legacy_ballot, false),
+                    AccountMeta::new(legacy_proposal, false),
+                ],
+                data: vec![7u8],
+            }],
+            &[],
+        )
+        .is_err(),
+        "{label}: a direct caller cannot impersonate the pool signer"
+    );
+    assert!(
+        env.send(&[terminal_return.clone()], &[]).is_err(),
+        "{label}: legacy compatibility cannot force an exit from a live market"
+    );
+    assert_eq!(
+        (
+            env.svm.get_account(&legacy_pool).unwrap(),
+            env.svm.get_account(&legacy_position).unwrap(),
+            env.svm.get_account(&legacy_ballot).unwrap(),
+        ),
+        state_before_finality,
+        "{label}: rejected authority/finality attacks are atomic"
+    );
+
+    // Resolve through the pinned Percolator program. The authority mutation
+    // represents the governance handoff that happened after the legacy vote;
+    // no test-only status byte is written.
+    let resolver = Keypair::new();
+    env.svm.airdrop(&resolver.pubkey(), 1_000_000_000).unwrap();
+    let mut slab_account = env.svm.get_account(&env.slab).unwrap();
+    let (mut wrapper, _) = percolator_prog::state::read_market(&slab_account.data)
+        .expect("read market wrapper");
+    wrapper.marketauth = resolver.pubkey().to_bytes();
+    percolator_prog::state::write_wrapper_config(&mut slab_account.data, &wrapper)
+        .expect("write resolver market authority");
+    let mut profile = percolator_prog::state::read_asset_oracle_profile(&slab_account.data, 0)
+        .expect("read asset-0 profile");
+    profile.oracle_authority = resolver.pubkey().to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(&mut slab_account.data, 0, &profile)
+        .expect("write resolver authority");
+    env.svm.set_account(env.slab, slab_account).unwrap();
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(resolver.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&resolver],
+    )
+    .expect("resolve the empty market through real Percolator");
+
+    let attacker = Pubkey::new_unique();
+    let attacker_destination = create_token_account(&mut env.svm, &payer, &env.mint, &attacker);
+    let pool_before_attacks = env.svm.get_account(&legacy_pool).unwrap();
+    let position_before_attacks = env.svm.get_account(&legacy_position).unwrap();
+    let ballot_before_attacks = env.svm.get_account(&legacy_ballot).unwrap();
+    let mut redirected = terminal_return.clone();
+    redirected.accounts[3] = AccountMeta::new(attacker_destination, false);
+    assert!(
+        env.send(&[redirected], &[]).is_err(),
+        "{label}: cranker cannot redirect historical principal"
+    );
+    let mut substituted = terminal_return.clone();
+    substituted.accounts[12] = AccountMeta::new(wrong_legacy_proposal, false);
+    assert!(
+        env.send(&[substituted], &[]).is_err(),
+        "{label}: cranker cannot retire a different legacy proposal's ballot"
+    );
+    assert_eq!(env.svm.get_account(&legacy_pool).unwrap(), pool_before_attacks);
+    assert_eq!(
+        env.svm.get_account(&legacy_position).unwrap(),
+        position_before_attacks
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_ballot).unwrap(),
+        ballot_before_attacks
+    );
+
+    let config_before_return = env.svm.get_account(&legacy_config).unwrap().data;
+    let proposal_before_return = env.svm.get_account(&legacy_proposal).unwrap().data;
+    env.send(&[terminal_return], &[])
+        .unwrap_or_else(|error| panic!("{label}: absent legacy voter remains a cleanup veto: {error}"));
+    assert_eq!(env.token_amount(&destination), amount, "{label}: principal returned only to its owner");
+    assert_eq!(env.token_amount(&attacker_destination), 0);
+    assert_eq!(asset_insurance_remaining(&env, 0), 0, "{label}: no user insurance remains in Percolator");
+    let retired_pool = env.svm.get_account(&legacy_pool).unwrap();
+    assert_eq!(u64::from_le_bytes(retired_pool.data[80..88].try_into().unwrap()), 0);
+    let retired_position = env.svm.get_account(&legacy_position).unwrap();
+    assert_eq!(
+        retired_position.data.len(),
+        if pre_share_layout { 104 } else { 120 },
+        "legacy position is not reallocated"
+    );
+    assert_eq!(u64::from_le_bytes(retired_position.data[72..80].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(retired_position.data[80..88].try_into().unwrap()), amount);
+    assert_eq!(retired_position.data[88], 1);
+    assert_eq!(retired_position.data[97], 0);
+    assert_eq!(retired_position.data[98], 1, "terminal reward snapshot preserved in reserved bytes");
+    assert!(retired_position.data[99..104].iter().any(|byte| *byte != 0));
+    let retired_ballot = env.svm.get_account(&legacy_ballot).unwrap();
+    assert!(
+        retired_ballot.data[40..contribution_end]
+            .iter()
+            .all(|byte| *byte == 0),
+        "{label}: inert legacy ballot retired atomically"
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_config).unwrap().data,
+        config_before_return,
+        "{label}: terminal compatibility does not reinterpret legacy tallies"
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_proposal).unwrap().data,
+        proposal_before_return,
+        "{label}: terminal compatibility does not rewrite legacy proposals"
+    );
+}
+
+// UPGRADE-INDUCED PUBLIC DOS: owner-signed legacy retraction protects an owner who
+// remains online, but an absent historical voter still blocked all terminal market
+// cleanup. Every legacy config/PDA generation must use the existing amountless,
+// owner-bound return once the real market is resolved and empty.
+#[test]
+fn every_absent_legacy_genesis_voter_can_be_returned_after_market_finality() {
+    for (config_size, pool_bound, label) in [
+        (232, false, "232-byte coin-only"),
+        (232, true, "232-byte pool-bound"),
+        (240, true, "240-byte widened"),
+        (248, true, "248-byte bootstrap-end"),
+    ] {
+        exercise_absent_legacy_genesis_terminal_return(config_size, pool_bound, label);
     }
 }
 

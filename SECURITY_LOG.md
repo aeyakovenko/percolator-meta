@@ -2,6 +2,29 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - absent legacy Genesis voters could block terminal market cleanup (surface B/C, PARTIAL DOS)
+
+Owner-signed compatibility let every historical Genesis voter retract and recover principal after an
+upgrade, but the permissionless resolved-market return accepted only the current 272-byte pool, 120-byte
+position, and 264-byte Genesis config. An owner who disappeared with one vote-locked atom in a 192/208-byte
+pool therefore remained a permanent cleanup veto even after its old election was inert and the real
+Percolator market was resolved and empty.
+
+The retained real-SBF LiteSVM regression deposits through Subledger into pinned Percolator, reconstructs
+each exact 232-byte coin-only, 232-byte pool-bound, 240-byte widened, and 248-byte bootstrap-end Genesis
+generation around the live principal, and uses the oldest 192-byte pool and 104-byte position. Pinned
+Percolator resolves the empty market through its public instruction. The old binaries reject the existing
+amountless terminal return. The fixed binaries reject an attacker-owned destination and a different valid
+legacy proposal byte-atomically, then pay the complete principal only to the recorded owner, clear the exact
+ballot, preserve historical global/proposal bytes, and remove all remaining Percolator insurance.
+
+FIX: Genesis shares one strict legacy config/PDA parser between signed retraction and terminal retirement.
+Only the configured Subledger pool PDA signer may clear an exact inert legacy ballot; no current instruction
+can vote or trigger through those layouts. Subledger permits its existing resolved-and-empty, full-position
+return for historical vote-bound insurance pools and records the same immutable principal/return-slot reward
+snapshot in the six bytes already reserved by a 104-byte position. No account is reallocated and no signer,
+admin, payer, amount, beneficiary, authority setter, or governance withdrawal path was added.
+
 ## Tick - permissionless TWAP pull could consume one insurance domain's principal (surface B/C)
 
 TWAP protected its retained insurance with one aggregate `reserved_floor`, then withdrew the configured
