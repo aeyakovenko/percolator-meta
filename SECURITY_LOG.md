@@ -13923,3 +13923,25 @@ legacy fallback marker. Current triggers persist proposal execution and the glob
 so the conflicting state cannot be produced by the current binary; it is only legacy execution evidence.
 The transition adds no instruction, signer, beneficiary, amount, token account, authority, or fund-moving
 CPI. It restores only the existing fixed owner-bound terminal return.
+
+## Tick - oversized auction round could permanently lock public bids (surface A, PARTIAL LOF)
+
+`init_book` rejected a `round_length` whose doubled cancellation cooldown overflowed and separately
+required the first `current_slot + round_length` round end to fit. Those checks did not prove
+`current_slot + 2 * round_length` fit. At any slot above one, a timelocked DAO initialization using
+`u64::MAX / 2` therefore created a book successfully. A public bidder could then transfer COIN into the
+shared escrow, but its owner cancellation always failed while adding the doubled cooldown to the placement
+slot. At the first round end, permissionless execute also failed while adding one more round length to the
+clock. Neither path could settle or refund the bid, and every failed transaction left the escrow unchanged.
+
+The clean-room real-SBF LiteSVM probe executed the malformed initialization through the real Squads fixture,
+placed a 100-COIN public bid, and observed both owner cancel and permissionless execute fail with arithmetic
+overflow while all 100 COIN remained in escrow. The retained regression uses the same timelocked init and
+requires rejection before the book PDA is created. Removing only the new deadline check makes that regression
+accept the malformed book and fail.
+
+FIX: book initialization computes the representable doubled cooldown and requires the current slot plus that
+cooldown to fit before creating any state. This also proves the first round can roll. The change adds no
+instruction, signer, authority, recipient, token account, or token CPI. The finding is partial because a
+timelocked DAO action must first choose the malformed duration, but after that action ordinary public bid
+custody had no executable recovery path.

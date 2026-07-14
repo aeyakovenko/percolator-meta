@@ -31345,6 +31345,103 @@ fn e2e_init_book_rejects_degenerate_params() {
     );
 }
 
+// A round can pass both `round_length * 2` and `now + round_length` while the two
+// deadlines every escrowed bid depends on still overflow: cancellation computes
+// `place_slot + 2 * round_length`, and execute rolls to `now + round_length` at the
+// first round end. Once such a book accepts a bid, neither public exit can commit.
+#[test]
+fn e2e_init_book_rejects_a_round_whose_cancel_and_roll_deadlines_overflow() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let book = book_pda(&env.twap_cfg);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(
+        &mut svm,
+        &settlement_usd,
+        &env.collateral_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+
+    let round_length = u64::MAX / 2;
+    assert!(round_length.checked_mul(2).is_some());
+    let now = svm.get_sysvar::<Clock>().slot;
+    assert!(now.checked_add(round_length).is_some());
+    assert!(now.checked_add(round_length.checked_mul(2).unwrap()).is_none());
+
+    let msg = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &env.twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        1,
+        1,
+        round_length,
+        0,
+        0,
+        None,
+    );
+    let remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &msg,
+            &remaining,
+        )
+        .is_err(),
+        "init_book must reject a round whose public cancellation and roll deadlines overflow"
+    );
+    assert!(
+        svm.get_account(&book).map_or(true, |account| account.data.is_empty()),
+        "an overflow-locked auction book must never be created"
+    );
+}
+
 // INIT_BOOK OVER A PRE-FUNDED ESCROW (stranded-COIN anti-strand): init_book binds the coin_escrow + settlement_usd
 // to a FRESH book that records 0 bids. If either already holds a balance (a donated/leftover amount, or a re-init
 // attempt after bids exist), binding it would STRAND that balance — no bidder slot owns it, and only claim/cancel

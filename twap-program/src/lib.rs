@@ -2821,11 +2821,10 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     } else {
         u64::MAX
     };
-    if reserve_den == 0
-        || round_length == 0
-        || round_length.checked_mul(2).is_none()
-        || sink_mode > SINK_SEND
-    {
+    let cancel_cooldown = round_length
+        .checked_mul(2)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if reserve_den == 0 || round_length == 0 || sink_mode > SINK_SEND {
         return Err(ProgramError::InvalidInstructionData);
     }
     if *system_program.key != solana_program::system_program::ID {
@@ -2907,9 +2906,15 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         Pubkey::default()
     };
 
-    let round_end = solana_program::clock::Clock::get()?
-        .slot
+    let current_slot = solana_program::clock::Clock::get()?.slot;
+    let round_end = current_slot
         .checked_add(round_length)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Both public exits must have representable deadlines before a book can
+    // accept custody. Otherwise the first execute cannot roll the round and an
+    // unsettled bidder cannot age into cancellation.
+    current_slot
+        .checked_add(cancel_cooldown)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let sink_cutoff_slot = if sink_mode == SINK_SEND {
         if requested_sink_cutoff < round_end {
