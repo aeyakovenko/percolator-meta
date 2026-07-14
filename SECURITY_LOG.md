@@ -14092,3 +14092,25 @@ post-exit reserve normalization uses the same invariant. The change adds no inst
 administrator, recipient, token account, CPI, authority, or fund-moving path. The finding is partial because
 the donor burns capital, only sub-threshold deposits are denied, and the default Genesis policy is principal
 only; the supported with-surplus configuration and finite public deposit window are required.
+
+## Tick - frozen shared settlement could permanently disable every auction round (surface C, PARTIAL DOS)
+
+The auction already tolerated a bidder's collateral destination becoming frozen after placement, but its
+single shared settlement account remained immutable. A collateral issuer could freeze that account after a
+bid committed. Execute then failed atomically when it tried to park the winning USD. The bidder's COIN stayed
+escrowed and eventually remained owner-cancellable, but every later round used the same frozen destination,
+so the singleton buyback auction could never settle again.
+
+The retained real-Percolator LiteSVM regression commits `400,000` COIN, permanently freezes shared settlement,
+and proves failed execution leaves the market, book, and escrow byte-atomic. The old TWAP SBF rejects every
+replacement and the regression fails. The fixed chain rejects cranker-owned and preloaded replacements,
+binds a clean empty account owned by the existing book-escrow PDA, executes the original bid, pays the exact
+USD, empties shared escrow, and reopens the book.
+
+FIX: a new permissionless instruction can change only `book.settlement_usd`. It requires the book to be open,
+the old exact binding to be an SPL-frozen account owned by the derived book-escrow PDA, and the replacement to
+be an initialized, empty, same-mint SPL account owned solely by that PDA with no delegate or close authority.
+A settled book is ineligible because its settlement account holds attributed bidder payouts. The instruction
+moves no token, accepts no recipient or amount, and adds no signer, governance privilege, or withdrawal path.
+The finding is partial because it requires the collateral mint's external freeze authority; bidder principal
+was recoverable after the cooldown, while the repeated auction lifecycle was permanently unavailable.

@@ -179,6 +179,10 @@ const IX_RETURN_RESOLVED_PROTOCOL_INSURANCE: u8 = 19;
 const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 20;
 // Timelocked, value-neutral restart for asset 0 while this program holds asset_admin.
 const IX_RESTART_ASSET0: u8 = 21;
+// Permissionless recovery for an externally frozen shared settlement account. It
+// can only replace already-frozen custody while the book is open, and the new
+// empty account remains exclusively owned by the same book-escrow PDA.
+const IX_REPLACE_FROZEN_SETTLEMENT: u8 = 22;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -550,6 +554,9 @@ pub fn process_instruction(
             process_return_resolved_asset0_backing(program_id, accounts, data)
         }
         IX_RESTART_ASSET0 => process_restart_asset0(program_id, accounts, data),
+        IX_REPLACE_FROZEN_SETTLEMENT => {
+            process_replace_frozen_settlement(program_id, accounts, data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -3060,6 +3067,81 @@ fn process_set_coin_sink(
     };
     d[BK_SINK_CUTOFF_SLOT..BK_SINK_CUTOFF_SLOT + 8]
         .copy_from_slice(&sink_cutoff_slot.to_le_bytes());
+    Ok(())
+}
+
+// replace_frozen_settlement accounts:
+// [config, book(w), book_escrow(pda), frozen_settlement, replacement_settlement]
+// data: none
+//
+// A collateral issuer can freeze the shared settlement account after bids commit.
+// Execute then rolls back before any bidder becomes settled, but an immutable
+// binding would permanently disable every future auction round. While the book is
+// OPEN there is no attributed USD in settlement custody, so anyone may abandon an
+// already-frozen account in favor of a clean empty account controlled by the exact
+// same escrow PDA. Settled books are immutable because their account holds bidder
+// payouts. No token moves and no caller-selected authority or beneficiary exists.
+fn process_replace_frozen_settlement(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let book_account = next_account_info(iter)?;
+    let book_escrow = next_account_info(iter)?;
+    let frozen_settlement = next_account_info(iter)?;
+    let replacement_settlement = next_account_info(iter)?;
+    if iter.next().is_some() || !book_account.is_writable {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if config_account.owner != program_id || book_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let book = load_book_header(&book_account.try_borrow_data()?)?;
+    if book.config != *config_account.key
+        || book.state != BOOK_STATE_OPEN
+        || *frozen_settlement.key != book.settlement_usd
+        || frozen_settlement.key == replacement_settlement.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let escrow_bump = [book.escrow_bump];
+    let escrow_seeds: [&[u8]; 3] = [BOOK_ESCROW_SEED, config_account.key.as_ref(), &escrow_bump];
+    let expected_escrow = Pubkey::create_program_address(&escrow_seeds, program_id)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
+    if *book_escrow.key != expected_escrow {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if frozen_settlement.owner != &spl_token::ID || replacement_settlement.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let frozen = spl_token::state::Account::unpack(&frozen_settlement.try_borrow_data()?)?;
+    if frozen.state != spl_token::state::AccountState::Frozen
+        || frozen.owner != expected_escrow
+        || frozen.mint != book.collateral_mint
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let replacement =
+        spl_token::state::Account::unpack(&replacement_settlement.try_borrow_data()?)?;
+    if replacement.state != spl_token::state::AccountState::Initialized
+        || replacement.owner != expected_escrow
+        || replacement.mint != book.collateral_mint
+        || replacement.amount != 0
+        || replacement.delegate.is_some()
+        || replacement.delegated_amount != 0
+        || replacement.close_authority.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    book_account.try_borrow_mut_data()?[BK_SETTLEMENT_USD..BK_SETTLEMENT_USD + 32]
+        .copy_from_slice(replacement_settlement.key.as_ref());
     Ok(())
 }
 
