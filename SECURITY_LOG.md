@@ -13898,3 +13898,28 @@ terminal return records `terminal_refunds_started` before changing any tally, an
 reject. The pool schedule offsets are cross-pinned to Subledger. No new instruction, account, signer,
 recipient, amount, token authority, or fund-moving CPI was added; transaction account locking gives the
 boundary a single winner.
+
+## Tick - losing fallback could block a pre-flag winning voter after upgrade (surface B/C, PARTIAL DOS)
+
+Genesis triggers created before the global election-state bytes were assigned persisted execution only
+on the winning proposal. After upgrade, a losing voter or nonvoter could take the public fallback first
+and set `terminal_refunds_started`. A later terminal return for an absent winning voter authenticated the
+old proposal's executed byte but rejected the conflicting fallback marker. The recorded owner could still
+return, retract, and withdraw, so this was not a direct fund loss or an unconditional user freeze. If that
+owner remained absent, however, its principal and the resolved market slab could not be retired by a
+public cranker.
+
+The retained real-SBF LiteSVM regression deposits two units for the winner and one for a nonvoter, seals
+the election through public instructions, and clears only the reserved global-execution byte to reproduce
+a pre-flag trigger. At the real fallback slot it uses the nonvoter's actual public Subledger return to set
+the conflicting marker, then permissionlessly returns the winning position to its owner-only token
+account, preserves the authenticated terminal capital-reward cutoff, crystallizes and claims that reward,
+and closes the drained real Percolator slab. Before the fix the winning return rejects with
+`InvalidAccountData` and all of that transaction's value movement rolls back. Restoring the old condition
+afterward makes the retained test fail at that exact return, proving the regression is mutation-sharp.
+
+FIX: an immutable executed proposal now upgrades the global state to `distribution_executed` and clears a
+legacy fallback marker. Current triggers persist proposal execution and the global bit in one transaction,
+so the conflicting state cannot be produced by the current binary; it is only legacy execution evidence.
+The transition adds no instruction, signer, beneficiary, amount, token account, authority, or fund-moving
+CPI. It restores only the existing fixed owner-bound terminal return.

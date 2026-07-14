@@ -614,9 +614,12 @@ fn retire_terminal_ballot(
     // that backed it. New triggers also persist this bit globally, so losing voters
     // and nonvoters can return immediately after the winner seals.
     if proposal.as_ref().is_some_and(|proposal| proposal.executed) {
-        if config.terminal_refunds_started {
-            return Err(ProgramError::InvalidAccountData);
-        }
+        // Pre-flag triggers persisted only the proposal byte. A losing voter may
+        // therefore have started the upgraded fallback before the winning ballot
+        // supplied this legacy execution evidence. New triggers set the proposal
+        // and global bit atomically, so an executed proposal safely supersedes the
+        // fallback marker and restores terminal cleanup for every remaining voter.
+        config.terminal_refunds_started = false;
         config.distribution_executed = true;
     }
     if !config.distribution_executed {
