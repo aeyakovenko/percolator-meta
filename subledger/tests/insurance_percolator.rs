@@ -2046,6 +2046,60 @@ fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
     assert_eq!(env.pool_outstanding(), 0, "all principal retired");
 }
 
+#[test]
+fn with_surplus_split_exit_cannot_capture_a_codepositors_yield() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+
+    let principal = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, principal);
+    let (bob, bob_ata) = new_depositor(&mut env, principal);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, principal)
+        .expect("alice deposits");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, principal)
+        .expect("bob deposits");
+
+    let live_balance = 3_000_003u64;
+    impair_market(&mut env, live_balance as u128);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, live_balance),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Exercise both tiny floor-heavy exits and a final full-share retirement.
+    for amount in [1u64, 2, 3, 7, 11, 101, 999_875] {
+        env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
+            .expect("split with-surplus exit");
+    }
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, principal)
+        .expect("co-depositor exits");
+
+    let alice_paid = env.token_amount(&alice_ata);
+    let bob_paid = env.token_amount(&bob_ata);
+    let reserve = env.token_amount(&env.perc_vault);
+    assert!(
+        alice_paid <= bob_paid,
+        "splitting cannot take yield from the unsplit co-depositor: alice={alice_paid}, bob={bob_paid}"
+    );
+    assert_eq!(
+        alice_paid + bob_paid + reserve,
+        live_balance,
+        "all yield remains conserved between owners and protocol reserve"
+    );
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 // LOSS-OF-FUNDS/LIVENESS PROBE: repeated recapitalization after market losses can make a
 // valid position's share count much larger than its principal. The full-exit fraction is still
 // exactly `position.shares`, but computing `shares * amount / principal` must not require the
