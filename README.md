@@ -169,7 +169,9 @@ is merged on top of this exact security line.
    role.
 2. **Deposit window.** Deposits are accepted only during
    `[bootstrap_start, bootstrap_start + deposit_window)`. The default window is about one week and
-   cannot extend past bootstrap end. Topping up resets that position's age.
+   cannot extend past bootstrap end. Pool initialization also proves that bootstrap end plus the
+   fallback trigger window is representable, so every accepted schedule has a reachable terminal
+   refund deadline. Topping up resets that position's age.
 3. **Bootstrap vote.** The default bootstrap delay is six 30-day months and is configurable in the
    pool/config PDA. A voter must retract before changing proposals or withdrawing. Quorum and the
    winning weighted majority are computed from live, unwithdrawn principal. A proposal is not

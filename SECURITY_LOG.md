@@ -14022,3 +14022,19 @@ earned by the end, and capital tenure is clamped to the end. Existing predecesso
 including zero-point stakes. The change adds no instruction, signer, authority, recipient, token account,
 CPI, or principal movement. The finding is partial because the current genesis and continuous lifecycle use
 the already-safe reusable epoch instruction; only callable predecessor configs had the vulnerable timing.
+
+## Tick - genesis schedule could overflow the fallback-refund deadline (surface A, PARTIAL DOS)
+
+The public Subledger genesis-pool initializer checked the deposit deadline and bootstrap end independently,
+but Genesis Vote opens unsealed-election fallback refunds at `bootstrap_end + deposit_window`. A near-maximum
+schedule could make both initializer sums valid while that terminal sum overflowed. Once such a pool accepted
+deposits, every no-winner terminal return would fail before retiring the ballot or returning principal.
+
+The retained real-Percolator LiteSVM regression submits that schedule through the public pool initializer and
+requires rejection before the pool PDA is allocated. Its adjacent boundary proves a deadline exactly equal to
+`u64::MAX` remains valid. Against the old SBF, the malformed pool initializes and the regression fails.
+
+FIX: pool initialization now proves the later Genesis Vote fallback deadline is representable before creating
+state. The change adds no instruction, signer, authority, recipient, account, CPI, or fund-moving path. The
+finding is partial because it requires deployment to select an extreme malformed schedule; a normally
+initialized live instance cannot be moved into this state.

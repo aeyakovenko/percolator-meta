@@ -6147,6 +6147,64 @@ fn deposit_window_cannot_outlive_the_bootstrap() {
 }
 
 #[test]
+fn bootstrap_schedule_rejects_an_overflowing_terminal_refund_grace() {
+    let window = 20u64;
+    let start = u64::MAX - 100;
+    let delay = 90u64;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&window.to_le_bytes());
+    data.extend_from_slice(&start.to_le_bytes());
+    data.extend_from_slice(&delay.to_le_bytes());
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+
+    assert!(
+        env.send(&[ix], &[]).is_err(),
+        "an accepted schedule must have a representable fallback-refund deadline"
+    );
+    assert!(env
+        .svm
+        .get_account(&env.pool)
+        .map_or(true, |a| a.data.is_empty()));
+
+    let exact_fit_delay = 80u64;
+    let mut exact_fit = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        window,
+        start,
+        exact_fit_delay,
+    );
+    exact_fit.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(window),
+        Some(start),
+    );
+    assert!(!exact_fit
+        .svm
+        .get_account(&exact_fit.pool)
+        .expect("exact-fit pool")
+        .data
+        .is_empty());
+}
+
+#[test]
 fn exact_schedule_boundaries_complete_real_percolator_genesis_and_return_principal() {
     let window = 3u64;
     let start = 110u64;
