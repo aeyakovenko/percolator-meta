@@ -33697,6 +33697,73 @@ fn e2e_frozen_canonical_holding_can_be_replaced_without_a_user_fund_path() {
     assert_eq!(token_amount(&svm, &bk.holding), 7);
 }
 
+// A same-mint book makes the configured COIN sink a structurally valid collateral
+// account owned by the TWAP authority. Permissionless holding repair must preserve
+// init/set_coin_sink's custody segregation instead of turning bought rewards into
+// the next round's auction budget.
+#[test]
+fn e2e_holding_replacement_cannot_alias_the_same_mint_coin_sink() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff_with_mint_mode(&mut svm, &payer, true);
+    let coin_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &coin_sink,
+        &env.coin_mint,
+        &env.twap_authority,
+        0,
+    );
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 1, Some(coin_sink), 0);
+
+    let freeze_authority = Keypair::new();
+    let mut mint_account = svm.get_account(&env.coin_mint).unwrap();
+    let mut mint_state = spl_token::state::Mint::unpack(&mint_account.data).unwrap();
+    mint_state.freeze_authority = COption::Some(freeze_authority.pubkey());
+    spl_token::state::Mint::pack(mint_state, &mut mint_account.data).unwrap();
+    svm.set_account(env.coin_mint, mint_account).unwrap();
+    send(
+        &mut svm,
+        &[&payer, &freeze_authority],
+        spl_token::instruction::freeze_account(
+            &spl_token::ID,
+            &bk.holding,
+            &env.collateral_mint,
+            &freeze_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("freeze the original same-mint holding");
+
+    let book_before = svm.get_account(&bk.book).unwrap();
+    let replace = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new(bk.book, false),
+            AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new_readonly(bk.holding, false),
+            AccountMeta::new_readonly(coin_sink, false),
+        ],
+        data: vec![23u8],
+    };
+    assert!(
+        send(&mut svm, &[&payer], replace).is_err(),
+        "holding repair cannot merge auction budget with the configured reward sink"
+    );
+    assert_eq!(svm.get_account(&bk.book).unwrap(), book_before);
+}
+
 // ADVERSARIAL CU-DOS (finding AC): the bid ranking is O(N^2) comparisons. When bid-vs-bid used the
 // continued-fraction (Euclidean) cmp_rate over attacker-controlled rates, a full 32-slot book of
 // close, long-continued-fraction (Fibonacci-ratio) bids made execute EXCEED the 1.4M compute budget

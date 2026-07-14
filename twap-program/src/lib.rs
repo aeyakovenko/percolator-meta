@@ -3199,13 +3199,15 @@ fn process_replace_frozen_holding(
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     let book = load_book_header(&book_account.try_borrow_data()?)?;
-    // Keep the two collateral buckets segregated. An initialized savings alias
-    // would make execute reject, but could not qualify for another frozen repair.
+    // Preserve every custody separation enforced by book initialization and
+    // reconfiguration. A savings alias would make execute reject permanently;
+    // a same-mint COIN-sink alias would recycle bought rewards as auction budget.
     if book.config != *config_account.key
         || book.state != BOOK_STATE_OPEN
         || *frozen_holding.key != book.holding
         || frozen_holding.key == replacement_holding.key
         || *replacement_holding.key == config.base_unit_savings_account
+        || *replacement_holding.key == book.coin_sink
     {
         return Err(ProgramError::InvalidAccountData);
     }
