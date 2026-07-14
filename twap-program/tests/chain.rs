@@ -42206,12 +42206,19 @@ enum OrganicRewardCleanup {
     BeforeCrystallize,
     PostEmissionLoss,
     OwnerCloseAfterRecovery,
+    OwnerReinitializeAfterRecovery,
 }
 
 fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCleanup) {
     use percolator_prog::ix::Instruction as PIx;
     let maintenance_fee_cleanup = cleanup == OrganicRewardCleanup::BeforeCrystallize;
-    let owner_close_after_recovery = cleanup == OrganicRewardCleanup::OwnerCloseAfterRecovery;
+    let owner_close_after_recovery = matches!(
+        cleanup,
+        OrganicRewardCleanup::OwnerCloseAfterRecovery
+            | OrganicRewardCleanup::OwnerReinitializeAfterRecovery
+    );
+    let owner_reinitialize_after_recovery =
+        cleanup == OrganicRewardCleanup::OwnerReinitializeAfterRecovery;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -42945,19 +42952,35 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
             bh,
         ))
         .expect("withdraw all collateral before the public owner close");
-        send(
-            &mut svm,
-            &[&loser],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(loser.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(loser_pf, false),
+        let close_portfolio = pix(
+            vec![
+                AccountMeta::new_readonly(loser.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(loser_pf, false),
+            ],
+            PIx::ClosePortfolio,
+        );
+        if owner_reinitialize_after_recovery {
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                &[
+                    close_portfolio,
+                    solana_sdk::system_instruction::transfer(
+                        &payer.pubkey(),
+                        &loser_pf,
+                        1_000_000_000,
+                    ),
                 ],
-                PIx::ClosePortfolio,
-            ),
-        )
-        .expect("owner publicly closes the empty reward witness");
+                Some(&payer.pubkey()),
+                &[&payer, &loser],
+                bh,
+            ))
+            .expect("owner closes while a public funder preserves the reusable program account");
+        } else {
+            send(&mut svm, &[&loser], close_portfolio)
+                .expect("owner publicly closes the empty reward witness");
+        }
         assert!(
             svm.get_account(&loser_pf)
                 .map_or(true, |account| account.data.is_empty()),
@@ -43060,11 +43083,100 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     ))
     .expect("freeze");
 
+    if owner_reinitialize_after_recovery {
+        send(
+            &mut svm,
+            &[&loser],
+            pix(
+                vec![
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("owner reinitializes the same portfolio key on the same market");
+        let fresh_source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &fresh_source,
+            &collateral,
+            &loser.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&loser],
+            pix(
+                vec![
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                    AccountMeta::new(fresh_source, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("fund the recreated portfolio");
+        send(
+            &mut svm,
+            &[&winner, &loser],
+            pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: pos,
+                    exec_price: initial_price / 2,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("recreated portfolio opens a fresh post-epoch long");
+        svm.set_sysvar(&Clock {
+            slot: 710,
+            unix_timestamp: 710,
+            ..Clock::default()
+        });
+        send(
+            &mut svm,
+            &[&admin],
+            pix(
+                vec![
+                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: 710,
+                    mark_e6: initial_price / 4,
+                },
+            ),
+        )
+        .expect("post-epoch oracle move creates a fresh loss");
+        for pf in [&winner_pf, &loser_pf] {
+            crank(&mut svm, pf, 710).expect("settle post-epoch recreated portfolio");
+            crank(&mut svm, pf, 710).expect("refresh post-epoch recreated portfolio");
+        }
+        assert!(
+            read_portfolio_crystallized(&svm, &loser_pf) > 0,
+            "the recreated generation supplies fresh post-epoch loss"
+        );
+    }
+
     let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
     if owner_close_after_recovery {
         assert!(
             svm.get_account(&loser_archive).is_none(),
-            "the attack reaches claim with no authenticated live-cap archive"
+            "the attack reaches claim with no authenticated prior-generation archive"
         );
     } else if maintenance_fee_cleanup {
         svm.expire_blockhash();
@@ -43197,7 +43309,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     if owner_close_after_recovery {
         assert!(
             claim_result.is_err(),
-            "a dematerialized trader without an archive must not bypass its zero live cap"
+            "closing or recreating a trader without an archive must not bypass its zero live cap"
         );
         assert_eq!(token_amount(&svm, &loser_coin), 0);
         assert_eq!(token_amount(&svm, &rd_vault), supply);
@@ -43429,6 +43541,13 @@ fn e2e_legacy_reward_end_excludes_post_period_real_trade_loss() {
 fn e2e_owner_close_cannot_bypass_trader_live_cap_after_organic_recovery() {
     run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         OrganicRewardCleanup::OwnerCloseAfterRecovery,
+    );
+}
+
+#[test]
+fn e2e_same_key_reinitialization_cannot_revive_consumed_trader_reward() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(
+        OrganicRewardCleanup::OwnerReinitializeAfterRecovery,
     );
 }
 
