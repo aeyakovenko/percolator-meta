@@ -14038,3 +14038,28 @@ FIX: pool initialization now proves the later Genesis Vote fallback deadline is 
 state. The change adds no instruction, signer, authority, recipient, account, CPI, or fund-moving path. The
 finding is partial because it requires deployment to select an extreme malformed schedule; a normally
 initialized live instance cannot be moved into this state.
+
+## Tick - owner exit could revive an expired Genesis trigger (surface B/D, REAL LOF)
+
+Genesis Vote enforced the bootstrap trigger phase's lower bound but not its upper bound. Owner-signed vote
+retraction and ordinary Subledger withdrawal intentionally remain available so a vote lock cannot trap
+principal. At the exact fallback-refund boundary, before any terminal cranker recorded the global fallback
+flag, a voter could therefore retract a competing ballot and withdraw. That reduced both live cast weight and
+outstanding principal, allowing a formerly tied proposal to satisfy strict majority and quorum after the
+documented election had expired. The old real binaries then sealed that proposal's allocation of the complete
+fixed COIN supply. The exiting owner recovered only its own principal, but the late trigger could redirect the
+reward/governance supply.
+
+The retained real-Percolator LiteSVM regression deposits equal principal for two voters, registers competing
+complete distributions, proves both triggers reject on a tie, advances to the exact fallback boundary, and
+executes the ordinary owner's retract-plus-withdraw transaction. It requires the principal return to remain
+live while both expired triggers reject and the distribution stays unsealed. Against the old Genesis Vote SBF,
+the first proposal seals after that exit and the regression fails. The adjacent in-window regression still
+proves that the same exit legitimately lets the stayer win before expiry, and the tied-election terminal return
+still drains both owner-bound positions and closes the real market.
+
+FIX: `trigger` authenticates the canonical Subledger pool's immutable schedule and rejects at or after
+`bootstrap_end + deposit_window`, independently of whether a fallback return has run. The existing fallback
+marker remains the transaction-ordering guard for concurrent returns. Retraction and owner-bound principal
+recovery are unchanged. The change adds no instruction, signer, administrator, recipient, amount, token
+account, authority, CPI, or fund-moving path.

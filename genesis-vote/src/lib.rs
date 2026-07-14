@@ -1307,7 +1307,8 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    if Clock::get()?.slot < config.bootstrap_end_slot {
+    let now = Clock::get()?.slot;
+    if now < config.bootstrap_end_slot {
         msg!("bootstrap delay has not elapsed");
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -1346,7 +1347,12 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     if sub_pool.owner != &config.subledger_program || *sub_pool.key != config.subledger_pool {
         return Err(ProgramError::InvalidAccountData);
     }
-    let live_outstanding = read_sub_pool_outstanding(&sub_pool.try_borrow_data()?)?;
+    let pool_data = sub_pool.try_borrow_data()?;
+    if now >= terminal_refund_start_slot(&pool_data, &config)? {
+        msg!("trigger phase has elapsed");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let live_outstanding = read_sub_pool_outstanding(&pool_data)?;
     // Quorum: more than half of the live outstanding insurance principal has voted.
     if (config.total_voted_principal as u128) * 2 <= live_outstanding as u128 {
         msg!("vote lacks a principal quorum");

@@ -84,6 +84,8 @@ struct Env {
     vault: Pubkey,
     sub_pid: Pubkey,
     sub_pool: Pubkey,
+    bootstrap_delay_slots: u64,
+    bootstrap_start_slot: u64,
     total_supply: u64,
 }
 
@@ -126,6 +128,8 @@ impl Env {
             vault,
             sub_pid,
             sub_pool,
+            bootstrap_delay_slots: TEST_BOOTSTRAP_DELAY_SLOTS,
+            bootstrap_start_slot: TEST_BOOTSTRAP_START_SLOT,
             total_supply,
         };
         env.set_pool_outstanding(0);
@@ -155,7 +159,20 @@ impl Env {
         let dist_config = dist_config_pda(&coin_mint, &gv_config);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
-        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool, total_supply: 100 };
+        let mut env = Env {
+            svm,
+            payer,
+            coin_mint,
+            mint_auth,
+            gv_config,
+            dist_config,
+            vault,
+            sub_pid,
+            sub_pool,
+            bootstrap_delay_slots: TEST_BOOTSTRAP_DELAY_SLOTS,
+            bootstrap_start_slot: TEST_BOOTSTRAP_START_SLOT,
+            total_supply: 100,
+        };
         env.set_pool_outstanding(0);
         env.init_distribution();
         env
@@ -185,6 +202,8 @@ impl Env {
             vault,
             sub_pid,
             sub_pool,
+            bootstrap_delay_slots: delay_slots,
+            bootstrap_start_slot: start_slot,
             total_supply: 100,
         };
         env.set_pool_outstanding(0);
@@ -196,14 +215,22 @@ impl Env {
     /// subledger program) with the given `outstanding_principal` at offset 80..88
     /// and the SUBPOOL1 discriminator. This is what the trigger reads live.
     fn set_pool_outstanding(&mut self, outstanding: u64) {
-        // 192-byte SUBPOOL1: mint at [8..40], outstanding at [80..88], and the
-        // vote_authority at [160..192] = this gv config PDA (init_config now binds
-        // the pool to the config, so the fixture must satisfy that).
-        let mut data = vec![0u8; 192];
+        // Current SUBPOOL1 layout: the trigger binds both the vote authority and
+        // the pool's immutable bootstrap schedule before reading live outstanding.
+        let deposit_window_slots = 1u64;
+        let deposit_deadline = self
+            .bootstrap_start_slot
+            .checked_add(deposit_window_slots)
+            .expect("test schedule deposit deadline");
+        let mut data = vec![0u8; 272];
         data[..8].copy_from_slice(b"SUBPOOL1");
         data[8..40].copy_from_slice(self.coin_mint.as_ref());
         data[80..88].copy_from_slice(&outstanding.to_le_bytes());
         data[160..192].copy_from_slice(self.gv_config.as_ref());
+        data[240..248].copy_from_slice(&deposit_deadline.to_le_bytes());
+        data[248..256].copy_from_slice(&deposit_window_slots.to_le_bytes());
+        data[256..264].copy_from_slice(&self.bootstrap_start_slot.to_le_bytes());
+        data[264..272].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
         let acc = solana_sdk::account::Account {
             lamports: 1_000_000,
             data,
