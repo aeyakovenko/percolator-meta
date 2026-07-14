@@ -472,9 +472,9 @@ struct Config {
     // coin_mint has no mint authority (GX/EZ) — so the supply can't be inflated under the claimers.
     // Pubkey::default() until frozen.
     vault: Pubkey,
-    // Slots AFTER emission_end before the denominators lock. Legacy configs may crystallize during
-    // this window. Reward epochs close crystallization at emission_end so cumulative counters cannot
-    // add post-period points; their window is an operational delay before permissionless freeze.
+    // Slots AFTER emission_end before the denominators lock. Reward point growth closes at the end;
+    // owner-signed capital finalization is clamped there, while trader finalization is reduce-only.
+    // Monotonic portfolio counters cannot add post-period points before permissionless freeze.
     finalize_window: u64,
     // ---- Residual tail. `total_points`/`insurance_total_points` above are BACKING and INSURANCE;
     // these add LP/TRADER residual cohorts and the backing pool scope. trader_bps is implicit from the
