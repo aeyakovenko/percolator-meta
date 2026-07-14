@@ -14110,7 +14110,10 @@ USD, empties shared escrow, and reopens the book.
 FIX: a new permissionless instruction can change only `book.settlement_usd`. It requires the book to be open,
 the old exact binding to be an SPL-frozen account owned by the derived book-escrow PDA, and the replacement to
 be an initialized, empty, same-mint SPL account owned solely by that PDA with no delegate or close authority.
-A settled book is ineligible because its settlement account holds attributed bidder payouts. The instruction
-moves no token, accepts no recipient or amount, and adds no signer, governance privilege, or withdrawal path.
+A settled book is ineligible because its settlement account holds attributed bidder payouts. The replacement
+also cannot be the configured COIN sink: in a same-mint SEND book, claims would drain only recorded bidder
+obligations and strand the bought reward under escrow authority. A dedicated real-SBF regression proves this
+book-escrow-owned alias is rejected without changing the book. The instruction moves no token, accepts no
+recipient or amount, and adds no signer, governance privilege, or withdrawal path.
 The finding is partial because it requires the collateral mint's external freeze authority; bidder principal
 was recoverable after the cooldown, while the repeated auction lifecycle was permanently unavailable.

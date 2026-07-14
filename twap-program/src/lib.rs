@@ -3106,6 +3106,7 @@ fn process_replace_frozen_settlement(
         || book.state != BOOK_STATE_OPEN
         || *frozen_settlement.key != book.settlement_usd
         || frozen_settlement.key == replacement_settlement.key
+        || *replacement_settlement.key == book.coin_sink
     {
         return Err(ProgramError::InvalidAccountData);
     }

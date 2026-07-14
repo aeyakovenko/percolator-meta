@@ -33353,6 +33353,74 @@ fn e2e_frozen_shared_settlement_can_be_replaced_without_exposing_bidder_funds() 
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
     assert_eq!(token_amount(&svm, &clean_settlement), 0);
 }
+
+// A same-mint book can configure a clean COIN sink owned by the book escrow PDA.
+// Permissionless settlement repair must not make that reward sink bidder custody:
+// claims account only for settlement and refunds, so bought rewards would remain
+// permanently under escrow authority after every bidder obligation was paid.
+#[test]
+fn e2e_settlement_replacement_cannot_alias_the_same_mint_coin_sink() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff_with_mint_mode(&mut svm, &payer, true);
+    let book_escrow = book_escrow_pda(&env.twap_cfg);
+    let coin_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &coin_sink,
+        &env.coin_mint,
+        &book_escrow,
+        0,
+    );
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 1, Some(coin_sink), 0);
+
+    let freeze_authority = Keypair::new();
+    let mut mint_account = svm.get_account(&env.coin_mint).unwrap();
+    let mut mint_state = spl_token::state::Mint::unpack(&mint_account.data).unwrap();
+    mint_state.freeze_authority = COption::Some(freeze_authority.pubkey());
+    spl_token::state::Mint::pack(mint_state, &mut mint_account.data).unwrap();
+    svm.set_account(env.coin_mint, mint_account).unwrap();
+    send(
+        &mut svm,
+        &[&payer, &freeze_authority],
+        spl_token::instruction::freeze_account(
+            &spl_token::ID,
+            &bk.settlement_usd,
+            &env.collateral_mint,
+            &freeze_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("freeze the original same-mint settlement account");
+
+    let book_before = svm.get_account(&bk.book).unwrap();
+    let replace = Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new(bk.book, false),
+            AccountMeta::new_readonly(bk.book_escrow, false),
+            AccountMeta::new_readonly(bk.settlement_usd, false),
+            AccountMeta::new_readonly(coin_sink, false),
+        ],
+        data: vec![22u8],
+    };
+    assert!(
+        send(&mut svm, &[&payer], replace).is_err(),
+        "settlement repair cannot merge bidder custody with the configured reward sink"
+    );
+    assert_eq!(svm.get_account(&bk.book).unwrap(), book_before);
+}
 // ADVERSARIAL CU-DOS (finding AC): the bid ranking is O(N^2) comparisons. When bid-vs-bid used the
 // continued-fraction (Euclidean) cmp_rate over attacker-controlled rates, a full 32-slot book of
 // close, long-continued-fraction (Fibonacci-ratio) bids made execute EXCEED the 1.4M compute budget
