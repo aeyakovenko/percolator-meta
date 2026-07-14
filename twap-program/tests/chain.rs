@@ -22162,8 +22162,9 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
 // both voters disappear. Resolution ends the code/market risk they backed, so a fixed
 // public return must still recover each deposit to its recorded owner and unblock slab
 // retirement. An unsealed election gets one public trigger phase, then the first
-// fallback return closes triggering before any exact tally changes. Refund order
-// therefore cannot select either tied proposal.
+// fallback return closes triggering before any exact tally changes. The first
+// fallback may even be a nonvoter with no materialized ballot; refund order still
+// cannot select either tied proposal.
 #[test]
 fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     let mut svm =
@@ -22285,8 +22286,10 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
 
     let voter_a = Keypair::new();
     let voter_b = Keypair::new();
+    let nonvoter = Keypair::new();
     let (position_a, destination_a) = deposit(&mut svm, &voter_a);
     let (position_b, destination_b) = deposit(&mut svm, &voter_b);
+    let (nonvoter_position, nonvoter_destination) = deposit(&mut svm, &nonvoter);
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot += 16;
     svm.set_sysvar(&clock);
@@ -22346,6 +22349,7 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     };
     let ballot_a = ballot_for(voter_a.pubkey());
     let ballot_b = ballot_for(voter_b.pubkey());
+    let nonvoter_ballot = ballot_for(nonvoter.pubkey());
     let pool_before_early_refund = svm.get_account(&env.pool).unwrap();
     let position_before_early_refund = svm.get_account(&position_a).unwrap();
     assert!(
@@ -22370,6 +22374,42 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     );
 
     advance_to_test_terminal_refund_start(&mut svm);
+    send(
+        &mut svm,
+        &[&payer],
+        terminal_return(
+            nonvoter.pubkey(),
+            nonvoter_position,
+            nonvoter_destination,
+            nonvoter_ballot,
+            vote_a,
+        ),
+    )
+    .expect("a nonvoter can atomically close the expired trigger phase");
+    assert_eq!(token_amount(&svm, &nonvoter_destination), 1);
+    let config_after_nonvoter = svm.get_account(&env.gv_config).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(
+            config_after_nonvoter.data[200..208]
+                .try_into()
+                .unwrap()
+        ),
+        2,
+        "a nonvoter refund cannot alter either proposal's principal tally"
+    );
+    assert_eq!(
+        u128::from_le_bytes(
+            config_after_nonvoter.data[208..224]
+                .try_into()
+                .unwrap()
+        ),
+        8,
+        "a nonvoter refund cannot alter either proposal's weight tally"
+    );
+    assert!(
+        trigger(&mut svm, vote_a, dist_a).is_err(),
+        "the first ballot-free fallback refund permanently closes triggering"
+    );
     send(
         &mut svm,
         &[&payer],
