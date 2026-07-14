@@ -41910,10 +41910,10 @@ fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
 }
 
 // PUBLIC DOS: a canonical TWAP handoff preserves retained protocol insurance above depositor
-// principal in its monotonic floor. After resolution and every owner exit, a zero-principal
-// re-handoff intentionally preserves that floor, so the auction cannot pull it while CloseSlab
-// cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
-// exact residual only through clean PDA-owned transits into controller custody.
+// principal in its monotonic floor. The final depositor may also disappear behind a live Genesis
+// ballot, so terminal cleanup must first return TWAP custody and retire that exact ballot without
+// the owner or DAO. After every owner exit, a zero-principal re-handoff intentionally preserves the
+// protocol floor; fixed recovery must route it through clean PDA-owned transits before CloseSlab.
 #[test]
 fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
     let mut svm =
@@ -41937,6 +41937,14 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
         .unwrap();
     let env = setup_genesis(&mut svm, &payer);
+    let (depositor_distribution, depositor_proposal) = register_proposal(
+        &mut svm,
+        &payer,
+        &env,
+        1,
+        &Pubkey::new_unique(),
+        100,
+    );
     let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
     let asset0_backing_amount = 7u64;
     let asset0_provider_destination =
@@ -42137,6 +42145,39 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     )
     .expect("second owner deposits the one-unit live-exit probe");
     let total_principal = principal + exiting_principal;
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot += 8;
+    svm.set_sysvar(&clock);
+    let depositor_ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            env.gv_config.as_ref(),
+            depositor.pubkey().as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(depositor_ballot, false),
+                AccountMeta::new(depositor_proposal, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: vec![3u8, 1u8],
+        },
+    )
+    .expect("remaining depositor locks its principal behind a genesis ballot");
+    assert_eq!(svm.get_account(&position).unwrap().data[97], 1);
 
     send(
         &mut svm,
@@ -42532,32 +42573,84 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     // Custody is now back at the canonical pool until a public cranker re-hands it
     // to TWAP. A second owner may use that interval to make an ordinary partial
     // exit. The later re-handoff must derive the aggregate live principal from the
-    // pool instead of subtracting only the owner consumed by the atomic return.
+    // pool instead of subtracting only the owner consumed by the atomic return. This
+    // owner retracts around the exit and re-backs the reduced principal, then disappears.
     let interleaved_exit = 4u64;
     let mut interleaved_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
     interleaved_withdraw_data.extend_from_slice(&interleaved_exit.to_le_bytes());
+    let interleaved_withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new(pool_holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: interleaved_withdraw_data,
+    };
+    let vote_after_return = |action: u8| Instruction {
+        program_id: gv_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(env.gv_config, false),
+            AccountMeta::new(depositor_ballot, false),
+            AccountMeta::new(depositor_proposal, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, action],
+    };
+    svm.expire_blockhash();
+    let blockhash = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[
+            vote_after_return(2),
+            interleaved_withdraw,
+            vote_after_return(1),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &depositor],
+        blockhash,
+    ))
+    .expect("owner retracts, partially exits, and re-backs the reduced principal atomically");
+    assert_eq!(token_amount(&svm, &depositor_ata), interleaved_exit);
+    assert_eq!(svm.get_account(&position).unwrap().data[97], 1);
+    assert!(
+        u128::from_le_bytes(
+            svm.get_account(&depositor_proposal).unwrap().data[72..88]
+                .try_into()
+                .unwrap()
+        ) > 0,
+        "the remaining principal is still bound to a live ballot"
+    );
+
+    advance_to_test_bootstrap_end(&mut svm);
     send(
         &mut svm,
-        &[&payer, &depositor],
+        &[&payer],
         Instruction {
-            program_id: sub_id(),
+            program_id: gv_id_e2e(),
             accounts: vec![
-                AccountMeta::new(depositor.pubkey(), true),
-                AccountMeta::new(env.pool, false),
-                AccountMeta::new(position, false),
-                AccountMeta::new(depositor_ata, false),
-                AccountMeta::new(pool_holding, false),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new(env.perc_vault, false),
-                AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(depositor_proposal, false),
+                AccountMeta::new_readonly(dist_id_e2e(), false),
+                AccountMeta::new(env.dist_config, false),
+                AccountMeta::new(depositor_distribution, false),
+                AccountMeta::new_readonly(env.pool, false),
             ],
-            data: interleaved_withdraw_data,
+            data: vec![4u8],
         },
     )
-    .expect("a second owner exits while the pool holds returned custody");
-    assert_eq!(token_amount(&svm, &depositor_ata), interleaved_exit);
+    .expect("permissionless trigger seals the reduced re-backed vote before resolution");
 
     // Resolution can race the external re-handoff crank after these owner exits. The
     // established pending permit must remain usable in resolved mode; otherwise this ordinary
@@ -42603,7 +42696,6 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     };
     send(&mut svm, &[&payer], permissionless_rehandoff.clone())
         .expect("any cranker resumes established TWAP custody after the owner exit");
-    let remaining_principal = principal - interleaved_exit;
     let retained_floor =
         retained_floor - exiting_principal as u128 - interleaved_exit as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
@@ -42682,15 +42774,18 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     send(&mut svm, &[&payer], public_return_to_pool)
         .expect("any cranker returns resolved custody to the canonical owner-bound pool");
 
-    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
-    withdraw_data.extend_from_slice(&remaining_principal.to_le_bytes());
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = TEST_BOOTSTRAP_START_SLOT
+        + TEST_BOOTSTRAP_DELAY_SLOTS
+        + TEST_GENESIS_DEPOSIT_WINDOW_SLOTS;
+    svm.set_sysvar(&clock);
     send(
         &mut svm,
-        &[&payer, &depositor],
+        &[&payer],
         Instruction {
             program_id: sub_id(),
             accounts: vec![
-                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new_readonly(depositor.pubkey(), false),
                 AccountMeta::new(env.pool, false),
                 AccountMeta::new(position, false),
                 AccountMeta::new(depositor_ata, false),
@@ -42700,13 +42795,26 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(env.gv_config, false),
+                AccountMeta::new_readonly(depositor_proposal, false),
+                AccountMeta::new_readonly(gv_id_e2e(), false),
             ],
-            data: withdraw_data,
+            data: vec![12u8], // IX_RETURN_TERMINAL_INSURANCE
         },
     )
-    .expect("owner recovers the complete protected principal after resolution");
+    .expect("any cranker proves the winning vote and returns the absent owner's principal");
     assert_eq!(token_amount(&svm, &depositor_ata), principal);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_protocol_insurance as u128);
+    assert_eq!(svm.get_account(&position).unwrap().data[97], 0);
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&env.pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "the absent voter no longer blocks terminal pool attestation"
+    );
 
     let market_before_unpending_rehandoff = svm.get_account(&env.slab).unwrap();
     let config_before_unpending_rehandoff = svm.get_account(&twap_cfg).unwrap();
