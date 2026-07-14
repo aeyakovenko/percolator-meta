@@ -3198,6 +3198,10 @@ fn e2e_permissionless_market_init_cannot_consume_an_unsigned_preallocated_slab()
             AccountMeta::new(market.pubkey(), false),
             AccountMeta::new_readonly(collateral_mint, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(
+                retired_market_pda(&market.pubkey(), &perc_id()),
+                false,
+            ),
         ],
         data: init_data.clone(),
     };
@@ -3223,6 +3227,10 @@ fn e2e_permissionless_market_init_cannot_consume_an_unsigned_preallocated_slab()
                 AccountMeta::new(market.pubkey(), true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market.pubkey(), &perc_id()),
+                    false,
+                ),
             ],
             data: init_data,
         },
@@ -3289,6 +3297,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
                 AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -3549,6 +3558,7 @@ fn e2e_controller_cannot_enable_the_pinned_global_batch_gate() {
                 AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -3818,6 +3828,7 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
                 AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -4509,6 +4520,7 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -4660,6 +4672,7 @@ fn poolless_twap_custody_returns_absent_asset0_backing_after_resolution() {
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -5364,7 +5377,7 @@ fn build_controller_accept_and_top_up_asset0_backing_message(
     m.push(1); // governance is the signer for both instructions
     m.push(0);
     m.push(3); // market, provider source, and vault are writable
-    m.push(9);
+    m.push(10);
     for key in [
         governance,
         market,
@@ -5374,15 +5387,16 @@ fn build_controller_accept_and_top_up_asset0_backing_message(
         &spl_token::ID,
         percolator_program,
         custody_state,
+        &retired_market_pda(market, percolator_program),
         &controller_id(),
     ] {
         m.extend_from_slice(key.as_ref());
     }
     m.push(2);
 
-    m.push(8); // market-controller program
-    m.push(6);
-    for index in [0u8, 0, 4, 1, 6, 7] {
+    m.push(9); // market-controller program
+    m.push(7);
+    for index in [0u8, 0, 4, 1, 6, 8, 7] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -5416,21 +5430,22 @@ fn build_controller_accept_market_authority_message(
     m.push(1); // governance is also the current market authority signer
     m.push(0);
     m.push(1); // market writable
-    m.push(6);
+    m.push(7);
     for key in [
         governance,
         market,
         controller,
         percolator_program,
         custody_state,
+        &retired_market_pda(market, percolator_program),
         &controller_id(),
     ] {
         m.extend_from_slice(key.as_ref());
     }
     m.push(1);
-    m.push(5); // market-controller program
-    m.push(6);
-    for index in [0u8, 0, 2, 1, 3, 4] {
+    m.push(6); // market-controller program
+    m.push(7);
+    for index in [0u8, 0, 2, 1, 3, 5, 4] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -5451,7 +5466,7 @@ fn build_controller_accept_market_authority_with_distinct_governance_message(
     m.push(1); // current_authority is the Squads vault signer
     m.push(0);
     m.push(1); // market writable
-    m.push(7);
+    m.push(8);
     for key in [
         current_authority,
         market,
@@ -5459,14 +5474,15 @@ fn build_controller_accept_market_authority_with_distinct_governance_message(
         controller,
         percolator_program,
         custody_state,
+        &retired_market_pda(market, percolator_program),
         &controller_id(),
     ] {
         m.extend_from_slice(key.as_ref());
     }
     m.push(1);
-    m.push(6); // market-controller program
-    m.push(6);
-    for index in [2u8, 0, 3, 1, 4, 5] {
+    m.push(7); // market-controller program
+    m.push(7);
+    for index in [2u8, 0, 3, 1, 4, 6, 5] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -6477,6 +6493,7 @@ fn e2e_market_donation_rejects_a_raw_creator_batch_gate() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
     };
@@ -6624,6 +6641,7 @@ fn e2e_subledger_custody_can_clear_an_inherited_batch_gate() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
                 AccountMeta::new_readonly(pool, false),
             ],
             data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
@@ -6940,6 +6958,7 @@ fn e2e_controller_activation_clears_a_retired_slots_latent_batch_gate() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
             ],
             data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
         },
@@ -7101,6 +7120,7 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
     };
@@ -7215,6 +7235,7 @@ fn e2e_funded_creator_insurance_exits_before_donation_and_genesis_grant() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
     };
@@ -7438,6 +7459,7 @@ fn assert_market_donation_rejects_split_asset0_insurance_custody(
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8],
     };
@@ -7650,6 +7672,7 @@ fn assert_funded_market_donation_rejects_a_delegated_asset0_admin(
                     AccountMeta::new_readonly(controller, false),
                     AccountMeta::new(slab, false),
                     AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
                 ],
                 data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
             },
@@ -7784,6 +7807,7 @@ fn e2e_foreign_canonical_twap_config_cannot_bless_a_market_handoff() {
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(foreign_config, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     let market_before = svm.get_account(&env.slab).unwrap();
@@ -7850,6 +7874,7 @@ fn e2e_twap_handoff_rejects_a_mismatched_market_controller() {
         AccountMeta::new_readonly(foreign_controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -8042,6 +8067,7 @@ fn e2e_controller_activation_cannot_install_an_external_insurance_withdrawal_key
             AccountMeta::new(slab, true),
             AccountMeta::new_readonly(collateral_mint, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: init_data,
     };
@@ -8397,6 +8423,7 @@ fn assert_controller_donation_rejects_delegated_role(delegated_kind: u8) {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
     };
@@ -8615,6 +8642,7 @@ fn e2e_market_donation_cannot_preserve_an_unfunded_provider_that_skims_later_tra
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(market, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
         },
@@ -8841,6 +8869,7 @@ fn e2e_funded_creator_must_exit_before_donation_and_cannot_skim_later_fees() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
         ],
         data: vec![3u8],
     };
@@ -9059,6 +9088,7 @@ fn e2e_market_donation_does_not_replace_a_distinct_asset0_backing_provider() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8],
     };
@@ -9198,6 +9228,7 @@ fn e2e_market_donation_rejects_a_live_secondary_asset() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
     };
@@ -9411,6 +9442,7 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
                 AccountMeta::new(slab, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -9865,6 +9897,7 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
                 AccountMeta::new(slab, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -10610,181 +10643,6 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
         "a retired allow-list key cannot admit an attacker-controlled reward stake"
     );
 
-    // Reward identity stays permanently retired, but the stateless controller may still accept a
-    // later market generation at this key. That replacement must retain the ordinary governed
-    // shutdown/cleanup lifecycle instead of becoming uncloseable solely because the marker exists.
-    send(
-        &mut svm,
-        &[&market_hijacker],
-        pix(
-            vec![
-                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
-                AccountMeta::new(slab, false),
-                AccountMeta::new(hijack_portfolio.pubkey(), false),
-            ],
-            percolator_prog::ix::Instruction::ClosePortfolio,
-        ),
-    )
-    .expect("replacement owner closes its empty portfolio");
-    send(
-        &mut svm,
-        &[&market_hijacker],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), false),
-                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new_readonly(perc_id(), false),
-            ],
-            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
-        },
-    )
-    .expect("public handoff accepts the clean replacement generation");
-    assert_eq!(
-        percolator_accounting::read_market_authority(&svm.get_account(&slab).unwrap().data)
-            .unwrap(),
-        controller.to_bytes()
-    );
-
-    replacement_clock.slot = 110;
-    replacement_clock.unix_timestamp = 110;
-    svm.set_sysvar(&replacement_clock);
-    send(
-        &mut svm,
-        &[&payer],
-        Instruction {
-            program_id: perc_id(),
-            accounts: vec![AccountMeta::new(slab, false)],
-            data: percolator_prog::ix::Instruction::ResolveStalePermissionless {
-                now_slot: replacement_clock.slot,
-            }
-            .encode(),
-        },
-    )
-    .expect("an unaffiliated caller resolves the attacker-configured replacement market");
-
-    replacement_clock.slot = 111;
-    replacement_clock.unix_timestamp = 111;
-    svm.set_sysvar(&replacement_clock);
-
-    let attacker_destination = Pubkey::new_unique();
-    let victim_replacement_destination = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &attacker_destination,
-        &collateral_mint,
-        &attacker.pubkey(),
-        0,
-    );
-    set_token(
-        &mut svm,
-        &victim_replacement_destination,
-        &collateral_mint,
-        &victim.pubkey(),
-        0,
-    );
-    for (owner, account, destination) in [
-        (
-            attacker.pubkey(),
-            portfolio.pubkey(),
-            attacker_destination,
-        ),
-        (
-            victim.pubkey(),
-            victim_portfolio.pubkey(),
-            victim_replacement_destination,
-        ),
-    ] {
-        send(
-            &mut svm,
-            &[&payer],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(owner, false),
-                    AccountMeta::new(slab, false),
-                    AccountMeta::new(account, false),
-                    AccountMeta::new(destination, false),
-                    AccountMeta::new(percolator_vault, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                percolator_prog::ix::Instruction::CloseResolved {
-                    fee_rate_per_slot: 0,
-                },
-            ),
-        )
-        .expect("public resolved payout empties a replacement portfolio");
-    }
-
-    let replacement_attacker_archive =
-        rd_portfolio_archive_pda(&slab, &attacker.pubkey(), &portfolio.pubkey());
-    let replacement_victim_archive = rd_portfolio_archive_pda(
-        &slab,
-        &victim.pubkey(),
-        &victim_portfolio.pubkey(),
-    );
-    let replacement_before_legacy_cleanup = svm.get_account(&portfolio.pubkey()).unwrap();
-    assert!(
-        send(
-            &mut svm,
-            &[&payer],
-            Instruction {
-                program_id: controller_id(),
-                accounts: vec![
-                    AccountMeta::new_readonly(governance.pubkey(), false),
-                    AccountMeta::new_readonly(controller, false),
-                    AccountMeta::new(slab, false),
-                    AccountMeta::new(portfolio.pubkey(), false),
-                    AccountMeta::new_readonly(perc_id(), false),
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new(replacement_attacker_archive, false),
-                    AccountMeta::new_readonly(rd_id(), false),
-                    AccountMeta::new_readonly(system_program::ID, false),
-                ],
-                data: vec![11u8],
-            },
-        )
-        .is_err(),
-        "omitting the retired-market marker cannot recover the vulnerable archive path"
-    );
-    assert_eq!(
-        svm.get_account(&portfolio.pubkey()).unwrap(),
-        replacement_before_legacy_cleanup,
-        "rejected legacy cleanup leaves the replacement portfolio intact"
-    );
-    for (account, archive) in [
-        (portfolio.pubkey(), replacement_attacker_archive),
-        (victim_portfolio.pubkey(), replacement_victim_archive),
-    ] {
-        send(
-            &mut svm,
-            &[&payer],
-            Instruction {
-                program_id: controller_id(),
-                accounts: vec![
-                    AccountMeta::new_readonly(governance.pubkey(), false),
-                    AccountMeta::new_readonly(controller, false),
-                    AccountMeta::new(slab, false),
-                    AccountMeta::new(account, false),
-                    AccountMeta::new_readonly(perc_id(), false),
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new(archive, false),
-                    AccountMeta::new_readonly(rd_id(), false),
-                    AccountMeta::new_readonly(system_program::ID, false),
-                    AccountMeta::new_readonly(retired_market, false),
-                ],
-                data: vec![11u8],
-            },
-        )
-        .expect("public controller retires a replacement portfolio with reward telemetry");
-    }
-    assert!(
-        svm.get_account(&replacement_attacker_archive)
-            .is_none_or(|account| account.data.is_empty()),
-        "a retired market generation must not append paid funding to the original archive"
-    );
     assert!(
         send(
             &mut svm,
@@ -10799,124 +10657,61 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
             ),
         )
         .is_err(),
-        "the original zero-counter stake cannot crystallize replacement-generation funding"
+        "the original stake cannot crystallize replacement-generation funding",
     );
 
-    let replacement_market = svm.get_account(&slab).unwrap();
-    let replacement_backing_provider = Pubkey::new_from_array(
-        percolator_accounting::read_asset_backing_authority(&replacement_market.data, 0).unwrap(),
-    );
-    let replacement_backing_amount = percolator_accounting::read_asset_backing_balances(
-        &replacement_market.data,
-        0,
-    )
-    .unwrap()
-    .iter()
-    .map(|balance| balance.principal_atoms + balance.earnings_atoms)
-    .sum::<u128>();
-    assert!(
-        replacement_backing_amount > 0,
-        "real funding settlement must leave provider-owned backing to return"
-    );
-    let replacement_backing_destination = Pubkey::new_unique();
-    let replacement_backing_transit = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &replacement_backing_destination,
-        &collateral_mint,
-        &replacement_backing_provider,
-        0,
-    );
-    set_token(
-        &mut svm,
-        &replacement_backing_transit,
-        &collateral_mint,
-        &controller,
-        0,
-    );
-    let backing_ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
-    let backing_ledger_rent = svm.minimum_balance_for_rent_exemption(backing_ledger_len);
-    let long_backing_ledger = Keypair::new();
-    let short_backing_ledger = Keypair::new();
-    for ledger in [&long_backing_ledger, &short_backing_ledger] {
-        send(
-            &mut svm,
-            &[&payer, ledger],
-            solana_sdk::system_instruction::create_account(
-                &payer.pubkey(),
-                &ledger.pubkey(),
-                backing_ledger_rent,
-                backing_ledger_len as u64,
-                &perc_id(),
-            ),
-        )
-        .expect("a public cranker allocates a temporary Percolator backing ledger");
-    }
     send(
         &mut svm,
-        &[&payer],
-        controller_return_resolved_asset0_backing_ix(
-            &governance.pubkey(),
-            &controller,
-            &controller,
-            &slab,
-            &replacement_backing_destination,
-            &replacement_backing_transit,
-            &percolator_vault,
-            &vault_authority,
-            &long_backing_ledger.pubkey(),
-            &short_backing_ledger.pubkey(),
-            &perc_id(),
+        &[&market_hijacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(hijack_portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::ClosePortfolio,
         ),
     )
-    .expect("public cleanup returns replacement backing to its recorded provider");
-    assert_eq!(
-        token_amount(&svm, &replacement_backing_destination) as u128,
-        replacement_backing_amount,
-        "terminal cleanup cannot redirect replacement backing"
-    );
-    set_token(
-        &mut svm,
-        &controller_transit,
-        &collateral_mint,
-        &controller,
-        0,
-    );
-    let marker_before_reclose = svm.get_account(&retired_market).unwrap();
-    send(
-        &mut svm,
-        &[&payer, &governance],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new(governance.pubkey(), true),
-                AccountMeta::new(controller, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new_readonly(vault_authority, false),
-                AccountMeta::new(percolator_vault, false),
-                AccountMeta::new(controller_transit, false),
-                AccountMeta::new(governance_destination, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new(retired_market, false),
-            ],
-            data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
-        },
-    )
-    .expect("an existing valid marker cannot block replacement-market cleanup");
+    .expect("replacement owner closes its empty portfolio");
+
+    // The immutable marker now protects governance identity as well as reward identity.
+    // A replacement remains a valid direct Percolator market, but it cannot inherit the
+    // retired generation's stateless controller and approved governance transactions.
+    let replacement_before_handoff = svm.get_account(&slab).unwrap();
     assert!(
-        svm.get_account(&slab)
-            .map_or(true, |account| account.lamports == 0),
-        "the replacement slab closes normally"
+        send(
+            &mut svm,
+            &[&market_hijacker],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(market_hijacker.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(retired_market, false),
+                ],
+                data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+            },
+        )
+        .is_err(),
+        "a retired slab key cannot enter Meta governance again",
     );
     assert_eq!(
-        svm.get_account(&retired_market).unwrap(),
-        marker_before_reclose,
-        "terminal cleanup reuses the immutable marker without rewriting it"
+        svm.get_account(&slab).unwrap(),
+        replacement_before_handoff,
+        "rejected controller admission preserves every replacement-market role and balance",
+    );
+    assert_eq!(
+        percolator_accounting::read_market_authority(&replacement_before_handoff.data).unwrap(),
+        market_hijacker.pubkey().to_bytes(),
+    );
+    assert!(
+        percolator_accounting::market_is_live(&replacement_before_handoff.data).unwrap(),
+        "the direct replacement market remains live after rejected admission",
     );
 }
-
 // PUBLIC TERMINAL DOS: an external collateral issuer can freeze the provider's
 // canonical ATA and the controller's empty canonical transit after backing is
 // deposited, then revoke the freeze authority. The fixed return must retain the
@@ -11012,6 +10807,7 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
             ],
             data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
         },
@@ -11394,6 +11190,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: vec![3u8],
     };
@@ -11863,6 +11660,7 @@ fn e2e_controller_freezes_shutdown_returns_when_stale_resolution_matures() {
                 AccountMeta::new(slab, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -12301,6 +12099,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
             AccountMeta::new(slab, true),
             AccountMeta::new_readonly(collateral_mint, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
         data: init_data,
     };
@@ -13688,6 +13487,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
                 AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: init_data,
         },
@@ -17396,6 +17196,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -21322,6 +21123,329 @@ fn e2e_completed_squads_execute_cannot_be_replayed() {
         ))
         .is_err(),
         "an already-executed Squads vault transaction must not be replayable"
+    );
+}
+
+// CROSS-GENERATION GOVERNANCE DOS PROBE: a Squads proposal commits to the market
+// account key, while Percolator permits a closed slab to be initialized again at
+// that key. An approved instruction for the retired generation must not remain
+// executable against a later live generation merely because both use the same
+// stateless controller PDA.
+#[test]
+fn e2e_approved_old_generation_resolve_cannot_shutdown_reused_market_key() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    send(
+        &mut svm,
+        &[&payer, &create_key],
+        multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&dao.pubkey()),
+            1,
+            &[(dao.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        ),
+    )
+    .expect("initialize the real Squads governance instance");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the first market generation");
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+    let controller = controller_pda(&squads_vault, &market.pubkey(), &perc_id());
+    let init_market = || {
+        let mut data = vec![1u8]; // IX_INIT_MARKET
+        data.extend_from_slice(&controller_init_market_data(1));
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market.pubkey(), &perc_id()),
+                    false,
+                ),
+            ],
+            data,
+        }
+    };
+    send(&mut svm, &[&payer, &market], init_market())
+        .expect("permissionlessly initialize the first controller-owned generation");
+
+    let resolve_message = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market.pubkey(), false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+
+    // Approve transaction 1 for generation A, but deliberately leave it unexecuted.
+    let stale_index = 1u64;
+    let stale_transaction = transaction_pda(&squads, &multisig, stale_index);
+    let stale_proposal = proposal_pda(&squads, &multisig, stale_index);
+    send(
+        &mut svm,
+        &[&dao],
+        vault_transaction_create_ix(
+            &squads,
+            &multisig,
+            &stale_transaction,
+            &dao.pubkey(),
+            &resolve_message,
+        ),
+    )
+    .expect("record the old-generation resolve transaction");
+    send(
+        &mut svm,
+        &[&dao],
+        proposal_create_ix(
+            &squads,
+            &multisig,
+            &stale_proposal,
+            &dao.pubkey(),
+            stale_index,
+        ),
+    )
+    .expect("create the old-generation proposal");
+    send(
+        &mut svm,
+        &[&dao],
+        proposal_approve_ix(&squads, &multisig, &stale_proposal, &dao.pubkey()),
+    )
+    .expect("approve the old-generation proposal");
+
+    // A separate approved action resolves generation A so it can complete its normal
+    // terminal cleanup while transaction 1 remains live in Squads.
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        2,
+        &resolve_message,
+        &resolve_remaining,
+    )
+    .expect("resolve the first generation with a separate governance action");
+
+    let vault_authority = perc_vault_authority(&market.pubkey(), &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let controller_transit = Pubkey::new_unique();
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &collateral_mint,
+        &squads_vault,
+        0,
+    );
+    let close_message = build_controller_close_and_reclaim_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &percolator_vault,
+        &vault_authority,
+        &controller_transit,
+        &governance_destination,
+    );
+    let close_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(market.pubkey(), false),
+        AccountMeta::new(percolator_vault, false),
+        AccountMeta::new(controller_transit, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&market.pubkey(), &perc_id()), false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        3,
+        &close_message,
+        &close_remaining,
+    )
+    .expect("close and retire the first generation");
+    assert!(
+        svm.get_account(&market.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "the first slab generation is gone",
+    );
+
+    // Percolator can publicly reinitialize the zero-lamport retired slab without
+    // the old market key signing. A fresh creator then uses the controller's fixed
+    // public acceptance path to donate generation B to the same DAO.
+    let replacement_creator = Keypair::new();
+    svm.airdrop(&replacement_creator.pubkey(), 1_000_000_000)
+        .unwrap();
+    send(
+        &mut svm,
+        &[&replacement_creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(replacement_creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            percolator_prog::ix::Instruction::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 3,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: 1,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("permissionlessly initialize the replacement generation at the same key");
+    assert!(
+        send(
+            &mut svm,
+            &[&replacement_creator],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(squads_vault, false),
+                    AccountMeta::new_readonly(replacement_creator.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market.pubkey(), false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(
+                        retired_market_pda(&market.pubkey(), &perc_id()),
+                        false,
+                    ),
+                ],
+                data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+            },
+        )
+        .is_err(),
+        "a retired slab key cannot re-enter the old Meta controller",
+    );
+    assert_eq!(
+        percolator_accounting::read_market_authority(
+            &svm.get_account(&market.pubkey()).unwrap().data,
+        )
+        .unwrap(),
+        replacement_creator.pubkey().to_bytes(),
+        "rejected admission leaves every replacement role unchanged",
+    );
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    assert!(
+        percolator_accounting::market_is_live(&svm.get_account(&market.pubkey()).unwrap().data)
+            .unwrap(),
+        "the replacement starts live",
+    );
+
+    let stale_execute = vault_transaction_execute_ix(
+        &squads,
+        &multisig,
+        &stale_proposal,
+        &stale_transaction,
+        &dao.pubkey(),
+        &resolve_remaining,
+    );
+    assert!(
+        send(&mut svm, &[&dao], stale_execute).is_err(),
+        "an approved action for a retired generation must not resolve its replacement",
+    );
+    assert!(
+        percolator_accounting::market_is_live(&svm.get_account(&market.pubkey()).unwrap().data)
+            .unwrap(),
+        "rejecting stale governance preserves the replacement market",
     );
 }
 
@@ -40617,6 +40741,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(market_key, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
             ],
             data: vec![3u8],
         },
@@ -42282,6 +42407,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
                     AccountMeta::new_readonly(controller, false),
                     AccountMeta::new(market, false),
                     AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
                 ],
                 data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
             },
@@ -42574,6 +42700,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -44555,6 +44682,7 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
                 AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
             ],
             data: init_data,
         },

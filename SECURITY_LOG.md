@@ -13970,3 +13970,29 @@ burn, or escrow transfer. Every bid accepted by the current program therefore ha
 cancellation deadline even if a later round cannot roll. No instruction, signer, authority, recipient,
 account, or CPI was added. The finding is partial because a timelocked DAO action must first choose the
 extreme duration; after that, the vulnerable public method accepted ordinary bidder funds into the trap.
+
+## Tick - approved governance action could cross a retired market generation (surface D, PARTIAL DOS)
+
+Squads transactions and the stateless controller PDA bind a market by its account key. Pinned Percolator
+permits a closed slab key to be initialized again, and Meta previously allowed that replacement to enter
+the same controller. An approved but unexecuted action for generation one therefore remained executable
+against generation two. The clean-room real-SBF LiteSVM exploit approved one `ResolveMarket`, used separate
+Squads actions to resolve and close generation one, reinitialized the same slab through pinned Percolator,
+handed the live replacement to the controller, and then executed the stale action. The replacement became
+resolved without any approval for its generation.
+
+The retained regression drives that complete lifecycle through real Squads, controller, and pinned
+Percolator binaries. It requires controller admission of the replacement and the stale Squads execution to
+reject, verifies the creator remains its authority, and proves the replacement remains live. The existing
+replacement-generation reward probe still manufactures real funding telemetry, rejects both reward replay
+and controller admission, and preserves every replacement-market byte on the rejected handoff.
+
+FIX: controller market initialization and authority acceptance now require the canonical immutable
+retirement-marker PDA and reject a marker that already exists. A slab key can enter Meta governance for one
+generation only; fresh keys remain permissionless, and direct Percolator reuse remains outside Meta custody.
+Pinned Percolator requires the incoming market authority to co-sign, while the controller's generic proxy
+excludes authority rotation, so those two checked instructions are the only ingress to the controller PDA.
+The change adds no administrator, recipient, amount, token account, or value-moving CPI. The finding is
+partial because exploitation required an already approved old action and an execute-capable Squads member.
+It could irreversibly shut down a live replacement, but did not redirect user collateral and Percolator's
+resolved user-recovery lifecycle remained available.
