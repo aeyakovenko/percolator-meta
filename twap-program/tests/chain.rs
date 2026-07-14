@@ -6158,8 +6158,17 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         &alice.pubkey(),
         amount,
     );
+    // A caller may select any pool-owned transit. Keep unrelated value in it and prove
+    // both public directions consume only the exact transaction delta.
     let holding = Pubkey::new_unique();
-    set_token(&mut svm, &holding, &collateral_mint, &pool, 0);
+    let unrelated_holding_balance = 17u64;
+    set_token(
+        &mut svm,
+        &holding,
+        &collateral_mint,
+        &pool,
+        unrelated_holding_balance,
+    );
     let position = sub_position_pda(&pool, &alice.pubkey());
 
     let mut dd = vec![4u8]; // IX_INSURANCE_DEPOSIT
@@ -6199,6 +6208,11 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         token_amount(&svm, &alice_ata),
         0,
         "depositor collateral moved into insurance"
+    );
+    assert_eq!(
+        token_amount(&svm, &holding),
+        unrelated_holding_balance,
+        "deposit tops up only the signed amount and preserves unrelated transit value"
     );
 
     // PUBLIC LOF REGRESSION: after the canonical genesis grant, Squads is no
@@ -6317,6 +6331,11 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     .expect("with-surplus owner retains the direct exit path");
     assert_eq!(token_amount(&svm, &alice_ata), amount);
     assert_eq!(token_amount(&svm, &perc_vault), 0);
+    assert_eq!(
+        token_amount(&svm, &holding),
+        unrelated_holding_balance,
+        "withdraw pays only newly returned insurance and cannot sweep transit value"
+    );
 }
 
 fn init_creator_owned_market(
