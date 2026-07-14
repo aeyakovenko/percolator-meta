@@ -30,6 +30,12 @@ capital's own tenure.
   same provider, so governance cannot invite an external deposit while retaining its withdrawal key.
   TWAP accepts only a real 1-of-1 Squads multisig whose sole all-permissions member and config
   authority are the named MetaDAO, with at least a one-week timelock.
+- **Immutable deployment is a precondition.** Before accepting deposits, revoke the upgrade
+  authorities for Percolator and every Meta program whose PDA signs for custody or governance.
+  A retained upgrade authority can replace these on-chain constraints and invalidates the
+  no-withdrawal-key guarantee. Verify deployed program IDs, binaries, and ProgramData authorities
+  against the audited commits; Squads and MetaDAO upgradeability remain explicit external trust
+  assumptions.
 - **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
   `marketauth` and can sign only a fixed allow-list of lifecycle, oracle, and fee-policy calls. Its
   generic proxy rejects live deposits, withdrawals, swaps, portfolio operations, and every
