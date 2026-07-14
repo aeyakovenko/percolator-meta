@@ -13922,3 +13922,143 @@ legacy fallback marker. Current triggers persist proposal execution and the glob
 so the conflicting state cannot be produced by the current binary; it is only legacy execution evidence.
 The transition adds no instruction, signer, beneficiary, amount, token account, authority, or fund-moving
 CPI. It restores only the existing fixed owner-bound terminal return.
+
+## Tick - oversized auction round could permanently lock public bids (surface A, PARTIAL LOF)
+
+`init_book` rejected a `round_length` whose doubled cancellation cooldown overflowed and separately
+required the first `current_slot + round_length` round end to fit. Those checks did not prove
+`current_slot + 2 * round_length` fit. At any slot above one, a timelocked DAO initialization using
+`u64::MAX / 2` therefore created a book successfully. A public bidder could then transfer COIN into the
+shared escrow, but its owner cancellation always failed while adding the doubled cooldown to the placement
+slot. At the first round end, permissionless execute also failed while adding one more round length to the
+clock. Neither path could settle or refund the bid, and every failed transaction left the escrow unchanged.
+
+The clean-room real-SBF LiteSVM probe executed the malformed initialization through the real Squads fixture,
+placed a 100-COIN public bid, and observed both owner cancel and permissionless execute fail with arithmetic
+overflow while all 100 COIN remained in escrow. The retained regression uses the same timelocked init and
+requires rejection before the book PDA is created. Removing only the new deadline check makes that regression
+accept the malformed book and fail.
+
+FIX: book initialization computes the representable doubled cooldown and requires the current slot plus that
+cooldown to fit before creating any state. This also proves the first round can roll. The change adds no
+instruction, signer, authority, recipient, token account, or token CPI. The finding is partial because a
+timelocked DAO action must first choose the malformed duration, but after that action ordinary public bid
+custody had no executable recovery path.
+
+## Tick - late auction placement could overflow its own cancellation deadline (surface A, PARTIAL LOF)
+
+The initialization guard above proves the doubled cooldown fits from the book's creation slot, but bids
+arrive later. A timelocked book using `u64::MAX / 3` as its round length passes that guard at an ordinary
+slot. Near the first round end, however, `place_slot + 2 * round_length` overflows even though the book was
+valid when created. The old public placement path accepted custody without recomputing that owner-exit
+deadline.
+
+The clean-room real-SBF LiteSVM probe initialized that book through the real Squads fixture, raised the
+reserve above the probe bid, protected all live insurance, and placed 100 COIN one slot before the round
+ended. Owner cancellation failed with arithmetic overflow. The first below-reserve round rolled without
+settlement, but the next permissionless execute failed while computing the following round end. A second
+owner cancellation still failed and all 100 COIN remained in escrow. Thus settlement was not an alternate
+recovery path.
+
+The retained regression uses the same real market, TWAP, and Squads chain and requires the late placement
+to reject while the bidder still owns all 100 COIN and escrow remains empty. Removing only the placement
+deadline check reproduces the accepted custody and fails the regression.
+
+FIX: `place_bid` now requires its actual slot plus the doubled cooldown to fit before any eviction, fee
+burn, or escrow transfer. Every bid accepted by the current program therefore has a representable owner
+cancellation deadline even if a later round cannot roll. No instruction, signer, authority, recipient,
+account, or CPI was added. The finding is partial because a timelocked DAO action must first choose the
+extreme duration; after that, the vulnerable public method accepted ordinary bidder funds into the trap.
+
+## Tick - approved governance action could cross a retired market generation (surface D, PARTIAL DOS)
+
+Squads transactions and the stateless controller PDA bind a market by its account key. Pinned Percolator
+permits a closed slab key to be initialized again, and Meta previously allowed that replacement to enter
+the same controller. An approved but unexecuted action for generation one therefore remained executable
+against generation two. The clean-room real-SBF LiteSVM exploit approved one `ResolveMarket`, used separate
+Squads actions to resolve and close generation one, reinitialized the same slab through pinned Percolator,
+handed the live replacement to the controller, and then executed the stale action. The replacement became
+resolved without any approval for its generation.
+
+The retained regression drives that complete lifecycle through real Squads, controller, and pinned
+Percolator binaries. It requires controller admission of the replacement and the stale Squads execution to
+reject, verifies the creator remains its authority, and proves the replacement remains live. The existing
+replacement-generation reward probe still manufactures real funding telemetry, rejects both reward replay
+and controller admission, and preserves every replacement-market byte on the rejected handoff.
+
+FIX: controller market initialization and authority acceptance now require the canonical immutable
+retirement-marker PDA and reject a marker that already exists. A slab key can enter Meta governance for one
+generation only; fresh keys remain permissionless, and direct Percolator reuse remains outside Meta custody.
+Pinned Percolator requires the incoming market authority to co-sign, while the controller's generic proxy
+excludes authority rotation, so those two checked instructions are the only ingress to the controller PDA.
+The change adds no administrator, recipient, amount, token account, or value-moving CPI. The finding is
+partial because exploitation required an already approved old action and an execute-capable Squads member.
+It could irreversibly shut down a live replacement, but did not redirect user collateral and Percolator's
+resolved user-recovery lifecycle remained available.
+
+## Tick - predecessor rewards admitted post-emission market flow (surface D, PARTIAL LOF)
+
+The predecessor fixed-distribution instruction stored an immutable emission end and finalize window, but
+only reusable reward-epoch configs enforced that end in registration and crystallization. Until a delayed
+permissionless freeze, a portfolio could therefore register after the nominal period or turn real LP,
+funding-payer, or trader flow created after the period into denominator points. A late participant could
+dilute or capture fixed reward COIN without bearing the intended in-period risk. Current continuous epochs
+already rejected this flow, and neither path could debit or redirect collateral, insurance, or backing.
+
+The retained focused LiteSVM regressions register a predecessor funding stake before the end, create its
+entire paid-funding accumulator afterward, and prove neither that growth nor a new late stake enters the
+denominator. A second probe models a post-end Subledger top-up and clock reset; restoring only the old
+capital cutoff mints `6,000,000` points, while the fixed binary credits zero. The retained full-chain
+regression registers before slot 105, opens a signed position through the pinned Percolator binary, moves
+the authenticated oracle and permissionlessly crystallizes the real loss at slot 110, then freezes and
+claims. With the old distributor SBF the sole stake captured all `1,000,000` COIN; the fixed binary credits
+zero and leaves the vault unchanged. Restoring only the old timing branches reproduces those exact results,
+so both regressions are mutation-sharp.
+
+FIX: predecessor and reusable configs now close registration before their immutable end and share the same
+post-emission rules. LP and funding growth is closed, trader refresh is reduce-only against points already
+earned by the end, and capital tenure is clamped to the end. Existing predecessor stakes remain claimable,
+including zero-point stakes. The change adds no instruction, signer, authority, recipient, token account,
+CPI, or principal movement. The finding is partial because the current genesis and continuous lifecycle use
+the already-safe reusable epoch instruction; only callable predecessor configs had the vulnerable timing.
+
+## Tick - genesis schedule could overflow the fallback-refund deadline (surface A, PARTIAL DOS)
+
+The public Subledger genesis-pool initializer checked the deposit deadline and bootstrap end independently,
+but Genesis Vote opens unsealed-election fallback refunds at `bootstrap_end + deposit_window`. A near-maximum
+schedule could make both initializer sums valid while that terminal sum overflowed. Once such a pool accepted
+deposits, every no-winner terminal return would fail before retiring the ballot or returning principal.
+
+The retained real-Percolator LiteSVM regression submits that schedule through the public pool initializer and
+requires rejection before the pool PDA is allocated. Its adjacent boundary proves a deadline exactly equal to
+`u64::MAX` remains valid. Against the old SBF, the malformed pool initializes and the regression fails.
+
+FIX: pool initialization now proves the later Genesis Vote fallback deadline is representable before creating
+state. The change adds no instruction, signer, authority, recipient, account, CPI, or fund-moving path. The
+finding is partial because it requires deployment to select an extreme malformed schedule; a normally
+initialized live instance cannot be moved into this state.
+
+## Tick - owner exit could revive an expired Genesis trigger (surface B/D, REAL LOF)
+
+Genesis Vote enforced the bootstrap trigger phase's lower bound but not its upper bound. Owner-signed vote
+retraction and ordinary Subledger withdrawal intentionally remain available so a vote lock cannot trap
+principal. At the exact fallback-refund boundary, before any terminal cranker recorded the global fallback
+flag, a voter could therefore retract a competing ballot and withdraw. That reduced both live cast weight and
+outstanding principal, allowing a formerly tied proposal to satisfy strict majority and quorum after the
+documented election had expired. The old real binaries then sealed that proposal's allocation of the complete
+fixed COIN supply. The exiting owner recovered only its own principal, but the late trigger could redirect the
+reward/governance supply.
+
+The retained real-Percolator LiteSVM regression deposits equal principal for two voters, registers competing
+complete distributions, proves both triggers reject on a tie, advances to the exact fallback boundary, and
+executes the ordinary owner's retract-plus-withdraw transaction. It requires the principal return to remain
+live while both expired triggers reject and the distribution stays unsealed. Against the old Genesis Vote SBF,
+the first proposal seals after that exit and the regression fails. The adjacent in-window regression still
+proves that the same exit legitimately lets the stayer win before expiry, and the tied-election terminal return
+still drains both owner-bound positions and closes the real market.
+
+FIX: `trigger` authenticates the canonical Subledger pool's immutable schedule and rejects at or after
+`bootstrap_end + deposit_window`, independently of whether a fallback return has run. The existing fallback
+marker remains the transaction-ordering guard for concurrent returns. Retraction and owner-bound principal
+recovery are unchanged. The change adds no instruction, signer, administrator, recipient, amount, token
+account, authority, CPI, or fund-moving path.

@@ -21950,8 +21950,7 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
 // outstanding (so A's principal becomes a strict QUORUM). Both the majority denominator (cast weight) and the
 // quorum denominator (live outstanding) recompute on the exit, handing the win to the stayer. Then winner-take-
 // all holds: B can no longer seal. Real subledger + genesis-vote + distribution.
-#[test]
-fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
+fn run_competing_voter_veto_exit_deadlock_boundary(trigger_phase_expired: bool) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -22094,6 +22093,9 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
         trigger(&mut svm, &gv_b, &prop_b).is_err(),
         "50/50 tie -> B cannot seal"
     );
+    if trigger_phase_expired {
+        advance_to_test_terminal_refund_start(&mut svm);
+    }
 
     // bob VETO-EXITS his own competing proposal: ONE tx [retract B, insurance_withdraw 500k].
     let withdraw = Instruction {
@@ -22131,21 +22133,47 @@ fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
         "bob pulled his capital out"
     );
 
-    // The deadlock breaks for the STAYER: alice's A now holds 100% of cast weight (majority) and her 500k is
-    // 100% of the remaining outstanding (quorum). A seals.
-    trigger(&mut svm, &gv_a, &prop_a)
-        .expect("after the competing voter exits, A has both majority and quorum");
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
-    assert_eq!(
-        Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
-        prop_a,
-        "A wins once the competing voter leaves"
-    );
-    // Winner-take-all: B can no longer seal (the distribution is sealed to A).
-    assert!(
-        trigger(&mut svm, &gv_b, &prop_b).is_err(),
-        "B cannot seal after A won — winner-take-all"
-    );
+    if trigger_phase_expired {
+        assert!(
+            trigger(&mut svm, &gv_a, &prop_a).is_err(),
+            "an expired trigger phase cannot be revived by a post-boundary owner exit"
+        );
+        assert_eq!(
+            Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
+            Pubkey::default(),
+            "a former tie stays unsealed after the terminal-refund boundary"
+        );
+        assert!(
+            trigger(&mut svm, &gv_b, &prop_b).is_err(),
+            "neither expired tied proposal can seal"
+        );
+    } else {
+        // During the trigger phase, the deadlock breaks for the stayer: Alice has
+        // 100% of both cast weight and remaining outstanding principal.
+        trigger(&mut svm, &gv_a, &prop_a)
+            .expect("after the competing voter exits, A has both majority and quorum");
+        let dist_cfg = svm.get_account(&env.dist_config).unwrap();
+        assert_eq!(
+            Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
+            prop_a,
+            "A wins once the competing voter leaves"
+        );
+        assert!(
+            trigger(&mut svm, &gv_b, &prop_b).is_err(),
+            "B cannot seal after A won — winner-take-all"
+        );
+    }
+}
+
+#[test]
+fn e2e_competing_voter_veto_exit_breaks_the_deadlock_stayers_decide() {
+    run_competing_voter_veto_exit_deadlock_boundary(false);
+}
+
+#[test]
+fn e2e_post_grace_owner_exit_cannot_revive_an_expired_tied_distribution() {
+    run_competing_voter_veto_exit_deadlock_boundary(true);
 }
 
 // PUBLIC TERMINAL DOS REGRESSION: an exact tie can survive the bootstrap forever when
