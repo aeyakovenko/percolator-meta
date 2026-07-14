@@ -14215,3 +14215,20 @@ proves its native feed remains ahead of the stripped witness through real Squads
 A second real-SBF lifecycle test covers
 shutdown and retirement after secondary-slot restart. The witness has no data or lamports and adds no
 signer, authority, recipient, token account, CPI, custody state, or value-moving path.
+
+## Tick - stale TWAP restart could re-anchor a replacement asset generation (surface C, PARTIAL DOS)
+
+TWAP's fixed asset-0 restart wrapper was authorized by a timeless Squads proposal bound only to the
+TWAP config and slab. A proposal approved while generation A was recovering could remain unexecuted,
+another proposal could restart A as generation B, and the old action could later execute whenever B
+entered Recovery. The retained real-SBF LiteSVM regression reproduces that complete one-week Squads
+path: the stale action assigns B another market ID and its generation-A price while preserving the
+insurance balance. Percolator requires an empty asset, so no open position or backing is mutated, but
+the replacement can be re-anchored without a generation-B authorization.
+
+FIX: the fixed TWAP restart wire now includes the proposal's expected current Percolator `market_id`.
+TWAP reads asset 0's generation from the pinned slab and rejects a zero or mismatched ID before signing
+the Percolator CPI. The regression proves a correctly bound generation-A restart succeeds, a separately
+bound controller action shuts down generation B, and the untouched A proposal then rejects with
+byte-identical B recovery accounting. The check adds no account, state, signer, authority, recipient,
+amount, token path, or value-moving CPI.

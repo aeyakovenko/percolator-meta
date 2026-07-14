@@ -405,6 +405,10 @@ restart instruction only while both insurance roles remain on the controller; it
 recipient or move insurance/backing while doing so. A deployed predecessor asset that still names an
 external insurance key can finish recovery and retire, but cannot reopen and credit that zero-capital
 key with fees from a new lifecycle.
+When TWAP holds asset-0 custody, its fixed restart instruction includes the current Percolator
+`market_id`. TWAP compares that generation before signing, so an approved restart that outlives one
+recovery cannot later re-anchor a replacement generation. The check is read-only and changes no
+custody role or collateral accounting.
 Here, empty means every Percolator position, funding, loss, spent-budget, backing, and reservation
 ledger is zero, not only zero OI. A previously traded slot with residual K/F accumulators cannot use
 restart and must complete terminal recovery before governance initializes a fresh controller market.
