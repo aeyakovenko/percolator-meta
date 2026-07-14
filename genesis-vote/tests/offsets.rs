@@ -7,8 +7,9 @@
 //! program id against the real deployed program.
 
 use genesis_vote_program::{
-    SUB_POOL_OUTSTANDING_OFF, SUB_POS_OWNER_OFF, SUB_POS_POOL_OFF, SUB_POS_PRINCIPAL_OFF,
-    SUB_POS_START_SLOT_OFF,
+    SUB_POOL_BOOTSTRAP_DELAY_OFF, SUB_POOL_DEPOSIT_DEADLINE_OFF,
+    SUB_POOL_DEPOSIT_START_OFF, SUB_POOL_DEPOSIT_WINDOW_OFF, SUB_POOL_OUTSTANDING_OFF,
+    SUB_POS_OWNER_OFF, SUB_POS_POOL_OFF, SUB_POS_PRINCIPAL_OFF, SUB_POS_START_SLOT_OFF,
 };
 
 #[test]
@@ -20,6 +21,26 @@ fn subledger_mirror_offsets_match_the_real_subledger_layout() {
     assert_eq!(
         SUB_POOL_OUTSTANDING_OFF, subledger_program::POOL_OUTSTANDING_PRINCIPAL_OFF,
         "Pool.outstanding_principal (quorum denominator) offset"
+    );
+    assert_eq!(
+        SUB_POOL_DEPOSIT_DEADLINE_OFF,
+        subledger_program::POOL_DEPOSIT_DEADLINE_SLOT_OFF,
+        "Pool.deposit_deadline_slot offset"
+    );
+    assert_eq!(
+        SUB_POOL_DEPOSIT_WINDOW_OFF,
+        subledger_program::POOL_DEPOSIT_WINDOW_SLOTS_OFF,
+        "Pool.deposit_window_slots (terminal trigger grace) offset"
+    );
+    assert_eq!(
+        SUB_POOL_DEPOSIT_START_OFF,
+        subledger_program::POOL_DEPOSIT_START_SLOT_OFF,
+        "Pool.deposit_start_slot offset"
+    );
+    assert_eq!(
+        SUB_POOL_BOOTSTRAP_DELAY_OFF,
+        subledger_program::POOL_BOOTSTRAP_DELAY_SLOTS_OFF,
+        "Pool.bootstrap_delay_slots offset"
     );
 }
 

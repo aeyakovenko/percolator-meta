@@ -16,7 +16,9 @@
 //! Trigger (permissionless): the first proposal to clear quorum + a weighted
 //! majority is sealed by CPI into the distribution program (this program's config
 //! PDA is that program's seal `authority`). No mint here — the fixed COIN supply
-//! is distributed by the distribution program's claim/burn.
+//! is distributed by the distribution program's claim/burn. An unsealed outcome
+//! gets one deposit-window-long trigger phase before fallback terminal refunds
+//! permanently close triggering and retire ballots.
 
 #![no_std]
 extern crate alloc;
@@ -68,6 +70,11 @@ pub const SUB_POS_OWNER_OFF: usize = 40;
 pub const SUB_POS_PRINCIPAL_OFF: usize = 72;
 pub const SUB_POS_START_SLOT_OFF: usize = 89;
 pub const SUB_POOL_OUTSTANDING_OFF: usize = 80;
+pub const SUB_POOL_DEPOSIT_DEADLINE_OFF: usize = 240;
+pub const SUB_POOL_DEPOSIT_WINDOW_OFF: usize = 248;
+pub const SUB_POOL_DEPOSIT_START_OFF: usize = 256;
+pub const SUB_POOL_BOOTSTRAP_DELAY_OFF: usize = 264;
+const SUB_POOL_CURRENT_SIZE: usize = 272;
 // Distribution proposal: disc[8], config[8..40]. Used to bind a registered vote to
 // the genesis's OWN distribution config (so a winning vote is always sealable).
 const DIST_PROPOSAL_DISC: [u8; 8] = *b"DISTPRP1";
@@ -173,11 +180,21 @@ struct Config {
     bootstrap_end_slot: u64,
     bootstrap_delay_slots: u64,
     bootstrap_start_slot: u64,
+    distribution_executed: bool,
+    terminal_refunds_started: bool,
 }
 
 impl Config {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
         if d.len() < CONFIG_SIZE || d[..8] != CONFIG_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let distribution_executed = d[257];
+        let terminal_refunds_started = d[258];
+        if distribution_executed > 1
+            || terminal_refunds_started > 1
+            || (distribution_executed == 1 && terminal_refunds_started == 1)
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -194,6 +211,8 @@ impl Config {
             bootstrap_end_slot: u64::from_le_bytes(d[233..241].try_into().unwrap()),
             bootstrap_delay_slots: u64::from_le_bytes(d[241..249].try_into().unwrap()),
             bootstrap_start_slot: u64::from_le_bytes(d[249..257].try_into().unwrap()),
+            distribution_executed: distribution_executed == 1,
+            terminal_refunds_started: terminal_refunds_started == 1,
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -211,7 +230,9 @@ impl Config {
         d[233..241].copy_from_slice(&self.bootstrap_end_slot.to_le_bytes());
         d[241..249].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
         d[249..257].copy_from_slice(&self.bootstrap_start_slot.to_le_bytes());
-        d[257..CONFIG_SIZE].fill(0);
+        d[257] = self.distribution_executed as u8;
+        d[258] = self.terminal_refunds_started as u8;
+        d[259..CONFIG_SIZE].fill(0);
     }
 }
 
@@ -294,6 +315,51 @@ fn read_sub_pool_outstanding(data: &[u8]) -> Result<u64, ProgramError> {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(u64::from_le_bytes(data[SUB_POOL_OUTSTANDING_OFF..SUB_POOL_OUTSTANDING_OFF + 8].try_into().unwrap()))
+}
+
+fn terminal_refund_start_slot(data: &[u8], config: &Config) -> Result<u64, ProgramError> {
+    if data.len() < SUB_POOL_CURRENT_SIZE || data[..8] != SUB_POOL_DISC {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let deposit_deadline = u64::from_le_bytes(
+        data[SUB_POOL_DEPOSIT_DEADLINE_OFF..SUB_POOL_DEPOSIT_DEADLINE_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let deposit_window = u64::from_le_bytes(
+        data[SUB_POOL_DEPOSIT_WINDOW_OFF..SUB_POOL_DEPOSIT_WINDOW_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let bootstrap_start = u64::from_le_bytes(
+        data[SUB_POOL_DEPOSIT_START_OFF..SUB_POOL_DEPOSIT_START_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let bootstrap_delay = u64::from_le_bytes(
+        data[SUB_POOL_BOOTSTRAP_DELAY_OFF..SUB_POOL_BOOTSTRAP_DELAY_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    if deposit_window == 0
+        || deposit_window > bootstrap_delay
+        || bootstrap_start != config.bootstrap_start_slot
+        || bootstrap_delay != config.bootstrap_delay_slots
+        || bootstrap_start
+            .checked_add(deposit_window)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            != deposit_deadline
+        || bootstrap_start
+            .checked_add(bootstrap_delay)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            != config.bootstrap_end_slot
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    config
+        .bootstrap_end_slot
+        .checked_add(deposit_window)
+        .ok_or(ProgramError::ArithmeticOverflow)
 }
 
 struct ProposalVote {
@@ -460,10 +526,11 @@ fn assert_bootstrap_ended(
 //
 // Subledger invokes this in the same transaction that returns an absent owner's
 // complete terminal deposit. The configured pool PDA proves the call came from
-// that fixed return path; no owner signature is needed. A live ballot is removed
-// from both exact tallies before the return can commit, so refunded votes cannot
-// later satisfy quorum. A nonvoter supplies the canonical empty ballot PDA and
-// leaves all Genesis state unchanged.
+// that fixed return path; no owner signature is needed. A sealed distribution
+// permits immediate returns. Otherwise the election gets one deposit-window-long
+// trigger phase, after which the first fallback return permanently closes trigger
+// before changing any denominator or ballot. A live ballot is then removed from
+// both exact tallies before the return can commit.
 fn retire_terminal_ballot(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -484,7 +551,7 @@ fn retire_terminal_ballot(
     if !sub_pool.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    if config_account.owner != program_id {
+    if config_account.owner != program_id || !config_account.is_writable {
         return Err(ProgramError::IllegalOwner);
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
@@ -492,46 +559,76 @@ fn retire_terminal_ballot(
     if *sub_pool.key != config.subledger_pool || sub_pool.owner != &config.subledger_program {
         return Err(ProgramError::InvalidAccountData);
     }
-    if Clock::get()?.slot < config.bootstrap_end_slot {
+    let now = Clock::get()?.slot;
+    if now < config.bootstrap_end_slot {
         return Err(ProgramError::InvalidInstructionData);
     }
+    let refund_start = terminal_refund_start_slot(&sub_pool.try_borrow_data()?, &config)?;
 
     let expected_ballot =
         Pubkey::find_program_address(&ballot_seeds(config_account.key, owner.key), program_id).0;
     if *ballot_account.key != expected_ballot {
         return Err(ProgramError::InvalidSeeds);
     }
-    if ballot_account.data_len() == 0 {
+    let mut ballot = if ballot_account.data_len() == 0 {
         if ballot_account.owner != &solana_program::system_program::ID {
             return Err(ProgramError::IllegalOwner);
         }
+        None
+    } else {
+        if ballot_account.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+        let ballot = Ballot::deserialize(&ballot_account.try_borrow_data()?)?;
+        if ballot.owner != *owner.key {
+            return Err(ProgramError::IllegalOwner);
+        }
+        Some(ballot)
+    };
+
+    let mut proposal = if let Some(ballot) = ballot.as_ref().filter(|b| b.has_live_ballot()) {
+        if !ballot_account.is_writable
+            || !proposal_account.is_writable
+            || *proposal_account.key != ballot.voted_proposal
+            || proposal_account.owner != program_id
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let proposal = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
+        let expected_proposal = Pubkey::find_program_address(
+            &proposal_seeds(config_account.key, &proposal.distribution_proposal),
+            program_id,
+        )
+        .0;
+        if *proposal_account.key != expected_proposal || proposal.config != *config_account.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Some(proposal)
+    } else {
+        None
+    };
+
+    // A canonical executed proposal is sufficient upgrade evidence for the voter
+    // that backed it. New triggers also persist this bit globally, so losing voters
+    // and nonvoters can return immediately after the winner seals.
+    if proposal.as_ref().is_some_and(|proposal| proposal.executed) {
+        if config.terminal_refunds_started {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        config.distribution_executed = true;
+    }
+    if !config.distribution_executed {
+        if now < refund_start {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        config.terminal_refunds_started = true;
+    }
+
+    let Some(ballot) = ballot.as_mut().filter(|ballot| ballot.has_live_ballot()) else {
+        config.serialize(&mut config_account.try_borrow_mut_data()?);
         return Ok(());
-    }
-    if ballot_account.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let mut ballot = Ballot::deserialize(&ballot_account.try_borrow_data()?)?;
-    if ballot.owner != *owner.key {
-        return Err(ProgramError::IllegalOwner);
-    }
-    if !ballot.has_live_ballot() {
-        return Ok(());
-    }
-    if !config_account.is_writable || !ballot_account.is_writable || !proposal_account.is_writable {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    if *proposal_account.key != ballot.voted_proposal || proposal_account.owner != program_id {
-        return Err(ProgramError::InvalidAccountData);
-    }
-    let mut proposal = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
-    let expected_proposal = Pubkey::find_program_address(
-        &proposal_seeds(config_account.key, &proposal.distribution_proposal),
-        program_id,
-    )
-    .0;
-    if *proposal_account.key != expected_proposal || proposal.config != *config_account.key {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    };
+    let proposal = proposal.as_mut().ok_or(ProgramError::InvalidAccountData)?;
 
     proposal.support_weight = proposal
         .support_weight
@@ -702,6 +799,8 @@ fn init_config<'a>(
         bootstrap_end_slot,
         bootstrap_delay_slots,
         bootstrap_start_slot,
+        distribution_executed: false,
+        terminal_refunds_started: false,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -1175,9 +1274,13 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     if config_account.owner != program_id || proposal_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     let mut pv = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
-    if pv.config != *config_account.key || pv.executed {
+    if pv.config != *config_account.key
+        || pv.executed
+        || config.distribution_executed
+        || config.terminal_refunds_started
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     if Clock::get()?.slot < config.bootstrap_end_slot {
@@ -1232,7 +1335,9 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     }
 
     pv.executed = true;
+    config.distribution_executed = true;
     pv.serialize(&mut proposal_account.try_borrow_mut_data()?);
+    config.serialize(&mut config_account.try_borrow_mut_data()?);
 
     // Seal the distribution. The config PDA is the distribution's seal authority.
     let bump_arr = [config.bump];
@@ -1290,6 +1395,8 @@ mod tests {
             bootstrap_end_slot: 1234,
             bootstrap_delay_slots: 100,
             bootstrap_start_slot: 1134,
+            distribution_executed: true,
+            terminal_refunds_started: false,
         };
         let mut b = [0u8; CONFIG_SIZE];
         c.serialize(&mut b);
@@ -1300,6 +1407,8 @@ mod tests {
         assert_eq!(d.bootstrap_end_slot, 1234);
         assert_eq!(d.bootstrap_delay_slots, 100);
         assert_eq!(d.bootstrap_start_slot, 1134);
+        assert!(d.distribution_executed);
+        assert!(!d.terminal_refunds_started);
         assert_eq!(d.subledger_program, sub_program);
         assert_eq!(d.subledger_pool, sub_pool);
 
