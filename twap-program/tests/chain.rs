@@ -6338,6 +6338,145 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     );
 }
 
+#[test]
+fn e2e_public_backing_vault_donation_cannot_be_captured_by_the_next_depositor() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let donor = Keypair::new();
+    let depositor = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+
+    let mint = Pubkey::new_unique();
+    let no_market = Pubkey::default();
+    let pool = sub_pool_pda(
+        &mint,
+        0,
+        &no_market,
+        &no_market,
+        &no_market,
+        POLICY_WITH_SURPLUS,
+        DOMAIN_BACKING,
+    );
+    let vault = Pubkey::new_unique();
+    set_token(&mut svm, &vault, &mint, &pool, 0);
+
+    let mut init_data = vec![0u8]; // IX_INIT_POOL
+    init_data.extend_from_slice(&0u64.to_le_bytes());
+    init_data.push(POLICY_WITH_SURPLUS);
+    init_data.push(DOMAIN_BACKING);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("initialize segregated backing pool");
+
+    // Anyone can transfer directly into a plain SPL vault. This donation has no
+    // position or shares and therefore must remain an unowned reserve.
+    let reserve = 1_000_000u64;
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &mint,
+        &donor.pubkey(),
+        reserve,
+    );
+    send(
+        &mut svm,
+        &[&payer, &donor],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donor_source,
+            &vault,
+            &donor.pubkey(),
+            &[],
+            reserve,
+        )
+        .unwrap(),
+    )
+    .expect("public donor preloads the backing vault");
+
+    let principal = 100_000u64;
+    let depositor_tokens = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &depositor_tokens,
+        &mint,
+        &depositor.pubkey(),
+        principal,
+    );
+    let position = sub_position_pda(&pool, &depositor.pubkey());
+    let mut deposit_data = vec![1u8]; // IX_DEPOSIT
+    deposit_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_tokens, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("late depositor enters after the donation");
+    assert_eq!(token_amount(&svm, &vault), reserve + principal);
+
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_tokens, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: vec![2u8], // IX_WITHDRAW
+        },
+    )
+    .expect("late depositor exits without capturing the reserve");
+    assert_eq!(
+        token_amount(&svm, &depositor_tokens),
+        principal - 1,
+        "the virtual-share defense bounds public-donation rounding loss to one atom"
+    );
+    assert_eq!(
+        token_amount(&svm, &vault),
+        reserve + 1,
+        "the public donation and the single rounding atom remain unowned in the reserve"
+    );
+    assert_eq!(
+        token_amount(&svm, &depositor_tokens) + token_amount(&svm, &vault),
+        reserve + principal,
+        "the deposit, donation, and rounding reserve are exactly conserved"
+    );
+}
+
 fn init_creator_owned_market(
     svm: &mut LiteSVM,
     payer: &Keypair,
