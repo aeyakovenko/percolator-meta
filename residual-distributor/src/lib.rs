@@ -2484,7 +2484,9 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 //   insurance/backing cohorts append one more: the subledger position (for the live HE cap).
 //   LP/trader cohorts append three more: the Percolator portfolio, canonical cumulative archive,
 //   and exact read-only retired-market marker PDA.
-//   A pre-archive direct Percolator maintenance close retains the historical frozen fallback.
+//   A pre-archive direct Percolator close retains the frozen fallback only for LP points, whose
+//   received counter is monotonic. Trader points require live counters or a controller archive so
+//   later residual spending cannot be hidden by dematerializing the portfolio.
 //
 // PERMISSIONLESS self-service claim (replaces the cranker-assembled seal for the portfolio
 // cohort). Pays the stake's OWN deterministic share —
@@ -2686,10 +2688,14 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 {
                     return Err(ProgramError::InvalidSeeds);
                 }
-                // Percolator can dematerialize an empty portfolio through maintenance-fee or
-                // old owner-directed paths that predate the controller archive. If counters were
-                // crystallized and frozen before that close, the bound recipient and denominator
-                // remain sufficient. Controller cleanup now always supplies an archive instead.
+                // LP received-flow is monotonic, so its frozen numerator remains valid after a
+                // pre-archive close. Trader loss is not: later public trades raise `spent` and
+                // lower its live cap. Paying trader points without either live counters or an
+                // authenticated controller archive lets an owner close the portfolio to erase
+                // that cap and claim stale points.
+                if stake.cohort == COHORT_TRADER {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 points_to_amount(cohort_supply, stake.points, frozen_denom)
             } else {
                 let totals = portfolio_totals(

@@ -311,8 +311,11 @@ sum that canonical archive with the current live generation. Registration binds 
 to its real Percolator market and rejects a nonzero immutable maintenance fee; capital cohorts are
 unaffected. Terminal `CloseSlab` also creates a permanent marker keyed by Percolator program and slab;
 new portfolio-flow stakes reject that retired key, and existing stakes ignore any public reinitialization
-under it. The historical public-maintenance fallback remains claim-only for an already frozen
-stake, even if a third party donates lamports to the closed address. The wrapper accepts no
+  under it. A pre-archive empty-account fallback remains claim-only for frozen LP received-flow,
+  which is monotonic even if a third party donates lamports to the closed address. Trader loss points
+  require either the live portfolio or the controller archive because later public trades can raise
+  their spent counter and lower the claim cap; an owner who directly closes first forfeits those
+  unverifiable points. The wrapper accepts no
 amount, token account, or destination and exposes no generic portfolio authority. Telemetry-bearing
 cleanup requires the exact retirement-marker PDA: before slab retirement it archives the original
 generation, and after retirement the controller refuses to admit or act on later generations.

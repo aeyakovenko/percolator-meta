@@ -42229,6 +42229,10 @@ fn read_portfolio_crystallized(svm: &LiteSVM, pf: &Pubkey) -> u128 {
     let d = svm.get_account(pf).unwrap().data;
     u128::from_le_bytes(d[196..212].try_into().unwrap()) // HEADER_LEN(16) + offset_of(crystallized) 180
 }
+fn read_portfolio_residual_spent(svm: &LiteSVM, pf: &Pubkey) -> u128 {
+    let d = svm.get_account(pf).unwrap().data;
+    u128::from_le_bytes(d[212..228].try_into().unwrap()) // HEADER_LEN(16) + offset_of(spent) 196
+}
 fn read_asset0_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
     let data = svm.get_account(market).unwrap().data;
     let (_, group) = percolator_prog::state::read_market(&data).unwrap();
@@ -42653,11 +42657,13 @@ enum OrganicRewardCleanup {
     None,
     BeforeCrystallize,
     PostEmissionLoss,
+    OwnerCloseAfterRecovery,
 }
 
 fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCleanup) {
     use percolator_prog::ix::Instruction as PIx;
     let maintenance_fee_cleanup = cleanup == OrganicRewardCleanup::BeforeCrystallize;
+    let owner_close_after_recovery = cleanup == OrganicRewardCleanup::OwnerCloseAfterRecovery;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -42691,7 +42697,8 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     // Real InitMarket (the percolator-test path): 5% margins so a leveraged long can be driven
     // underwater, and a FULL b-settlement chunk (public_b_chunk_atoms = MAX_VAULT_TVL) so one crank
     // realizes the whole marked loss into pnl (make_live_market's 100% margins + 1-atom chunks can't).
-    let mlen = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_slots = if owner_close_after_recovery { 2 } else { 1 };
+    let mlen = percolator_prog::state::market_account_len_for_capacity(market_slots).unwrap();
     svm.set_account(
         market,
         Account {
@@ -42715,7 +42722,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
                 AccountMeta::new_readonly(collateral, false),
             ],
             PIx::InitMarket {
-                max_portfolio_assets: 1,
+                max_portfolio_assets: market_slots as u16,
                 h_min: 0,
                 h_max: 10,
                 initial_price,
@@ -42798,7 +42805,8 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     }
 
     // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
-    let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let plen =
+        percolator_prog::state::portfolio_account_len_for_market_slots(market_slots).unwrap();
     let loser = Keypair::new();
     svm.airdrop(&loser.pubkey(), 1_000_000_000).unwrap();
     let winner = Keypair::new();
@@ -43177,6 +43185,152 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     ))
     .expect("crystallize");
 
+    if owner_close_after_recovery {
+        // Spend the frozen trader-loss budget through the pinned program's ordinary public trade
+        // path on an independent active asset. The loss-bearing asset's domain barrier remains
+        // intact; the same counterparty supplies new margin on asset 1, so Percolator transfers the
+        // residual credit and closes this trader's live reward cap.
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 1,
+                    size_q: pos,
+                    exec_price: initial_price,
+                    fee_bps: 0,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &winner, &loser],
+            bh,
+        ))
+        .expect("public recovery trade spends the frozen trader loss");
+        let spent = read_portfolio_residual_spent(&svm, &loser_pf);
+        assert_eq!(
+            spent, crystallized,
+            "the public recovery consumes the full frozen loss, so a live claim is capped to zero"
+        );
+
+        // Flatten the independent asset at the same mark, then reduce the original asset to zero
+        // through the domain barrier's explicitly allowed same-side reduction path.
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 1,
+                    size_q: -pos,
+                    exec_price: initial_price,
+                    fee_bps: 0,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &winner, &loser],
+            bh,
+        ))
+        .expect("flatten the recovery-credit asset");
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(winner.pubkey(), true),
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner_pf, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: -pos,
+                    exec_price: initial_price / 2,
+                    fee_bps: 0,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &winner, &loser],
+            bh,
+        ))
+        .expect("flatten the loss-bearing asset through the pending-domain barrier");
+        for pf in [&winner_pf, &loser_pf] {
+            crank(&mut svm, pf, 110).expect("settle flattened recovery portfolio");
+        }
+
+        let loser_state = svm.get_account(&loser_pf).unwrap();
+        let loser_capital = percolator_prog::state::read_portfolio(&loser_state.data)
+            .unwrap()
+            .capital
+            .get();
+        assert!(loser_capital > 0, "recovered trader retains collateral to withdraw");
+        let loser_collateral = canonical_insurance_vault(&loser.pubkey(), &collateral);
+        set_token(
+            &mut svm,
+            &loser_collateral,
+            &collateral,
+            &loser.pubkey(),
+            0,
+        );
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                    AccountMeta::new(loser_collateral, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw {
+                    amount: loser_capital,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &loser],
+            bh,
+        ))
+        .expect("withdraw all collateral before the public owner close");
+        send(
+            &mut svm,
+            &[&loser],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::ClosePortfolio,
+            ),
+        )
+        .expect("owner publicly closes the empty reward witness");
+        assert!(
+            svm.get_account(&loser_pf)
+                .map_or(true, |account| account.data.is_empty()),
+            "the pinned program dematerializes the reward witness"
+        );
+        assert!(
+            svm.get_account(&loser_archive).is_none(),
+            "a direct Percolator owner close cannot create the controller archive"
+        );
+    }
+
     if maintenance_fee_cleanup {
         // Flatten through the real trading path, then leave one collateral atom. The public
         // maintenance sync below can consume that atom and trigger Percolator's intended dust close.
@@ -43269,7 +43423,12 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     .expect("freeze");
 
     let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
-    if maintenance_fee_cleanup {
+    if owner_close_after_recovery {
+        assert!(
+            svm.get_account(&loser_archive).is_none(),
+            "the attack reaches claim with no authenticated live-cap archive"
+        );
+    } else if maintenance_fee_cleanup {
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -43392,13 +43551,22 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
         ],
         data: vec![5u8],
     };
-    svm.send_transaction(Transaction::new_signed_with_payer(
+    let claim_result = svm.send_transaction(Transaction::new_signed_with_payer(
         &[claim],
         Some(&payer.pubkey()),
         &[&payer],
         bh,
-    ))
-    .expect("claim");
+    ));
+    if owner_close_after_recovery {
+        assert!(
+            claim_result.is_err(),
+            "a dematerialized trader without an archive must not bypass its zero live cap"
+        );
+        assert_eq!(token_amount(&svm, &loser_coin), 0);
+        assert_eq!(token_amount(&svm, &rd_vault), supply);
+        return;
+    }
+    claim_result.expect("claim");
     let expected_reward = if cleanup == OrganicRewardCleanup::PostEmissionLoss {
         0
     } else {
@@ -43563,6 +43731,13 @@ fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
 fn e2e_legacy_reward_end_excludes_post_period_real_trade_loss() {
     run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         OrganicRewardCleanup::PostEmissionLoss,
+    );
+}
+
+#[test]
+fn e2e_owner_close_cannot_bypass_trader_live_cap_after_organic_recovery() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(
+        OrganicRewardCleanup::OwnerCloseAfterRecovery,
     );
 }
 
