@@ -44097,8 +44097,9 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(env.gv_config, false),
-                AccountMeta::new_readonly(depositor_proposal, false),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(depositor_ballot, false),
+                AccountMeta::new(depositor_proposal, false),
                 AccountMeta::new_readonly(gv_id_e2e(), false),
             ],
             data: vec![12u8], // IX_RETURN_TERMINAL_INSURANCE
@@ -44611,7 +44612,10 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
 // another cleanup veto.
 #[test]
 fn e2e_absent_finalized_genesis_voter_cannot_block_terminal_market_close() {
-    run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(POLICY_PRINCIPAL, false);
+    run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
+        POLICY_PRINCIPAL,
+        false,
+    );
 }
 
 #[test]
@@ -44623,13 +44627,16 @@ fn e2e_absent_with_surplus_voter_cannot_block_terminal_market_close() {
 }
 
 #[test]
-fn e2e_reward_freeze_before_terminal_return_preserves_capital_claim() {
-    run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(POLICY_PRINCIPAL, true);
+fn e2e_pre_flag_sealed_genesis_voter_survives_losing_fallback_upgrade() {
+    run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
+        POLICY_PRINCIPAL,
+        true,
+    );
 }
 
 fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     pool_policy: u8,
-    freeze_before_terminal_return: bool,
+    emulate_legacy_fallback: bool,
 ) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -44656,6 +44663,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
 
     let absent_voter = Keypair::new();
     let attacker = Keypair::new();
+    let deposit_amount = if emulate_legacy_fallback { 2 } else { 1 };
     svm.airdrop(&absent_voter.pubkey(), 1_000_000_000)
         .unwrap();
     let deposit_source = Pubkey::new_unique();
@@ -44664,7 +44672,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         &deposit_source,
         &env.collateral_mint,
         &absent_voter.pubkey(),
-        1,
+        deposit_amount,
     );
     let owner_destination = Pubkey::new_unique();
     set_token(
@@ -44715,7 +44723,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     );
     let position = sub_position_pda(&env.pool, &absent_voter.pubkey());
     let mut deposit_data = vec![4u8];
-    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    deposit_data.extend_from_slice(&deposit_amount.to_le_bytes());
     send(
         &mut svm,
         &[&payer, &absent_voter],
@@ -44736,9 +44744,57 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
             data: deposit_data,
         },
     )
-    .expect("one-unit genesis risk deposit");
+    .expect("genesis risk deposit");
     assert_eq!(token_amount(&svm, &deposit_source), 0);
     assert_eq!(token_amount(&svm, &owner_destination), 0);
+
+    let fallback_nonvoter = if emulate_legacy_fallback {
+        let owner = Keypair::new();
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            1,
+        );
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        let position = sub_position_pda(&env.pool, &owner.pubkey());
+        let mut data = vec![4u8];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data,
+            },
+        )
+        .expect("nonvoter deposits the fallback unit");
+        Some((owner, position, destination))
+    } else {
+        None
+    };
 
     // Register a one-staker capital reward before terminal cleanup, but leave it
     // uncrystallized. Permissionless principal return must preserve the reward
@@ -44780,7 +44836,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     // Subledger snapshot. Slots 1023 -> 1200 cross a floor_log2 boundary, so
     // the regression also catches accidental post-epoch tenure inflation.
     let reward_end = TEST_BOOTSTRAP_START_SLOT + 1_023;
-    let reward_finalize_window = 256u64;
+    let reward_finalize_window = if emulate_legacy_fallback { 2_048 } else { 256 };
     send(
         &mut svm,
         &[&payer, &reward_authority],
@@ -44873,7 +44929,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
             data: vec![3u8, 1u8],
         },
     )
-    .expect("sole depositor votes and locks the atom");
+    .expect("winning depositor votes and locks its principal");
     advance_to_test_bootstrap_end(&mut svm);
     send(
         &mut svm,
@@ -44896,25 +44952,43 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     assert_eq!(svm.get_account(&winner).unwrap().data[96], 1);
     assert_eq!(svm.get_account(&position).unwrap().data[97], 1);
 
-    let terminal_return = |proposal: Pubkey, destination: Pubkey| Instruction {
-        program_id: sub_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(absent_voter.pubkey(), false),
-            AccountMeta::new(env.pool, false),
-            AccountMeta::new(position, false),
-            AccountMeta::new(destination, false),
-            AccountMeta::new(holding, false),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new(env.perc_vault, false),
-            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new(env.gv_config, false),
-            AccountMeta::new(ballot, false),
-            AccountMeta::new(proposal, false),
-            AccountMeta::new_readonly(gv_id_e2e(), false),
-        ],
-        data: vec![12u8],
+    let terminal_return_for = |owner: Pubkey,
+                               position: Pubkey,
+                               proposal: Pubkey,
+                               destination: Pubkey| {
+        let ballot = Pubkey::find_program_address(
+            &[b"gv_ballot", env.gv_config.as_ref(), owner.as_ref()],
+            &gv_id_e2e(),
+        )
+        .0;
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(owner, false),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(proposal, false),
+                AccountMeta::new_readonly(gv_id_e2e(), false),
+            ],
+            data: vec![12u8],
+        }
+    };
+    let terminal_return = |proposal: Pubkey, destination: Pubkey| {
+        terminal_return_for(
+            absent_voter.pubkey(),
+            position,
+            proposal,
+            destination,
+        )
     };
 
     let pool_before = svm.get_account(&env.pool).unwrap();
@@ -44949,40 +45023,35 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     )
     .expect("governance resolves the empty real Percolator market");
 
-    if freeze_before_terminal_return {
-        let mut clock = svm.get_sysvar::<Clock>();
-        clock.slot = reward_end;
-        svm.set_sysvar(&clock);
-        send(
-            &mut svm,
-            &[&payer, &absent_voter],
-            rd_crystallize_ix(
-                &absent_voter.pubkey(),
-                &reward_config,
-                &absent_voter.pubkey(),
-                &env.slab,
-                &position,
-                0,
-            ),
-        )
-        .expect("owner crystallizes live capital before reward freeze");
-        clock.slot = reward_end + 1;
-        svm.set_sysvar(&clock);
+    if emulate_legacy_fallback {
+        // A trigger executed by the pre-flag Genesis binary persisted only the
+        // proposal's executed byte; its reserved config tail remained zero.
+        let mut legacy_config = svm.get_account(&env.gv_config).unwrap();
+        legacy_config.data[257] = 0;
+        svm.set_account(env.gv_config, legacy_config).unwrap();
+        advance_to_test_terminal_refund_start(&mut svm);
+
+        let (nonvoter, nonvoter_position, nonvoter_destination) =
+            fallback_nonvoter.as_ref().unwrap();
         send(
             &mut svm,
             &[&payer],
-            rd_freeze_ix(
-                &payer.pubkey(),
-                &reward_config,
-                &reward_mint,
-                &reward_vault,
+            terminal_return_for(
+                nonvoter.pubkey(),
+                *nonvoter_position,
+                winner,
+                *nonvoter_destination,
             ),
         )
-        .expect("freeze capital rewards before terminal principal return");
+        .expect("a real nonvoter fallback opens terminal refunds after upgrade");
+        assert_eq!(token_amount(&svm, nonvoter_destination), 1);
+        let fallback_config = svm.get_account(&env.gv_config).unwrap();
+        assert_eq!(fallback_config.data[257], 0);
+        assert_eq!(fallback_config.data[258], 1);
     }
 
     let mut ordinary_withdraw_data = vec![5u8];
-    ordinary_withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    ordinary_withdraw_data.extend_from_slice(&deposit_amount.to_le_bytes());
     assert!(
         send(
             &mut svm,
@@ -45083,7 +45152,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     )
     .expect("the exact finalized ballot can be retired with its terminal deposit");
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
-    assert_eq!(token_amount(&svm, &owner_destination), 1);
+    assert_eq!(token_amount(&svm, &owner_destination), deposit_amount);
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
     let pool = svm.get_account(&env.pool).unwrap();
     assert_eq!(u64::from_le_bytes(pool.data[80..88].try_into().unwrap()), 0);
@@ -45092,7 +45161,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     assert_eq!(u64::from_le_bytes(retired.data[72..80].try_into().unwrap()), 0);
     assert_eq!(
         u64::from_le_bytes(retired.data[80..88].try_into().unwrap()),
-        1,
+        deposit_amount,
         "terminal return snapshots only the remaining principal at risk"
     );
     assert_eq!(retired.data[88], 1);
@@ -45111,7 +45180,12 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         Pubkey::default()
     );
     let terminal_return_slot = svm.get_sysvar::<Clock>().slot;
-    assert_eq!(terminal_return_slot, TEST_BOOTSTRAP_DELAY_SLOTS);
+    let expected_return_slot = if emulate_legacy_fallback {
+        TEST_BOOTSTRAP_DELAY_SLOTS + TEST_GENESIS_DEPOSIT_WINDOW_SLOTS
+    } else {
+        TEST_BOOTSTRAP_DELAY_SLOTS
+    };
+    assert_eq!(terminal_return_slot, expected_return_slot);
     assert!(
         terminal_return_slot > reward_end
             && terminal_return_slot < reward_end + reward_finalize_window,
@@ -45150,16 +45224,17 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         u64::from_le_bytes(retired.data[89..97].try_into().unwrap());
     let reward_tenure = reward_end
         .saturating_sub(core::cmp::max(reward_start, position_start_slot));
-    let expected_points = if reward_tenure < 2 {
+    let expected_multiplier = if reward_tenure < 2 {
         0
     } else {
         (63 - reward_tenure.leading_zeros()) as u128
     };
+    let expected_points = expected_multiplier * deposit_amount as u128;
     assert!(expected_points > 0, "the probe must exercise an earned reward");
     assert_eq!(
         u128::from_le_bytes(reward_stake.data[176..192].try_into().unwrap()),
         expected_points,
-        "one unit earns only through the terminal return slot"
+        "principal earns only through the terminal return slot"
     );
     assert_eq!(
         u128::from_le_bytes(reward_stake.data[194..210].try_into().unwrap()),
