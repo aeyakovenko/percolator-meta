@@ -13945,3 +13945,28 @@ cooldown to fit before creating any state. This also proves the first round can 
 instruction, signer, authority, recipient, token account, or token CPI. The finding is partial because a
 timelocked DAO action must first choose the malformed duration, but after that action ordinary public bid
 custody had no executable recovery path.
+
+## Tick - late auction placement could overflow its own cancellation deadline (surface A, PARTIAL LOF)
+
+The initialization guard above proves the doubled cooldown fits from the book's creation slot, but bids
+arrive later. A timelocked book using `u64::MAX / 3` as its round length passes that guard at an ordinary
+slot. Near the first round end, however, `place_slot + 2 * round_length` overflows even though the book was
+valid when created. The old public placement path accepted custody without recomputing that owner-exit
+deadline.
+
+The clean-room real-SBF LiteSVM probe initialized that book through the real Squads fixture, raised the
+reserve above the probe bid, protected all live insurance, and placed 100 COIN one slot before the round
+ended. Owner cancellation failed with arithmetic overflow. The first below-reserve round rolled without
+settlement, but the next permissionless execute failed while computing the following round end. A second
+owner cancellation still failed and all 100 COIN remained in escrow. Thus settlement was not an alternate
+recovery path.
+
+The retained regression uses the same real market, TWAP, and Squads chain and requires the late placement
+to reject while the bidder still owns all 100 COIN and escrow remains empty. Removing only the placement
+deadline check reproduces the accepted custody and fails the regression.
+
+FIX: `place_bid` now requires its actual slot plus the doubled cooldown to fit before any eviction, fee
+burn, or escrow transfer. Every bid accepted by the current program therefore has a representable owner
+cancellation deadline even if a later round cannot roll. No instruction, signer, authority, recipient,
+account, or CPI was added. The finding is partial because a timelocked DAO action must first choose the
+extreme duration; after that, the vulnerable public method accepted ordinary bidder funds into the trap.

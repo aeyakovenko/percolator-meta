@@ -3145,6 +3145,15 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if now >= book.round_end {
         return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
     }
+    // Init proves the cooldown is representable from the book's creation slot, but
+    // bids can arrive later in the round. Recheck from this bid's actual place slot
+    // before accepting custody, so the owner can always reach cancel_bid.
+    let cancel_cooldown = book
+        .round_length
+        .checked_mul(2)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    now.checked_add(cancel_cooldown)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     if *coin_mint.key != book.coin_mint
         || *coin_mint.key != config.coin_mint
         || *collateral_mint.key != book.collateral_mint

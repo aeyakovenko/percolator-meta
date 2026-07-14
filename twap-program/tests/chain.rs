@@ -31442,6 +31442,65 @@ fn e2e_init_book_rejects_a_round_whose_cancel_and_roll_deadlines_overflow() {
     );
 }
 
+// A book can be valid at init while a bid placed near the end of its first round
+// cannot represent `place_slot + 2 * round_length`. Reject that bid before moving
+// its COIN into escrow, even though the book's original cancel deadline fitted.
+#[test]
+fn e2e_place_bid_rejects_an_overflowing_cancel_deadline_before_escrow() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let round_length = u64::MAX / 3;
+    let bk = setup_auction(&mut svm, &payer, &env, round_length, 0, None, 0);
+    let round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    let init_slot = round_end.checked_sub(round_length).unwrap();
+    let cancel_cooldown = round_length.checked_mul(2).unwrap();
+    assert!(init_slot.checked_add(cancel_cooldown).is_some());
+
+    let placement_slot = round_end - 1;
+    assert!(placement_slot.checked_add(cancel_cooldown).is_none());
+    let (bidder, bidder_coin, bidder_usd) = new_bidder(&mut svm, &payer, &env, 100);
+    warp_to(&mut svm, placement_slot);
+
+    assert!(
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &bidder_coin,
+                &bidder_usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                100,
+                100,
+                None,
+            ),
+        )
+        .is_err(),
+        "place_bid must reject before accepting COIN with no representable cancel deadline"
+    );
+    assert_eq!(token_amount(&svm, &bidder_coin), 100);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+}
+
 // INIT_BOOK OVER A PRE-FUNDED ESCROW (stranded-COIN anti-strand): init_book binds the coin_escrow + settlement_usd
 // to a FRESH book that records 0 bids. If either already holds a balance (a donated/leftover amount, or a re-init
 // attempt after bids exist), binding it would STRAND that balance — no bidder slot owns it, and only claim/cancel
