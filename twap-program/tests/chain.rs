@@ -5573,6 +5573,99 @@ fn build_controller_close_and_reclaim_message(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_controller_close_and_reclaim_with_subledger_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    controller_destination: &Pubkey,
+    governance_destination: &Pubkey,
+    pool: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    let retired_market = retired_market_pda(market, &perc_id());
+    m.push(1);
+    m.push(1);
+    m.push(6);
+    m.push(14);
+    for key in [
+        governance,
+        controller,
+        market,
+        vault,
+        controller_destination,
+        governance_destination,
+        &retired_market,
+        vault_authority,
+        &perc_id(),
+        &spl_token::ID,
+        &system_program::ID,
+        &controller_id(),
+        pool,
+        &sub_id(),
+    ] {
+        m.extend_from_slice(key.as_ref());
+    }
+    m.push(1);
+    m.push(11);
+    m.push(13);
+    for index in [0u8, 1, 2, 7, 3, 4, 5, 8, 9, 10, 6, 12, 13] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(5);
+    m.push(0);
+    m
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_controller_close_and_reclaim_with_twap_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    controller_destination: &Pubkey,
+    governance_destination: &Pubkey,
+    twap_config: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    let retired_market = retired_market_pda(market, &perc_id());
+    m.push(1);
+    m.push(1);
+    m.push(6);
+    m.push(13);
+    for key in [
+        governance,
+        controller,
+        market,
+        vault,
+        controller_destination,
+        governance_destination,
+        &retired_market,
+        vault_authority,
+        &perc_id(),
+        &spl_token::ID,
+        &system_program::ID,
+        &controller_id(),
+        twap_config,
+    ] {
+        m.extend_from_slice(key.as_ref());
+    }
+    m.push(1);
+    m.push(11);
+    m.push(12);
+    for index in [0u8, 1, 2, 7, 3, 4, 5, 8, 9, 10, 6, 12] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(5);
+    m.push(0);
+    m
+}
+
+#[allow(clippy::too_many_arguments)]
 fn controller_return_shutdown_backing_ix(
     governance: &Pubkey,
     controller: &Pubkey,
@@ -11802,6 +11895,8 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new(retired_market_pda(&slab, &perc_id()), false),
+            AccountMeta::new_readonly(cleanup_pool, false),
+            AccountMeta::new_readonly(sub_id(), false),
         ],
         data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
     };
@@ -13569,7 +13664,31 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         "raw CloseSlab must be denied because its mandatory controller destinations strand value"
     );
 
-    let close = build_controller_close_and_reclaim_message(
+    let terminal_market = svm.get_account(&slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_admin(&terminal_market.data, 0).unwrap(),
+        pool.to_bytes(),
+        "the owner-bound pool remains the terminal asset custodian"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_authority(&terminal_market.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_operator(&terminal_market.data, 0).unwrap(),
+        pool.to_bytes()
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "the pool has no remaining owner principal"
+    );
+
+    let close = build_controller_close_and_reclaim_with_subledger_message(
         &squads_vault,
         &controller,
         &slab,
@@ -13577,6 +13696,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &vault_authority,
         &controller_destination,
         &governance_destination,
+        &pool,
     );
     let close_remaining = vec![
         AccountMeta::new(squads_vault, false),
@@ -13591,6 +13711,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(controller_id(), false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(
         &mut svm,
@@ -14040,7 +14162,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &squads_vault,
         0,
     );
-    let close = build_controller_close_and_reclaim_message(
+    let close = build_controller_close_and_reclaim_with_subledger_message(
         &squads_vault,
         &controller,
         &market,
@@ -14048,6 +14170,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &vault_authority,
         &controller_transit,
         &governance_destination,
+        &pool,
     );
     let close_remaining = vec![
         AccountMeta::new(squads_vault, false),
@@ -14062,6 +14185,8 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(controller_id(), false),
+        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new_readonly(sub_id(), false),
     ];
     assert!(
         squads_execute(
@@ -14078,6 +14203,31 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         "the late protocol atom blocks CloseSlab before fixed custody recovery"
     );
 
+    let twap_close = build_controller_close_and_reclaim_with_twap_message(
+        &squads_vault,
+        &controller,
+        &market,
+        &percolator_vault,
+        &vault_authority,
+        &controller_transit,
+        &governance_destination,
+        &twap_config,
+    );
+    let twap_close_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new(percolator_vault, false),
+        AccountMeta::new(controller_transit, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&market, &perc_id()), false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+        AccountMeta::new_readonly(twap_config, false),
+    ];
     squads_execute(
         &mut svm,
         &squads,
@@ -14116,8 +14266,8 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &dao,
         &payer,
         6,
-        &close,
-        &close_remaining,
+        &twap_close,
+        &twap_close_remaining,
     )
     .expect("terminal recovery unblocks real CloseSlab");
     assert_eq!(token_amount(&svm, &governance_destination), 1);
@@ -44957,7 +45107,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &controller,
         0,
     );
-    let fallback_close = build_controller_close_and_reclaim_message(
+    let fallback_close = build_controller_close_and_reclaim_with_subledger_message(
         &env.squads_vault,
         &controller,
         &env.slab,
@@ -44965,6 +45115,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &perc_vault_authority(&env.slab, &perc_id()),
         &close_controller_transit,
         &governance_destination,
+        &env.pool,
     );
     let fallback_close_remaining = vec![
         AccountMeta::new(env.squads_vault, false),
@@ -44979,6 +45130,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new_readonly(spl_token::ID, false),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(controller_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(
         &mut svm,
@@ -46345,4 +46498,329 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         "both cleanup cycles move only fee atoms and preserve all remaining trader capital"
     );
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
+}
+// A fully realized market loss can leave Subledger's nominal owner claims nonzero
+// after every Percolator balance reaches zero. Closing the slab before those fixed
+// zero-value returns run would make the positions impossible to retire and leave
+// stale capital eligible for later reward epochs.
+#[test]
+fn e2e_market_close_waits_for_fully_impaired_subledger_claims() {
+    use percolator::{EngineAssetSlotV16Account as Asset, MarketGroupV16HeaderAccount as Header};
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &env.pool,
+    );
+    let accept_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &donate_market,
+        &accept_remaining,
+    )
+    .expect("donate lifecycle while the canonical pool holds asset custody");
+
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let depositor_source = Pubkey::new_unique();
+    let pool_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &depositor_source,
+        &env.collateral_mint,
+        &depositor.pubkey(),
+        1,
+    );
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &depositor.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_source, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("deposit the one-unit claim that bears the total market loss");
+
+    let resolve = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &resolve,
+        &controller_remaining,
+    )
+    .expect("resolve the empty market through the real controller and engine");
+
+    // Reproduce the terminal snapshot of a real complete insurance loss: both domain
+    // budgets are fully spent and the group/vault aggregates contain no atoms.
+    let mut market = svm.get_account(&env.slab).unwrap();
+    let header = percolator_prog::constants::MARKET_GROUP_OFF;
+    let engine = header
+        + core::mem::size_of::<Header>()
+        + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN;
+    for (budget, spent) in [
+        (
+            core::mem::offset_of!(Asset, insurance_domain_budget_long),
+            core::mem::offset_of!(Asset, insurance_domain_spent_long),
+        ),
+        (
+            core::mem::offset_of!(Asset, insurance_domain_budget_short),
+            core::mem::offset_of!(Asset, insurance_domain_spent_short),
+        ),
+    ] {
+        let budget_value = market.data[engine + budget..engine + budget + 16].to_vec();
+        market.data[engine + spent..engine + spent + 16].copy_from_slice(&budget_value);
+    }
+    for offset in [
+        core::mem::offset_of!(Header, insurance),
+        core::mem::offset_of!(Header, vault),
+    ] {
+        market.data[header + offset..header + offset + 16]
+            .copy_from_slice(&0u128.to_le_bytes());
+    }
+    svm.set_account(env.slab, market).unwrap();
+    let mut vault = svm.get_account(&env.perc_vault).unwrap();
+    vault.data[64..72].copy_from_slice(&0u64.to_le_bytes());
+    svm.set_account(env.perc_vault, vault).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&env.pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        1,
+        "the owner still has a nominal claim to retire"
+    );
+
+    svm.set_account(
+        controller,
+        Account {
+            lamports: 1,
+            data: vec![],
+            owner: system_program::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let transit = Pubkey::new_unique();
+    let destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let close = build_controller_close_and_reclaim_with_subledger_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &env.perc_vault,
+        &perc_vault_authority(&env.slab, &perc_id()),
+        &transit,
+        &destination,
+        &env.pool,
+    );
+    let close_remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new(transit, false),
+        AccountMeta::new(destination, false),
+        AccountMeta::new(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(controller_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    let market_before_close = svm.get_account(&env.slab).unwrap();
+    let position_before_close = svm.get_account(&position).unwrap();
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            4,
+            &close,
+            &close_remaining,
+        )
+        .is_err(),
+        "market close must wait until every fully impaired Subledger claim is retired"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_close);
+    assert_eq!(svm.get_account(&position).unwrap(), position_before_close);
+
+    let unguarded_close = build_controller_close_and_reclaim_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &env.perc_vault,
+        &perc_vault_authority(&env.slab, &perc_id()),
+        &transit,
+        &destination,
+    );
+    let unguarded_remaining = close_remaining[..12].to_vec();
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            5,
+            &unguarded_close,
+            &unguarded_remaining,
+        )
+        .is_err(),
+        "omitting the canonical pool cannot bypass the terminal claim attestation"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_close);
+
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_source, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(
+                    perc_vault_authority(&env.slab, &perc_id()),
+                    false,
+                ),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: vec![13u8], // IX_INSURANCE_WITHDRAW_FULL
+        },
+    )
+    .expect("the owner retires the fully impaired claim without a zero-value CPI");
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&env.pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        0
+    );
+    assert_eq!(svm.get_account(&position).unwrap().data[88], 1);
+
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &close,
+        &close_remaining,
+    )
+    .expect("the guarded close succeeds after every owner claim is retired");
+    assert!(
+        svm.get_account(&env.slab)
+            .map_or(true, |account| account.lamports == 0),
+        "the fully wound-down slab is reclaimed"
+    );
 }

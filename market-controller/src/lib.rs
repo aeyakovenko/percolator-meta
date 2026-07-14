@@ -95,6 +95,7 @@ const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 const ASSET_AUTH_BACKING_BUCKET: u8 = 3;
 const ASSET_AUTH_ORACLE: u8 = 4;
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
+const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -430,6 +431,89 @@ fn validate_constrained_custody_admin(
     } else {
         Err(ProgramError::IllegalOwner)
     }
+}
+
+fn attest_terminal_owner_claims_cleared<'a>(
+    governance: &AccountInfo<'a>,
+    controller: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    custody_state: Option<&AccountInfo<'a>>,
+    subledger_program: Option<&AccountInfo<'a>>,
+) -> ProgramResult {
+    let (asset_admin, insurance_authority, insurance_operator) = {
+        let market_data = market.try_borrow_data()?;
+        (
+            percolator_accounting::read_asset_admin(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+            percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+            percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        )
+    };
+    if asset_admin == controller.key.to_bytes() {
+        if custody_state.is_some() || subledger_program.is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        return Ok(());
+    }
+
+    let custody_state = custody_state.ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if custody_state.owner == &SUBLEDGER_PROGRAM_ID {
+        let subledger_program = subledger_program.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if *custody_state.key != Pubkey::new_from_array(asset_admin)
+            || *subledger_program.key != SUBLEDGER_PROGRAM_ID
+            || !subledger_program.executable
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let pool = custody_state.try_borrow_data()?;
+        if pool.len() < 160
+            || pool[..8] != SUBLEDGER_POOL_DISC
+            || pool[88] > 1
+            || pool[90] != 0
+            || pool[96..128] != market.key.to_bytes()
+            || pool[128..160] != percolator_program.key.to_bytes()
+            || insurance_authority != asset_admin
+            || insurance_operator != asset_admin
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        drop(pool);
+        invoke(
+            &Instruction {
+                program_id: SUBLEDGER_PROGRAM_ID,
+                accounts: vec![AccountMeta::new_readonly(*custody_state.key, false)],
+                data: vec![SUBLEDGER_IX_ASSERT_NO_PRINCIPAL],
+            },
+            &[custody_state.clone(), subledger_program.clone()],
+        )?;
+        return Ok(());
+    }
+
+    if custody_state.owner == &TWAP_PROGRAM_ID {
+        if subledger_program.is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        validate_twap_custody_admin(
+            governance,
+            market,
+            percolator_program,
+            custody_state,
+            asset_admin,
+            insurance_authority,
+            insurance_operator,
+        )?;
+        let config = custody_state.try_borrow_data()?;
+        let custody_principal = u64::from_le_bytes(config[257..265].try_into().unwrap());
+        if custody_principal != 0 || config[266] != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        return Ok(());
+    }
+
+    Err(ProgramError::IllegalOwner)
 }
 
 /// Exact pinned-v16 generic governance surface. Every value mover, authority
@@ -2017,7 +2101,8 @@ fn process_close_resolved_portfolio<'a>(
 // [governance(s,w), controller(w), market(w), vault_authority,
 //  primary_vault(w), controller_primary_transit(w), governance_primary_dest(w),
 //  percolator_program, token_program, system_program, retired_market_marker(w),
-//  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w)]
+//  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w),
+//  optional custody_state, subledger_program]
 //
 // Percolator's CloseSlab requires its current marketauth to receive the slab rent,
 // vault rent, and any raw vault dust. Here marketauth is the stateless controller
@@ -2051,9 +2136,21 @@ fn process_close_market_and_reclaim<'a>(
     let system_program = next_account_info(iter)?;
     let retired_market = next_account_info(iter)?;
     let optional: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
-    let secondary = match optional.as_slice() {
-        [] => None,
-        [vault, transit, destination] => Some((vault, transit, destination)),
+    let (secondary, custody_state, subledger_program) = match optional.as_slice() {
+        [] => (None, None, None),
+        [custody_state] => (None, Some(custody_state), None),
+        [custody_state, subledger_program] => {
+            (None, Some(custody_state), Some(subledger_program))
+        }
+        [vault, transit, destination] => (Some((vault, transit, destination)), None, None),
+        [vault, transit, destination, custody_state] => {
+            (Some((vault, transit, destination)), Some(custody_state), None)
+        }
+        [vault, transit, destination, custody_state, subledger_program] => (
+            Some((vault, transit, destination)),
+            Some(custody_state),
+            Some(subledger_program),
+        ),
         _ => return Err(ProgramError::InvalidInstructionData),
     };
 
@@ -2099,6 +2196,14 @@ fn process_close_market_and_reclaim<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    attest_terminal_owner_claims_cleared(
+        governance,
+        controller,
+        market,
+        percolator_program,
+        custody_state,
+        subledger_program,
+    )?;
 
     let (marker_exists, retired_market_bump) = retired_market_marker_state(
         program_id,

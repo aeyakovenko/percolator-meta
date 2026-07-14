@@ -46,7 +46,8 @@ capital's own tenure.
   a fixed terminal cleanup forwards vault dust, any pre-upgrade controller balance, and account rent
   to Squads after reserving reclaimed slab rent in an immutable market-retirement marker. Governance
   still signs, Percolator still requires a fully wound-down market, and the destination remains
-  Squads-owned. Before that close,
+  Squads-owned. If asset custody remains on Subledger or TWAP, that custodian must also attest that
+  owner principal is zero before the slab can be reclaimed. Before that close,
   anyone can ask the controller to deregister an
   abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
   portfolio and returns its rent only to the slab. Before deleting nonzero LP/trader/funding-payer

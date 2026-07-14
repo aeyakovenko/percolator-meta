@@ -14168,3 +14168,26 @@ The instruction moves no token, accepts no recipient or amount, and adds no sign
 or withdrawal path. Holding contains auctionable protocol surplus only: bidder payouts remain in settlement and
 the monotonic reserved floor remains inside Percolator. The finding is partial because it requires the external
 collateral freeze authority; no user deposit or bidder principal becomes withdrawable by another party.
+
+## Tick - terminal close could delete a fully impaired owner claim witness (surface A/B, PARTIAL DOS)
+
+`CloseMarketAndReclaim` previously relied only on Percolator's zero engine balances. A complete market loss can
+leave a Subledger position with nominal principal but a zero payout; that position still needs the resolved slab
+to execute its fixed zero-value retirement. Governance could reclaim the slab first, permanently preventing the
+owner from retiring the position and leaving stale principal available to later vote or reward accounting. No
+remaining collateral is diverted: the claim is already fully impaired, so the impact is lifecycle denial and
+possible points inflation rather than loss of deposited tokens.
+
+The retained real-SBF LiteSVM regression constructs the internally consistent terminal loss snapshot, proves both
+the guarded and omitted-custodian close shapes reject byte-atomically while one principal atom remains, retires
+that atom through Subledger's owner-signed full exit, and then completes Squads-controlled `CloseSlab`. Existing
+terminal tests cover controller-owned, pool-owned, and TWAP-owned custody after all claims are clear. A separate
+public trading-loss probe was discarded because its forfeited recovery winner left Percolator vault accounting
+nonzero, so old `CloseSlab` was independently unreachable in that fixture.
+
+FIX: terminal reclaim reads asset-0's current admin. Controller-owned custody needs no new account; canonical
+Subledger custody must pass its exact pool and a read-only `assert_no_principal` CPI, while canonical TWAP custody
+must show zero recorded pool principal and no re-handoff in progress. The check runs before `CloseSlab`, moves no
+value, and adds no signer, administrator, recipient, amount, token account, or withdrawal path. The finding is
+partial because the precise total-loss terminal state is validated structurally rather than reproduced end to end
+through the current one-asset public-loss fixture.
