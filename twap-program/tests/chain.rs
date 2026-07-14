@@ -18116,6 +18116,261 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
     );
 }
 
+// LIVENESS PROBE (composed genesis + TWAP locks): a live genesis ballot locks its
+// owner's position, while TWAP custody closes the pool's ordinary withdrawal path.
+// Neither lock may make the initial risk deposit permanent. The owner must be able
+// to clear the ballot and invoke TWAP's fixed return-plus-full-exit in one atomic
+// transaction; a failed bare exit must roll back the custody return first.
+#[test]
+fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+    let (_, proposal) = register_proposal(
+        &mut svm,
+        &payer,
+        &env,
+        1,
+        &Pubkey::new_unique(),
+        100,
+    );
+
+    let voter = Keypair::new();
+    svm.airdrop(&voter.pubkey(), 1_000_000_000).unwrap();
+    let amount = 1_000_000u64;
+    let voter_ata = Pubkey::new_unique();
+    let pool_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &voter_ata,
+        &env.collateral_mint,
+        &voter.pubkey(),
+        amount,
+    );
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &voter.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&amount.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &voter],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(voter.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(voter_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("voter deposits genesis risk capital");
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot += 8;
+    svm.set_sysvar(&clock);
+
+    let ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            env.gv_config.as_ref(),
+            voter.pubkey().as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    let vote = |action: u8| Instruction {
+        program_id: gv_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(voter.pubkey(), true),
+            AccountMeta::new(env.gv_config, false),
+            AccountMeta::new(ballot, false),
+            AccountMeta::new(proposal, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, action],
+    };
+    send(&mut svm, &[&payer, &voter], vote(1)).expect("voter backs proposal");
+    assert!(
+        u128::from_le_bytes(
+            svm.get_account(&proposal).unwrap().data[72..88]
+                .try_into()
+                .unwrap()
+        ) > 0
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize TWAP config");
+    let twap_config = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority = Pubkey::find_program_address(
+        &[b"market-0-twap", twap_config.as_ref()],
+        &twap_id(),
+    )
+    .0;
+    let handoff = build_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_config,
+        &twap_authority,
+        &perc_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_config, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("genesis pool hands custody to TWAP");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), amount as u128);
+
+    let mut owner_exit = twap_return_to_subledger_ix(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_config,
+        &twap_authority,
+        &perc_id(),
+    );
+    owner_exit.accounts[1] = AccountMeta::new(twap_config, false);
+    owner_exit.accounts[3] = AccountMeta::new(env.pool, false);
+    owner_exit
+        .accounts
+        .push(AccountMeta::new_readonly(voter.pubkey(), true));
+    owner_exit.accounts.push(AccountMeta::new(position, false));
+    owner_exit.accounts.push(AccountMeta::new(voter_ata, false));
+    owner_exit
+        .accounts
+        .push(AccountMeta::new(pool_holding, false));
+    owner_exit
+        .accounts
+        .push(AccountMeta::new(env.perc_vault, false));
+    owner_exit.accounts.push(AccountMeta::new_readonly(
+        perc_vault_authority(&env.slab, &perc_id()),
+        false,
+    ));
+    owner_exit
+        .accounts
+        .push(AccountMeta::new_readonly(spl_token::ID, false));
+
+    let market_before = svm.get_account(&env.slab).unwrap();
+    let config_before = svm.get_account(&twap_config).unwrap();
+    let pool_before = svm.get_account(&env.pool).unwrap();
+    assert!(
+        send(&mut svm, &[&payer, &voter], owner_exit.clone()).is_err(),
+        "a bare TWAP exit must not bypass the live ballot lock"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&twap_config).unwrap(), config_before);
+    assert_eq!(svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(token_amount(&svm, &voter_ata), 0);
+
+    svm.expire_blockhash();
+    let blockhash = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[vote(2), owner_exit],
+        Some(&payer.pubkey()),
+        &[&payer, &voter],
+        blockhash,
+    ))
+    .expect("retract and TWAP return-plus-exit compose atomically");
+    assert_eq!(token_amount(&svm, &voter_ata), amount);
+    assert_eq!(svm.get_account(&position).unwrap().data[88], 1);
+    assert_eq!(
+        u128::from_le_bytes(
+            svm.get_account(&proposal).unwrap().data[72..88]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "the exited principal leaves no live genesis weight"
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&env.pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "all user principal is retired from the subledger"
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(env.squads_vault, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new(twap_config, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ],
+            data: vec![8u8],
+        },
+    )
+    .expect("any cranker resumes TWAP custody after the voter exits");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 0);
+}
+
 // ATTACK PROBE (stale vote weight via PARTIAL withdraw — capital-less inflated ballot): the vote weight
 // `floor(log2(hold)) * principal` is tallied at back-time from the position's principal. The veto-exit test
 // above only exercises a FULL withdraw while vote-locked. The sharper free-weight attack is a PARTIAL exit:
