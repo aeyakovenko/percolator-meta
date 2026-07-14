@@ -23,11 +23,12 @@ The regular `register -> crystallize -> freeze -> claim` instructions are shared
 - TWAP books that target an epoch vault bind an inclusive sink cutoff to the epoch end. A later
   permissionless round burns the would-be reward share, so no COIN can arrive outside the frozen
   snapshot and become permanently unclaimable.
-- Registration is half-open `[start, end)` and ordinary crystallization closes at the inclusive
-  `end` slot. Before freeze, a permissionless reduce-only trader refresh may remove points whose
-  crystallized loss was subsequently spent; it uses the same monotonic live cap as claim and cannot
-  admit counter growth created after the reward period. The finalize window gives crankers time to
-  remove that stale denominator before permissionless freeze.
+- Registration is half-open `[start, end)` and point growth closes at the inclusive `end` slot.
+  During the finalize window, an owner may crystallize live or terminal capital at that fixed cutoff;
+  Subledger resets the position clock on every top-up, so post-epoch capital earns zero tenure. A
+  permissionless reduce-only trader refresh may remove points whose crystallized loss was subsequently
+  spent; it uses the same monotonic live cap as claim and cannot admit counter growth created after the
+  reward period. Permissionless freeze opens only after that window.
 - A scope may omit insurance/backing pools and contribute only portfolio-flow points. This lets a
   handed-off genesis market provide capital cohorts while other DAO-vetted live markets provide OI.
 
@@ -93,7 +94,9 @@ redirect, lock, or confiscate insurance/backing principal.
   grouped into one epoch must use the same underlying denomination; use separate epochs otherwise.
   Crystallization updates the authoritative denominator by subtract-old/add-new. Claim rechecks
   live principal, `withdrawn`, and the resettable position clock; exits and later top-ups can only lower
-  a payout. Forfeited COIN remains in the immutable epoch vault and is never redistributed.
+  a payout. The finalize window admits owner-signed capital crystallization clamped to the epoch end;
+  authenticated terminal returns clamp further to their return slot. Forfeited COIN remains in the
+  immutable epoch vault and is never redistributed.
 - Done: Percolator portfolio residual and funding-counter offsets pinned with offset_of! (tests/offsets.rs).
 
 ## Market allow-list (portfolio-flow cohorts) — finding IL+

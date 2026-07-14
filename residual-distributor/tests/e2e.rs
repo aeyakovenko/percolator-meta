@@ -397,6 +397,24 @@ fn set_position_principal(svm: &mut LiteSVM, key: &Pubkey, principal: u64) {
     account.data[72..80].copy_from_slice(&principal.to_le_bytes());
     svm.set_account(*key, account).unwrap();
 }
+
+fn set_terminal_return_snapshot(
+    svm: &mut LiteSVM,
+    key: &Pubkey,
+    returned_principal: u64,
+    return_slot: u64,
+) {
+    let encoded_slot = return_slot.checked_add(1).expect("return slot encoding");
+    assert!(encoded_slot < (1u64 << 40), "return slot fits Subledger");
+    let mut account = svm.get_account(key).expect("position");
+    account.data[72..80].copy_from_slice(&0u64.to_le_bytes());
+    account.data[80..88].copy_from_slice(&returned_principal.to_le_bytes());
+    account.data[88] = 1;
+    account.data[98] = 1;
+    account.data[99..104].copy_from_slice(&encoded_slot.to_le_bytes()[..5]);
+    account.data[104..120].copy_from_slice(&0u128.to_le_bytes());
+    svm.set_account(*key, account).unwrap();
+}
 fn initialize_portfolio_header(
     data: &mut [u8],
     key: &Pubkey,
@@ -6758,6 +6776,283 @@ fn terminal_return_preserves_only_the_remaining_frozen_capital_reward() {
         50_000,
         "the terminal snapshot preserves the remaining half, not the withdrawn half"
     );
+}
+
+// PUBLIC REWARD LOF: the finalize window must let capital owners crystallize after the epoch ends.
+// Live and terminal capital are clamped to emission_end, and Subledger's top-up clock prevents fresh
+// post-epoch capital from borrowing the registered stake's old tenure.
+#[test]
+fn reward_finalize_window_clamps_live_and_terminal_capital_to_epoch_end() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    let authority = Keypair::new();
+    let mint_authority = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let supply = 1_000_000u64;
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let epoch_id = 9_002u64;
+    let rd_config = reward_epoch_pda(&authority.pubkey(), &coin_mint, epoch_id);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let market = Pubkey::new_unique();
+    let ins_pool = Pubkey::new_unique();
+    let back_pool = Pubkey::new_unique();
+    let emission_start = 100u64;
+    let emission_end = 1_123u64;
+    let finalize_window = 256u64;
+    set_slot(&mut svm, 50);
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                authority.pubkey(),
+                coin_mint,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                emission_start,
+                emission_end,
+                supply,
+                5_000,
+                5_000,
+                0,
+                0,
+                finalize_window,
+                0,
+                &[RewardEpochMarket {
+                    market,
+                    insurance_pool: ins_pool,
+                    backing_pool: back_pool,
+                }],
+            ),
+        }],
+        &[&authority],
+    )
+    .expect("initialize capital reward epoch");
+    mint_to(
+        &mut svm,
+        &payer,
+        &coin_mint,
+        &mint_authority,
+        &vault,
+        supply,
+    );
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_authority);
+    let env = Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth: Keypair::new(),
+        stub_sub,
+        stub_perc,
+        ins_pool,
+        back_pool,
+        market,
+        supply,
+        emission_end,
+        finalize_window,
+    };
+
+    let insurance_owner = Keypair::new();
+    let backing_owner = Keypair::new();
+    let live_owner = Keypair::new();
+    let deadline_owner = Keypair::new();
+    let insurance_position = Pubkey::new_unique();
+    let backing_position = Pubkey::new_unique();
+    let live_position = Pubkey::new_unique();
+    let deadline_position = Pubkey::new_unique();
+    for (position, pool, owner) in [
+        (insurance_position, ins_pool, insurance_owner.pubkey()),
+        (backing_position, back_pool, backing_owner.pubkey()),
+        (live_position, ins_pool, live_owner.pubkey()),
+        (deadline_position, ins_pool, deadline_owner.pubkey()),
+    ] {
+        set_position(
+            &mut svm,
+            &position,
+            &stub_sub,
+            &pool,
+            &owner,
+            100,
+            false,
+        );
+        set_position_start_slot(&mut svm, &position, emission_start);
+    }
+
+    set_slot(&mut svm, emission_start);
+    for (owner, position, cohort) in [
+        (&insurance_owner, insurance_position, COHORT_INSURANCE),
+        (&backing_owner, backing_position, COHORT_BACKING),
+        (&live_owner, live_position, COHORT_INSURANCE),
+        (&deadline_owner, deadline_position, COHORT_INSURANCE),
+    ] {
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            owner,
+            &owner.pubkey(),
+            &position,
+            cohort,
+        )
+        .expect("register capital before emission closes");
+    }
+
+    let return_slot = 1_224u64;
+    set_slot(&mut svm, return_slot);
+    for position in [insurance_position, backing_position, deadline_position] {
+        set_terminal_return_snapshot(&mut svm, &position, 100, return_slot);
+    }
+
+    let live_stake = stake_pda_for_cohort(
+        &env,
+        &live_owner.pubkey(),
+        &live_position,
+        COHORT_INSURANCE,
+    );
+    crystallize(
+        &mut svm,
+        &payer,
+        &env,
+        &live_owner,
+        &live_position,
+    )
+    .expect("slow live backer finalizes during the documented window");
+    let live_data = svm.get_account(&live_stake).unwrap().data;
+    assert_eq!(
+        u128::from_le_bytes(live_data[176..192].try_into().unwrap()),
+        900
+    );
+    assert_eq!(
+        u128::from_le_bytes(live_data[194..210].try_into().unwrap()),
+        emission_end as u128
+    );
+
+    // Model a real Subledger top-up: principal rises and its last-write clock
+    // resets after emission. Re-crystallization can only reduce this stake to zero.
+    set_position_principal(&mut svm, &live_position, 1_000_000);
+    set_position_start_slot(&mut svm, &live_position, return_slot);
+    crystallize(
+        &mut svm,
+        &payer,
+        &env,
+        &live_owner,
+        &live_position,
+    )
+    .expect("post-epoch top-up is safely re-evaluated");
+    assert_eq!(
+        u128::from_le_bytes(
+            svm.get_account(&live_stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "fresh post-epoch capital cannot inflate the frozen denominator"
+    );
+
+    crystallize(
+        &mut svm,
+        &payer,
+        &env,
+        &insurance_owner,
+        &insurance_position,
+    )
+    .expect("finalize terminal insurance snapshot");
+    crystallize(
+        &mut svm,
+        &payer,
+        &env,
+        &backing_owner,
+        &backing_position,
+    )
+    .expect("finalize terminal backing snapshot");
+    for (owner, position, cohort) in [
+        (
+            &insurance_owner,
+            insurance_position,
+            COHORT_INSURANCE,
+        ),
+        (&backing_owner, backing_position, COHORT_BACKING),
+    ] {
+        let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &position, cohort);
+        let data = svm.get_account(&stake).unwrap().data;
+        assert_eq!(
+            u128::from_le_bytes(data[176..192].try_into().unwrap()),
+            900,
+            "100 principal earns floor_log2(1023)=9, not post-epoch tenure"
+        );
+        assert_eq!(
+            u128::from_le_bytes(data[194..210].try_into().unwrap()),
+            emission_end as u128,
+            "terminal capital crystallization is clamped to emission_end"
+        );
+    }
+
+    set_slot(&mut svm, emission_end + finalize_window);
+    let deadline_stake = stake_pda_for_cohort(
+        &env,
+        &deadline_owner.pubkey(),
+        &deadline_position,
+        COHORT_INSURANCE,
+    );
+    let deadline_stake_before = svm.get_account(&deadline_stake).unwrap();
+    let config_before_deadline = svm.get_account(&rd_config).unwrap();
+    assert!(
+        crystallize(
+            &mut svm,
+            &payer,
+            &env,
+            &deadline_owner,
+            &deadline_position,
+        )
+        .is_err(),
+        "the first freeze-eligible slot is no longer in the finalize window"
+    );
+    assert_eq!(
+        svm.get_account(&deadline_stake).unwrap(),
+        deadline_stake_before
+    );
+    assert_eq!(
+        svm.get_account(&rd_config).unwrap(),
+        config_before_deadline
+    );
+
+    freeze(&mut svm, &payer, &env).expect("freeze at exact cutoff");
+    let insurance_recipient =
+        create_token_account(&mut svm, &payer, &coin_mint, &insurance_owner.pubkey());
+    let backing_recipient =
+        create_token_account(&mut svm, &payer, &coin_mint, &backing_owner.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &insurance_owner,
+        &insurance_recipient,
+        Some(&insurance_position),
+    )
+    .expect("claim terminal insurance reward");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &backing_owner,
+        &backing_recipient,
+        Some(&backing_position),
+    )
+    .expect("claim terminal backing reward");
+    assert_eq!(token_amount(&svm, &insurance_recipient), supply / 2);
+    assert_eq!(token_amount(&svm, &backing_recipient), supply / 2);
+    assert_eq!(token_amount(&svm, &vault), 0);
 }
 
 // ATTACK PROBE (post-freeze capital inflation): the insurance/backing claim pays

@@ -2187,11 +2187,16 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
-    // Reward counters stop accruing at emission_end. During the delayed freeze window, permit only
-    // a reduce-only trader refresh: residual spent can consume a previously crystallized loss and
-    // otherwise leave stale points in the frozen denominator. Capital forfeiture remains owner-timed,
-    // and monotonic LP/funding counters need no post-period mutation.
-    if post_emission_finalize && stake.cohort != COHORT_TRADER {
+    // Reward counters stop accruing at emission_end. During the delayed freeze window, permit a
+    // reduce-only trader refresh and owner-signed capital finalization clamped to the epoch end.
+    // Subledger resets a position's start clock on every top-up, so fresh post-epoch capital earns
+    // zero tenure. Monotonic LP/funding counters remain closed after the period.
+    if post_emission_finalize
+        && !matches!(
+            stake.cohort,
+            COHORT_INSURANCE | COHORT_BACKING | COHORT_TRADER
+        )
+    {
         return Err(ProgramError::InvalidInstructionData);
     }
     if stake.config != *config_account.key || stake.backing_ledger != *backing_ledger.key {
@@ -2235,17 +2240,37 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let (principal, withdrawn) = read_subledger_principal(&data)?;
             let position_start_slot = read_subledger_start_slot(&data)?;
             let now = Clock::get()?.slot;
-            let (live_principal, crystallized_slot) =
-                match read_terminal_return_snapshot(&data)? {
-                    Some((terminal_principal, Some(return_slot))) => {
-                        (terminal_principal, core::cmp::min(now, return_slot))
-                    }
-                    // Historical terminal snapshots predate the return-slot field.
-                    // Preserve their already-crystallized claim cap, but do not
-                    // guess a tenure and inflate a newly crystallized reward.
-                    Some((_terminal_principal, None)) => (0, now),
-                    None => (capital_points(principal, withdrawn), now),
-                };
+            let terminal_snapshot = read_terminal_return_snapshot(&data)?;
+            if post_emission_finalize {
+                let freeze_cutoff = config
+                    .emission_end_slot
+                    .checked_add(config.finalize_window)
+                    .ok_or(ProgramError::InvalidInstructionData)?;
+                if now >= freeze_cutoff {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+            }
+            let accrual_cutoff = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
+                core::cmp::min(now, config.emission_end_slot)
+            } else {
+                now
+            };
+            let (live_principal, crystallized_slot) = match terminal_snapshot {
+                Some((terminal_principal, Some(return_slot))) => {
+                    (
+                        terminal_principal,
+                        core::cmp::min(accrual_cutoff, return_slot),
+                    )
+                }
+                // Historical terminal snapshots predate the return-slot field.
+                // Preserve their already-crystallized claim cap, but do not
+                // guess a tenure and inflate a newly crystallized reward.
+                Some((_terminal_principal, None)) if !post_emission_finalize => (0, now),
+                Some((_terminal_principal, None)) => {
+                    return Err(ProgramError::InvalidInstructionData)
+                }
+                None => (capital_points(principal, withdrawn), accrual_cutoff),
+            };
             let effective_start = core::cmp::max(stake.start_slot, position_start_slot);
             let multiplier = floor_log2(crystallized_slot.saturating_sub(effective_start));
             let new_pts = multiplier.saturating_mul(live_principal);
