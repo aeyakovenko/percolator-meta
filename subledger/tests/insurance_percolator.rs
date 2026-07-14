@@ -3481,6 +3481,19 @@ fn topping_up_a_voted_position_does_not_inflate_or_unlock_the_vote() {
         "top-up did NOT unlock the live vote — capital still pledged");
     assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).is_err(),
         "the topped-up, still-voted position cannot exit until the vote is retracted");
+
+    // Retraction must back out the ORIGINAL ballot snapshot, not the now-larger
+    // position. It must also release the current position in full; otherwise a
+    // legal top-up while voted would permanently lock the added principal.
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract after top-up");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (0, 0),
+        "retract backs out the stored ballot contribution exactly");
+    assert!(env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap().data[97] == 0,
+        "retract releases the topped-up position");
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 2 * amount)
+        .expect("recover the entire topped-up principal after retracting");
+    assert_eq!(env.token_amount(&alice_ata), 2 * amount,
+        "a stale ballot snapshot cannot strand the top-up or original deposit");
 }
 
 // TARGETED DISENFRANCHISEMENT (lamport-prefund DOS on a voter's ballot, finding AI on the vote path):
