@@ -94,6 +94,7 @@ const BPS_DENOMINATOR: u16 = 10_000;
 // vault(w), vault_authority, token_program, ledger(optional)] — same order the old tag-23 pull used.
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
+const PERC_IX_TOP_UP_INSURANCE_DOMAIN: u8 = 56;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
@@ -3411,10 +3412,12 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
 
     // 1) surplus and the 80/20 split. The retained share stays in insurance AND is ratcheted into
     //    the principal counter so it is protected and compounds; only the burn-share is pulled.
-    let insurance = read_asset_insurance(
+    let insurance_balance = percolator_accounting::read_asset_insurance_balance(
         &market_slab.try_borrow_data()?,
         config.market_0_domain as usize,
-    )?;
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?;
+    let insurance = insurance_balance.remaining_atoms;
     let surplus = insurance.saturating_sub(config.reserved_floor);
     let burnable = surplus
         .checked_mul(config.surplus_buy_burn_bps as u128)
@@ -3432,6 +3435,25 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         .ok_or(ProgramError::ArithmeticOverflow)?
         .checked_sub(savings)
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    let total_pull = burnable
+        .checked_add(savings)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let floor_after = config
+        .reserved_floor
+        .checked_add(retained)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let withdrawal_plan = if insurance < config.reserved_floor {
+        // An unarmed sentinel or a realized loss leaves no complete floor to rebalance.
+        // Preserve its domain provenance and retain the historical no-op execute path.
+        percolator_accounting::InsuranceWithdrawalPlan::default()
+    } else {
+        percolator_accounting::plan_insurance_withdrawal_to_domains(
+            insurance_balance,
+            total_pull,
+            percolator_accounting::balanced_insurance_domains(floor_after),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?
+    };
 
     // Validate the optional savings destination before either insurance pull. The book holding is
     // also a valid twap-authority-owned collateral account, but aliasing it would merge the savings
@@ -3443,8 +3465,14 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         {
             return Err(ProgramError::InvalidAccountData);
         }
+        if savings_dest.owner != &spl_token::ID {
+            return Err(ProgramError::IllegalOwner);
+        }
         let sd = spl_token::state::Account::unpack(&savings_dest.try_borrow_data()?)?;
-        if sd.mint != book.collateral_mint {
+        if sd.mint != book.collateral_mint
+            || sd.owner != expected_auth
+            || sd.state != spl_token::state::AccountState::Initialized
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         Some(savings_dest)
@@ -3452,14 +3480,24 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         None
     };
 
-    // 2) pull the burn-share into the holding (twap_authority is the percolator insurance operator).
-    //    tag-57 WithdrawInsuranceAsset: asset_index (0 = the genesis market_0_domain) + amount. The
-    //    percolator caps it to the available insurance; the meta floor (reserved_floor) is the principal
-    //    guard layered on top (it was subtracted from `surplus` above, so `burnable` can never reach it).
-    if burnable > 0 {
+    // 2) Pull both configured surplus shares through one asset-wide withdrawal, then restore the
+    //    exact 50/50 floor with domain top-ups. Percolator consumes long before short, so pulling
+    //    only the net amount would silently replace long-domain principal with short-domain surplus.
+    if withdrawal_plan.gross_withdrawal != 0 {
+        let plan = withdrawal_plan;
+        if plan.redeposit != [0, 0]
+            && percolator_accounting::read_asset_insurance_authority(
+                &market_slab.try_borrow_data()?,
+                config.market_0_domain as usize,
+            )
+            .map_err(|_| ProgramError::InvalidAccountData)?
+                != twap_authority.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
         ix_data.extend_from_slice(&(config.market_0_domain as u16).to_le_bytes());
-        ix_data.extend_from_slice(&burnable.to_le_bytes());
+        ix_data.extend_from_slice(&plan.gross_withdrawal.to_le_bytes());
         invoke_signed(
             &Instruction {
                 program_id: *percolator_program.key,
@@ -3484,45 +3522,68 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             ],
             &[&auth_seeds],
         )?;
-    }
-    // 2b) pull the savings share to the DAO's base-unit (collateral) savings sink via the SAME tag-57.
-    //     OPTIONAL trailing account: only consumed when a savings share is configured, so the (savings=0)
-    //     default keeps the existing execute account list unchanged. The destination is pinned to
-    //     config.base_unit_savings_account and must hold the market's collateral mint.
-    if let Some(savings_dest) = savings_dest {
-        let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
-        ix_data.extend_from_slice(&(config.market_0_domain as u16).to_le_bytes());
-        ix_data.extend_from_slice(&savings.to_le_bytes());
-        invoke_signed(
-            &Instruction {
-                program_id: *percolator_program.key,
-                accounts: vec![
-                    AccountMeta::new_readonly(*twap_authority.key, true),
-                    AccountMeta::new(*market_slab.key, false),
-                    AccountMeta::new(*savings_dest.key, false),
-                    AccountMeta::new(*percolator_vault.key, false),
-                    AccountMeta::new_readonly(*vault_authority.key, false),
-                    AccountMeta::new_readonly(*token_program.key, false),
+
+        for (domain_offset, amount) in plan.redeposit.into_iter().enumerate() {
+            if amount == 0 {
+                continue;
+            }
+            let domain = (config.market_0_domain as usize)
+                .checked_mul(2)
+                .and_then(|v| v.checked_add(domain_offset))
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            let domain = u16::try_from(domain).map_err(|_| ProgramError::ArithmeticOverflow)?;
+            let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE_DOMAIN];
+            ix_data.extend_from_slice(&domain.to_le_bytes());
+            ix_data.extend_from_slice(&amount.to_le_bytes());
+            invoke_signed(
+                &Instruction {
+                    program_id: *percolator_program.key,
+                    accounts: vec![
+                        AccountMeta::new_readonly(*twap_authority.key, true),
+                        AccountMeta::new(*market_slab.key, false),
+                        AccountMeta::new(*holding.key, false),
+                        AccountMeta::new(*percolator_vault.key, false),
+                        AccountMeta::new_readonly(*token_program.key, false),
+                    ],
+                    data: ix_data,
+                },
+                &[
+                    twap_authority.clone(),
+                    market_slab.clone(),
+                    holding.clone(),
+                    percolator_vault.clone(),
+                    token_program.clone(),
+                    percolator_program.clone(),
                 ],
-                data: ix_data,
-            },
+                &[&auth_seeds],
+            )?;
+        }
+    }
+
+    // 2b) The combined pull lands in the canonical holding. Route only the configured savings
+    //     share onward; the auction's burn/buyback budget remains in holding exactly as before.
+    if let Some(savings_dest) = savings_dest {
+        let savings = u64::try_from(savings).map_err(|_| ProgramError::ArithmeticOverflow)?;
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                holding.key,
+                savings_dest.key,
+                twap_authority.key,
+                &[],
+                savings,
+            )?,
             &[
-                twap_authority.clone(),
-                market_slab.clone(),
+                holding.clone(),
                 savings_dest.clone(),
-                percolator_vault.clone(),
-                vault_authority.clone(),
+                twap_authority.clone(),
                 token_program.clone(),
-                percolator_program.clone(),
             ],
             &[&auth_seeds],
         )?;
     }
     // 3) ratchet the retained share into the principal counter.
-    config.reserved_floor = config
-        .reserved_floor
-        .checked_add(retained)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    config.reserved_floor = floor_after;
 
     // 4) clear the book against the budget now in the holding.
     let budget = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?.amount as u128;

@@ -18,6 +18,36 @@ VERDICT: BLOCKED by construction in pinned Percolator: backing fees are charged 
 new source-lien delta, so a named key with no deposited capacity has no claim. This closes the
 previously source-audited but Meta-level unpinned assumption behind preserving external backing.
 No production code or security PR.
+## Tick - permissionless TWAP pull could consume one insurance domain's principal (surface B/C)
+
+TWAP protected its retained insurance with one aggregate `reserved_floor`, then withdrew the configured
+auction and savings shares through Percolator's asset-wide instruction. That instruction consumes the
+long domain before the short domain. The canonical public handoff began with `[750,000, 750,000]` for a
+`1,000,000` principal floor plus `500,000` surplus; the first ordinary 80/20 permissionless round pulled
+`400,000` and ratcheted the aggregate floor to `1,100,000`, but left `[350,000, 750,000]`. It had silently
+removed `150,000` of long-domain principal protection while opposite-domain surplus made the aggregate
+floor appear fully funded. A later short bankruptcy could forfeit winning long value with protected
+insurance still stranded in the other domain.
+
+The retained real-SBF LiteSVM regression executes the full Squads custody handoff, inbound insurance
+donation, floor setup, auction-book initialization, and permissionless TWAP round. The old binary ends at
+`[350,000, 750,000]`; the fixed binary ends at `[550,000, 550,000]` while preserving the exact `400,000`
+auction budget and `1,100,000` aggregate floor. The existing 80/10/10 savings regression now additionally
+requires `[525,000, 525,000]`, with unchanged auction, savings, vault, and floor amounts.
+
+An upgrade regression preserves the exact aggregate, token, and domain state left by that predecessor
+round, then runs the upgraded binary with no new surplus. The planner supports a zero-net withdrawal and
+redeposit, so any public execute repairs `[350,000, 750,000]` to `[550,000, 550,000]` without changing the
+floor, holding, Percolator vault, or aggregate insurance. Existing deployments do not depend on future fees
+to recover the invariant.
+
+FIX: a shared pure accounting planner models Percolator's exact long-first withdrawal order, per-domain
+reservation floors, and global capacity. TWAP combines auction and savings into one planned gross
+withdrawal, atomically tops up the exact domain amounts needed for the ratcheted floor's canonical 50/50
+split, then transfers only the fixed savings share from its existing holding. Subledger's owner-exit
+planner uses the same primitive. No instruction, signer, authority, recipient, caller-selected amount,
+admin role, or governance withdrawal path was added.
+
 ## Tick - public insurance exit could reassign another depositor's loss domain (surface B/C)
 
 Percolator splits each ordinary insurance top-up independently, rounding every odd remainder into
