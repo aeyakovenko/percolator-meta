@@ -150,7 +150,7 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
 const GENESIS_VOTE_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("GenesisVote11111111111111111111111111111111");
-const GENESIS_IX_ASSERT_BOOTSTRAP_ENDED: u8 = 6;
+const GENESIS_IX_RETIRE_TERMINAL_BALLOT: u8 = 7;
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
@@ -2314,13 +2314,14 @@ fn process_insurance_withdraw_full(
 
 // return_finalized_position accounts: [owner, pool(w), position(w), owner_ata(w),
 //   holding(w), market_slab(w), percolator_vault(w), vault_authority,
-//   percolator_program, token_program, genesis_config, genesis_witness,
-//   genesis_vote_program]
+//   percolator_program, token_program, genesis_config(w), genesis_ballot(w),
+//   genesis_proposal(w), genesis_vote_program]
 // data: none
 //
 // Once the immutable bootstrap deadline has elapsed and its real market is resolved
-// and empty, anyone may retire an absent depositor's complete position. The witness
-// account is retained for instruction compatibility but grants no authority. The
+// and empty, anyone may retire an absent depositor's complete position. Genesis
+// atomically retires that owner's exact live ballot before the capital return, so a
+// refunded vote cannot later count against a smaller live-principal quorum. The
 // instruction has no amount and accepts only a clean token account owned by the
 // depositor, so neither a cranker nor governance can capture or partially manipulate
 // the payout.
@@ -2351,12 +2352,13 @@ fn process_insurance_withdraw_impl(
     let token_program = next_account_info(iter)?;
     let genesis_accounts = if terminal {
         let config = next_account_info(iter)?;
+        let ballot = next_account_info(iter)?;
         let proposal = next_account_info(iter)?;
         let genesis_program = next_account_info(iter)?;
         if iter.next().is_some() {
             return Err(ProgramError::InvalidInstructionData);
         }
-        Some((config, proposal, genesis_program))
+        Some((config, ballot, proposal, genesis_program))
     } else {
         None
     };
@@ -2421,7 +2423,7 @@ fn process_insurance_withdraw_impl(
     }
 
     if terminal {
-        let (genesis_config, _genesis_witness, genesis_program) =
+        let (genesis_config, genesis_ballot, genesis_proposal, genesis_program) =
             genesis_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
         if pool_account.data_len() < POOL_SIZE
             || position_account.data_len() < POSITION_SIZE
@@ -2448,22 +2450,30 @@ fn process_insurance_withdraw_impl(
                 return Err(ProgramError::InvalidAccountData);
             }
         }
-        // The genesis program owns this state and attests the immutable deadline
-        // plus canonical pool binding read-only. Market finality is proved above,
-        // so custody recovery cannot depend on an absent voter breaking a tie or
-        // otherwise producing an executed distribution proposal.
-        invoke(
+        // The Genesis program attests the immutable deadline and canonical pool
+        // binding, then retires this owner's exact live ballot. The pool PDA signer
+        // prevents a direct caller from deleting votes. Market finality is proved
+        // above, so custody recovery does not depend on a winning proposal.
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
             &Instruction {
                 program_id: *genesis_program.key,
                 accounts: vec![
-                    AccountMeta::new_readonly(*genesis_config.key, false),
-                    AccountMeta::new_readonly(*pool_account.key, false),
+                    AccountMeta::new_readonly(*pool_account.key, true),
+                    AccountMeta::new(*genesis_config.key, false),
+                    AccountMeta::new_readonly(*owner.key, false),
+                    AccountMeta::new(*genesis_ballot.key, false),
+                    AccountMeta::new(*genesis_proposal.key, false),
                 ],
-                data: vec![GENESIS_IX_ASSERT_BOOTSTRAP_ENDED],
+                data: vec![GENESIS_IX_RETIRE_TERMINAL_BALLOT],
             },
             &[
-                genesis_config.clone(),
                 pool_account.clone(),
+                genesis_config.clone(),
+                owner.clone(),
+                genesis_ballot.clone(),
+                genesis_proposal.clone(),
                 genesis_program.clone(),
             ],
         )?;
@@ -2751,8 +2761,8 @@ fn process_insurance_withdraw_impl(
         position.withdrawn = true;
         if terminal {
             // Terminal market finality ends the deposit's risk period; do not
-            // leave a stale lock on retired capital. Historical vote tallies remain
-            // read-only evidence of the risk taken during bootstrap.
+            // leave a stale lock on retired capital. Genesis already removed the
+            // ballot from its exact proposal and global tallies in this transaction.
             position.vote_locked = false;
             position.terminal_returned = true;
             position.terminal_return_slot = Some(core::cmp::min(
