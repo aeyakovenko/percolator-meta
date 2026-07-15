@@ -4774,14 +4774,12 @@ fn funding_payer_claim_does_not_require_portfolio_after_freeze() {
     );
 }
 
-// PUBLIC DOS (terminal residual claim): after Percolator closes a portfolio, anyone can transfer one
-// lamport to its zero-data address. Depending on runtime purge timing the address can retain its old
-// Percolator owner or return to the system program; a PDA-owned portfolio has no signer that can remove
-// that dust. The exact linked key still proves which frozen stake is being claimed, and neither empty
-// account can carry live Percolator counters, so dust must not disable the dematerialized-witness
-// fallback. Exercise both residual cohorts and owner states through the deployed SBF.
+// TERMINAL FALLBACK BOUNDARY: after Percolator closes a portfolio, anyone can transfer one lamport
+// to its zero-data address. The exact linked key is sufficient for LP points because received flow is
+// monotonic. It is not sufficient for trader points: a public recovery can raise `spent` after the last
+// crystallize, so an empty witness without a controller archive cannot prove the claim's live cap.
 #[test]
-fn lamport_dust_cannot_lock_frozen_lp_or_trader_reward() {
+fn lamport_dust_preserves_lp_fallback_but_cannot_erase_trader_live_cap() {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
@@ -4929,20 +4927,31 @@ fn lamport_dust_cannot_lock_frozen_lp_or_trader_reward() {
         None,
     )
     .expect("public LP claim survives dusted closed witness");
-    claim_as(
-        &mut svm,
-        &payer,
-        &env,
-        &payer,
-        &trader.pubkey(),
-        &trader_ata,
-        None,
-    )
-    .expect("public trader claim survives dusted closed witness");
+    let trader_stake =
+        stake_pda_for_cohort(&env, &trader.pubkey(), &trader_pf, COHORT_TRADER);
+    let trader_stake_before = svm.get_account(&trader_stake).unwrap();
+    assert!(
+        claim_as(
+            &mut svm,
+            &payer,
+            &env,
+            &payer,
+            &trader.pubkey(),
+            &trader_ata,
+            None,
+        )
+        .is_err(),
+        "a trader claim needs live counters or an authenticated controller archive"
+    );
 
     assert_eq!(token_amount(&svm, &lp_ata), 400_000);
-    assert_eq!(token_amount(&svm, &trader_ata), 400_000);
-    assert_eq!(token_amount(&svm, &env.vault), 200_000);
+    assert_eq!(token_amount(&svm, &trader_ata), 0);
+    assert_eq!(token_amount(&svm, &env.vault), 600_000);
+    assert_eq!(
+        svm.get_account(&trader_stake).unwrap(),
+        trader_stake_before,
+        "rejected no-archive trader claim is atomic"
+    );
 }
 
 // PAY-UP PROBE (funding-payer claim one-sided live cap): if paid funding grows after the last crystallize,
