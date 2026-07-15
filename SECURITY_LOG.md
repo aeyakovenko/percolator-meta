@@ -13870,3 +13870,55 @@ fresh post-epoch principal has zero tenure and cannot inflate a denominator. Slo
 snapshots remain unable to mint points, LP/funding growth remains closed, and trader finalization remains
 permissionless and reduce-only. The change adds no authority, recipient, token account, CPI, or
 collateral movement surface.
+
+## Tick - public terminal refunds could select a tied Genesis winner (surface B/D, REAL LOF)
+
+At the bootstrap deadline, both `trigger` and the resolved-market absent-owner return were public. The
+return correctly paid only the recorded owner and retired that owner's vote, but it left `trigger` live
+against the reduced ballot and principal tallies. With two equal voters on competing full-supply
+proposals, neither side initially had a strict majority. A public cranker could return side A's one base
+unit, then trigger side B with 100% of the remaining cast weight and principal before returning side B.
+Choosing refund order therefore selected the recipient of the complete fixed COIN supply. Collateral
+could not be redirected, but this was a live reward/governance loss of funds through public methods.
+
+The retained real-SBF LiteSVM regression deposits equal one-unit positions through Subledger, backs two
+complete distributions, proves both triggers reject, resolves the pinned Percolator market through
+Squads, and executes the exploit ordering. The old binaries successfully seal the opposite proposal
+after the first owner-bound refund. The fixed chain rejects refunds byte-atomically during the trigger
+phase, accepts the first fallback refund at the exact boundary, rejects both proposal triggers before a
+second refund, returns both deposits, and closes the real slab. The prior half-quorum and already-sealed
+terminal-return paths remain covered independently.
+
+FIX: the existing Genesis config reserves two bytes for mutually exclusive `distribution_executed` and
+`terminal_refunds_started` states. A successful trigger records the former in the same atomic transaction
+as `SealWinner`, so all terminal returns remain immediate after finalization. Otherwise Subledger's
+immutable configured deposit window becomes a post-bootstrap trigger phase. At its end, the first fixed
+terminal return records `terminal_refunds_started` before changing any tally, and all later triggers
+reject. The pool schedule offsets are cross-pinned to Subledger. No new instruction, account, signer,
+recipient, amount, token authority, or fund-moving CPI was added; transaction account locking gives the
+boundary a single winner.
+
+## Tick - losing fallback could block a pre-flag winning voter after upgrade (surface B/C, PARTIAL DOS)
+
+Genesis triggers created before the global election-state bytes were assigned persisted execution only
+on the winning proposal. After upgrade, a losing voter or nonvoter could take the public fallback first
+and set `terminal_refunds_started`. A later terminal return for an absent winning voter authenticated the
+old proposal's executed byte but rejected the conflicting fallback marker. The recorded owner could still
+return, retract, and withdraw, so this was not a direct fund loss or an unconditional user freeze. If that
+owner remained absent, however, its principal and the resolved market slab could not be retired by a
+public cranker.
+
+The retained real-SBF LiteSVM regression deposits two units for the winner and one for a nonvoter, seals
+the election through public instructions, and clears only the reserved global-execution byte to reproduce
+a pre-flag trigger. At the real fallback slot it uses the nonvoter's actual public Subledger return to set
+the conflicting marker, then permissionlessly returns the winning position to its owner-only token
+account, preserves the authenticated terminal capital-reward cutoff, crystallizes and claims that reward,
+and closes the drained real Percolator slab. Before the fix the winning return rejects with
+`InvalidAccountData` and all of that transaction's value movement rolls back. Restoring the old condition
+afterward makes the retained test fail at that exact return, proving the regression is mutation-sharp.
+
+FIX: an immutable executed proposal now upgrades the global state to `distribution_executed` and clears a
+legacy fallback marker. Current triggers persist proposal execution and the global bit in one transaction,
+so the conflicting state cannot be produced by the current binary; it is only legacy execution evidence.
+The transition adds no instruction, signer, beneficiary, amount, token account, authority, or fund-moving
+CPI. It restores only the existing fixed owner-bound terminal return.
