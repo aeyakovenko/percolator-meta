@@ -46,14 +46,14 @@ capital's own tenure.
   only to the recorded insurance authority and its backing only to the recorded backing provider,
   both after shutdown matures and after a public stale resolver wins the race. Asset 0 instead has a
   fixed whole-market resolution path that derives and atomically returns both backing domains after
-  Percolator proves the market empty. Controller-owned protocol insurance is recovered only to a
-  clean controller-owned account after resolution and stays there until terminal close. Raw
-  `CloseSlab` is excluded; a fixed terminal cleanup forwards that protocol insurance, vault dust,
-  and account rent to Squads after reserving reclaimed slab rent in an immutable market-retirement
-  marker. Its controller-owned transit may be replaced when a canonical ATA was
-  permanently frozen, including after a fixed return placed protocol insurance in the fallback;
-  governance still signs, Percolator still requires a fully wound-down market, and the destination
-  remains Squads-owned. Before that close,
+  Percolator proves the market empty. Controller-owned protocol insurance is recovered through an
+  empty one-shot controller transit directly to a clean Squads-vault-owned account. TWAP uses the
+  same governance destination rule after proving no owner principal remains, so public cleanup
+  cannot split protocol value across persistent controller accounts. Raw `CloseSlab` is excluded;
+  a fixed terminal cleanup forwards vault dust, any pre-upgrade controller balance, and account rent
+  to Squads after reserving reclaimed slab rent in an immutable market-retirement marker. Governance
+  still signs, Percolator still requires a fully wound-down market, and the destination remains
+  Squads-owned. Before that close,
   anyone can ask the controller to deregister an
   abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
   portfolio and returns its rent only to the slab. Before deleting nonzero LP/trader/funding-payer
@@ -107,18 +107,19 @@ capital's own tenure.
   and its return slot, so a cranker cannot erase an uncrystallized capital reward, exited capital
   cannot keep aging, and earlier owner withdrawals stay excluded.
   An empty pool cannot pull terminal protocol insurance
-  back from TWAP. After that insurance is first recovered to a clean controller-owned account,
+  back from TWAP. After that insurance is first recovered to a clean Squads-vault-owned account,
   anyone may return the now value-less roles to the same pool so its fixed wrapper can release an
   absent asset-0 backing provider. The pool-less
   compatibility handoff accepts only an empty asset-0 insurance balance; later value must enter
   through the inbound-only donation path. Current-layout pool-less handoffs persist that empty-state
-  attestation, allowing any cranker to move later donated terminal insurance only to the canonical
-  controller account after resolution. Historical unmarked configs cannot infer protocol ownership.
+  attestation, allowing any cranker to move later donated terminal insurance through an empty
+  TWAP-owned transit only to a clean Squads-vault-owned account after resolution. Historical
+  unmarked configs cannot infer protocol ownership.
   If external asset-0 backing remains, a separate amountless TWAP wrapper invokes only the
   controller's provider-bound resolved return, preserving controller insurance while paying both
   backing domains to Percolator's recorded provider.
-  For pool-bound custody, TWAP can move a retained terminal floor to that controller account only
-  after the bound pool itself attests that no owner principal or shares remain.
+  For pool-bound custody, TWAP can return a retained terminal floor to the same fixed governance
+  owner only after the bound pool itself attests that no owner principal or shares remain.
 - **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
   approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
   Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
@@ -135,12 +136,12 @@ capital's own tenure.
 | Crate | Responsibility |
 |---|---|
 | `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, resolved-empty state, and portfolio reward telemetry in the pinned Percolator layout. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
-| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, batch-safe fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Terminal close reserves reclaimed rent in a permanent market-retirement PDA before forwarding the remainder. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, deregisters only empty resolved portfolios, and retains controller-owned protocol insurance for terminal reclaim. |
+| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, batch-safe fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal dust/rent from an empty slab. Terminal close reserves reclaimed rent in a permanent market-retirement PDA before forwarding the remainder. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, sends controller-owned protocol insurance through an empty one-shot transit to a clean Squads-vault-owned account, and deregisters only empty resolved portfolios. |
 | `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. A principal-policy pool can hand live custody to TWAP with its protected floor. A with-surplus pool cannot cross that boundary until every owner claim is gone; it may then reuse the same terminal path for later protocol fees or unowned rounding reserve. Its amountless full-exit entry point reuses the ordinary owner, pool, destination, loss, and share checks for an atomic live TWAP recovery. After recovery the pool can otherwise sign only fixed resolved cleanup. Once genesis-vote attests an executed winner and the bound market is resolved and empty, anyone can retire an absent depositor's complete position only into a clean account owned by that depositor, preserving its remaining-principal and return-slot reward cap. Its terminal read-only attestation proves when the pool has no owner claims. |
 | `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. Only a proposal with its complete declared entry shape can become votable. New backing closes exactly when the configured bootstrap deadline makes the permissionless trigger live; retraction remains open so a vote lock cannot trap principal. The trigger seals the winner into `distribution`. Holds no funds. |
 | `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries allocating at most the fixed supply. Each recipient authorizes its own claim; unclaimed or unallocated COIN is burned after the claim window. Never mints. |
 | `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. Controller cleanup preserves terminal portfolio counters in a cumulative read-only PDA; each stake binds the archive's allow-listed market, and the controller's immutable retirement marker prevents a reused slab key from admitting or influencing rewards. Witnesses must carry the exact Subledger-position discriminator or pinned Percolator portfolio provenance, and permissionless portfolio-flow claims reject delegated recipient accounts. It reads principal-bearing accounts but cannot debit them. |
-| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, apply the trade-fee setter and clear predecessor backing-fee policies, and timelock-restart only an empty recovering asset 0. Pool-bound recovery stays bound to the original genesis pool; a signing owner may use its fixed live full-exit proxy, whose value accounts are all revalidated by Subledger. After resolution, either that pool proves zero claims or a current-layout pool-less config proves it began empty; TWAP can then route the terminal protocol floor only through clean PDA-owned transits to market-controller custody. A pool-less config can also sign only the controller's amountless, provider-bound asset-0 backing return. |
+| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, apply the trade-fee setter and clear predecessor backing-fee policies, and timelock-restart only an empty recovering asset 0. Pool-bound recovery stays bound to the original genesis pool; a signing owner may use its fixed live full-exit proxy, whose value accounts are all revalidated by Subledger. After resolution, either that pool proves zero claims or a current-layout pool-less config proves it began empty; TWAP can then route the terminal protocol floor through an empty TWAP-owned transit only to a clean Squads-vault-owned account. A pool-less config can also sign only the controller's amountless, provider-bound asset-0 backing return. |
 | `twap/` | Host-side auction simulation and Percolator wire helpers. It does not expose the obsolete raw Squads/operator rotation conveniences; deployed custody transitions live in `subledger` and `twap-program`. |
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
@@ -294,12 +295,15 @@ DAO-selected beneficiary; this lets a cranker bypass a permanently frozen ATA wi
 funds. The temporary receiving account is likewise replaceable but must be a clean same-mint account
 owned solely by the controller PDA. Backing earnings are paid first and the controller forwards
 exactly the value attributed to that provider. It closes the temporary controller account only when no unrelated balance
-remains. Protocol insurance or token dust already held there stays in controller custody for the
-fixed terminal reclaim. Fee insurance whose recorded authority and operator are both the controller
-uses the same destination. Its fixed cleanup first rotates only the local operator to an
+remains. External-provider value already held there stays isolated from the exact provider return.
+Fee insurance whose recorded authority and operator are both the controller instead uses an empty
+one-shot transit and a clean Squads-vault-owned destination. Its fixed cleanup first rotates only the local operator to an
 asset-scoped instruction-only PDA, which makes Percolator itself enforce the delayed shutdown and
-empty-asset checks before retaining the complete balance in canonical controller custody. While
-live, no return can bypass Percolator's delayed secondary-asset shutdown override.
+empty-asset checks. Only after Percolator withdraws the complete balance does the same atomic call
+restore the controller operator, so a later oracle restart does not inherit the one-shot role. The
+transit starts empty, forwards the exact amount to governance, and closes atomically; a caller cannot
+redirect or fragment it, and a frozen canonical account is never required. While live, no return can
+bypass Percolator's delayed secondary-asset shutdown override.
 
 Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
 run. The resolved companions require the whole market to be resolved and empty, derive every amount
@@ -310,16 +314,16 @@ still choose neither an amount nor a recipient, and any failed rotation, withdra
 close rolls the entire operation back.
 
 If the slab instead records the controller itself as insurance authority, including for asset 0,
-the resolved companion withdraws only the exact asset-local amount into the canonical controller
-account and leaves it there. It cannot select another destination. The balance reaches Squads only
-through the existing governance-signed terminal reclaim after Percolator accepts `CloseSlab`.
+the resolved companion withdraws only the exact asset-local amount through an empty controller-owned
+transit to a clean account owned by the bound Squads vault, then closes the transit. It cannot select
+another beneficiary or leave a persistent controller balance.
 
 The same terminal custody applies to TWAP-retained insurance after all genesis owners exit. The
 subledger program first attests that its bound principal pool has no outstanding principal or
 shares; only then can a permissionless TWAP crank route the exact resolved asset-0 remainder through
-an empty clean TWAP-owned transit into a clean controller-owned transit. Replaceable transits prevent
-a permanently frozen canonical ATA from blocking cleanup, while exact ownership and the empty source
-prevent redirection or an unrelated TWAP balance sweep. Once
+an empty clean TWAP-owned transit into a clean account owned by the bound Squads vault. Replaceable
+accounts prevent a permanently frozen canonical ATA from blocking cleanup, while exact ownership and
+the empty source prevent redirection or an unrelated TWAP balance sweep. Once
 the slab's asset-0 insurance is zero, a public role-only return to the same pool is safe and lets its
 existing fixed wrapper complete asset-0 backing cleanup without a surviving DAO.
 
@@ -370,7 +374,7 @@ builder, but it cannot use that role to move insurance or backing. Post-genesis,
 insurance roles and `asset_admin`; its exposed Percolator CPIs are fixed-purpose and accept no
 arbitrary withdrawal destination. Governance therefore has no arbitrary resolved-mode insurance
 withdrawal; external funds use the provider-bound fixed cleanup, while controller-owned protocol
-insurance can move only to a clean controller-owned account for terminal reclaim.
+insurance can move only through an empty one-shot transit to a clean Squads-vault-owned account.
 
 ## Build And Test
 
