@@ -256,18 +256,11 @@ pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
 pub const SUB_POS_TERMINAL_RETURNED: usize = 98;
 pub const SUB_POS_TERMINAL_RETURN_SLOT: usize = 99;
+pub const SUB_POS_SHARE_GENERATION: usize = SUB_POS_TERMINAL_RETURN_SLOT;
 
 fn validate_subledger_position(data: &[u8]) -> ProgramResult {
     let withdrawn = data.get(SUB_POS_WITHDRAWN).copied().unwrap_or(2);
     let terminal_returned = data.get(SUB_POS_TERMINAL_RETURNED).copied().unwrap_or(0);
-    let terminal_return_slot_encoded = data
-        .get(SUB_POS_TERMINAL_RETURN_SLOT..SUB_POS_TERMINAL_RETURN_SLOT + 5)
-        .map(|bytes| {
-            let mut encoded = [0u8; 8];
-            encoded[..5].copy_from_slice(bytes);
-            u64::from_le_bytes(encoded)
-        })
-        .unwrap_or(0);
     let principal = data
         .get(SUB_POS_PRINCIPAL..SUB_POS_PRINCIPAL + 8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
@@ -275,7 +268,6 @@ fn validate_subledger_position(data: &[u8]) -> ProgramResult {
     if data.get(..8) != Some(SUB_POSITION_DISC.as_slice())
         || withdrawn > 1
         || terminal_returned > 1
-        || (terminal_returned == 0 && terminal_return_slot_encoded != 0)
         || (terminal_returned == 1 && (withdrawn != 1 || principal != 0))
     {
         return Err(ProgramError::InvalidAccountData);
@@ -2826,6 +2818,18 @@ mod tests {
         assert_eq!(read_subledger_start_slot(&d).unwrap(), 4242);
         assert_eq!(capital_points(555, true), 0, "withdrawn -> forfeit");
         assert_eq!(capital_points(555, false), 555, "live -> principal");
+    }
+
+    #[test]
+    fn accepts_active_subledger_share_generations() {
+        let mut d = [0u8; 120];
+        d[..8].copy_from_slice(&SUB_POSITION_DISC);
+        d[72..80].copy_from_slice(&555u64.to_le_bytes());
+        d[SUB_POS_SHARE_GENERATION..SUB_POS_SHARE_GENERATION + 5]
+            .copy_from_slice(&7u64.to_le_bytes()[..5]);
+
+        assert_eq!(read_subledger_principal(&d).unwrap(), (555, false));
+        assert_eq!(read_terminal_return_snapshot(&d).unwrap(), None);
     }
 
     #[test]

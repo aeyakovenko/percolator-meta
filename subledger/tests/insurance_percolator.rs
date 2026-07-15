@@ -454,6 +454,13 @@ impl Env {
         u128::from_le_bytes(acc.data[104..120].try_into().unwrap())
     }
 
+    fn position_share_generation(&self, owner: &Pubkey) -> u64 {
+        let acc = self.svm.get_account(&self.position_pda(owner)).unwrap();
+        let mut generation = [0u8; 8];
+        generation[..5].copy_from_slice(&acc.data[99..104]);
+        u64::from_le_bytes(generation)
+    }
+
     fn pool_outstanding(&self) -> u64 {
         let acc = self.svm.get_account(&self.pool).unwrap();
         u64::from_le_bytes(acc.data[80..88].try_into().unwrap())
@@ -461,6 +468,13 @@ impl Env {
     fn pool_total_shares(&self) -> u128 {
         let acc = self.svm.get_account(&self.pool).unwrap();
         u128::from_le_bytes(acc.data[192..208].try_into().unwrap())
+    }
+
+    fn pool_share_generation(&self) -> u64 {
+        let acc = self.svm.get_account(&self.pool).unwrap();
+        let mut generation = [0u8; 8];
+        generation[..5].copy_from_slice(&acc.data[91..96]);
+        u64::from_le_bytes(generation)
     }
 }
 
@@ -968,6 +982,24 @@ fn make_live_market_with_public_chunk(
     init_slot: u64,
     public_b_chunk_atoms: u128,
 ) -> Vec<u8> {
+    make_live_market_with_public_chunk_and_margin(
+        slab,
+        mint,
+        marketauth,
+        init_slot,
+        public_b_chunk_atoms,
+        10_000,
+    )
+}
+
+fn make_live_market_with_public_chunk_and_margin(
+    slab: &Pubkey,
+    mint: &Pubkey,
+    marketauth: &Pubkey,
+    init_slot: u64,
+    public_b_chunk_atoms: u128,
+    margin_bps: u64,
+) -> Vec<u8> {
     let initial_price = 1_000_000u64;
     let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
     wrapper.marketauth = marketauth.to_bytes();
@@ -988,15 +1020,20 @@ fn make_live_market_with_public_chunk(
     wrapper.oracle_target_price_e6 = initial_price;
 
     let mut data = vec![0u8; percolator_prog::constants::MARKET_ACCOUNT_LEN];
-    let mut cfg = percolator_prog::risk::V16Config::public_user_fund(1, 0, 10);
-    cfg.min_nonzero_mm_req = 1;
-    cfg.min_nonzero_im_req = 2;
-    cfg.maintenance_margin_bps = 10_000;
-    cfg.initial_margin_bps = 10_000;
+    let h_max = if margin_bps == 10_000 { 10 } else { 6_480_000 };
+    let mut cfg = percolator_prog::risk::V16Config::public_user_fund(1, 0, h_max);
+    cfg.min_nonzero_mm_req = if margin_bps == 10_000 { 1 } else { 599 };
+    cfg.min_nonzero_im_req = if margin_bps == 10_000 { 2 } else { 600 };
+    cfg.maintenance_margin_bps = margin_bps;
+    cfg.initial_margin_bps = margin_bps;
     cfg.max_trading_fee_bps = 10_000;
     cfg.max_accrual_dt_slots = 1;
     cfg.min_funding_lifetime_slots = 1;
-    cfg.max_price_move_bps_per_slot = 10_000;
+    cfg.max_price_move_bps_per_slot = if margin_bps == 10_000 {
+        10_000
+    } else {
+        margin_bps.saturating_sub(100).max(1)
+    };
     cfg.max_account_b_settlement_chunks = 1;
     cfg.max_bankrupt_close_chunks = 1;
     cfg.max_bankrupt_close_lifetime_slots = 1;
@@ -1020,6 +1057,31 @@ fn install_public_loss_fixture(env: &mut Env, oracle_authority: &Pubkey) {
         &env.pool,
         100,
         percolator::MAX_VAULT_TVL,
+    );
+    let (mut wrapper, _) = percolator_prog::state::read_market(&data).unwrap();
+    wrapper.marketauth = oracle_authority.to_bytes();
+    percolator_prog::state::write_wrapper_config(&mut data, &wrapper).unwrap();
+    let mut profile = percolator_prog::state::read_asset_oracle_profile(&data, 0).unwrap();
+    profile.oracle_authority = oracle_authority.to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(&mut data, 0, &profile).unwrap();
+
+    let mut account = env.svm.get_account(&env.slab).unwrap();
+    account.data = data;
+    env.svm.set_account(env.slab, account).unwrap();
+}
+
+fn install_public_loss_fixture_with_margin(
+    env: &mut Env,
+    oracle_authority: &Pubkey,
+    margin_bps: u64,
+) {
+    let mut data = make_live_market_with_public_chunk_and_margin(
+        &env.slab,
+        &env.mint,
+        &env.pool,
+        100,
+        percolator::MAX_VAULT_TVL,
+        margin_bps,
     );
     let (mut wrapper, _) = percolator_prog::state::read_market(&data).unwrap();
     wrapper.marketauth = oracle_authority.to_bytes();
@@ -1086,6 +1148,266 @@ fn create_percolator_portfolio(env: &mut Env, owner: &Keypair, capital: u64) -> 
     )
     .expect("fund public Percolator portfolio");
     portfolio
+}
+
+fn public_percolator_crank(
+    env: &mut Env,
+    portfolio: Pubkey,
+    slot: u64,
+    observe_asset: bool,
+) -> Result<(), String> {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let observations = if observe_asset {
+        vec![percolator_prog::ix::CrankObservationHint {
+            asset_index: 0,
+            oracle_accounts: 0,
+        }]
+    } else {
+        vec![]
+    };
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data: PIx::PermissionlessCrank {
+                now_slot: slot,
+                observations,
+            }
+            .encode(),
+        }],
+        &[],
+    )
+}
+
+fn effective_price(env: &Env) -> u64 {
+    percolator_prog::state::read_market(&env.svm.get_account(&env.slab).unwrap().data)
+        .unwrap()
+        .1
+        .assets[0]
+        .effective_price
+}
+
+fn advance_public_mark(
+    env: &mut Env,
+    oracle: &Keypair,
+    observer_portfolio: Pubkey,
+    slot: &mut u64,
+    target: u64,
+    max_steps: usize,
+) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    *slot = slot.checked_add(1).unwrap();
+    env.warp_slot(*slot);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: *slot,
+                mark_e6: target,
+            }
+            .encode(),
+        }],
+        &[oracle],
+    )
+    .expect("publish authenticated target mark");
+
+    for _ in 0..max_steps {
+        env.warp_slot(*slot);
+        public_percolator_crank(env, observer_portfolio, *slot, true)
+            .expect("an empty public portfolio advances the bounded mark");
+        if effective_price(env) == target {
+            return;
+        }
+        *slot = slot.checked_add(1).unwrap();
+    }
+    panic!(
+        "bounded public mark did not reach {target}; stopped at {}",
+        effective_price(env),
+    );
+}
+
+fn open_public_pair(
+    env: &mut Env,
+    position_q: i128,
+    price: u64,
+    capital: u64,
+) -> (Keypair, Pubkey, Keypair, Pubkey) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(env, &long, capital);
+    let short_portfolio = create_percolator_portfolio(env, &short, capital);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: position_q,
+                exec_price: price,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open balanced public position");
+    (long, long_portfolio, short, short_portfolio)
+}
+
+fn liquidate_stale_public_loser(env: &mut Env, portfolio: Pubkey, slot: u64) {
+    public_percolator_crank(env, portfolio, slot, true)
+        .expect("settle the stale losing portfolio at the reached mark");
+    for _ in 0..4 {
+        public_percolator_crank(env, portfolio, slot, false)
+            .expect("permissionless liquidation makes bounded progress");
+    }
+    let state = percolator_prog::state::read_portfolio(
+        &env.svm.get_account(&portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(percolator::active_bitmap_is_empty(
+        state.active_bitmap.map(percolator::V16PodU64::get),
+    ));
+}
+
+fn clear_stale_public_winner(
+    env: &mut Env,
+    owner: &Keypair,
+    portfolio: Pubkey,
+    slot: u64,
+) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    public_percolator_crank(env, portfolio, slot, false)
+        .expect("refresh the reset winner");
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data: PIx::ForfeitRecoveryLeg {
+                asset_index: 0,
+                b_delta_budget: percolator::MAX_VAULT_TVL,
+            }
+            .encode(),
+        }],
+        &[owner],
+    )
+    .expect("owner clears the stale offsetting leg");
+    for side in [0, 1] {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![AccountMeta::new(env.slab, false)],
+                data: PIx::FinalizeResetSide {
+                    asset_index: 0,
+                    side,
+                }
+                .encode(),
+            }],
+            &[],
+        )
+        .expect("permissionless side reset completes");
+    }
+    let state = percolator_prog::state::read_portfolio(
+        &env.svm.get_account(&portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(percolator::active_bitmap_is_empty(
+        state.active_bitmap.map(percolator::V16PodU64::get),
+    ));
+}
+
+fn run_complete_public_insurance_loss(
+    env: &mut Env,
+    oracle: &Keypair,
+    observer_portfolio: Pubkey,
+    slot: &mut u64,
+    low_entry: u64,
+    low_capital: u64,
+    high_entry: u64,
+    high_capital: u64,
+    domain_tranche: u64,
+    expected_remaining: u128,
+) -> Vec<(Keypair, Pubkey)> {
+    let position_q = 1_000_000_000_000i128;
+    let pnl_atoms_per_price = position_q.unsigned_abs() / percolator::POS_SCALE;
+    let insurance_before = asset_insurance_remaining(env, 0);
+    assert_eq!(effective_price(env), low_entry);
+    assert_eq!(
+        (domain_tranche as u128 + low_capital as u128) % pnl_atoms_per_price,
+        0,
+    );
+
+    let (low_long, low_long_portfolio, low_short, low_short_portfolio) =
+        open_public_pair(env, position_q, low_entry, low_capital);
+    let high_target = low_entry
+        .checked_add(
+            u64::try_from(
+                (domain_tranche as u128 + low_capital as u128) / pnl_atoms_per_price,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    advance_public_mark(env, oracle, observer_portfolio, slot, high_target, 300);
+    liquidate_stale_public_loser(env, low_short_portfolio, *slot);
+    assert_eq!(
+        asset_insurance_remaining(env, 0),
+        insurance_before - domain_tranche as u128,
+    );
+    clear_stale_public_winner(env, &low_long, low_long_portfolio, *slot);
+
+    advance_public_mark(env, oracle, observer_portfolio, slot, high_entry, 100);
+    let (high_long, high_long_portfolio, high_short, high_short_portfolio) =
+        open_public_pair(env, position_q, high_entry, high_capital);
+    let terminal_low = low_entry;
+    let long_loss = pnl_atoms_per_price
+        .checked_mul((high_entry - terminal_low) as u128)
+        .unwrap();
+    let second_insurance_loss = long_loss.checked_sub(high_capital as u128).unwrap();
+    assert_eq!(
+        second_insurance_loss,
+        insurance_before - domain_tranche as u128 - expected_remaining,
+    );
+    advance_public_mark(env, oracle, observer_portfolio, slot, terminal_low, 400);
+    liquidate_stale_public_loser(env, high_long_portfolio, *slot);
+    assert_eq!(
+        asset_insurance_remaining(env, 0),
+        expected_remaining,
+    );
+    clear_stale_public_winner(env, &high_short, high_short_portfolio, *slot);
+
+    vec![
+        (low_long, low_long_portfolio),
+        (low_short, low_short_portfolio),
+        (high_long, high_long_portfolio),
+        (high_short, high_short_portfolio),
+    ]
 }
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
@@ -2046,66 +2368,12 @@ fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
     assert_eq!(env.pool_outstanding(), 0, "all principal retired");
 }
 
+// A complete loss makes every prior share valueless. Repeated recapitalization therefore advances
+// the share generation instead of carrying an exponentially growing denominator forward. The same
+// owner's principal history remains intact for governance/reward accounting, but only the final
+// surviving tranche can claim live insurance.
 #[test]
-fn with_surplus_split_exit_cannot_capture_a_codepositors_yield() {
-    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
-    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
-
-    let principal = 1_000_000u64;
-    let (alice, alice_ata) = new_depositor(&mut env, principal);
-    let (bob, bob_ata) = new_depositor(&mut env, principal);
-    let pool = env.pool;
-    let alice_holding = create_holding(&mut env, &pool);
-    let bob_holding = create_holding(&mut env, &pool);
-    env.insurance_deposit(&alice, &alice_ata, &alice_holding, principal)
-        .expect("alice deposits");
-    env.insurance_deposit(&bob, &bob_ata, &bob_holding, principal)
-        .expect("bob deposits");
-
-    let live_balance = 3_000_003u64;
-    impair_market(&mut env, live_balance as u128);
-    env.svm
-        .set_account(
-            env.perc_vault,
-            Account {
-                lamports: 1_000_000,
-                data: token_account_data(&env.mint, &env.vault_authority, live_balance),
-                owner: spl_token::ID,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
-
-    // Exercise both tiny floor-heavy exits and a final full-share retirement.
-    for amount in [1u64, 2, 3, 7, 11, 101, 999_875] {
-        env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
-            .expect("split with-surplus exit");
-    }
-    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, principal)
-        .expect("co-depositor exits");
-
-    let alice_paid = env.token_amount(&alice_ata);
-    let bob_paid = env.token_amount(&bob_ata);
-    let reserve = env.token_amount(&env.perc_vault);
-    assert!(
-        alice_paid <= bob_paid,
-        "splitting cannot take yield from the unsplit co-depositor: alice={alice_paid}, bob={bob_paid}"
-    );
-    assert_eq!(
-        alice_paid + bob_paid + reserve,
-        live_balance,
-        "all yield remains conserved between owners and protocol reserve"
-    );
-    assert_eq!(env.pool_outstanding(), 0);
-}
-
-// LOSS-OF-FUNDS/LIVENESS PROBE: repeated recapitalization after market losses can make a
-// valid position's share count much larger than its principal. The full-exit fraction is still
-// exactly `position.shares`, but computing `shares * amount / principal` must not require the
-// overflowing product to fit in u128.
-#[test]
-fn large_insurance_share_position_can_exit_after_repeated_impairment() {
+fn current_share_generation_can_exit_after_repeated_total_impairment() {
     let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
     env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
 
@@ -2137,18 +2405,491 @@ fn large_insurance_share_position_can_exit_after_repeated_impairment() {
         }
     }
 
-    let shares = env.position_shares(&owner.pubkey());
-    assert!(
-        shares.checked_mul(total_deposit as u128).is_none(),
-        "fixture must cross the old u128 intermediate-overflow boundary"
-    );
+    assert_eq!(env.pool_share_generation(), 2);
+    assert_eq!(env.position_share_generation(&owner.pubkey()), 2);
+    assert_eq!(env.position_shares(&owner.pubkey()), tranche as u128 * 1_000_000);
     assert_eq!(env.read_position(&owner.pubkey()).0, total_deposit);
 
     env.insurance_withdraw(&owner, &owner_ata, &holding, &owner, total_deposit)
-        .expect("a bounded full exit must not depend on an overflowing intermediate");
-    assert!(env.token_amount(&owner_ata) > 0, "the remaining live insurance is returned");
+        .expect("the current generation remains withdrawable");
+    assert_eq!(
+        env.token_amount(&owner_ata),
+        tranche,
+        "old generations cannot claim the surviving recapitalization",
+    );
     assert_eq!(env.pool_outstanding(), 0, "the owner's full principal attribution retires");
     assert_eq!(env.pool_total_shares(), 0, "the full exit burns every real share");
+}
+
+#[test]
+fn impaired_share_generation_cannot_claim_a_later_deposit() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (old_owner, old_ata) = new_depositor(&mut env, amount);
+    let (new_owner, new_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let old_holding = create_holding(&mut env, &pool);
+    let new_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&old_owner, &old_ata, &old_holding, amount)
+        .expect("fund loss-bearing generation");
+
+    impair_market(&mut env, 0);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.insurance_deposit(&new_owner, &new_ata, &new_holding, amount)
+        .expect("recapitalize the fully impaired pool");
+
+    assert_eq!(env.pool_share_generation(), 1);
+    assert_eq!(env.position_share_generation(&old_owner.pubkey()), 0);
+    assert_eq!(env.position_share_generation(&new_owner.pubkey()), 1);
+    env.insurance_withdraw(&old_owner, &old_ata, &old_holding, &old_owner, amount)
+        .expect("the impaired position retires at zero without touching current capital");
+    assert_eq!(env.token_amount(&old_ata), 0);
+    assert_eq!(asset_insurance_remaining(&env, 0), amount as u128);
+
+    env.insurance_withdraw(&new_owner, &new_ata, &new_holding, &new_owner, amount)
+        .expect("the current depositor retains the recapitalization");
+    assert_eq!(env.token_amount(&new_ata), amount);
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.pool_total_shares(), 0);
+}
+
+#[test]
+fn public_repeated_total_losses_cannot_exhaust_the_insurance_share_namespace() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64.checked_mul(high_entry).unwrap();
+    let domain_tranche = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let tranche = domain_tranche.checked_mul(2).unwrap();
+    let (attacker, attacker_ata) = new_depositor(&mut env, tranche * 2 + 200);
+    let pool = env.pool;
+    let attacker_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+        .expect("fund the first loss-bearing tranche");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+
+    let mut slot = 100;
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        0,
+    );
+    assert_eq!(asset_insurance_remaining(&env, 0), 0);
+
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+        .expect("recapitalize after the first complete public loss");
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        0,
+    );
+    assert_eq!(asset_insurance_remaining(&env, 0), 0);
+
+    let mut successful_dust_recapitalizations = 0usize;
+    for _ in 0..200 {
+        if env
+            .insurance_deposit(&attacker, &attacker_ata, &attacker_holding, 1)
+            .is_err()
+        {
+            break;
+        }
+        successful_dust_recapitalizations += 1;
+    }
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, 1)
+        .expect("an open deposit window must retain a bounded path for later capital");
+    assert_eq!(
+        successful_dust_recapitalizations, 200,
+        "fully impaired recapitalization must not retain a finite-share admission cliff",
+    );
+    assert_eq!(env.pool_share_generation(), 2);
+    assert_eq!(env.position_share_generation(&attacker.pubkey()), 2);
+    assert_eq!(env.position_share_generation(&victim.pubkey()), 2);
+
+    assert_eq!(
+        env.position_shares(&attacker.pubkey()),
+        successful_dust_recapitalizations as u128 * 1_000_000,
+        "old-generation shares must not survive into the recapitalized fund",
+    );
+    assert_eq!(env.position_shares(&victim.pubkey()), 1_000_000);
+    assert_eq!(
+        env.pool_total_shares(),
+        (successful_dust_recapitalizations as u128 + 1) * 1_000_000,
+    );
+    assert_eq!(asset_insurance_remaining(&env, 0), 201);
+}
+
+// PUBLIC LOF: the first partial exit from an obsolete share generation pays zero and lazily
+// normalizes the position. That normalization must not make a second exit look like a historical
+// shareless position, which would let the impaired owner claim a later depositor's recapitalization.
+// The loss below is produced by the pinned Percolator binary through authenticated marks, public
+// trades, and permissionless liquidation/reset cranks.
+#[test]
+fn stale_generation_partial_exit_cannot_replay_as_a_historical_position() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64.checked_mul(high_entry).unwrap();
+    let domain_tranche = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let impaired_principal = domain_tranche.checked_mul(2).unwrap();
+    let (impaired_owner, impaired_ata) = new_depositor(&mut env, impaired_principal);
+    let pool = env.pool;
+    let impaired_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &impaired_owner,
+        &impaired_ata,
+        &impaired_holding,
+        impaired_principal,
+    )
+    .expect("fund the loss-bearing generation");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let mut slot = 100;
+    let mut loss_portfolios = run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        0,
+    );
+    assert_eq!(asset_insurance_remaining(&env, 0), 0);
+
+    let recapitalization = 1_000_000u64;
+    let (new_owner, new_ata) = new_depositor(&mut env, recapitalization);
+    let new_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&new_owner, &new_ata, &new_holding, recapitalization)
+        .expect("a new owner recapitalizes the fully impaired pool");
+    assert_eq!(asset_insurance_remaining(&env, 0), recapitalization as u128);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("the authenticated authority resolves the completed public loss epoch");
+    loss_portfolios.push((observer, observer_portfolio));
+    for (owner, portfolio) in loss_portfolios {
+        let payer = clone_kp(&env.payer);
+        let destination = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+        let mut last_resolved = None;
+        let mut last_close = None;
+        for _ in 0..512 {
+            last_resolved = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(env.vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    data: PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    }
+                    .encode(),
+                }],
+                &[&owner],
+            ));
+            last_close = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    data: PIx::ClosePortfolio.encode(),
+                }],
+                &[&owner],
+            ));
+            if last_close.as_ref().is_some_and(Result::is_ok) {
+                break;
+            }
+        }
+        assert!(
+            env.svm
+                .get_account(&portfolio)
+                .map_or(true, |account| account.lamports == 0),
+            "resolved public portfolio must not remain a withdrawal gate: close_resolved={last_resolved:?}, close={last_close:?}",
+        );
+    }
+    assert_ne!(
+        env.position_share_generation(&impaired_owner.pubkey()),
+        env.pool_share_generation(),
+    );
+
+    env.insurance_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &impaired_holding,
+        &impaired_owner,
+        1,
+    )
+    .expect("the first stale partial exit retires one lost principal atom at zero payout");
+    assert_eq!(env.token_amount(&impaired_ata), 0);
+    assert_eq!(env.position_shares(&impaired_owner.pubkey()), 0);
+    assert_eq!(
+        env.position_share_generation(&impaired_owner.pubkey()),
+        env.pool_share_generation(),
+    );
+
+    env.insurance_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &impaired_holding,
+        &impaired_owner,
+        impaired_principal - 1,
+    )
+    .expect("the remainder of the impaired position retires at zero payout");
+    assert_eq!(
+        env.token_amount(&impaired_ata),
+        0,
+        "normalization cannot turn an obsolete zero-share position into a pro-rata legacy claim",
+    );
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        recapitalization as u128,
+        "the new owner's recapitalization remains segregated",
+    );
+
+    env.insurance_withdraw(
+        &new_owner,
+        &new_ata,
+        &new_holding,
+        &new_owner,
+        recapitalization,
+    )
+    .expect("the current-generation owner recovers the recapitalization");
+    assert_eq!(env.token_amount(&new_ata), recapitalization);
+}
+
+// PUBLIC DEPOSIT-LIVENESS PROBE: a one-atom residual prevents the exact-loss generation reset.
+// Repeated real market loss/recapitalization cycles must not amplify the finite share exchange rate
+// until even the minimum deposit overflows. Every loss below is produced by the pinned Percolator
+// binary through authenticated marks, public trades, and permissionless liquidation/reset cranks.
+#[test]
+fn repeated_near_total_public_losses_preserve_one_atom_deposit_liveness() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64.checked_mul(high_entry).unwrap();
+    let domain_tranche = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let tranche = domain_tranche.checked_mul(2).unwrap();
+    let (attacker, attacker_ata) = new_depositor(&mut env, tranche * 2 + 105);
+    let pool = env.pool;
+    let attacker_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+        .expect("fund the first near-total loss cycle");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+
+    let mut slot = 100;
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital + 1,
+        domain_tranche,
+        1,
+    );
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+        .expect("recapitalize the one-atom residual");
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        1,
+    );
+
+    for (deposit, domain) in [(100u64, 50u64), (4u64, 2u64)] {
+        env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, deposit)
+            .expect("recapitalize the one-atom residual at the amplified share price");
+        run_complete_public_insurance_loss(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            100,
+            11_000_000 - domain,
+            1_000,
+            900_000_000 - domain,
+            domain,
+            1,
+        );
+    }
+
+    assert_eq!(asset_insurance_remaining(&env, 0), 1);
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, 1)
+        .expect("a live one-atom pool must retain its minimum public deposit path");
+    assert_eq!(asset_insurance_remaining(&env, 0), 2);
+
+    let scaled_generation = env.pool_share_generation();
+    let reset_generation_mask = (1u64 << 20) - 1;
+    assert_eq!(scaled_generation & reset_generation_mask, 0);
+    assert!(
+        scaled_generation >> 20 > 0,
+        "the public replay must actually enter the lazy share-rescale path",
+    );
+    assert_ne!(
+        env.position_share_generation(&attacker.pubkey()),
+        scaled_generation,
+        "an untouched depositor remains lazy until its next public operation",
+    );
+    let stale_attacker_shares = env.position_shares(&attacker.pubkey());
+    assert_eq!(env.token_amount(&attacker_ata), 1);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, 1)
+        .expect("an existing depositor can normalize lazily and top up");
+    assert_eq!(
+        env.position_share_generation(&attacker.pubkey()),
+        scaled_generation,
+    );
+    assert!(env.position_shares(&attacker.pubkey()) < stale_attacker_shares);
+    assert_eq!(asset_insurance_remaining(&env, 0), 3);
 }
 
 // SHARE-INFLATION FIRST-DEPOSITOR THEFT (finding HB, surface B). The classic ERC4626 attack: a dust first
