@@ -236,7 +236,7 @@ can earn from both its long-paid and short-paid totals. Insurance/backing reward
 base-unit principal times `floor(log2(tenure))`. Reward finalization and claims do not modify the
 underlying principal, shares, or Percolator balances. A permissionless terminal genesis return
 preserves only the remaining capital through its authenticated return slot, whether crystallized
-before or after cleanup; ordinary owner exits still forfeit rewards.
+before or after cleanup within the finalize window; ordinary owner exits still forfeit rewards.
 Permissionless portfolio-flow claims pay only
 to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
 cannot force rewards into an account it can spend. The same full-chain test then returns TWAP
@@ -244,9 +244,10 @@ custody and proves both the insurance and segregated backing depositors can rede
 their claimed COIN.
 
 Ordinary point growth closes at the reward epoch's inclusive end slot. During the finalize window,
-any cranker may only reduce a trader stake whose previously crystallized loss has since been spent;
-the shared claim cap makes this refresh monotonic, so post-epoch flow cannot mint points or dilute
-the frozen denominator.
+capital owners may crystallize live or terminal insurance/backing at that fixed cutoff; every top-up
+resets the Subledger position clock, so post-epoch capital earns zero tenure. Any cranker may only
+reduce a trader stake whose previously crystallized loss has since been spent; the shared claim cap
+makes this refresh monotonic, so post-epoch flow cannot mint points or dilute the frozen denominator.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads

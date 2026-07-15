@@ -44694,7 +44694,12 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     )
     .expect("fund terminal-return reward epoch");
     let reward_start = svm.get_sysvar::<Clock>().slot;
-    let reward_end = TEST_BOOTSTRAP_START_SLOT + TEST_BOOTSTRAP_DELAY_SLOTS + 8;
+    // End rewards before terminal market cleanup, but leave enough finalize
+    // window for the absent owner to return and crystallize the immutable
+    // Subledger snapshot. Slots 1023 -> 1200 cross a floor_log2 boundary, so
+    // the regression also catches accidental post-epoch tenure inflation.
+    let reward_end = TEST_BOOTSTRAP_START_SLOT + 1_023;
+    let reward_finalize_window = 256u64;
     send(
         &mut svm,
         &[&payer, &reward_authority],
@@ -44714,7 +44719,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
             0,
             0,
             0,
-            1,
+            reward_finalize_window,
             0,
             &[(env.slab, env.pool, Pubkey::default())],
         ),
@@ -45025,13 +45030,11 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         Pubkey::default()
     );
     let terminal_return_slot = svm.get_sysvar::<Clock>().slot;
-    assert_eq!(
-        terminal_return_slot,
-        if freeze_before_terminal_return {
-            reward_end + 1
-        } else {
-            TEST_BOOTSTRAP_DELAY_SLOTS
-        }
+    assert_eq!(terminal_return_slot, TEST_BOOTSTRAP_DELAY_SLOTS);
+    assert!(
+        terminal_return_slot > reward_end
+            && terminal_return_slot < reward_end + reward_finalize_window,
+        "terminal cleanup occurs after emission but before the reward freeze cutoff"
     );
     let mut encoded_return_slot = [0u8; 8];
     encoded_return_slot[..5].copy_from_slice(&retired.data[99..104]);
@@ -45041,24 +45044,19 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         "the subledger authenticates when permissionless cleanup removed capital"
     );
 
-    let mut clock = svm.get_sysvar::<Clock>();
-    if !freeze_before_terminal_return {
-        clock.slot = reward_end;
-        svm.set_sysvar(&clock);
-        send(
-            &mut svm,
-            &[&payer, &absent_voter],
-            rd_crystallize_ix(
-                &absent_voter.pubkey(),
-                &reward_config,
-                &absent_voter.pubkey(),
-                &env.slab,
-                &position,
-                0,
-            ),
-        )
-        .expect("owner crystallizes after permissionless terminal cleanup");
-    }
+    send(
+        &mut svm,
+        &[&payer, &absent_voter],
+        rd_crystallize_ix(
+            &absent_voter.pubkey(),
+            &reward_config,
+            &absent_voter.pubkey(),
+            &env.slab,
+            &position,
+            0,
+        ),
+    )
+    .expect("owner crystallizes after permissionless terminal cleanup");
     let reward_stake = svm
         .get_account(&rd_stake_pda(
             &reward_config,
@@ -45069,12 +45067,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         .unwrap();
     let position_start_slot =
         u64::from_le_bytes(retired.data[89..97].try_into().unwrap());
-    let crystallized_slot = if freeze_before_terminal_return {
-        reward_end
-    } else {
-        terminal_return_slot
-    };
-    let reward_tenure = crystallized_slot
+    let reward_tenure = reward_end
         .saturating_sub(core::cmp::max(reward_start, position_start_slot));
     let expected_points = if reward_tenure < 2 {
         0
@@ -45089,25 +45082,24 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
     );
     assert_eq!(
         u128::from_le_bytes(reward_stake.data[194..210].try_into().unwrap()),
-        crystallized_slot as u128,
-        "the frozen stake records the exact capital-risk cutoff"
+        reward_end as u128,
+        "post-epoch crystallization is clamped to the inclusive emission end"
     );
 
-    if !freeze_before_terminal_return {
-        clock.slot = reward_end + 1;
-        svm.set_sysvar(&clock);
-        send(
-            &mut svm,
-            &[&payer],
-            rd_freeze_ix(
-                &payer.pubkey(),
-                &reward_config,
-                &reward_mint,
-                &reward_vault,
-            ),
-        )
-        .expect("freeze the capital reward after delayed crystallization");
-    }
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = reward_end + reward_finalize_window;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        rd_freeze_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &reward_mint,
+            &reward_vault,
+        ),
+    )
+    .expect("freeze the capital reward after delayed crystallization");
     send(
         &mut svm,
         &[&payer, &absent_voter],

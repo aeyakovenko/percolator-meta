@@ -13844,3 +13844,29 @@ empty or already retracted ballot is a no-op, so nonvoters cannot block cleanup.
 tally, market, destination, or later token movement rolls back the whole transaction. The new instruction
 can mutate only Genesis counters, accepts no amount or recipient, holds no funds, and cannot be invoked by
 governance or a public caller without passing through Subledger's fixed owner-bound terminal return.
+
+## Tick - capital rewards could not use their finalize window (surface D, REAL LOF)
+
+Reward epochs reserve a nonzero finalize window before permissionless freeze, but crystallization's
+post-emission cohort gate admitted only reduce-only trader refreshes. Insurance and backing owners had
+to crystallize at the single inclusive end slot; one slot later, even an immutable Subledger terminal
+snapshot was rejected. A public terminal cleanup after market resolution could therefore return an
+absent depositor's principal correctly while making its uncrystallized fixed-COIN allocation impossible
+to enter the frozen denominator. The same timing loss affected a live slow backer. No path could debit
+or redirect collateral, but fixed reward COIN was stranded or redistributed to other cohort members.
+
+The retained focused real-SBF LiteSVM regression gives insurance and backing 50% each, finalizes both
+terminal snapshots after emission, and pays each complete cohort allocation. It also proves a live
+backer can use the window, a post-emission top-up collapses that stake to zero rather than borrowing old
+tenure, and the first freeze-eligible slot rejects further capital updates byte-atomically. The retained
+full-chain tests deposit through real Subledger, resolve the pinned real Percolator market through
+Squads, permissionlessly return the genesis principal after the reward end under both pool policies,
+crystallize across a `floor_log2` boundary, claim the full reward, and close the slab.
+
+FIX: during the open finalize window, only the recorded capital owner may crystallize insurance or
+backing. Its clock is fixed at the inclusive emission end; an authenticated terminal return clamps it
+further to the earlier return slot. Subledger already resets `Position.start_slot` on every deposit, so
+fresh post-epoch principal has zero tenure and cannot inflate a denominator. Slotless historical terminal
+snapshots remain unable to mint points, LP/funding growth remains closed, and trader finalization remains
+permissionless and reduce-only. The change adds no authority, recipient, token account, CPI, or
+collateral movement surface.
