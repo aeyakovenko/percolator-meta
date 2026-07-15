@@ -98,6 +98,10 @@ const IX_TRIGGER: u8 = 4;
 // Read-only finalization attestation used by terminal subledger cleanup. This
 // program owns the proposal layout, so consumers do not duplicate byte offsets.
 const IX_ASSERT_EXECUTED: u8 = 5;
+// Read-only terminal attestation. Once the immutable bootstrap deadline has
+// elapsed, a resolved market must be able to return owner-bound deposits even
+// when no proposal won (for example, because absent voters left an exact tie).
+const IX_ASSERT_BOOTSTRAP_ENDED: u8 = 6;
 
 const VOTE_BACK: u8 = 1;
 const VOTE_RETRACT: u8 = 2;
@@ -353,8 +357,26 @@ pub fn process_instruction<'a>(
         IX_VOTE => vote(program_id, accounts, data),
         IX_TRIGGER => trigger(program_id, accounts, data),
         IX_ASSERT_EXECUTED => assert_executed(program_id, accounts, data),
+        IX_ASSERT_BOOTSTRAP_ENDED => assert_bootstrap_ended(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
+}
+
+fn validate_config_identity(
+    program_id: &Pubkey,
+    config_key: &Pubkey,
+    config: &Config,
+) -> ProgramResult {
+    let delay = config.bootstrap_delay_slots.to_le_bytes();
+    let start = config.bootstrap_start_slot.to_le_bytes();
+    let (expected_config, bump) = Pubkey::find_program_address(
+        &config_seeds(&config.coin_mint, &config.subledger_pool, &delay, &start),
+        program_id,
+    );
+    if expected_config != *config_key || bump != config.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    Ok(())
 }
 
 // assert_executed accounts: [config, proposal_vote]
@@ -378,15 +400,7 @@ fn assert_executed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     let proposal = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
 
-    let delay = config.bootstrap_delay_slots.to_le_bytes();
-    let start = config.bootstrap_start_slot.to_le_bytes();
-    let (expected_config, bump) = Pubkey::find_program_address(
-        &config_seeds(&config.coin_mint, &config.subledger_pool, &delay, &start),
-        program_id,
-    );
-    if expected_config != *config_account.key || bump != config.bump {
-        return Err(ProgramError::InvalidSeeds);
-    }
+    validate_config_identity(program_id, config_account.key, &config)?;
     let expected_proposal = Pubkey::find_program_address(
         &proposal_seeds(config_account.key, &proposal.distribution_proposal),
         program_id,
@@ -397,6 +411,41 @@ fn assert_executed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         || !proposal.executed
     {
         return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+// assert_bootstrap_ended accounts: [config, subledger_pool]
+// data: none
+//
+// This proves only immutable schedule finality and config/pool identity. It is
+// intentionally read-only and grants no authority. The Subledger consumer adds
+// the fund-critical proof that the bound Percolator market is resolved and empty
+// before using this attestation to return a deposit to its recorded owner.
+fn assert_bootstrap_ended(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let sub_pool = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    validate_config_identity(program_id, config_account.key, &config)?;
+    if *sub_pool.key != config.subledger_pool || sub_pool.owner != &config.subledger_program {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if Clock::get()?.slot < config.bootstrap_end_slot {
+        return Err(ProgramError::InvalidInstructionData);
     }
     Ok(())
 }
