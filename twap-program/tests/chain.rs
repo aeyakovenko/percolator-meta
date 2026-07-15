@@ -41311,6 +41311,10 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         long_before_legacy_cleanup,
         "rejected legacy cleanup is atomic"
     );
+    let archived_long_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &long_before_legacy_cleanup.data,
+    )
+    .unwrap();
 
     let archive = rd_portfolio_archive_pda(
         &market_key,
@@ -41356,6 +41360,15 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         "the attacker rematerialized the victim key without its signature"
     );
     assert_eq!(svm.get_account(&archive).unwrap().owner, rd_id());
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&archive).unwrap().data[256..264]
+                .try_into()
+                .unwrap()
+        ),
+        archived_long_portfolio_id,
+        "the terminal archive must bind the exact portfolio incarnation it accumulated"
+    );
 
     // Retire the remaining original-market portfolio and then the whole slab. The long's foreign live
     // generation remains materialized, so the reward claim below proves the immutable market marker
@@ -42205,6 +42218,7 @@ enum OrganicRewardCleanup {
     None,
     BeforeCrystallize,
     PostEmissionLoss,
+    OwnerReinitializeBeforeCrystallize,
     OwnerCloseAfterRecovery,
     OwnerReinitializeAfterRecovery,
 }
@@ -42219,6 +42233,8 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     );
     let owner_reinitialize_after_recovery =
         cleanup == OrganicRewardCleanup::OwnerReinitializeAfterRecovery;
+    let owner_reinitialize_before_crystallize =
+        cleanup == OrganicRewardCleanup::OwnerReinitializeBeforeCrystallize;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -42426,6 +42442,10 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
         ))
         .expect("deposit");
     }
+    let registered_loser_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&loser_pf).unwrap().data,
+    )
+    .expect("registered trader has a portfolio incarnation ID");
 
     // ---- residual-distributor: trader cohort = 100% (insurance/backing/lp = 0) ----
     let coin_auth = Keypair::new();
@@ -42625,11 +42645,123 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
         return;
     }
     registration.expect("register loser (trader)");
+    let trader_stake = svm.get_account(&t_stake).unwrap();
+    assert_eq!(trader_stake.data.len(), 220);
+    assert_eq!(
+        u64::from_le_bytes(trader_stake.data[212..220].try_into().unwrap()),
+        registered_loser_portfolio_id,
+        "the reward stake must bind the portfolio incarnation observed at registration"
+    );
     assert_eq!(
         read_portfolio_crystallized(&svm, &loser_pf),
         0,
         "no crystallized loss yet"
     );
+    let crystallize_ix = || Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(rd_config, false),
+            AccountMeta::new(t_stake, false),
+            AccountMeta::new_readonly(loser_pf, false),
+            AccountMeta::new_readonly(loser_archive, false),
+            AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+        ],
+        data: vec![2u8],
+    };
+    if owner_reinitialize_before_crystallize {
+        let loser_collateral = canonical_insurance_vault(&loser.pubkey(), &collateral);
+        set_token(
+            &mut svm,
+            &loser_collateral,
+            &collateral,
+            &loser.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&loser],
+            pix(
+                vec![
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                    AccountMeta::new(loser_collateral, false),
+                    AccountMeta::new(perc_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount: 1_000_000 },
+            ),
+        )
+        .expect("withdraw the flat portfolio before the incarnation probe");
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(loser.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(loser_pf, false),
+                    ],
+                    PIx::ClosePortfolio,
+                ),
+                solana_sdk::system_instruction::transfer(
+                    &payer.pubkey(),
+                    &loser_pf,
+                    1_000_000_000,
+                ),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &loser],
+            bh,
+        ))
+        .expect("close the original portfolio while preserving its reusable account");
+        send(
+            &mut svm,
+            &[&loser],
+            pix(
+                vec![
+                    AccountMeta::new(loser.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(loser_pf, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("reinitialize the same portfolio address before crystallization");
+        let recreated_id = percolator_prog::state::read_portfolio_id(
+            &svm.get_account(&loser_pf).unwrap().data,
+        )
+        .unwrap();
+        assert!(recreated_id > registered_loser_portfolio_id);
+
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        let result = svm.send_transaction(Transaction::new_signed_with_payer(
+            &[crystallize_ix()],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ));
+        assert!(
+            result.is_err(),
+            "a replacement incarnation must not advance an old reward stake"
+        );
+        let stake = svm.get_account(&t_stake).unwrap();
+        assert_eq!(
+            u128::from_le_bytes(stake.data[176..192].try_into().unwrap()),
+            0,
+            "failed crystallization must leave the old stake's points unchanged"
+        );
+        assert_eq!(
+            u64::from_le_bytes(stake.data[212..220].try_into().unwrap()),
+            registered_loser_portfolio_id,
+            "failed crystallization must not rebind the old stake"
+        );
+        return;
+    }
 
     // ---- the organic loss: `winner` (owner_a) shorts, `loser` (owner_b) longs; the oracle drops, and a
     //      permissionless crank settles the long's now-negative PnL out of its principal. size_q is owner_a's
@@ -42800,18 +42932,7 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[Instruction {
-            program_id: rd_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(rd_config, false),
-                AccountMeta::new(t_stake, false),
-                AccountMeta::new_readonly(loser_pf, false),
-                AccountMeta::new_readonly(loser_archive, false),
-                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
-            ],
-            data: vec![2u8],
-        }],
+        &[crystallize_ix()],
         Some(&payer.pubkey()),
         &[&payer],
         bh,
@@ -43097,6 +43218,14 @@ fn run_organic_pnl_loss_real_trade_feeds_trader_cohort(cleanup: OrganicRewardCle
             ),
         )
         .expect("owner reinitializes the same portfolio key on the same market");
+        let recreated_loser_portfolio_id = percolator_prog::state::read_portfolio_id(
+            &svm.get_account(&loser_pf).unwrap().data,
+        )
+        .expect("recreated trader has a portfolio incarnation ID");
+        assert!(
+            recreated_loser_portfolio_id > registered_loser_portfolio_id,
+            "same-key reinitialization must advance the market-owned portfolio ID"
+        );
         let fresh_source = Pubkey::new_unique();
         set_token(
             &mut svm,
@@ -43541,6 +43670,13 @@ fn e2e_legacy_reward_end_excludes_post_period_real_trade_loss() {
 fn e2e_owner_close_cannot_bypass_trader_live_cap_after_organic_recovery() {
     run_organic_pnl_loss_real_trade_feeds_trader_cohort(
         OrganicRewardCleanup::OwnerCloseAfterRecovery,
+    );
+}
+
+#[test]
+fn e2e_reinitialized_portfolio_cannot_crystallize_old_reward_stake() {
+    run_organic_pnl_loss_real_trade_feeds_trader_cohort(
+        OrganicRewardCleanup::OwnerReinitializeBeforeCrystallize,
     );
 }
 

@@ -100,7 +100,8 @@ const CONFIG_EXTRA_BACKING_POOLS_OFF: usize =
     CONFIG_EXTRA_INSURANCE_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const CONFIG_SIZE: usize = CONFIG_EXTRA_BACKING_POOLS_OFF + MAX_EXTRA_MARKETS * 32;
 const LEGACY_STAKE_SIZE: usize = 211;
-const STAKE_SIZE: usize = 212; // +1 immutable portfolio-market index
+const INDEXED_STAKE_SIZE: usize = 212;
+const STAKE_SIZE: usize = 220; // +1 market index, +8 portfolio incarnation ID
 const PORTFOLIO_ARCHIVE_SIZE: usize = 264;
 // Capital + portfolio-flow cohorts. Insurance/backing reward base-unit principal;
 // LP/trader reward residual counters; optional funding-payer rewards the sum of
@@ -290,9 +291,7 @@ pub fn read_subledger_principal(data: &[u8]) -> Result<(u128, bool), ProgramErro
     Ok((principal, withdrawn))
 }
 
-fn read_terminal_return_snapshot(
-    data: &[u8],
-) -> Result<Option<(u128, Option<u64>)>, ProgramError> {
+fn read_terminal_return_snapshot(data: &[u8]) -> Result<Option<(u128, Option<u64>)>, ProgramError> {
     validate_subledger_position(data)?;
     if data.get(SUB_POS_TERMINAL_RETURNED).copied() != Some(1) {
         return Ok(None);
@@ -829,16 +828,12 @@ struct PortfolioArchive {
     funding_short_paid: u128,
     funding_short_received: u128,
     generation: u64,
-    archived_slot: u64,
+    // The latest portfolio incarnation included in the cumulative counters.
+    portfolio_id: u64,
 }
 
 impl PortfolioArchive {
-    fn empty(
-        percolator_program: Pubkey,
-        market: Pubkey,
-        owner: Pubkey,
-        portfolio: Pubkey,
-    ) -> Self {
+    fn empty(percolator_program: Pubkey, market: Pubkey, owner: Pubkey, portfolio: Pubkey) -> Self {
         Self {
             percolator_program,
             market,
@@ -852,7 +847,7 @@ impl PortfolioArchive {
             funding_short_paid: 0,
             funding_short_received: 0,
             generation: 0,
-            archived_slot: 0,
+            portfolio_id: 0,
         }
     }
 
@@ -865,19 +860,15 @@ impl PortfolioArchive {
             market: pk(data, 40),
             owner: pk(data, 72),
             portfolio: pk(data, 104),
-            residual_crystallized_loss: u128::from_le_bytes(
-                data[136..152].try_into().unwrap(),
-            ),
-            residual_spent_principal: u128::from_le_bytes(
-                data[152..168].try_into().unwrap(),
-            ),
+            residual_crystallized_loss: u128::from_le_bytes(data[136..152].try_into().unwrap()),
+            residual_spent_principal: u128::from_le_bytes(data[152..168].try_into().unwrap()),
             residual_received: u128::from_le_bytes(data[168..184].try_into().unwrap()),
             funding_long_paid: u128::from_le_bytes(data[184..200].try_into().unwrap()),
             funding_long_received: u128::from_le_bytes(data[200..216].try_into().unwrap()),
             funding_short_paid: u128::from_le_bytes(data[216..232].try_into().unwrap()),
             funding_short_received: u128::from_le_bytes(data[232..248].try_into().unwrap()),
             generation: u64::from_le_bytes(data[248..256].try_into().unwrap()),
-            archived_slot: u64::from_le_bytes(data[256..264].try_into().unwrap()),
+            portfolio_id: u64::from_le_bytes(data[256..264].try_into().unwrap()),
         })
     }
 
@@ -895,7 +886,7 @@ impl PortfolioArchive {
         data[216..232].copy_from_slice(&self.funding_short_paid.to_le_bytes());
         data[232..248].copy_from_slice(&self.funding_short_received.to_le_bytes());
         data[248..256].copy_from_slice(&self.generation.to_le_bytes());
-        data[256..264].copy_from_slice(&self.archived_slot.to_le_bytes());
+        data[256..264].copy_from_slice(&self.portfolio_id.to_le_bytes());
     }
 
     fn validate_identity(
@@ -915,17 +906,18 @@ impl PortfolioArchive {
         Ok(())
     }
 
-    fn add_live(
-        &mut self,
-        live: &percolator_accounting::PortfolioRewardSnapshot,
-        archived_slot: u64,
-    ) -> ProgramResult {
+    fn add_live(&mut self, live: &percolator_accounting::PortfolioRewardSnapshot) -> ProgramResult {
         self.validate_identity(
             &self.percolator_program,
             &Pubkey::new_from_array(live.market_group),
             &Pubkey::new_from_array(live.owner),
             &Pubkey::new_from_array(live.portfolio),
         )?;
+        if live.portfolio_id == 0
+            || (self.generation != 0 && live.portfolio_id <= self.portfolio_id)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
         macro_rules! add_counter {
             ($field:ident) => {
                 self.$field = self
@@ -945,7 +937,7 @@ impl PortfolioArchive {
             .generation
             .checked_add(1)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        self.archived_slot = archived_slot;
+        self.portfolio_id = live.portfolio_id;
         Ok(())
     }
 
@@ -957,6 +949,7 @@ impl PortfolioArchive {
             market_group: self.market.to_bytes(),
             portfolio: self.portfolio.to_bytes(),
             owner: self.owner.to_bytes(),
+            portfolio_id: self.portfolio_id,
             residual_crystallized_loss: self.residual_crystallized_loss,
             residual_spent_principal: self.residual_spent_principal,
             residual_received: self.residual_received,
@@ -972,6 +965,12 @@ impl PortfolioArchive {
                 &Pubkey::new_from_array(live.owner),
                 &Pubkey::new_from_array(live.portfolio),
             )?;
+            if live.portfolio_id == 0
+                || (self.generation != 0 && live.portfolio_id <= self.portfolio_id)
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            totals.portfolio_id = live.portfolio_id;
             macro_rules! add_counter {
                 ($field:ident) => {
                     totals.$field = totals
@@ -1018,6 +1017,9 @@ struct Stake {
     // Capital cohorts leave this zero. The binding prevents a same-transaction Percolator account
     // rematerialization from selecting another market's archive or blocking the original one.
     portfolio_market_index: u8,
+    // Market-owned monotonic ID assigned by Percolator InitPortfolio. Counter deltas are valid only
+    // while the live account or terminal archive names this exact incarnation.
+    portfolio_id: u64,
 }
 impl Stake {
     fn deserialize(d: &[u8]) -> Result<Self, ProgramError> {
@@ -1040,6 +1042,10 @@ impl Stake {
             // Historical stakes predate multi-market terminal archives and therefore use the
             // primary market. Appending this byte preserves every existing field offset.
             portfolio_market_index: d.get(211).copied().unwrap_or(0),
+            portfolio_id: d
+                .get(212..220)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -1058,6 +1064,9 @@ impl Stake {
         d[210] = self.claimed as u8;
         if let Some(index) = d.get_mut(211) {
             *index = self.portfolio_market_index;
+        }
+        if let Some(portfolio_id) = d.get_mut(212..220) {
+            portfolio_id.copy_from_slice(&self.portfolio_id.to_le_bytes());
         }
     }
 }
@@ -1090,11 +1099,9 @@ fn read_live_portfolio_snapshot(
     owner: &Pubkey,
     data: &[u8],
 ) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
-    let snapshot = percolator_accounting::read_portfolio_reward_snapshot(
-        data,
-        &portfolio_key.to_bytes(),
-    )
-    .map_err(|_| ProgramError::InvalidAccountData)?;
+    let snapshot =
+        percolator_accounting::read_portfolio_reward_snapshot(data, &portfolio_key.to_bytes())
+            .map_err(|_| ProgramError::InvalidAccountData)?;
     if snapshot.owner != owner.to_bytes()
         || !config.market_allowed(&Pubkey::new_from_array(snapshot.market_group))
     {
@@ -1176,11 +1183,15 @@ fn portfolio_totals(
     program_id: &Pubkey,
     config: &Config,
     owner: &Pubkey,
+    expected_portfolio_id: Option<u64>,
     portfolio: &AccountInfo,
     archive_account: &AccountInfo,
     bound_market: Option<&Pubkey>,
     retired: bool,
 ) -> Result<percolator_accounting::PortfolioRewardSnapshot, ProgramError> {
+    if expected_portfolio_id == Some(0) {
+        return Err(ProgramError::InvalidAccountData);
+    }
     if let Some(market) = bound_market {
         if !config.market_allowed(market) {
             return Err(ProgramError::IllegalOwner);
@@ -1200,7 +1211,10 @@ fn portfolio_totals(
                 &portfolio.key.to_bytes(),
             )
             .map_err(|_| ProgramError::InvalidAccountData)?;
-            if live.owner == owner.to_bytes() && live.market_group == market.to_bytes() {
+            if live.owner == owner.to_bytes()
+                && live.market_group == market.to_bytes()
+                && expected_portfolio_id.is_none_or(|expected| live.portfolio_id == expected)
+            {
                 return archive.totals_with_live(Some(&live));
             }
         }
@@ -1208,6 +1222,9 @@ fn portfolio_totals(
         // A controller archive is a complete terminal snapshot. A retired-market marker also makes
         // every later Percolator generation under the same slab key ineligible by construction.
         if exists {
+            if expected_portfolio_id.is_some_and(|expected| archive.portfolio_id != expected) {
+                return Err(ProgramError::InvalidAccountData);
+            }
             return archive.totals_with_live(None);
         }
         return Err(ProgramError::InvalidAccountData);
@@ -1232,6 +1249,12 @@ fn portfolio_totals(
             owner,
             portfolio.key,
         )?;
+        if expected_portfolio_id.is_some_and(|expected| live.portfolio_id != expected) {
+            if archive.generation != 0 && archive.portfolio_id == expected_portfolio_id.unwrap() {
+                return archive.totals_with_live(None);
+            }
+            return Err(ProgramError::InvalidAccountData);
+        }
         return archive.totals_with_live(Some(&live));
     }
 
@@ -1255,6 +1278,9 @@ fn portfolio_totals(
     if *archive_account.key != expected {
         return Err(ProgramError::InvalidSeeds);
     }
+    if expected_portfolio_id.is_some_and(|expected| archive.portfolio_id != expected) {
+        return Err(ProgramError::InvalidAccountData);
+    }
     archive.totals_with_live(None)
 }
 
@@ -1267,7 +1293,7 @@ fn portfolio_market_for_stake(
     archive_account: &AccountInfo,
     retired_market: &AccountInfo,
 ) -> Result<Pubkey, ProgramError> {
-    if stake_data_len >= STAKE_SIZE {
+    if stake_data_len >= INDEXED_STAKE_SIZE {
         return config
             .market_at(stake.portfolio_market_index)
             .ok_or(ProgramError::InvalidAccountData);
@@ -1425,11 +1451,7 @@ fn create_pda<'a>(
 // terminal ClosePortfolio CPI in the same transaction. If that close rejects,
 // the archive update rolls back. No token account is accepted and this program
 // cannot move collateral; it only checked-adds authenticated monotonic telemetry.
-fn archive_portfolio(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    data: &[u8],
-) -> ProgramResult {
+fn archive_portfolio(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     if !data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -1504,7 +1526,7 @@ fn archive_portfolio(
             PORTFOLIO_ARCHIVE_SIZE,
         )?;
     }
-    archive.add_live(&live, Clock::get()?.slot)?;
+    archive.add_live(&live)?;
     archive.serialize(&mut archive_account.try_borrow_mut_data()?);
     Ok(())
 }
@@ -2001,10 +2023,9 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         {
             return Err(ProgramError::InvalidSeeds);
         }
-        for (legacy_stake, linked_seed) in [
-            (legacy_owner_stake, false),
-            (legacy_linked_stake, true),
-        ] {
+        for (legacy_stake, linked_seed) in
+            [(legacy_owner_stake, false), (legacy_linked_stake, true)]
+        {
             if legacy_stake.data_len() == 0 {
                 continue;
             }
@@ -2036,7 +2057,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     }
     // `snap` is the register-time counter snapshot: 0 for capital cohorts (insurance/backing),
     // and the relevant portfolio-flow counter for portfolio cohorts (delta measured at crystallize).
-    let (snap, portfolio_market_index): (u128, u8) = match cohort {
+    let (snap, portfolio_market_index, portfolio_id): (u128, u8, u64) = match cohort {
         COHORT_INSURANCE | COHORT_BACKING => {
             // Capital cohort: `linked` is a subledger Position in this cohort's pool.
             if *linked.owner != config.subledger_program {
@@ -2053,7 +2074,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
             if !config.pool_allowed(cohort, &pk(&data, SUB_POS_POOL)) {
                 return Err(ProgramError::IllegalOwner);
             }
-            (0, 0)
+            (0, 0, 0)
         }
         _ => {
             // Include cumulative terminal archives in the start snapshot. A portfolio address can be
@@ -2062,6 +2083,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 program_id,
                 &config,
                 owner.key,
+                None,
                 linked,
                 portfolio_context
                     .map(|(archive, _, _)| archive)
@@ -2105,7 +2127,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 ),
                 _ => funding_payer_counter(totals.funding_long_paid, totals.funding_short_paid),
             };
-            (counter, portfolio_market_index)
+            (counter, portfolio_market_index, totals.portfolio_id)
         }
     };
     let start_slot = now;
@@ -2140,6 +2162,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         eligible_accum: 0,
         claimed: false,
         portfolio_market_index,
+        portfolio_id,
     }
     .serialize(&mut stake_account.try_borrow_mut_data()?);
     Ok(())
@@ -2256,12 +2279,10 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 now
             };
             let (live_principal, crystallized_slot) = match terminal_snapshot {
-                Some((terminal_principal, Some(return_slot))) => {
-                    (
-                        terminal_principal,
-                        core::cmp::min(accrual_cutoff, return_slot),
-                    )
-                }
+                Some((terminal_principal, Some(return_slot))) => (
+                    terminal_principal,
+                    core::cmp::min(accrual_cutoff, return_slot),
+                ),
                 // Historical terminal snapshots predate the return-slot field.
                 // Preserve their already-crystallized claim cap, but do not
                 // guess a tenure and inflate a newly crystallized reward.
@@ -2302,6 +2323,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 program_id,
                 &config,
                 &stake.owner,
+                Some(stake.portfolio_id),
                 backing_ledger,
                 portfolio_archive,
                 Some(&portfolio_market),
@@ -2364,6 +2386,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 program_id,
                 &config,
                 &stake.owner,
+                Some(stake.portfolio_id),
                 backing_ledger,
                 portfolio_archive,
                 Some(&portfolio_market),
@@ -2706,6 +2729,7 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                     program_id,
                     &config,
                     &stake.owner,
+                    Some(stake.portfolio_id),
                     portfolio,
                     portfolio_archive,
                     Some(&portfolio_market),
@@ -2861,6 +2885,99 @@ mod tests {
 
         assert_eq!(read_subledger_principal(&d).unwrap(), (555, false));
         assert_eq!(read_terminal_return_snapshot(&d).unwrap(), None);
+    }
+
+    fn reward_snapshot(
+        market: Pubkey,
+        portfolio: Pubkey,
+        owner: Pubkey,
+        portfolio_id: u64,
+        received: u128,
+    ) -> percolator_accounting::PortfolioRewardSnapshot {
+        percolator_accounting::PortfolioRewardSnapshot {
+            market_group: market.to_bytes(),
+            portfolio: portfolio.to_bytes(),
+            owner: owner.to_bytes(),
+            portfolio_id,
+            residual_received: received,
+            ..percolator_accounting::PortfolioRewardSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn archive_accumulates_only_strictly_newer_portfolio_incarnations() {
+        let percolator_program = Pubkey::new_unique();
+        let market = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let portfolio = Pubkey::new_unique();
+        let mut archive = PortfolioArchive::empty(
+            percolator_program,
+            market,
+            owner,
+            portfolio,
+        );
+        let first = reward_snapshot(market, portfolio, owner, 7, 10);
+        archive.add_live(&first).unwrap();
+        assert_eq!(archive.generation, 1);
+        assert_eq!(archive.portfolio_id, 7);
+        assert_eq!(archive.residual_received, 10);
+        assert_eq!(
+            archive.add_live(&first),
+            Err(ProgramError::InvalidAccountData),
+            "one incarnation cannot be archived twice"
+        );
+        assert_eq!(
+            archive.add_live(&reward_snapshot(market, portfolio, owner, 6, 1)),
+            Err(ProgramError::InvalidAccountData),
+            "archive IDs cannot move backward"
+        );
+
+        archive
+            .add_live(&reward_snapshot(market, portfolio, owner, 11, 4))
+            .unwrap();
+        let totals = archive.totals_with_live(None).unwrap();
+        assert_eq!(totals.portfolio_id, 11);
+        assert_eq!(totals.residual_received, 14);
+        let with_live = archive
+            .totals_with_live(Some(&reward_snapshot(market, portfolio, owner, 12, 3)))
+            .unwrap();
+        assert_eq!(with_live.portfolio_id, 12);
+        assert_eq!(with_live.residual_received, 17);
+        assert!(
+            archive
+                .totals_with_live(Some(&reward_snapshot(market, portfolio, owner, 10, 3)))
+                .is_err(),
+            "a stale live incarnation cannot be added to newer archived totals"
+        );
+    }
+
+    #[test]
+    fn stake_layout_appends_portfolio_id_without_reinterpreting_predecessors() {
+        let stake = Stake {
+            config: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            backing_ledger: Pubkey::new_unique(),
+            recipient: Pubkey::new_unique(),
+            residual_snap: 1,
+            earnings_snap: 2,
+            start_slot: 3,
+            points: 4,
+            bump: 5,
+            cohort: COHORT_TRADER,
+            eligible_accum: 6,
+            claimed: false,
+            portfolio_market_index: 7,
+            portfolio_id: 8,
+        };
+        let mut data = [0u8; STAKE_SIZE];
+        stake.serialize(&mut data);
+        let current = Stake::deserialize(&data).unwrap();
+        assert_eq!(current.portfolio_market_index, 7);
+        assert_eq!(current.portfolio_id, 8);
+
+        let predecessor = Stake::deserialize(&data[..INDEXED_STAKE_SIZE]).unwrap();
+        assert_eq!(predecessor.portfolio_market_index, 7);
+        assert_eq!(predecessor.portfolio_id, 0);
     }
 
     #[test]

@@ -430,6 +430,9 @@ fn initialize_portfolio_header(
     data[112..114].copy_from_slice(&1u16.to_le_bytes());
     data[114..116].copy_from_slice(&17u16.to_le_bytes());
     data[116..148].copy_from_slice(owner.as_ref());
+    data[percolator_prog::constants::PORTFOLIO_ID_OFF
+        ..percolator_prog::constants::PORTFOLIO_ID_OFF + 8]
+        .copy_from_slice(&1u64.to_le_bytes());
 }
 
 // Mock Percolator PortfolioAccount at the pinned provenance/counter offsets.
@@ -442,7 +445,7 @@ fn set_portfolio(
     received: u128,
     crystallized: u128,
 ) {
-    let mut data = vec![0u8; 512];
+    let mut data = vec![0u8; percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN];
     initialize_portfolio_header(&mut data, key, market, owner);
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[228..244].copy_from_slice(&received.to_le_bytes());
@@ -470,7 +473,7 @@ fn set_portfolio_full(
     crystallized: u128,
     spent: u128,
 ) {
-    let mut data = vec![0u8; 512];
+    let mut data = vec![0u8; percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN];
     initialize_portfolio_header(&mut data, key, market, owner);
     data[196..212].copy_from_slice(&crystallized.to_le_bytes());
     data[212..228].copy_from_slice(&spent.to_le_bytes());
@@ -499,7 +502,7 @@ fn set_portfolio_funding(
     short_paid: u128,
     short_received: u128,
 ) {
-    let mut data = vec![0u8; 512];
+    let mut data = vec![0u8; percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN];
     initialize_portfolio_header(&mut data, key, market, owner);
     data[244..260].copy_from_slice(&long_paid.to_le_bytes());
     data[260..276].copy_from_slice(&long_received.to_le_bytes());
@@ -2521,12 +2524,11 @@ fn allow_list_accepts_a_listed_extra_market_and_still_rejects_an_off_list_market
     .expect("the primary market still counts");
 }
 
-// UPGRADE LIVENESS: the market-index binding appended byte 211 to portfolio stakes. The preceding
-// public binary created 211-byte stakes while already accepting every configured extra market. An
-// extra-market stake must therefore derive its historical market from its authenticated live/archive
-// identity after upgrade; treating every predecessor as index 0 strands crystallize and claim.
+// SECURITY UPGRADE BOUNDARY: a predecessor stake has no portfolio incarnation ID. It cannot safely
+// resume counter accrual because the linked address may already name a replacement portfolio. Frozen
+// predecessor points remain claimable (covered below), but an unbound stake must re-register.
 #[test]
-fn pre_market_index_extra_market_stake_crystallizes_and_claims_after_upgrade() {
+fn pre_portfolio_id_stake_cannot_resume_counter_accrual_after_upgrade() {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
@@ -2561,14 +2563,14 @@ fn pre_market_index_extra_market_stake_crystallizes_and_claims_after_upgrade() {
     let mut predecessor = svm.get_account(&stake).unwrap();
     assert_eq!(
         predecessor.data.len(),
-        212,
-        "current fixture has the appended market index"
+        220,
+        "current fixture has the market index and portfolio ID"
     );
     assert_eq!(
         predecessor.data[211], 1,
         "the extra market is allow-list index one"
     );
-    predecessor.data.truncate(211);
+    predecessor.data.truncate(212);
     svm.set_account(stake, predecessor).unwrap();
 
     set_slot(&mut svm, 1_500);
@@ -2581,25 +2583,24 @@ fn pre_market_index_extra_market_stake_crystallizes_and_claims_after_upgrade() {
         12_000,
         0,
     );
-    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
-        .expect("the upgraded program derives the predecessor's extra market");
+    let result = crystallize(&mut svm, &payer, &env, &owner, &portfolio);
+    assert!(
+        result.is_err(),
+        "a stake without an incarnation ID must not resume counter accrual"
+    );
     assert_eq!(
         svm.get_account(&stake).unwrap().data.len(),
-        211,
-        "compatibility does not require reallocating deployed stake state"
+        212,
+        "rejected accrual does not mutate predecessor stake state"
     );
-
-    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
-    freeze(&mut svm, &payer, &env).expect("freeze the predecessor contribution");
-    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
-    claim_cohort(
-        &mut svm, &payer, &env, &owner, &recipient, &portfolio, COHORT_LP,
-    )
-    .expect("the upgraded program pays the predecessor's frozen extra-market reward");
     assert_eq!(
-        token_amount(&svm, &recipient),
-        400_000,
-        "the sole LP receives its cohort"
+        u128::from_le_bytes(
+            svm.get_account(&stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap()
+        ),
+        0,
+        "rejected accrual cannot add points"
     );
 }
 
@@ -2636,10 +2637,6 @@ fn pre_market_index_extra_market_stake_claims_after_pre_archive_portfolio_close(
     .expect("register the predecessor extra-market stake");
 
     let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_LP);
-    let mut predecessor = svm.get_account(&stake).unwrap();
-    predecessor.data.truncate(211);
-    svm.set_account(stake, predecessor).unwrap();
-
     set_slot(&mut svm, 1_500);
     set_portfolio(
         &mut svm,
@@ -2651,7 +2648,10 @@ fn pre_market_index_extra_market_stake_claims_after_pre_archive_portfolio_close(
         0,
     );
     crystallize(&mut svm, &payer, &env, &owner, &portfolio)
-        .expect("crystallize while the predecessor portfolio is live");
+        .expect("crystallize while the ID-bound portfolio is live");
+    let mut predecessor = svm.get_account(&stake).unwrap();
+    predecessor.data.truncate(211);
+    svm.set_account(stake, predecessor).unwrap();
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
     freeze(&mut svm, &payer, &env).expect("freeze the predecessor contribution");
 
