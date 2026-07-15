@@ -472,22 +472,6 @@ pub fn update_asset_authority_ix(
     }
 }
 
-pub fn update_market_0_insurance_operator_by_asset_admin_ix(
-    program: Pubkey,
-    asset_admin: Pubkey,
-    new_operator: Pubkey,
-    market: Pubkey,
-) -> Instruction {
-    update_asset_authority_ix(
-        program,
-        asset_admin,
-        new_operator,
-        market,
-        MARKET_0_ASSET_INDEX,
-        ASSET_AUTH_INSURANCE_OPERATOR,
-    )
-}
-
 pub fn update_insurance_policy_ix(
     program: Pubkey,
     admin: Pubkey,

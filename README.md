@@ -1,137 +1,408 @@
 # Percolator Meta
 
-A **non-custodial, Sybil-resistant governance bootstrap** for Percolator markets.
-Depositors put capital at risk in a Percolator market's insurance to earn time-weighted
-voting power over how a **fixed, pre-existing COIN supply** is distributed. The winning
-distribution *is* the MetaDAO token; control of the market keys then transfers to it
-through a time-locked Squads handover. No program here ever custodies user funds or sits
-in the withdrawal path beyond a tightly-constrained, time-locked authority.
+A non-custodial governance bootstrap and continuous reward system for Percolator markets.
+Participants put base units at risk in market insurance during a short deposit window, run a
+configurable bootstrap (six 30-day months by default), and vote on allocation of 100% of a fixed,
+pre-existing COIN supply. After sealing, the votes have no further authority and depositors can
+recover their owner-bound share of the insurance pool, subject to losses incurred during their
+capital's own tenure.
 
-> **Status.** Experimental, **educational-use-only**, provided **AS IS** with no warranties
-> (see [LICENSE](LICENSE)). Participants put real capital **at risk** in a live market and
-> can lose it to market losses.
+> **Status:** experimental, educational-use-only, and provided **AS IS**. Participants can lose
+> capital to market losses or program defects. See [LICENSE](LICENSE).
 
-## Premise
+## Invariants
 
-- **Depositing stakes capital to earn voting power.** The cost of a vote is the capital put
-  at risk in the market's insurance — that real downside is what makes votes expensive to
-  Sybil. The genesis pool is **share-based**: on exit a depositor redeems shares at the live
-  insurance balance, recovering principal **plus a pro-rata slice of any market surplus**, and
-  **pro-rata less under a loss**. A deployer may instead configure a **principal-only** pool
-  (`POLICY_PRINCIPAL`), where surplus is retained in insurance as the DAO's buy/burn fuel.
-  Because surplus is distributable it is also **winnable** — a deliberate governance tradeoff:
-  it gives participants an incentive to compete for a winning COIN distribution.
-- **COIN is a fixed supply with no mint authority.** Genesis does not mint — it *allocates* a
-  pre-existing pool. No inflation, dilution, or mint-to-drain vector exists.
-- **The DAO cannot take a user's principal.** User capital lives in Percolator insurance, never
-  in a genesis-owned vault. The genesis programs do attribution/accounting only; the one path to
-  unconstrained authority is a key rotation that runs through a **1-week Squads timelock**, giving
-  every depositor a pre-announced window to exit first.
+- **Fixed supply.** Genesis allocates an existing COIN vault. It never mints. Unclaimed genesis
+  allocations are burned. A proposal becomes votable only after every declared entry slot is
+  filled, so its creator cannot mutate it after voters lock capital. A claim can pay only an
+  initialized COIN account owned by its signing recipient.
+- **Capital stays segregated.** Insurance and backing principal stays in Percolator or an
+  owner-bound subledger vault. Insurance haircuts and TWAP surplus are computed from the selected
+  asset's own long/short domain budgets, so another asset's backing cannot mask a loss or authorize
+  a withdrawal. Every subledger exit also requires an initialized token destination owned by the
+  position owner. Ordinary exits require that owner's signature. After genesis is sealed and the
+  bound market is resolved and empty, a fixed public return can retire only the complete position
+  into a clean token account owned by that same depositor; it accepts no amount or beneficiary.
+  Governance and reward programs custody COIN points/rewards only.
+- **No governance withdrawal key.** Squads authorizes constrained program calls but does not hold
+  a funded market's insurance operator, insurance authority, backing authority, or `asset_admin`.
+  Controller-governed secondary activation requires the insurance authority and operator to be the
+  same provider, so governance cannot invite an external deposit while retaining its withdrawal key.
+  TWAP accepts only a real 1-of-1 Squads multisig whose sole all-permissions member and config
+  authority are the named MetaDAO, with at least a one-week timelock.
+- **Immutable deployment is a precondition.** Before accepting deposits, revoke the upgrade
+  authorities for Percolator and every Meta program whose PDA signs for custody or governance.
+  A retained upgrade authority can replace these on-chain constraints and invalidates the
+  no-withdrawal-key guarantee. Verify deployed program IDs, binaries, and ProgramData authorities
+  against the audited commits; Squads and MetaDAO upgradeability remain explicit external trust
+  assumptions. A collateral mint's freeze authority is equally explicit trust: it can freeze the
+  canonical Percolator vault and stop every withdrawal, which no Meta program can override. A
+  deployment claiming issuer-independent fund liveness must accept only collateral whose SPL Token
+  freeze authority is revoked.
+- **Lifecycle is separate from custody.** The immutable `market-controller` PDA holds
+  `marketauth` and can sign only a fixed allow-list of lifecycle, oracle, and fee-policy calls. Its
+  generic proxy rejects live deposits, withdrawals, swaps, portfolio operations, and every
+  authority mutation. Fixed permissionless paths return a secondary asset's remaining insurance
+  only to the recorded insurance authority and its backing only to the recorded backing provider,
+  both after shutdown matures and after a public stale resolver wins the race. Asset 0 instead has a
+  fixed whole-market resolution path that derives and atomically returns both backing domains after
+  Percolator proves the market empty. Controller-owned protocol insurance is recovered only to a
+  clean controller-owned account after resolution and stays there until terminal close. Raw
+  `CloseSlab` is excluded; a fixed terminal cleanup forwards that protocol insurance, vault dust,
+  and account rent to Squads after reserving reclaimed slab rent in an immutable market-retirement
+  marker. Its controller-owned transit may be replaced when a canonical ATA was
+  permanently frozen, including after a fixed return placed protocol insurance in the fallback;
+  governance still signs, Percolator still requires a fully wound-down market, and the destination
+  remains Squads-owned. Before that close,
+  anyone can ask the controller to deregister an
+  abandoned portfolio, but pinned Percolator accepts only a resolved market and an actually empty
+  portfolio and returns its rent only to the slab. Before deleting nonzero LP/trader/funding-payer
+  telemetry, the same atomic call checked-adds it into a residual-distributor PDA scoped to the
+  Percolator program, market, owner, and portfolio. Reward epochs read archived totals plus any live
+  account generation. Each stake also binds that market's immutable allow-list index, so a later
+  same-key account generation in another market cannot replace or block the archived identity. Every
+  portfolio-flow registration and counter read supplies the exact retirement marker: registration
+  rejects retired keys, while existing stakes read only their archive after retirement. Reinitializing
+  a closed slab therefore cannot revive its reward eligibility.
+  Terminal cleanup therefore cannot erase an uncrystallized allocation or hold insurance and backing
+  exits hostage. Portfolio-flow registration also authenticates the matching market and
+  requires its immutable account maintenance fee to be zero, so direct permissionless fee sync cannot
+  erase counters before they reach the archive. The archive has no token or value-moving instruction.
+  Before donating a creator-owned market, its raw
+  outgoing asset-0 insurance provider must withdraw any nonzero balance. The empty insurance roles
+  then migrate to the controller, while the recorded backing provider remains unchanged. This keeps
+  a former provider from withdrawing its principal yet retaining a claim on later trade fees.
+  `asset_admin` must
+  migrate to the controller even on an empty market, unless read-only canonical Subledger or TWAP
+  state proves that its fixed-cleanup PDA already owns admin and both insurance roles. This prevents
+  a cold delegated admin from funding one atom after handoff and blocking terminal close. Insurance
+  authority and operator must also be one identity even while empty, and that identity must be the
+  consenting outgoing authority, the controller, or a canonical constrained custodian. Otherwise an
+  unfunded third party could collect later public trade fees without putting capital at risk. Donation
+  is accepted only when every secondary slot is fully retired because Percolator does not migrate
+  secondary `asset_admin` roles with `marketauth`;
+  multi-asset markets are
+  instead initialized under the controller before governance-approved activation. The handoff also
+  requires direct permissionless asset append to be disabled, and the controller cannot enable it.
+  Inbound bootstrap donations additionally require the controller to hold `marketauth`, both asset-0
+  insurance roles, and asset-0 `asset_admin`, excluding any surviving key that could rotate and drain.
+  A genesis-pool grant cannot rotate nonzero external insurance into pool custody: its recorded owner
+  exits first, after which the same grant can proceed.
+- **Custody transitions are fixed.** Asset-0 custody moves
+  `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
+  pool's live `outstanding_principal` as a minimum floor. TWAP also re-reads `marketauth` and accepts
+  custody only before lifecycle donation, while its own Squads vault still controls the market, or
+  after donation to the controller derived from that same vault. The floor can only rise. Recovery can
+  return custody only to that same pool. Squads may authorize a live return, but a current-layout
+  pool-bound depositor does not depend on it: the signing owner can atomically return custody and
+  redeem their complete remaining position through the ordinary owner-bound Subledger checks. A
+  failed or redirected exit rolls the role return back; success consumes that position and creates
+  one exact-config re-handoff permit. Any cranker can consume that permit, replacing only the exited
+  principal component of the floor. It cannot initiate the first handoff or undo a governance or
+  terminal return. After the bound Percolator market is resolved and empty, anyone can crank the
+  same fixed return while the pool attests that owner principal remains. Once genesis is sealed, an
+  absent owner also cannot veto terminal cleanup: any cranker may
+  return that owner's full loss-adjusted position only to a clean account owned by the depositor,
+  after the real market is resolved and empty. That fixed return records the principal still at risk
+  and its return slot, so a cranker cannot erase an uncrystallized capital reward, exited capital
+  cannot keep aging, and earlier owner withdrawals stay excluded.
+  An empty pool cannot pull terminal protocol insurance
+  back from TWAP. After that insurance is first recovered to a clean controller-owned account,
+  anyone may return the now value-less roles to the same pool so its fixed wrapper can release an
+  absent asset-0 backing provider. The pool-less
+  compatibility handoff accepts only an empty asset-0 insurance balance; later value must enter
+  through the inbound-only donation path. Current-layout pool-less handoffs persist that empty-state
+  attestation, allowing any cranker to move later donated terminal insurance only to the canonical
+  controller account after resolution. Historical unmarked configs cannot infer protocol ownership.
+  If external asset-0 backing remains, a separate amountless TWAP wrapper invokes only the
+  controller's provider-bound resolved return, preserving controller insurance while paying both
+  backing domains to Percolator's recorded provider.
+  For pool-bound custody, TWAP can move a retained terminal floor to that controller account only
+  after the bound pool itself attests that no owner principal or shares remain.
+- **Market risk remains real.** Pool exits are pro rata under impairment. Governance can configure
+  approved oracles and shut down or resolve markets, and oracle/market behavior can cause losses.
+  Current insurance deposits are share-priced against loss-bearing principal on entry, so fresh
+  capital does not recapitalize an older position's historical loss and protocol-surplus pulls do
+  not look like depositor losses. A deposit whose newly minted shares would be worth more than one
+  base unit less than the deposit at the post-deposit price rejects before transfer, so virtual-share
+  rounding cannot silently consume material principal. Each exit rounds only that position's claim
+  down; enough unowned pricing shares remain to prevent a later exit from collecting the remainder.
+  Any final whole-atom remainder stays protocol insurance. Governance still cannot redirect a
+  depositor's withdrawal.
 
-## Modules
+## Programs
 
-How they fit: a depositor's stake is recorded by **subledger**; **genesis-vote** (or the
-alternative **residual-distributor**) reads that stake to decide a winner and seals it into
-**distribution**, which pays out the fixed COIN pool; post-mint, **Squads** rotates the market's
-insurance authority to **twap-program**, which buys and burns COIN from surplus. The two deciders
-are interchangeable behind the same distribution seam.
-
-| Crate | Role |
+| Crate | Responsibility |
 |---|---|
-| `subledger/` | The market's **asset-0 insurance operator** during genesis (a role granted by Squads). Mediates deposits (signs Percolator `TopUpInsurance` as the insurance authority) and owner-authorized exits, tracking per-owner attribution (`owner, principal, start_slot`). Genesis pools are **share-based** (ERC4626-style): exiting redeems shares at the live balance, returning principal **plus any surplus**, pro-rata under loss. Never rotates keys — `accept_operator` only *consents* to receive the role Squads grants. Also provides reusable owner-bound pools for assets 1..N. |
-| `genesis-vote/` | The **vote decider**. Runs a log-time quorum vote weighted by each voter's subledger attribution (`floor(log2(hold_time)) × principal`), one voter → one proposal. Seals the winner into `distribution` by CPI. Holds no funds. |
-| `residual-distributor/` | The **deterministic decider** — a pluggable alternative to `genesis-vote` behind the same seam. Awards points across share-value cohorts (insurance/backing), residual cohorts (LP/trader), and an optional cumulative funding-payer cohort (`long_paid + short_paid`) via self-service `register → crystallize → freeze → claim`. Requires a **market allow-list** (see below). |
-| `distribution/` | Holds the fixed COIN pool in a vault. A proposal is one on-chain account of up to ~10k `(pubkey, amount)` entries; the sealed winner's recipients **claim** permissionlessly, **unclaimed is burned**. Never mints. The `authority` (whichever decider PDA) is bound into the config seed, making it decider-pluggable. |
-| `twap-program/` | Deployable BPF for the **authority chain** and the post-mint **uniform-price (Dutch) buy/burn auction**. After the mint, Squads rotates the asset-0 insurance operator to its PDA; it then runs permissionless rounds that pull the burn-share of insurance *surplus*, clear a ranked, uncancellable bid book at one marginal price, and burn (or treasury-send) the bought COIN. Never reaches principal. |
-| `twap/` | Reference library for the buy/burn (schedule + bid book); only its overflow-safe rate comparator is reused on-chain. |
-| `setup/` | Host-side helper: init the fixed-supply 42M COIN mint and revoke the mint authority. |
+| `percolator-accounting/` | Shared read-only parser for asset-local insurance balances/roles, backing authority/balances, resolved-empty state, and portfolio reward telemetry in the pinned Percolator layout. It derives engine offsets from pinned layouts and exposes no instruction or authority. |
+| `market-controller/` | Stateless, deny-by-default market lifecycle controller. Anyone can initialize a controller-owned market or donate an existing market authority. Squads can configure approved oracle modes, batch-safe fee policies, asset lifecycle, shutdown, resolution, and atomically reclaim terminal protocol insurance/dust/rent from an empty slab. Terminal close reserves reclaimed rent in a permanent market-retirement PDA before forwarding the remainder. Its generic proxy cannot move insurance/backing, trade, rotate keys, or move portfolio collateral; fixed permissionless cleanup returns external insurance and backing only to their recorded providers, deregisters only empty resolved portfolios, and retains controller-owned protocol insurance for terminal reclaim. |
+| `subledger/` | Owner-bound insurance/backing accounting. Genesis insurance pools bind market, Percolator program, COIN mint, policy, domain, deposit schedule, and bootstrap delay into the PDA. One base unit is one principal unit; priced shares keep losses scoped to each deposit's tenure while principal remains the vote/reward unit. A principal-policy pool can hand live custody to TWAP with its protected floor. A with-surplus pool cannot cross that boundary until every owner claim is gone; it may then reuse the same terminal path for later protocol fees or unowned rounding reserve. Its amountless full-exit entry point reuses the ordinary owner, pool, destination, loss, and share checks for an atomic live TWAP recovery. After recovery the pool can otherwise sign only fixed resolved cleanup. Once genesis-vote attests an executed winner and the bound market is resolved and empty, anyone can retire an absent depositor's complete position only into a clean account owned by that depositor, preserving its remaining-principal and return-slot reward cap. Its terminal read-only attestation proves when the pool has no owner claims. |
+| `genesis-vote/` | Bootstrap decider. Principal is the quorum denominator; support is weighted by `floor(log2(hold_time)) * principal`. One voter backs one proposal. Only a proposal with its complete declared entry shape can become votable. New backing closes exactly when the configured bootstrap deadline makes the permissionless trigger live; retraction remains open so a vote lock cannot trap principal. The trigger seals the winner into `distribution`. Holds no funds. |
+| `distribution/` | Claims from the fixed genesis COIN vault. A sealed proposal contains recipient/amount entries allocating at most the fixed supply. Each recipient authorizes its own claim; unclaimed or unallocated COIN is burned after the claim window. Never mints. |
+| `residual-distributor/` | Reusable fixed or dynamic COIN reward epochs. It snapshots points from selected insurance/backing pools, realized residual flows, and cumulative funding paid (`long_paid + short_paid`, with no age multiplier), then pays only the position's bound recipient. Controller cleanup preserves terminal portfolio counters in a cumulative read-only PDA; each stake binds the archive's allow-listed market, and the controller's immutable retirement marker prevents a reused slab key from admitting or influencing rewards. Witnesses must carry the exact Subledger-position discriminator or pinned Percolator portfolio provenance, and permissionless portfolio-flow claims reject delegated recipient accounts. It reads principal-bearing accounts but cannot debit them. |
+| `twap-program/` | Post-genesis surplus auction and constrained asset-0 custodian. It can pull only insurance above the monotonic floor, run repeating uniform-price buybacks, burn or route bought COIN to a bound reward vault, accept inbound insurance donations, apply the trade-fee setter and clear predecessor backing-fee policies, and timelock-restart only an empty recovering asset 0. Pool-bound recovery stays bound to the original genesis pool; a signing owner may use its fixed live full-exit proxy, whose value accounts are all revalidated by Subledger. After resolution, either that pool proves zero claims or a current-layout pool-less config proves it began empty; TWAP can then route the terminal protocol floor only through clean PDA-owned transits to market-controller custody. A pool-less config can also sign only the controller's amountless, provider-bound asset-0 backing return. |
+| `twap/` | Host-side auction simulation and Percolator wire helpers. It does not expose the obsolete raw Squads/operator rotation conveniences; deployed custody transitions live in `subledger` and `twap-program`. |
+| `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
-The deterministic `residual-distributor` genesis path is tested with a 10% insurance / 10% backing /
-80% cumulative funding-payer split. Funding-payer points are per portfolio:
-`funding_long_paid_atoms_total + funding_short_paid_atoms_total`, with no age multiplier.
+The workspace pins `percolator-prog` to commit
+`7eea209b23e4ebbebcf834130918253c54599402` and its engine layout dependency to
+`143e68c4917ed0400a27b952f036a5677047cd84`.
 
-## Lifecycle
+That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
+active. Both governance wrappers therefore reject nonzero backing policies but preserve exact-zero
+updates to clear predecessor state; ordinary trade fees remain configurable. Backing fees can be
+re-enabled only after batch-safe accounting is merged on top of this exact security line.
 
-1. **Deposit** through the subledger (the insurance authority) into market-0 insurance; it signs the
-   Percolator top-up and records `owner, principal, start_slot` (last-write-time, so topping up resets
-   the vote clock). Stake is held as shares.
-2. **Vote** — `genesis-vote` reads the attribution. Weight = `floor(log2(hold_time)) × principal`,
-   resolved at vote time. Backing a different proposal requires retracting first.
-   Quorum = `total_voted_principal × 2 > outstanding`; winner = `support_weight × 2 > total_cast_weight`.
-3. **Exit / veto (any time)** — redeem shares through the subledger for principal + surplus (pro-rata
-   under loss). A live voter must **retract first**; the vote-lock blocks any withdraw not preceded by
-   a retract, so a voter exits via a single atomic `[retract, withdraw]` transaction. Exiting shrinks
-   `outstanding`, recomputing quorum against whoever stays — *those who stay decide*. This makes leaving
-   the depositor's veto on a capture attempt.
-4. **Trigger (permissionless)** — the first proposal to clear quorum + weighted majority is sealed into
-   `distribution` by CPI. No mint.
-5. **Claim / burn** — winning recipients claim their entry from the fixed COIN vault; unclaimed is burned.
-6. **Handoff (post-mint)** — control rotates `DAO → Squads (1-week timelock) → twap-program → Percolator`;
-   the insurance authority moves from the principal-safe subledger to the surplus-only twap-program.
-7. **Buy/burn (permissionless, repeating)** — each round, anyone `place_bid`s (escrow COIN, offer it for
-   USD at a limit rate; a flat anti-spam fee is burned per bid). Bids can't be yanked to spoof a pending
-   execute — early they can only be evicted by a strictly-better bid. When the round's slots expire,
-   anyone calls `execute`: it pulls the burn-share (DAO-set, default 80%) of the current surplus, ratchets
-   the retained share into the protected principal counter (so it compounds in insurance), clears the book
-   at one marginal price (every winner pays the same; better bidders give less COIN, surplus refunded),
-   and burns the bought COIN (or sends it to a DAO sink). Winners then `claim` their USD.
+## Genesis
 
-## Authority chain & the 1-week timelock
+1. **Create the market.** Anyone initializes a market with the governance-bound controller PDA as
+   `marketauth`. Before user funding, Squads grants asset-0 custody to the canonical genesis pool;
+   the only governance-held asset role is the oracle role.
+2. **Deposit window.** Deposits are accepted only during
+   `[bootstrap_start, bootstrap_start + deposit_window)`. The default window is about one week and
+   cannot extend past bootstrap end. Topping up resets that position's age.
+3. **Bootstrap vote.** The default bootstrap delay is six 30-day months and is configurable in the
+   pool/config PDA. A voter must retract before changing proposals or withdrawing. Quorum and the
+   winning weighted majority are computed from live, unwithdrawn principal. A proposal is not
+   votable until its declared entry capacity is full, so no creator action remains after voting.
+   New backing closes at the bootstrap deadline; retraction remains available so the lock cannot
+   trap principal while the permissionless trigger is pending or after it executes.
+4. **Seal 100% of supply.** After the deadline, anyone can trigger a qualifying proposal. The
+   winning allocation is immutable; recipients claim from the fixed vault and expired claims burn.
+5. **Return deposits.** The intended genesis flow keeps custody in the owner-bound pool while
+   initial risk takers redeem up to their loss-adjusted principal. If TWAP already holds custody,
+   a signing owner can use the fixed atomic live path to return the roles and fully redeem their own
+   remaining position without DAO cooperation. After resolution, returning the roles is
+   permissionless while the bound market is empty and the pool still has owner principal. Sealed
+   votes are no longer governance authority. If an owner disappears after sealing, any cranker can retire
+   only that owner's full principal- or with-surplus-policy position into a clean token account owned
+   by the depositor; the instruction has no caller-selected amount or beneficiary, so one atom cannot
+   veto terminal market closure.
+   Standalone with-surplus pools return their live share value pro rata and cannot enter TWAP
+   custody while any owner claim remains. After every owner exits, the same handoff may route only
+   later protocol fees or unowned rounding reserve through fixed terminal recovery.
+6. **Kickstart.** Futarchy can use retained surplus to initialize insurance/backing for approved
+   markets and set fee splits. Inbound-only donation instructions fund Percolator without giving
+   governance an insurance key and reject unless every asset-0 insurance withdrawal/rotation role is
+   already the constrained controller.
+7. **Handoff.** If capital remains for continuous operation, Squads authorizes the fixed
+   principal-pool-to-TWAP transition. The transition records the exact pool identity and live
+   principal in the TWAP floor. An atomic live owner exit creates a one-use permit for any cranker to
+   re-handoff that same pool to that same config; the crank replaces only the exited principal
+   component. Retained insurance stays protected and exited principal no longer strands fee surplus.
+   Ordinary deposits and partial exits remain closed while TWAP holds custody.
 
-`DAO → Squads (1/1, 1-week timelock) → {subledger | twap-program} → Percolator`.
+## Continuous Rewards
 
-A program-created [Squads v4](https://squads.so) 1/1 multisig holds the market's asset-0 `asset_admin`
-and is the **sole key-rotator**. At genesis it grants the insurance operator role to the subledger; post-mint
-it rotates it to the twap-program — both via `UpdateAssetAuthority{asset_index:0}`, and Percolator requires the
-incoming key to co-sign (the powerless `accept_operator` hooks). Every power-expanding rotation passes through
-the one-week timelock, in the clear, with the old constrained authority still live — which is the user-exit
-backstop: it bounds the blast radius of *any* bug in genesis-vote/distribution/chain to "users get a one-week,
-pre-announced exit window."
+TWAP rounds are externally cranked. Each round pulls only asset-0's live insurance surplus, retains
+the configured insurance share by ratcheting the floor upward, and buys COIN at one marginal
+clearing price. Whole-atom fills reconcile the USD payout to the integer COIN actually bought; every
+executed pair must still satisfy both the bidder's limit and the DAO reserve. Reconciliation releases
+fully refunded nominal allocations to lower executable bids in the same round and maximizes COIN at
+each unchanged USD payment even when no aggregate remainder remains. A bounded final-price replay also
+restores skipped priority bids when they buy more COIN for the same spend while preserving the marginal
+lot. Ordinary integer rounding remains in holding for a later round. A bid that cannot transact a
+whole-atom pair cannot reserve nominal budget or set the marginal price. If every eligible bid is
+integer-infeasible, the aged book settles for permissionless refunds without spending collateral.
+Insurance deposited for other assets is never counted toward that surplus. Bought COIN can be split
+between burn and a canonical dynamic reward vault. The collateral savings reserve must be distinct
+from the auction holding; an aliased configuration fails atomically before either surplus pull, so
+savings cannot enlarge the buy budget.
 
-## Market allow-list (residual-distributor)
+The full chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
+vault and burns 50%. At day 45 the accumulated reward vault distributes:
 
-The portfolio-flow cohorts award points from Percolator portfolio counters that **anyone who controls a
-market's oracle can manufacture** (stand up an auth-mark market, self-trade delta-neutral, push funding/marks).
-So a portfolio counts only if its market is on an orchestrator-vetted allow-list of trusted-Pyth markets
-(`market_group` + up to 9 extras, bound at `init`). Cohort 2 is LP residual received; cohort 3 is trader
-residual loss net of spent principal; cohort 4 is the cumulative funding-payer counter:
-`funding_long_paid_atoms_total + funding_short_paid_atoms_total`, with no age multiplier. Receiver-side funding counters do not earn points.
-**Setup:** the creator holds the markets' authority key locally, stands up and vets N Pyth markets, then transfers
-that key to the PDA that rotates it to the DAO via the same 1-week Squads timelock — so listed markets can never
-be repointed at an attacker oracle once points accrue. The allow-list bounds *who can mint points at all*, not
-wash-farming among already-trusted markets; see `residual-distributor/DESIGN.md` and `sim/` for that analysis.
+- 10% to selected insurance principal points;
+- 10% to selected backing principal points;
+- 80% to cumulative funding-payer points, summing long-paid and short-paid counters per portfolio.
 
-## Build & test
+Funding points have no age multiplier and receiver-side funding does not earn points. A portfolio
+can earn from both its long-paid and short-paid totals. Insurance/backing reward points use live
+base-unit principal times `floor(log2(tenure))`. Reward finalization and claims do not modify the
+underlying principal, shares, or Percolator balances. A permissionless finalized-genesis return
+preserves only the remaining capital through its authenticated return slot, whether crystallized
+before or after cleanup; ordinary owner exits still forfeit rewards.
+Permissionless portfolio-flow claims pay only
+to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
+cannot force rewards into an account it can spend. The same full-chain test then returns TWAP
+custody and proves both the insurance and segregated backing depositors can redeem without losing
+their claimed COIN.
+
+Ordinary point growth closes at the reward epoch's inclusive end slot. During the finalize window,
+any cranker may only reduce a trader stake whose previously crystallized loss has since been spent;
+the shared claim cap makes this refresh monotonic, so post-epoch flow cannot mint points or dilute
+the frozen denominator.
+
+Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
+six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads
+transaction under the network packet limit. Insurance and backing allocations must name distinct
+Subledger pools in both genesis and continuous epochs, so one position cannot enter both capital cohorts.
+The DAO may configure future epochs but cannot mutate a live epoch,
+redirect a user's claim, or sweep principal. After a sink epoch freezes, later rounds burn that stale
+sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
+also falls back to burn instead of stalling settlement. The configured COIN sink must remain external
+to the book's COIN escrow, collateral settlement escrow, and holding account, including when COIN is
+also the collateral mint.
+
+Auction placement requires the bidder's canonical initialized COIN and collateral ATAs. Closed ATAs
+are permissionlessly recreatable, and an already-frozen destination is rejected before any bid fee or
+escrow transfer can move. If a freezable collateral issuer freezes the canonical ATA only after
+placement, claims, eviction refunds, and owner cancellations may instead use a clean account for the
+same mint owned solely by the recorded bidder. Delegates and close authorities are rejected at payout,
+so a cranker can recover liveness but cannot change the beneficiary or expose the refund to a spender.
+
+## Authority Model
+
+Governance and custody are deliberately different chains:
+
+```text
+DAO -> Squads (DAO-only member, minimum 1-week timelock) -> market-controller PDA -> Percolator marketauth
+
+market-controller PDA -> owner-bound genesis pool -> config-bound TWAP PDA
+                           asset custody             asset custody
+```
+
+Squads can make the controller sign only the exact pinned allow-list. The allow-list includes market
+and asset lifecycle, approved oracle configuration, bounded fee policy, resolution, and empty-slab
+cleanup. Raw `CloseSlab` is not proxied: the dedicated cleanup forwards its mandatory controller
+destinations atomically. The proxy excludes deposits, withdrawals, swaps, portfolio operations,
+authority rotation, and backing-bucket movement. External backing providers retain their own
+asset-local withdrawal path; governance only sets the fee split that sends the configured share
+into insurance. Secondary activation may independently select backing and oracle providers, but its
+insurance authority and operator must be one key so deposit and withdrawal custody cannot diverge.
+
+Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
+cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
+fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Percolator rejects live or
+nonempty portfolios and sends the closed account's lamports only into the bound market slab. If a
+reward-relevant counter is nonzero, the legacy cleanup shape rejects and the extended shape first
+archives the authenticated counters; both CPIs are atomic. Reward registration and crystallization
+sum that canonical archive with the current live generation. Registration binds the live portfolio
+to its real Percolator market and rejects a nonzero immutable maintenance fee; capital cohorts are
+unaffected. Terminal `CloseSlab` also creates a permanent marker keyed by Percolator program and slab;
+new portfolio-flow stakes reject that retired key, and existing stakes ignore any public reinitialization
+under it. The historical public-maintenance fallback remains claim-only for an already frozen
+stake, even if a third party donates lamports to the closed address. The wrapper accepts no
+amount, token account, or destination and exposes no generic portfolio authority.
+
+An absent insurance authority or backing provider cannot block secondary-asset retirement with one
+remaining atom. After Squads shuts the asset down and Percolator's delay and empty-state checks pass,
+anyone can return its complete asset-local insurance and each backing domain through the controller.
+The controller derives the insurance amount from the pinned slab and accepts no caller-selected
+amount. Each destination must be a clean token account owned solely by the recorded provider, not a
+DAO-selected beneficiary; this lets a cranker bypass a permanently frozen ATA without redirecting
+funds. The temporary receiving account is likewise replaceable but must be a clean same-mint account
+owned solely by the controller PDA. Backing earnings are paid first and the controller forwards
+exactly the value attributed to that provider. It closes the temporary controller account only when no unrelated balance
+remains. Protocol insurance or token dust already held there stays in controller custody for the
+fixed terminal reclaim. Fee insurance whose recorded authority and operator are both the controller
+uses the same destination. Its fixed cleanup first rotates only the local operator to an
+asset-scoped instruction-only PDA, which makes Percolator itself enforce the delayed shutdown and
+empty-asset checks before retaining the complete balance in canonical controller custody. While
+live, no return can bypass Percolator's delayed secondary-asset shutdown override.
+
+Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
+run. The resolved companions require the whole market to be resolved and empty, derive every amount
+from the slab, and use the controller's existing secondary `asset_admin` role to rotate only the
+relevant insurance or backing role. They then return all value to a clean account owned solely by
+the outgoing recorded provider, but only up to the exact amount attributed by that cleanup. The caller and DAO
+still choose neither an amount nor a recipient, and any failed rotation, withdrawal, forwarding, or
+close rolls the entire operation back.
+
+If the slab instead records the controller itself as insurance authority, including for asset 0,
+the resolved companion withdraws only the exact asset-local amount into the canonical controller
+account and leaves it there. It cannot select another destination. The balance reaches Squads only
+through the existing governance-signed terminal reclaim after Percolator accepts `CloseSlab`.
+
+The same terminal custody applies to TWAP-retained insurance after all genesis owners exit. The
+subledger program first attests that its bound principal pool has no outstanding principal or
+shares; only then can a permissionless TWAP crank route the exact resolved asset-0 remainder through
+an empty clean TWAP-owned transit into a clean controller-owned transit. Replaceable transits prevent
+a permanently frozen canonical ATA from blocking cleanup, while exact ownership and the empty source
+prevent redirection or an unrelated TWAP balance sweep. Once
+the slab's asset-0 insurance is zero, a public role-only return to the same pool is safe and lets its
+existing fixed wrapper complete asset-0 backing cleanup without a surviving DAO.
+
+Asset 0 has no per-asset shutdown override. After whole-market resolution, its separate fixed path
+reads both domains' complete principal and earnings from the pinned slab, atomically transfers the
+backing role to the controller, and returns the full value to a clean account owned solely by the
+outgoing provider. Before genesis custody moves, the controller is the constrained asset admin; after TWAP,
+custody first returns to the canonical pool, whose only backing action is invoking this same fixed
+cleanup. A failed domain CPI rolls back every earlier transfer and the authority change.
+
+Permissionless market donation transfers lifecycle control, not funded creator capital. If the
+outgoing raw market authority still owns nonzero asset-0 insurance, donation rejects atomically; the
+creator withdraws first, then the unchanged permissionless handoff migrates both empty insurance
+roles to the controller. The recorded backing provider remains unchanged. A handoff that preserves
+a nonzero backing bucket is rejected unless `asset_admin` migrates to the controller. The only
+non-migrating exception requires the existing handoff to include canonical current-layout Subledger or TWAP state
+bound to this exact market and Percolator program; both insurance roles must name the same constrained
+PDA. An arbitrary delegated admin is rejected even while empty because it could fund after handoff.
+The insurance authority and operator must also match before handoff and belong to the outgoing
+authority, controller, or attested Subledger/TWAP custodian. An arbitrary equal-role third party could
+otherwise skim fee insurance generated by later public trades despite risking no insurance capital.
+Thus public stale resolution cannot make terminal recovery depend on a delegated signer.
+If the provider disappears after a valid handoff, the controller's amountless resolved return rotates
+only that value role and pays the complete asset-0 balance to a clean token account owned solely by the provider.
+Genesis custody cannot move to a pool until those external insurance roles hold no balance. The
+creator can also withdraw directly through Percolator, then the unchanged grant path installs the
+canonical owner-bound pool; governance cannot convert the external balance into its own or
+pool-controlled insurance. Percolator's market-authority update does not migrate secondary
+`asset_admin` roles, so the controller rejects donation while any secondary slot is active,
+drain-only, or recovering. Once those slots are empty and retired, the same permissionless handoff
+succeeds only if direct permissionless asset append is disabled. The controller proxy cannot enable
+that mode because a direct activator becomes an external `asset_admin`. New multi-asset deployments
+use permissionless controller initialization followed by governance-approved asset activation. Both
+insurance roles stay on the constrained controller, while external backing and oracle providers remain
+independently selectable. This prevents an unfunded raw key from collecting user-paid trade fees.
+The same constrained proxy can restart an empty recovering asset through Percolator's value-neutral
+restart instruction only while both insurance roles remain on the controller; it cannot choose a
+recipient or move insurance/backing while doing so. A deployed predecessor asset that still names an
+external insurance key can finish recovery and retire, but cannot reopen and credit that zero-capital
+key with fees from a new lifecycle.
+Here, empty means every Percolator position, funding, loss, spent-budget, backing, and reservation
+ledger is zero, not only zero OI. A previously traded slot with residual K/F accumulators cannot use
+restart and must complete terminal recovery before governance initializes a fresh controller market.
+
+At genesis-pool grant, the controller moves the oracle role to Squads and then atomically moves both
+insurance roles and `asset_admin` to the pool. Squads may self-rotate the oracle role to an approved
+builder, but it cannot use that role to move insurance or backing. Post-genesis, TWAP receives both
+insurance roles and `asset_admin`; its exposed Percolator CPIs are fixed-purpose and accept no
+arbitrary withdrawal destination. Governance therefore has no arbitrary resolved-mode insurance
+withdrawal; external funds use the provider-bound fixed cleanup, while controller-owned protocol
+insurance can move only to a clean controller-owned account for terminal reclaim.
+
+## Build And Test
 
 ```bash
-# build the deployable BPF programs (each self-contained)
-PERCOLATOR_MANIFEST="$(cargo metadata --format-version=1 | jq -r '.packages[] | select(.name=="percolator-prog") | .manifest_path')"
-CARGO_TARGET_DIR="$PWD/target/percolator-prog-c080" cargo build-sbf \
+# Build the exact pinned Percolator binary used by LiteSVM.
+PERCOLATOR_MANIFEST="$(cargo metadata --format-version=1 | jq -r \
+  '.packages[] | select(.name=="percolator-prog") | .manifest_path')"
+CARGO_TARGET_DIR="$PWD/target/percolator-prog-pinned" cargo build-sbf \
   --manifest-path "$PERCOLATOR_MANIFEST" \
   --sbf-out-dir "$PWD/target/deploy" \
   --no-default-features
+
+cargo build-sbf --manifest-path market-controller/Cargo.toml
 cargo build-sbf --manifest-path subledger/Cargo.toml
 cargo build-sbf --manifest-path distribution/Cargo.toml
 cargo build-sbf --manifest-path genesis-vote/Cargo.toml
 cargo build-sbf --manifest-path residual-distributor/Cargo.toml
 cargo build-sbf --manifest-path twap-program/Cargo.toml
 
-# tests (RUST_MIN_STACK is needed for the deep nested-CPI e2e)
-RUST_MIN_STACK=8388608 cargo test --manifest-path subledger/Cargo.toml
-RUST_MIN_STACK=8388608 cargo test --manifest-path genesis-vote/Cargo.toml
-cargo test --manifest-path distribution/Cargo.toml
-RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml
+cargo test --workspace
 
-# whole lifecycle across all six real binaries in one litesvm instance —
-#   deposit -> vote -> distribute -> claim -> DAO/Squads handoff -> buy/burn auction:
+# Full real-binary genesis, long/short funding, handoff, three TWAP rounds,
+# 50/50 buyback burn/reward routing, and cumulative 10/10/80 claims.
 RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
-    --test chain e2e_full_genesis_to_buy_burn
+  --test chain e2e_market_genesis_traders_residual_decider_then_handoff_twap \
+  -- --exact --nocapture
 ```
 
-Tests load the **real** binaries (the Cargo-pinned Percolator SBF at `target/deploy/percolator_prog.so`,
-real Squads v4 at `program/tests/fixtures/squads_v4.so`, plus the locally-built crates) — CPIs run against
-the actual programs, not mocks. The e2e needs those `.so` files prebuilt.
+LiteSVM loads the Cargo-pinned Percolator SBF, real Squads v4 fixture, and locally built program
+binaries. The end-to-end assertions exercise real CPIs rather than mocks. Oracle pushes and other
+permissionless cranks are triggered externally in the test, matching the intended deployment.
 
 ## License
 
-[Apache License 2.0](LICENSE). Provided "as is", educational use only — see the disclaimer above.
+[Apache License 2.0](LICENSE). Provided as is for educational use.

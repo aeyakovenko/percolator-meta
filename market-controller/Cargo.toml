@@ -1,5 +1,5 @@
 [package]
-name = "twap-program"
+name = "market-controller-program"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -7,7 +7,7 @@ publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "twap_program"
+name = "market_controller_program"
 path = "src/lib.rs"
 
 [features]
@@ -20,9 +20,3 @@ spl-token = { workspace = true }
 
 [dev-dependencies]
 solana-sdk = { workspace = true }
-litesvm = { workspace = true }
-spl-token = { version = "4.0", features = ["no-entrypoint"] }
-percolator-prog = { workspace = true }
-market-controller-program = { path = "../market-controller", features = ["no-entrypoint"] }
-percolator = { workspace = true }
-solana-program-runtime = "1.18"

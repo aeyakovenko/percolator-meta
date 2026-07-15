@@ -1,6 +1,6 @@
 //! Genesis COIN distribution by on-chain proposal list + permissionless claim.
 //!
-//! A proposal is a single on-chain account holding up to ~10k
+//! A proposal is a single on-chain account grown in append-sized increments to hold up to ~10k
 //! `(recipient pubkey, amount)` entries (40 bytes each → ~400KB). After a winner
 //! is sealed by the configured `authority`, recipients **claim** their own entry
 //! permissionlessly (pull model, indexed by offset); anything unclaimed when the
@@ -14,10 +14,10 @@
 //!
 //! This program is intentionally **agnostic to *how* the winner is chosen**. The
 //! sole trust hook is `config.authority` — the "decider" — which is bound into the
-//! config-PDA seed (`["dist_config", coin_mint, authority]`, finding P/AA) so each
-//! decider gets its own isolated config + vault. Any signer or program PDA can be a
-//! decider; this program never references `genesis-vote`. Two interchangeable
-//! deciders today:
+//! config-PDA seed (`["dist_config", coin_mint, authority, claim_window]`) so each
+//! decider gets its own isolated config + vault under the exact claim window it
+//! is authorizing. Any signer or program PDA can be a decider; this program never
+//! references `genesis-vote`. Two interchangeable deciders today:
 //!   - **`genesis-vote`** (the default): log-time-weighted insurance quorum vote;
 //!     its config PDA is the `authority` and its `trigger` CPIs `IX_SEAL_WINNER`.
 //!   - **a deterministic points distributor** (e.g. residual-backing points): a
@@ -47,6 +47,7 @@ use solana_program::{
     clock::Clock,
     declare_id,
     entrypoint::ProgramResult,
+    instruction::Instruction,
     program::{invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
@@ -74,15 +75,22 @@ const IX_BURN_UNCLAIMED: u8 = 5;
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
 
-// The config PDA binds the AUTHORITY into its seed (finding P/AA), not just the coin_mint.
-// Otherwise init_config was front-run squattable: an attacker could init the per-mint config FIRST
-// with authority=themselves AND the deployer's already-funded vault (owned by the deterministic
-// PDA) — then seal a self-dealing proposal and CLAIM the entire COIN supply (theft). By folding the
-// authority into the seed, an attacker's authority lands at a DIFFERENT PDA whose vault they must
-// own + fund themselves (impossible without the COIN), so the legit (authority = gv config PDA)
-// config + funded vault are untouchable.
-fn config_seeds<'a>(coin_mint: &'a Pubkey, authority: &'a Pubkey) -> [&'a [u8]; 3] {
-    [b"dist_config", coin_mint.as_ref(), authority.as_ref()]
+// The config PDA binds the AUTHORITY and claim window into its seed (finding P/AA + first-writer
+// policy bind), not just the coin_mint. The authority seed prevents an attacker from initializing
+// the per-mint config over the deployer's already-funded vault with authority=themselves. The
+// claim-window seed prevents the same authority/mint from being first-written with a hostile
+// burn/claim deadline before the intended setup lands.
+fn config_seeds<'a>(
+    coin_mint: &'a Pubkey,
+    authority: &'a Pubkey,
+    claim_window_slots: &'a [u8; 8],
+) -> [&'a [u8]; 4] {
+    [
+        b"dist_config",
+        coin_mint.as_ref(),
+        authority.as_ref(),
+        claim_window_slots,
+    ]
 }
 
 fn proposal_seeds<'a>(config: &'a Pubkey, id: &'a [u8; 8]) -> [&'a [u8]; 3] {
@@ -136,6 +144,77 @@ impl Config {
 
     fn is_sealed(&self) -> bool {
         self.sealed_proposal != Pubkey::default()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ConfigSeedVersion {
+    Authority,
+    ClaimWindow,
+}
+
+fn config_seed_version(
+    program_id: &Pubkey,
+    config_key: &Pubkey,
+    config: &Config,
+) -> Result<ConfigSeedVersion, ProgramError> {
+    let claim_window_bytes = config.claim_window_slots.to_le_bytes();
+    let (window_key, window_bump) = Pubkey::find_program_address(
+        &config_seeds(
+            &config.coin_mint,
+            &config.authority,
+            &claim_window_bytes,
+        ),
+        program_id,
+    );
+    if *config_key == window_key && config.bump == window_bump {
+        return Ok(ConfigSeedVersion::ClaimWindow);
+    }
+    let (authority_key, authority_bump) = Pubkey::find_program_address(
+        &[
+            b"dist_config",
+            config.coin_mint.as_ref(),
+            config.authority.as_ref(),
+        ],
+        program_id,
+    );
+    if *config_key == authority_key && config.bump == authority_bump {
+        return Ok(ConfigSeedVersion::Authority);
+    }
+    // Never revive the older mint-only signer. That schema let a first writer bind
+    // a pre-funded vault to an attacker authority (fixed by 418ca15).
+    Err(ProgramError::InvalidSeeds)
+}
+
+fn invoke_config_signed<'a>(
+    program_id: &Pubkey,
+    config_key: &Pubkey,
+    config: &Config,
+    instruction: &Instruction,
+    account_infos: &[AccountInfo<'a>],
+) -> ProgramResult {
+    let bump = [config.bump];
+    match config_seed_version(program_id, config_key, config)? {
+        ConfigSeedVersion::Authority => {
+            let seeds: [&[u8]; 4] = [
+                b"dist_config",
+                config.coin_mint.as_ref(),
+                config.authority.as_ref(),
+                &bump,
+            ];
+            invoke_signed(instruction, account_infos, &[&seeds])
+        }
+        ConfigSeedVersion::ClaimWindow => {
+            let claim_window_bytes = config.claim_window_slots.to_le_bytes();
+            let seeds: [&[u8]; 5] = [
+                b"dist_config",
+                config.coin_mint.as_ref(),
+                config.authority.as_ref(),
+                claim_window_bytes.as_ref(),
+                &bump,
+            ];
+            invoke_signed(instruction, account_infos, &[&seeds])
+        }
     }
 }
 
@@ -241,6 +320,24 @@ fn token_balance(account: &AccountInfo, expected_mint: &Pubkey) -> Result<u64, P
     Ok(st.amount)
 }
 
+fn validate_recipient_token_destination(
+    account: &AccountInfo,
+    expected_owner: &Pubkey,
+    expected_mint: &Pubkey,
+) -> ProgramResult {
+    if account.owner != &spl_token::ID {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let token = spl_token::state::Account::unpack(&account.try_borrow_data()?)?;
+    if token.state != spl_token::state::AccountState::Initialized
+        || token.owner != *expected_owner
+        || token.mint != *expected_mint
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 // Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
 // System `create_account` aborts with AccountAlreadyInUse on ANY pre-existing lamports, so a 1-
 // lamport transfer to the address (no signature needed) would PERMANENTLY brick init — the lamports
@@ -302,8 +399,11 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let (expected_config, bump) =
-        Pubkey::find_program_address(&config_seeds(coin_mint.key, authority.key), program_id);
+    let claim_window_bytes = claim_window_slots.to_le_bytes();
+    let (expected_config, bump) = Pubkey::find_program_address(
+        &config_seeds(coin_mint.key, authority.key, &claim_window_bytes),
+        program_id,
+    );
     if *config_account.key != expected_config {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -343,7 +443,10 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
         return Err(ProgramError::IllegalOwner);
     }
     let vault_state = spl_token::state::Account::unpack(&vault.try_borrow_data()?)?;
-    if vault_state.mint != *coin_mint.key || vault_state.owner != expected_config {
+    if vault_state.state != spl_token::state::AccountState::Initialized
+        || vault_state.mint != *coin_mint.key
+        || vault_state.owner != expected_config
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     // Solvency invariant: the vault must already hold the full promised supply. The
@@ -356,7 +459,13 @@ fn init_config(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 4] = [b"dist_config", coin_mint.key.as_ref(), authority.key.as_ref(), &bump_arr];
+    let seeds: [&[u8]; 5] = [
+        b"dist_config",
+        coin_mint.key.as_ref(),
+        authority.key.as_ref(),
+        claim_window_bytes.as_ref(),
+        &bump_arr,
+    ];
     create_pda_robust(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
 
     let config = Config {
@@ -411,10 +520,33 @@ fn create_proposal(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8
         return Err(ProgramError::AccountAlreadyInitialized);
     }
 
-    let size = PROPOSAL_HEADER + (capacity as usize) * ENTRY_SIZE;
+    let entries_size = (capacity as usize)
+        .checked_mul(ENTRY_SIZE)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let final_size = PROPOSAL_HEADER
+        .checked_add(entries_size)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Inner instructions may increase account data by at most 10,240 bytes. Fund the PDA for
+    // its declared final capacity now, allocate only its header, and let append_entries grow the
+    // program-owned account in transaction-sized increments.
+    let final_rent = solana_program::rent::Rent::get()?.minimum_balance(final_size);
+    let current = proposal_account.lamports();
+    if current < final_rent {
+        invoke(
+            &system_instruction::transfer(creator.key, proposal_account.key, final_rent - current),
+            &[creator.clone(), proposal_account.clone(), system_program.clone()],
+        )?;
+    }
     let bump_arr = [bump];
     let seeds: [&[u8]; 4] = [b"dist_proposal", config_account.key.as_ref(), &id_bytes, &bump_arr];
-    create_pda_robust(creator, proposal_account, system_program, program_id, &seeds, size)?;
+    create_pda_robust(
+        creator,
+        proposal_account,
+        system_program,
+        program_id,
+        &seeds,
+        PROPOSAL_HEADER,
+    )?;
 
     let header = ProposalHeader {
         config: *config_account.key,
@@ -448,8 +580,7 @@ fn append_entries(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]
         return Err(ProgramError::IllegalOwner);
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    let mut pd = proposal_account.try_borrow_mut_data()?;
-    let mut header = ProposalHeader::deserialize(&pd)?;
+    let mut header = ProposalHeader::deserialize(&proposal_account.try_borrow_data()?)?;
     if header.config != *config_account.key || header.creator != *creator.key {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -457,6 +588,14 @@ fn append_entries(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    let first_entry = header.entry_count;
+    let new_entry_count = first_entry
+        .checked_add(count)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if new_entry_count > header.capacity {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut new_total_amount = header.total_amount;
     for i in 0..count {
         let off = (i as usize) * ENTRY_SIZE;
         let pk = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
@@ -464,21 +603,29 @@ fn append_entries(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]
         if amount == 0 || pk == Pubkey::default() {
             return Err(ProgramError::InvalidInstructionData);
         }
-        if header.entry_count >= header.capacity {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        let eo = entry_offset(header.entry_count);
-        pd[eo..eo + 32].copy_from_slice(pk.as_ref());
-        pd[eo + 32..eo + 40].copy_from_slice(&amount.to_le_bytes());
-        header.entry_count += 1;
-        header.total_amount = header
-            .total_amount
+        new_total_amount = new_total_amount
             .checked_add(amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        if header.total_amount > config.total_supply {
+        if new_total_amount > config.total_supply {
             return Err(ProgramError::InvalidInstructionData);
         }
     }
+
+    let required_len = entry_offset(new_entry_count);
+    if proposal_account.data_len() < required_len {
+        proposal_account.realloc(required_len, false)?;
+    }
+    let mut pd = proposal_account.try_borrow_mut_data()?;
+    for i in 0..count {
+        let off = (i as usize) * ENTRY_SIZE;
+        let pk = Pubkey::new_from_array(data[off..off + 32].try_into().unwrap());
+        let amount = u64::from_le_bytes(data[off + 32..off + 40].try_into().unwrap());
+        let eo = entry_offset(first_entry + i);
+        pd[eo..eo + 32].copy_from_slice(pk.as_ref());
+        pd[eo + 32..eo + 40].copy_from_slice(&amount.to_le_bytes());
+    }
+    header.entry_count = new_entry_count;
+    header.total_amount = new_total_amount;
     header.serialize(&mut pd);
     Ok(())
 }
@@ -581,20 +728,22 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo], mut data: &[u8]) -> Prog
     if amount == 0 {
         return Err(ProgramError::InvalidInstructionData); // already claimed
     }
+    validate_recipient_token_destination(recipient_ata, recipient.key, &config.coin_mint)?;
 
-    let bump_arr = [config.bump];
-    let seeds: [&[u8]; 4] = [b"dist_config", config.coin_mint.as_ref(), config.authority.as_ref(), &bump_arr];
-    invoke_signed(
-        &spl_token::instruction::transfer(
-            token_program.key,
-            vault.key,
-            recipient_ata.key,
-            config_account.key,
-            &[],
-            amount,
-        )?,
+    let transfer_ix = spl_token::instruction::transfer(
+        token_program.key,
+        vault.key,
+        recipient_ata.key,
+        config_account.key,
+        &[],
+        amount,
+    )?;
+    invoke_config_signed(
+        program_id,
+        config_account.key,
+        &config,
+        &transfer_ix,
         &[vault.clone(), recipient_ata.clone(), config_account.clone(), token_program.clone()],
-        &[&seeds],
     )?;
 
     // Zero the entry so it cannot be re-claimed.
@@ -641,19 +790,20 @@ fn burn_unclaimed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 
     let remaining = token_balance(vault, &config.coin_mint)?;
     if remaining > 0 {
-        let bump_arr = [config.bump];
-        let seeds: [&[u8]; 4] = [b"dist_config", config.coin_mint.as_ref(), config.authority.as_ref(), &bump_arr];
-        invoke_signed(
-            &spl_token::instruction::burn(
-                token_program.key,
-                vault.key,
-                coin_mint.key,
-                config_account.key,
-                &[],
-                remaining,
-            )?,
+        let burn_ix = spl_token::instruction::burn(
+            token_program.key,
+            vault.key,
+            coin_mint.key,
+            config_account.key,
+            &[],
+            remaining,
+        )?;
+        invoke_config_signed(
+            program_id,
+            config_account.key,
+            &config,
+            &burn_ix,
             &[vault.clone(), coin_mint.clone(), config_account.clone(), token_program.clone()],
-            &[&seeds],
         )?;
     }
     Ok(())

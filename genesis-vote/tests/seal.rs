@@ -5,6 +5,7 @@
 
 use litesvm::LiteSVM;
 use solana_sdk::{
+    clock::Clock,
     instruction::{AccountMeta, Instruction},
     program_pack::Pack,
     pubkey::Pubkey,
@@ -25,6 +26,53 @@ fn so(name: &str) -> String {
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
+fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[
+            b"dist_config",
+            coin_mint.as_ref(),
+            authority.as_ref(),
+            &claim_window,
+        ],
+        &dist_id(),
+    )
+    .0
+}
+
+const TEST_BOOTSTRAP_DELAY_SLOTS: u64 = 1;
+const TEST_BOOTSTRAP_START_SLOT: u64 = 0;
+
+fn gv_init_data(delay_slots: u64) -> Vec<u8> {
+    gv_init_schedule_data(delay_slots, TEST_BOOTSTRAP_START_SLOT)
+}
+
+fn gv_init_schedule_data(delay_slots: u64, start_slot: u64) -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(&delay_slots.to_le_bytes());
+    data.extend_from_slice(&start_slot.to_le_bytes());
+    data
+}
+
+fn gv_config_for_schedule(
+    coin_mint: &Pubkey,
+    sub_pool: &Pubkey,
+    delay_slots: u64,
+    start_slot: u64,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"gv_config",
+            coin_mint.as_ref(),
+            sub_pool.as_ref(),
+            &delay_slots.to_le_bytes(),
+            &start_slot.to_le_bytes(),
+        ],
+        &gv_id(),
+    )
+    .0
+}
 
 struct Env {
     svm: LiteSVM,
@@ -36,10 +84,15 @@ struct Env {
     vault: Pubkey,
     sub_pid: Pubkey,
     sub_pool: Pubkey,
+    total_supply: u64,
 }
 
 impl Env {
     fn new() -> Self {
+        Self::with_supply(100)
+    }
+
+    fn with_supply(total_supply: u64) -> Self {
         let mut svm = LiteSVM::new();
         svm.add_program_from_file(gv_id(), so("genesis_vote_program")).unwrap();
         svm.add_program_from_file(dist_id(), so("distribution_program")).unwrap();
@@ -53,13 +106,28 @@ impl Env {
         // config PDA now commits to the pool (finding R), so derive it after.
         let sub_pid = Pubkey::new_from_array([7u8; 32]);
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
-        let gv_config =
-            Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
+        let gv_config = gv_config_for_schedule(
+            &coin_mint,
+            &sub_pool,
+            TEST_BOOTSTRAP_DELAY_SLOTS,
+            TEST_BOOTSTRAP_START_SLOT,
+        );
+        let dist_config = dist_config_pda(&coin_mint, &gv_config);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
-        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
+        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, total_supply);
 
-        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool };
+        let mut env = Env {
+            svm,
+            payer,
+            coin_mint,
+            mint_auth,
+            gv_config,
+            dist_config,
+            vault,
+            sub_pid,
+            sub_pool,
+            total_supply,
+        };
         env.set_pool_outstanding(0);
         env.init_distribution();
         env.init_gv().expect("gv init");
@@ -78,12 +146,47 @@ impl Env {
         let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
         let sub_pid = Pubkey::new_from_array([7u8; 32]);
         let sub_pool = Pubkey::new_from_array([8u8; 32]);
-        let gv_config =
-            Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref(), sub_pool.as_ref()], &gv_id()).0;
-        let dist_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), gv_config.as_ref()], &dist_id()).0;
+        let gv_config = gv_config_for_schedule(
+            &coin_mint,
+            &sub_pool,
+            TEST_BOOTSTRAP_DELAY_SLOTS,
+            TEST_BOOTSTRAP_START_SLOT,
+        );
+        let dist_config = dist_config_pda(&coin_mint, &gv_config);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
-        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool };
+        let mut env = Env { svm, payer, coin_mint, mint_auth, gv_config, dist_config, vault, sub_pid, sub_pool, total_supply: 100 };
+        env.set_pool_outstanding(0);
+        env.init_distribution();
+        env
+    }
+
+    fn new_unwired_with_schedule(delay_slots: u64, start_slot: u64) -> Self {
+        let mut svm = LiteSVM::new();
+        svm.add_program_from_file(gv_id(), so("genesis_vote_program")).unwrap();
+        svm.add_program_from_file(dist_id(), so("distribution_program")).unwrap();
+        let payer = Keypair::new();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+        let mint_auth = Keypair::new();
+        let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+        let sub_pid = Pubkey::new_from_array([7u8; 32]);
+        let sub_pool = Pubkey::new_from_array([8u8; 32]);
+        let gv_config = gv_config_for_schedule(&coin_mint, &sub_pool, delay_slots, start_slot);
+        let dist_config = dist_config_pda(&coin_mint, &gv_config);
+        let vault = create_token_account(&mut svm, &payer, &coin_mint, &dist_config);
+        mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, 100);
+        let mut env = Env {
+            svm,
+            payer,
+            coin_mint,
+            mint_auth,
+            gv_config,
+            dist_config,
+            vault,
+            sub_pid,
+            sub_pool,
+            total_supply: 100,
+        };
         env.set_pool_outstanding(0);
         env.init_distribution();
         env
@@ -122,6 +225,12 @@ impl Env {
         self.svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{:?}", e))
     }
 
+    fn set_slot(&mut self, slot: u64) {
+        let mut clock = self.svm.get_sysvar::<Clock>();
+        clock.slot = slot;
+        self.svm.set_sysvar::<Clock>(&clock);
+    }
+
     // distribution InitConfig with authority = the genesis-vote config PDA.
     fn init_distribution(&mut self) {
         // Fixed-supply COIN (Safety §4): revoke the mint authority before init.
@@ -138,8 +247,8 @@ impl Env {
         self.send(&[revoke], &[&auth]).expect("revoke coin mint authority");
 
         let mut data = vec![0u8];
-        data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
-        data.extend_from_slice(&100u64.to_le_bytes()); // total supply
+        data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes()); // claim window
+        data.extend_from_slice(&self.total_supply.to_le_bytes()); // total supply
         let ix = Instruction {
             program_id: dist_id(),
             accounts: vec![
@@ -163,7 +272,8 @@ impl Env {
         let proposal = self.dist_proposal(id);
         let mut data = vec![1u8];
         data.extend_from_slice(&id.to_le_bytes());
-        data.extend_from_slice(&4u32.to_le_bytes()); // capacity
+        let capacity = core::cmp::max(1, entries.len() as u32);
+        data.extend_from_slice(&capacity.to_le_bytes());
         let create = Instruction {
             program_id: dist_id(),
             accounts: vec![
@@ -195,6 +305,14 @@ impl Env {
     }
 
     fn init_gv(&mut self) -> Result<(), String> {
+        let result = self.init_gv_with_delay(TEST_BOOTSTRAP_DELAY_SLOTS);
+        if result.is_ok() {
+            self.set_slot(TEST_BOOTSTRAP_DELAY_SLOTS);
+        }
+        result
+    }
+
+    fn init_gv_with_delay(&mut self, delay_slots: u64) -> Result<(), String> {
         let dummy = Pubkey::new_unique();
         let ix = Instruction {
             program_id: gv_id(),
@@ -209,7 +327,27 @@ impl Env {
                 AccountMeta::new_readonly(dummy, false),         // _reserved
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![0u8],
+            data: gv_init_data(delay_slots),
+        };
+        self.send(&[ix], &[])
+    }
+
+    fn init_gv_with_schedule(&mut self, delay_slots: u64, start_slot: u64) -> Result<(), String> {
+        let dummy = Pubkey::new_unique();
+        let ix = Instruction {
+            program_id: gv_id(),
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new(self.gv_config, false),
+                AccountMeta::new_readonly(dist_id(), false),
+                AccountMeta::new_readonly(self.dist_config, false),
+                AccountMeta::new_readonly(self.sub_pid, false),
+                AccountMeta::new_readonly(self.sub_pool, false),
+                AccountMeta::new_readonly(dummy, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: gv_init_schedule_data(delay_slots, start_slot),
         };
         self.send(&[ix], &[])
     }
@@ -232,7 +370,7 @@ impl Env {
                 AccountMeta::new_readonly(dummy, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![0u8],
+            data: gv_init_data(TEST_BOOTSTRAP_DELAY_SLOTS),
         };
         self.send(&[ix], &[])
     }
@@ -255,7 +393,7 @@ impl Env {
                 AccountMeta::new_readonly(dummy, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
-            data: vec![0u8],
+            data: gv_init_data(TEST_BOOTSTRAP_DELAY_SLOTS),
         };
         self.send(&[ix], &[])
     }
@@ -445,6 +583,122 @@ fn trigger_seals_the_distribution_cross_program() {
     assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "no double seal");
 }
 
+// MAX-SHAPE HANDOFF PROBE: a distribution that reaches the advertised 10,000-entry
+// shape must remain registerable and sealable through the permissionless genesis CPI.
+#[test]
+fn trigger_seals_a_full_max_capacity_distribution() {
+    const ENTRIES: u32 = 10_000;
+    const CHUNK: usize = 24;
+    let mut env = Env::with_supply(ENTRIES as u64);
+    let proposal = env.dist_proposal(99);
+
+    let mut create_data = vec![1u8];
+    create_data.extend_from_slice(&99u64.to_le_bytes());
+    create_data.extend_from_slice(&ENTRIES.to_le_bytes());
+    let create = Instruction {
+        program_id: dist_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.dist_config, false),
+            AccountMeta::new(proposal, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: create_data,
+    };
+    env.send(&[create], &[]).expect("create maximum proposal");
+
+    let recipient = Pubkey::new_unique();
+    let mut appended = 0u32;
+    while appended < ENTRIES {
+        let count = core::cmp::min(CHUNK, (ENTRIES - appended) as usize);
+        let mut append_data = vec![2u8];
+        append_data.extend_from_slice(&(count as u32).to_le_bytes());
+        for _ in 0..count {
+            append_data.extend_from_slice(recipient.as_ref());
+            append_data.extend_from_slice(&1u64.to_le_bytes());
+        }
+        let append = Instruction {
+            program_id: dist_id(),
+            accounts: vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new_readonly(env.dist_config, false),
+                AccountMeta::new(proposal, false),
+            ],
+            data: append_data,
+        };
+        env.send(&[append], &[]).expect("append maximum proposal chunk");
+        appended += count as u32;
+    }
+    assert_eq!(env.svm.get_account(&proposal).unwrap().data.len(), 400_104);
+
+    let gv_proposal = env.register(&proposal);
+    env.set_pool_outstanding(1);
+    env.inject_tally(&gv_proposal, 1, 1, 1, 1, 1);
+    env.trigger(&gv_proposal, &proposal).expect("genesis trigger seals maximum proposal");
+    assert_eq!(env.dist_sealed_proposal(), proposal);
+}
+
+#[test]
+fn trigger_rejects_before_configured_bootstrap_delay_elapsed() {
+    let mut env = Env::new_unwired_with_schedule(100, 0);
+    env.init_gv_with_delay(100).expect("gv init with configured bootstrap delay");
+
+    let alice = Pubkey::new_unique();
+    let dist_proposal = env.create_dist_proposal(1, &[(alice, 100)]);
+    let gv_proposal = env.register(&dist_proposal);
+    env.set_pool_outstanding(10);
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
+
+    env.set_slot(99);
+    assert!(
+        env.trigger(&gv_proposal, &dist_proposal).is_err(),
+        "quorum and majority must not seal before the bootstrap delay"
+    );
+    assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "not sealed before bootstrap end");
+
+    env.set_slot(100);
+    env.trigger(&gv_proposal, &dist_proposal).expect("trigger after bootstrap delay");
+    assert_eq!(env.dist_sealed_proposal(), dist_proposal, "sealed once bootstrap delay elapsed");
+}
+
+#[test]
+fn init_config_schedule_cannot_be_first_writer_shortened_or_started_early() {
+    let intended_delay = 100u64;
+    let intended_start = 1_000u64;
+    let mut env = Env::new_unwired_with_schedule(intended_delay, intended_start);
+
+    assert!(
+        env.init_gv_with_schedule(1, intended_start).is_err(),
+        "a short-delay first writer must land outside the intended schedule-bound config"
+    );
+    assert!(
+        env.init_gv_with_schedule(intended_delay, 0).is_err(),
+        "an early-start first writer must land outside the intended schedule-bound config"
+    );
+    assert!(
+        env.svm.get_account(&env.gv_config).is_none(),
+        "the intended config PDA remains uninitialized after wrong-schedule attempts"
+    );
+    env.init_gv_with_schedule(intended_delay, intended_start)
+        .expect("the intended schedule initializes the intended config PDA");
+
+    let recipient = Pubkey::new_unique();
+    let dist_proposal = env.create_dist_proposal(1, &[(recipient, 100)]);
+    let gv_proposal = env.register(&dist_proposal);
+    env.set_pool_outstanding(10);
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
+
+    env.set_slot(intended_start + intended_delay - 1);
+    assert!(
+        env.trigger(&gv_proposal, &dist_proposal).is_err(),
+        "trigger must wait until the explicit bootstrap start plus delay"
+    );
+    env.set_slot(intended_start + intended_delay);
+    env.trigger(&gv_proposal, &dist_proposal)
+        .expect("trigger succeeds at the explicit bootstrap end");
+    assert_eq!(env.dist_sealed_proposal(), dist_proposal, "the scheduled genesis seals");
+}
+
 // SUBSTITUTED-POOL QUORUM COLLAPSE (no-capital / minority capture via account substitution). The trigger
 // re-reads the LIVE pool outstanding as the quorum denominator (the deliberate fix vs a stale cache). That
 // design is only safe if the pool ACCOUNT is bound: if the trigger trusted whatever pool the cranker
@@ -610,16 +864,9 @@ fn register_rejects_an_empty_proposal() {
     env.register(&full);
 }
 
-// BAIT-AND-SWITCH (post-registration distribution tampering, LOF on voters): voters back a gv
-// proposal whose distribution they have read. `register` freezes a (entry_count, total_amount)
-// SNAPSHOT, and `trigger` (lib.rs ~724) refuses to seal unless the live distribution still matches it.
-// The danger this blocks: the distribution-side append-freeze only kicks in at SEAL — but the seal
-// happens INSIDE trigger, so between register and trigger the distribution proposal is NOT yet sealed
-// and its creator CAN still append. A creator could thus register an honest "60 to alice, 40 burned",
-// collect a quorum+majority on it, then append a self-dealing "40 to mallory" into the burn-bound
-// headroom (60+40 == total_supply, so the distribution's own supply cap never fires) and trigger to
-// privatize the 40 voters expected destroyed. The gv snapshot check is the ONLY guard over this exact
-// window; if it were absent the inflated distribution would seal. Confirm trigger refuses the tamper.
+// Defense in depth: current registrations require a full declared shape, so no
+// public append can change the proposal afterward. The trigger snapshot still
+// rejects a corrupted or historical proposal whose header changes after registration.
 #[test]
 fn trigger_refuses_a_distribution_inflated_after_registration() {
     let mut env = Env::new();
@@ -630,24 +877,10 @@ fn trigger_refuses_a_distribution_inflated_after_registration() {
     env.set_pool_outstanding(10);
     env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10); // quorum + majority on the HONEST proposal
 
-    // ATTACK: after voters backed it, the creator appends a self-dealing 40 into the headroom. This
-    // append SUCCEEDS at the distribution layer (not sealed yet; 60+40 == supply, so the cap passes)
-    // — only the gv snapshot stands between it and a sealed rug.
-    let mallory = Pubkey::new_unique();
-    let mut ad = vec![2u8]; // IX_APPEND_ENTRIES
-    ad.extend_from_slice(&1u32.to_le_bytes());
-    ad.extend_from_slice(mallory.as_ref());
-    ad.extend_from_slice(&40u64.to_le_bytes());
-    let append = Instruction {
-        program_id: dist_id(),
-        accounts: vec![
-            AccountMeta::new(env.payer.pubkey(), true),
-            AccountMeta::new_readonly(env.dist_config, false),
-            AccountMeta::new(dist_proposal, false),
-        ],
-        data: ad,
-    };
-    env.send(&[append], &[]).expect("the append itself is accepted pre-seal (only the snapshot guards the trigger)");
+    let mut changed = env.svm.get_account(&dist_proposal).unwrap();
+    changed.data[84..88].copy_from_slice(&2u32.to_le_bytes());
+    changed.data[88..96].copy_from_slice(&100u64.to_le_bytes());
+    env.svm.set_account(dist_proposal, changed).unwrap();
 
     // The trigger must now REFUSE: the live (entry_count=2, total=100) no longer matches the frozen
     // snapshot (1, 60). The voters' approved distribution can never be silently inflated.
@@ -658,14 +891,8 @@ fn trigger_refuses_a_distribution_inflated_after_registration() {
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "nothing sealed — the rug was blocked, not paid out");
 }
 
-// OFFSET CANARY (anti-bait-and-switch snapshot, sweep): the trigger reads the distribution proposal's
-// entry_count + total_amount at HARDCODED byte offsets (src: pd[84..88], pd[88..96]) and compares them to the
-// snapshot taken at registration — the guard the test above relies on. Those offsets were NOT canaried against
-// the distribution's real ProposalHeader layout (gv offsets.rs pins only the subledger offsets + program id). A
-// distribution ProposalHeader reorder would silently drift them: the snapshot would read a non-changing field
-// and ALWAYS match, so an inflated distribution would slip past voters' approval (LOF/governance hijack) with the
-// behavioral test passing unpredictably. Pin the offsets E2E against the REAL distribution binary: build a
-// proposal with known entries and assert the bytes at 84/88 decode to the real entry_count/total_amount.
+// OFFSET CANARY: registration reads capacity and trigger reads entry_count plus
+// total_amount from the real distribution proposal layout.
 #[test]
 fn gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout() {
     let mut env = Env::new();
@@ -676,10 +903,27 @@ fn gv_distribution_snapshot_offsets_match_the_real_distribution_proposal_layout(
     ];
     let proposal = env.create_dist_proposal(7, &entries); // 3 entries, total 60, via the real distribution .so
     let data = env.svm.get_account(&proposal).unwrap().data;
-    let entry_count = u32::from_le_bytes(data[84..88].try_into().unwrap());
-    let total_amount = u64::from_le_bytes(data[88..96].try_into().unwrap());
-    assert_eq!(entry_count, 3, "gv's hardcoded entry_count offset (84) must read the real distribution entry_count");
-    assert_eq!(total_amount, 60, "gv's hardcoded total_amount offset (88) must read the real distribution total_amount");
+    let capacity = u32::from_le_bytes(
+        data[genesis_vote_program::DIST_PROPOSAL_CAPACITY_OFF
+            ..genesis_vote_program::DIST_PROPOSAL_ENTRY_COUNT_OFF]
+            .try_into()
+            .unwrap(),
+    );
+    let entry_count = u32::from_le_bytes(
+        data[genesis_vote_program::DIST_PROPOSAL_ENTRY_COUNT_OFF
+            ..genesis_vote_program::DIST_PROPOSAL_TOTAL_AMOUNT_OFF]
+            .try_into()
+            .unwrap(),
+    );
+    let total_amount = u64::from_le_bytes(
+        data[genesis_vote_program::DIST_PROPOSAL_TOTAL_AMOUNT_OFF
+            ..genesis_vote_program::DIST_PROPOSAL_TOTAL_AMOUNT_OFF + 8]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(capacity, 3);
+    assert_eq!(entry_count, 3);
+    assert_eq!(total_amount, 60);
 }
 
 // COIN-SUPPLY REDIRECT (trigger substitutes a sibling distribution proposal): trigger is permissionless
@@ -735,13 +979,13 @@ fn register_rejects_a_proposal_from_a_foreign_distribution_config() {
     let bad_proposal = Pubkey::new_unique();
 
     // A distribution-program-owned proposal header: disc DISTPRP1, config = FOREIGN, creator = payer
-    // (so the creator-binding passes), capacity 4, entry_count 1, total 100 — fully registerable but
+    // (so the creator-binding passes), capacity 1, entry_count 1, total 100 — fully registerable but
     // for the config.
     let mut data = vec![0u8; 257];
     data[..8].copy_from_slice(b"DISTPRP1");
     data[8..40].copy_from_slice(foreign_config.as_ref());
     data[48..80].copy_from_slice(env.payer.pubkey().as_ref()); // creator
-    data[80..84].copy_from_slice(&4u32.to_le_bytes()); // capacity
+    data[80..84].copy_from_slice(&1u32.to_le_bytes()); // capacity
     data[84..88].copy_from_slice(&1u32.to_le_bytes()); // entry_count (non-empty)
     data[88..96].copy_from_slice(&100u64.to_le_bytes()); // total_amount
     env.svm
@@ -903,9 +1147,10 @@ fn init_config_rejects_pool_not_bound_to_this_config() {
 // attacker front-running the permissionless init_config could bind the genesis to a
 // distribution it does NOT control the seal of — making the trigger's seal CPI fail
 // (authority mismatch) and bricking finalize (DOS), or pointing the genesis at the wrong
-// COIN. The honest distribution's own seed binds its authority (finding P/AA: dist_config =
-// f(coin, authority)), so the ONLY distribution that satisfies `authority == gv PDA` is the
-// real one whose funded vault holds the COIN — which an attacker cannot forge.
+// COIN. The honest distribution's own seed binds its authority and claim window (finding P/AA:
+// dist_config = f(coin, authority, claim_window)), so the ONLY distribution that satisfies
+// `authority == gv PDA` under the configured deadline is the real one whose funded vault holds the
+// COIN — which an attacker cannot forge.
 #[test]
 fn init_config_rejects_a_distribution_not_authority_bound_to_this_config() {
     // (a) right coin, but seal authority is an attacker key (not this gv config PDA).
@@ -955,15 +1200,15 @@ fn init_rejects_a_fake_distribution_program() {
         "gv init must reject a non-canonical distribution program (anti front-run squat)"
     );
     // Boundary check: the SAME bytes under the REAL distribution program are accepted — the reject is
-    // the program-pin, not some unrelated failure. (The real dist_config is authority+coin bound.)
+    // the program-pin, not some unrelated failure. (The real dist_config is authority+coin+window bound.)
     let real = env.dist_config;
     env.init_gv_with_dist(real).expect("the canonical distribution program + bound config is accepted");
 }
 
 // Finding R regression: the gv config PDA now commits to its subledger_pool. init_config
-// is permissionless, and the distribution config it binds is a UNIQUE PDA f(COIN) whose
-// seal authority is pinned to one gv PDA. So a genesis can be wired to exactly ONE pool —
-// the one the real distribution's authority commits to. An attacker cannot front-run
+// is permissionless, and the distribution config it binds is a UNIQUE PDA f(COIN, gv PDA,
+// claim_window) whose seal authority is pinned to one gv PDA. So a genesis can be wired to exactly
+// ONE pool — the one the real distribution's authority commits to. An attacker cannot front-run
 // init_config to bind the genesis to a DIFFERENT (their own) valid pool: doing so makes
 // `expected` = f(COIN, attacker_pool), which no longer matches the distribution's pinned
 // authority, so the binding is refused. (Pre-fix the gv PDA was f(COIN) regardless of the
@@ -975,17 +1220,24 @@ fn gv_config_cannot_be_bound_to_a_substituted_pool() {
 
     // The gv config PDA now commits to the pool: it is NOT the old market-only address.
     // (This assertion would fail before the finding-R fix, where gv config = f(COIN).)
-    let old_style = Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id()).0;
-    assert_ne!(env.gv_config, old_style, "gv config PDA commits to the subledger_pool (finding R)");
+    let coin_only = Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id()).0;
+    assert_ne!(env.gv_config, coin_only, "gv config PDA commits to the subledger_pool (finding R)");
+    let unscheduled = Pubkey::find_program_address(
+        &[b"gv_config", env.coin_mint.as_ref(), env.sub_pool.as_ref()],
+        &gv_id(),
+    )
+    .0;
+    assert_ne!(env.gv_config, unscheduled, "gv config PDA commits to the bootstrap schedule");
 
     // An attacker's OWN valid insurance pool at a different address, with vote_authority
     // set to the gv PDA *that* pool would imply — so the pool's own binding check passes.
     let attacker_pool = Pubkey::new_from_array([9u8; 32]);
-    let attacker_gv = Pubkey::find_program_address(
-        &[b"gv_config", env.coin_mint.as_ref(), attacker_pool.as_ref()],
-        &gv_id(),
-    )
-    .0;
+    let attacker_gv = gv_config_for_schedule(
+        &env.coin_mint,
+        &attacker_pool,
+        TEST_BOOTSTRAP_DELAY_SLOTS,
+        TEST_BOOTSTRAP_START_SLOT,
+    );
     let mut data = vec![0u8; 192];
     data[..8].copy_from_slice(b"SUBPOOL1");
     data[8..40].copy_from_slice(env.coin_mint.as_ref());
@@ -1021,7 +1273,7 @@ fn gv_config_cannot_be_bound_to_a_substituted_pool() {
             AccountMeta::new_readonly(dummy, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(TEST_BOOTSTRAP_DELAY_SLOTS),
     };
     assert!(
         env.send(&[ix], &[]).is_err(),

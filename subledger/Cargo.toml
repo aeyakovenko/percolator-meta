@@ -14,6 +14,7 @@ path = "src/lib.rs"
 no-entrypoint = []
 
 [dependencies]
+percolator-accounting = { path = "../percolator-accounting" }
 solana-program = { workspace = true }
 spl-token = { workspace = true }
 
@@ -22,7 +23,7 @@ solana-sdk = { workspace = true }
 litesvm = { workspace = true }
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 percolator-prog = { workspace = true }
-percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "bbe745a26fb3fa7deda4bedb3560eb3499dd295f" }
+percolator = { workspace = true }
 genesis-vote-program = { path = "../genesis-vote", features = ["no-entrypoint"] }
 distribution-program = { path = "../distribution", features = ["no-entrypoint"] }
 solana-program-runtime = "1.18"

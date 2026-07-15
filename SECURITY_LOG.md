@@ -2,6 +2,896 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - zero-capital backing keys cannot collect trade fees (surface A/C; coverage only)
+
+Market donation intentionally preserves a distinct asset-0 backing provider while it rejects an
+unfunded external insurance operator. That asymmetry is safe only if the backing key earns from
+capital actually liened at risk, rather than merely from remaining named in the asset profile.
+
+A fresh real-SBF LiteSVM probe rotates an empty asset-0 backing role to an external provider,
+enables a 1% backing-fee policy, donates market lifecycle control to the constrained controller,
+and executes two funded public round-trip trades. Both backing domains retain exactly zero
+principal and zero earnings. The provider's direct attempt to withdraw one earnings atom rejects
+atomically, leaving the slab, vault, and destination unchanged.
+
+VERDICT: BLOCKED by construction in pinned Percolator: backing fees are charged only on a positive
+new source-lien delta, so a named key with no deposited capacity has no claim. This closes the
+previously source-audited but Meta-level unpinned assumption behind preserving external backing.
+No production code or security PR.
+
+## Tick - restart revived a zero-capital legacy fee operator (surface A/C)
+
+Predecessor controller activation and donation paths could leave matched external insurance roles on
+an otherwise controller-governed asset. The external provider could publicly deposit and withdraw all
+principal, governance could shut down and restart the empty asset, and pinned
+`RestartAssetOracle` preserved that zero-capital key as the live operator. Two ordinary public trades
+then generated 120 fee atoms that the stale key could withdraw despite risking no capital in the new
+lifecycle.
+
+The clean-room LiteSVM regression starts from the exact predecessor-compatible role layout, performs
+the provider's public deposit and full exit, then executes governed shutdown and restart against the
+real pinned Percolator SBF. On the vulnerable controller it completes a funded public trade round trip
+and proves the stale key withdraws the complete 120-atom fee balance.
+
+FIX: the constrained governance proxy now forwards `RestartAssetOracle` only when both selected-asset
+insurance roles already equal the controller PDA. Existing controller-owned restart remains unchanged.
+Legacy external-role assets can still complete provider-bound recovery and retire, but must activate a
+fresh controller-insured slot instead of carrying an unfunded fee recipient into a new lifecycle. The
+guard adds no signer, destination, amount, role mutation, or value-moving instruction.
+
+## Tick - restart preserved a one-shot insurance operator and blocked later retirement (surface A/C)
+
+Controller-owned secondary insurance cleanup temporarily installed an instruction-scoped PDA as
+the local insurance operator to force Percolator's delayed market-authority shutdown path. The
+withdrawal emptied the first fee balance but left that PDA installed. Pinned
+`RestartAssetOracle` intentionally preserves all asset roles, so a legitimate governance restart
+carried the one-shot operator into the next active lifecycle. Public round-trip trades could then
+recreate fee insurance, but the controller no longer classified it as controller-owned and neither
+public cleanup account shape could return it. One 120-atom fee cycle permanently blocked secondary
+retirement unless governance resolved the entire market.
+
+The clean-room LiteSVM regression runs two complete lifecycles against the real pinned Percolator
+SBF. It creates fees through funded public trades, matures shutdown, returns the exact balance via a
+clean fallback because the canonical transit is permanently frozen, restarts the oracle, recreates
+the same fee balance, and repeats shutdown, cleanup, and retirement. It verifies both cleanup
+account shapes, both one-shot transit closures, and exact conservation of all trader collateral and
+the two 120-atom fee balances.
+
+FIX: after Percolator accepts the delayed full insurance withdrawal, the controller atomically
+restores itself as local operator before retaining or forwarding the withdrawn tokens. The restore
+runs only after the slab-derived balance reaches zero and any later forwarding failure rolls the
+whole transaction back. It adds no instruction, signer, destination, amount, or reusable external
+authority and preserves Percolator's shutdown delay by construction.
+
+## Tick - stale donated-market operator could skim later trade fees (surface A/C)
+
+An empty creator market could donate `marketauth` to the controller while preserving an unrelated
+asset-0 insurance operator. The controller's inbound donation path correctly rejected that shape,
+but ordinary trades credit fee insurance directly. The old operator therefore was not inert: after
+handoff, two public round-trip trades created 120 fee atoms and the stale key withdrew all 120 from
+the controller-governed market through pinned Percolator's public insurance-withdraw instruction.
+
+The clean-room LiteSVM regression uses the real Percolator SBF for the complete public sequence:
+creator market initialization, operator delegation, lifecycle donation, two funded trader
+portfolios, a round trip that pays fees, and the stale operator's successful withdrawal. It fails on
+the vulnerable controller only after proving the attacker received the exact fee balance.
+
+FIX: market donation now requires the asset-0 insurance authority and operator to be the same key
+regardless of the current insurance balance. This changes no role and adds no signer or recovery
+surface; it rejects the unsafe handoff byte-atomically. Canonical Subledger/TWAP custody already uses
+one constrained PDA for both roles, and external providers retain their original matched custody.
+
+## Tick - frozen controller ATA could block protocol-insurance cleanup (surface A/C)
+
+The fixed provider-return paths already tolerated a collateral issuer permanently freezing a
+canonical token account, but the newest controller-owned insurance path required the canonical
+controller ATA. A freeze-authority holder could freeze that empty ATA, revoke the freeze key, and
+leave asset-local fee insurance with no valid withdrawal destination. The balance then prevented a
+secondary asset from retiring after its shutdown delay; the same hard pin blocked terminal cleanup
+after whole-market resolution.
+
+Clean-room LiteSVM regressions exercise both public branches against the pinned Percolator SBF. One
+creates secondary fee insurance through real round-trip trades and matures the governed shutdown;
+the other publicly donates asset-0 insurance and resolves the stale market. Each permanently freezes
+the canonical controller ATA, proves that path fails byte-atomically, and completes cleanup through
+a fresh controller-owned transit. Attacker-owned destinations and preloaded replacement transits
+reject without changing the slab or vault. The accepted fallback pays only a clean account owned by
+the governance key, closes in the same transaction, and preserves every trader collateral atom.
+
+FIX: canonical retention remains unchanged. For controller-owned insurance only, shutdown and
+resolved cleanup may alternatively use an empty clean controller transit plus a clean
+governance-owned destination of the same mint. The amount is still the complete slab-derived
+asset-local balance, and the replacement is forwarded and closed atomically. A public caller gains
+no amount, provider, user-principal, reusable signer, or attacker recipient surface and cannot split
+protocol custody across fallback accounts.
+
+## Tick - controller-owned secondary fee insurance could block asset retirement (surface A/C)
+
+Secondary activation may intentionally bind both insurance roles to the constrained controller.
+Ordinary public trades then credit asset-local protocol insurance without any provider top-up. The
+controller's live shutdown return rejected a controller-owned operator to prevent permissionless
+withdrawal before the shutdown delay, while its generic proxy correctly denied raw withdrawals.
+After a fee-bearing round trip, governance therefore could not drain the secondary budget and
+retire that asset without resolving the entire market.
+
+A fresh controller + pinned-Percolator LiteSVM regression activates asset 1 with controller-owned
+insurance, opens and closes a real public position pair, and observes exactly `120` insurance atoms
+from two round-trip 3-bps trades. Direct retirement fails on that balance. The old controller SBF
+also rejects its only fixed return after shutdown and the ten-slot delay mature. The retained test
+first invokes the repaired path before shutdown and requires the market, vault, ledger, operator,
+and transit to remain byte-atomic; after maturity it returns all `120` atoms to canonical controller
+custody and retires asset 1 while the rest of the market stays live.
+Both traders then withdraw every remaining collateral atom; together with the `120` retained fee
+atoms, the test conserves the complete `2,000,000`-atom deposit.
+
+FIX: controller-owned shutdown cleanup atomically rotates only the asset-local insurance operator
+to an asset-scoped instruction-only PDA, then invokes Percolator as market authority. This forces
+the pinned Percolator binary itself to enforce recovery mode, the empty-asset predicate, and its
+configured shutdown delay; any early or unsafe call rolls the role rotation back. The amount remains
+slab-derived and the destination must be the canonical controller token account, so no caller or DAO
+can select a recipient. External provider cleanup is unchanged. No generic authority setter,
+withdrawal amount, governance destination, user-principal path, or reusable admin signer was added.
+
+## Tick - parent-ray reconciliation could miss a safe off-ray integer lot (surface C)
+
+The bounded continued-fraction fallback checked the simplest marginal-to-bid fraction and its two
+Stern-Brocot parent rays, but those rays do not span every denominator class in the interval. Ten
+public `3 COIN / 3 USD` bids followed by `11 / 14` and final-marginal `3 / 4` bids made the previous
+binary settle only 32 units of an exact 34-unit reward budget and burn 29 COIN. Uniform repricing
+released ten USD, and the skipped `11 / 14` bid could safely sell `7 COIN / 9 USD`; the old `6 / 8`
+ray candidate stranded one additional spendable unit. This suppressed point buyback and burn only;
+it could not cross custody floors, redirect escrow, or debit insurance, backing, or bidder principal.
+
+The retained pinned-Percolator + TWAP LiteSVM regression proves the fixed path settles 33 units,
+burns 30 COIN, leaves only one unit after every eligible deposited COIN atom has been considered,
+pays all twelve owner-bound bidder accounts exactly, and drains both shared auction escrows to zero.
+An exhaustive unit regression compares the maximum spend for every valid narrow-excess
+configuration with rate legs up to 12 and budgets up to 16 against brute force. The existing
+32-slot Fibonacci probes continue to pass their 650,000-CU and 1.2M-CU liveness gates.
+
+FIX: for reduced interval `a/b <= x/q <= c/d`, reconciliation bounds the lattice excess
+`r = b*x - a*q` by `(b*c - a*d)*max_usd/d`. Small bounds are solved exactly by enumerating at most
+eight excess classes; the upper Stern-Brocot parent of `a/b` maps each class directly to its largest
+budget-safe denominator. Larger bounds retain a descending 128-step projection with the established
+safe endpoint/continued-fraction result as fallback. The globally maximal rounded candidate remains
+the common constant-work path. No signer, authority, recipient, reserve, custody, principal,
+withdrawal, or admin surface was added.
+
+## Tick - market donation could preserve funded split insurance custody (surface A/C)
+
+Percolator lets asset 0 name separate insurance deposit and withdrawal keys. Secondary activation
+already required those roles to match, but the permissionless creator-market handoff preserved any
+funded asset-0 roles independently. A creator could assign an external provider as authority, assign
+an unrelated key as operator, accept `700,000` insurance units from the provider, and donate
+`marketauth` to the controller. The previous real SBF accepted the handoff with both split roles
+intact, after which the surviving operator withdrew the provider's complete balance. The same drain
+worked when the split external roles were donated while empty and the authority funded only after
+handoff. Controller governance therefore appeared constrained while onboarding an external deposit
+with a separate withdrawal key.
+
+The retained pinned-Percolator + controller LiteSVM regressions construct both role rotations and
+the deposit through public instructions, prove the old post-handoff drains for funding both before
+and after donation, and now require the handoff to reject before changing the slab, canonical vault,
+or unfunded provider source. The existing same-provider creator insurance, external backing,
+controller donation, terminal provider-return, and full-chain handoff tests remain live.
+
+FIX: before accepting market authority, a nonzero asset-0 insurance balance now requires its
+recorded insurance authority and operator to be identical. An empty asset with an external authority
+that can fund after handoff has the same requirement. Empty creator-owned custody remains freely
+donatable, and an external provider remains supported when it owns both roles. No role is rewritten
+to governance, no withdrawal or repair instruction is added, and no signer, destination, custody,
+or admin surface changes.
+
+## Tick - endpoint-only reconciliation could skip a safe interior price lot (surface C)
+
+Final-price reconciliation considered the largest rounded pair and exact reduced lots at the
+marginal and bid prices. The bidder-safe rational interval between those endpoints can contain a
+smaller whole-atom pair even when all three candidates fail. Ten public `11 COIN / 23 USD` bids,
+followed by `227 / 480` and `11 / 24`, made the previous binary settle only 234 units of an exact
+254-unit reward budget. Uniform repricing released 20 units, and `8 COIN / 17 USD` was safe at both
+the final marginal and original bidder limit, but neither endpoint lot could represent it. The
+public book therefore suppressed 20/254 of the round even though only three units were unavoidable.
+This affected point buyback and burn only; it could not cross custody floors, redirect escrow, or
+debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the fixed path settles 251 units, burns 119 COIN,
+pays all twelve owner-bound bidder accounts exactly, leaves only three units of sub-lot dust, and
+drains both shared auction escrows to zero. A second retained 32-slot probe funds the complete
+u64-scale high-Fibonacci book, requires execution below 1.2M CU, and conserves every USD atom. The
+smaller full-book Fibonacci canary consumes 596,278 CU under its 650,000-CU gate, retaining more
+than 53% of the network limit as headroom.
+
+FIX: when both exact endpoint fallbacks are insufficient, reconciliation finds the simplest
+fraction in the closed marginal-to-bid interval with a bounded 128-step u64 continued-fraction
+procedure, then checks its scaled form and both Stern-Brocot parent rays through the unchanged
+bidder-limit validator. A determinant-derived lower bound rejects impossible interior denominators
+before Euclidean work, and ordered endpoints require only one public division per step. No
+budget-sized scan, signer, authority, recipient, reserve, custody, principal, withdrawal, or admin
+surface was added.
+
+## Tick - final-price reconciliation could skip a safe exact marginal lot (surface C)
+
+TWAP reconciliation retried the largest final-price rounded pair and then a whole lot at the bid's
+own reduced ratio. It did not retry a whole lot at the final marginal's reduced ratio. Three public
+`2 COIN / 2 USD` bids followed by `5 / 7` and `2 / 3` bids made the old binary settle only six units
+of an exact ten-unit reward budget. Uniform repricing released three units from the better bids; the
+skipped `5 / 7` bid could safely take an exact `2 COIN / 3 USD` marginal lot, but neither of the old
+candidate forms found it. A five-bid public book could therefore strand 40% of that round's budget.
+This suppressed reward-point buyback and burn; it could not cross custody floors, redirect escrow,
+or debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the fixed path settles nine units, burns seven COIN,
+leaves only the unavoidable one-unit sub-lot remainder, pays all five owner-bound bidder accounts
+exactly, and drains both shared auction escrows to zero.
+
+FIX: final-price reconciliation now also considers the largest exact reduced marginal-price lot
+capped by the remaining USD and the bid's deposited COIN, then chooses the larger safe result between
+that and the existing exact bid-price fallback. The marginal GCD is computed once per execution and
+the per-bid work remains bounded. No signer, authority, recipient, budget, reserve, custody,
+principal, withdrawal, or admin surface was added.
+
+## Tick - provisional integer exclusion could suppress a final-price whole-lot fill (surface C)
+
+TWAP recomputation permanently excluded a bid when its first integer reconstruction was infeasible,
+even though a larger bidder-safe pair could fit the same USD allocation during final-price
+reconciliation. With a three-unit budget, public `31 COIN / 1 USD` and `21 COIN / 14 USD` bids made
+the old binary settle only two units. The first bid initially reconstructed to a zero-USD pair and
+was excluded, but the final `21/14` price safely supports its `2 COIN / 1 USD` whole-lot fill. One
+rounding-edge bid could therefore strand one third of a round.
+This suppressed reward-point buyback and burn; it could not cross custody floors, redirect escrow,
+or debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the final price settles all three units, burns five
+COIN, pays the two owner-bound bidder accounts `1 + 2` USD, returns `29 + 18` COIN, and drains both
+shared auction escrows exactly to zero.
+
+FIX: final-price remainder reconciliation no longer inherits provisional exclusion flags. It still
+considers only bids ranked above the final stable marginal or exactly equal to it, caps every fill by
+the remaining budget and original bid, and recomputes a bidder-safe integer pair under the unchanged
+final price. No signer, authority, recipient, budget, reserve, custody, principal, withdrawal, or
+admin surface was added.
+
+## Tick - equal-price bids could be starved after uniform integer repricing (surface C)
+
+TWAP nominal allocation could consume the complete round budget before uniform integer repricing
+exposed the aggregate whole-lot remainder. Reconciliation enlarged only bids that already had a
+nominal allocation, even when an unallocated bid had exactly the stable marginal price. Thirty
+public `2 COIN / 3,669 USD` bids, followed by `158 / 289,930` and `29 / 53,215` bids, made the old
+binary settle only 344,980 of a 400,000-USD budget. The attacker could therefore strand 55,020 USD
+(13.755% of the round) with 60 COIN while a same-price whole-lot fill was already committed on-book.
+This suppressed reward-point buyback and burn; it could not cross custody floors, redirect escrow,
+or debit insurance, backing, or bidder principal.
+
+The retained real-SBF LiteSVM regression proves the full 32-slot configuration settles 398,195 USD,
+burns 217 COIN, leaves only the unavoidable 1,805-USD sub-lot remainder, and stays below its
+500,000-CU gate. It permissionlessly claims every bid and requires both shared auction escrows to
+end at exactly zero.
+
+FIX: the bounded reconciliation scan now considers every non-excluded bid ranked above the stable
+marginal and every later bid exactly equal to it. Previously unallocated bids start at zero, cache
+their reduced ratio on first use, and receive only executable whole lots under the unchanged stable
+price and original bidder limit. Lower-price bids remain ineligible. No signer, authority, recipient,
+budget, reserve, custody, principal, withdrawal, or admin surface was added.
+
+## Tick - a historical reward stake could be registered again after an upgrade (surface D)
+
+Pre-epoch configs preserve claims for owner-only V0 and owner+linked V1 stake PDAs, while current
+registration creates a family-scoped V2 PDA. An unfrozen config could therefore retain nonzero
+points from a predecessor stake and accept a second registration for the same owner, witness, and
+reward family. Both terms entered the frozen denominator and both stakes remained claimable,
+diluting other COIN recipients. No collateral account is writable in this path.
+
+The real-SBF LiteSVM regression migrates an already-crystallized stake into each predecessor schema
+and proves the previous binary creates the parallel V2 stake. The retained tests require both
+duplicates to reject without creating state. They also prove a zero-point predecessor can still
+migrate and one-lamport prefunding of either predecessor PDA cannot block a legitimate registration.
+
+FIX: pre-epoch registration now receives both canonically derived predecessor addresses and rejects
+only a program-owned predecessor carrying nonzero points for the same linked witness and current
+reward family. Current configs keep their existing account list. This adds no authority, recipient,
+withdrawal, principal, or custody surface.
+
+## Tick - legacy reward init could count one capital pool in both cohorts (surface D)
+
+Reusable reward epochs rejected a Subledger pool reused across insurance and backing scopes, but
+the original/genesis reward initializer did not. Because those cohorts intentionally use distinct
+stake families, one position in an aliased pool could crystallize the same principal twice and
+consume both COIN allocations. The configuration required the live COIN mint authority, and the
+effect was limited to reward points; no path could debit Subledger principal, Percolator insurance,
+or backing.
+
+The real-SBF LiteSVM regression first proved that the old legacy initializer accepted a 50/50
+aliased configuration. It now requires atomic rejection while the existing distinct-pool legacy
+configuration and reusable-epoch alias regression remain green.
+
+FIX: legacy init now applies the same immutable cross-domain pool segregation rule as reward-epoch
+init. This adds no signer, authority, recipient, withdrawal, custody, or admin surface.
+
+## Tick - a feasible reduced bid lot could be skipped and suppress a TWAP reward round (surface C)
+
+TWAP preflight tested only the largest nominal partial allocation at a bid's own rate. Integer
+rounding could make that pair cross the bidder's limit even when a smaller exact reduced-ratio lot
+fit. A one-USD strictly better bid followed by a `399,998 COIN / 400,000 USD` bid therefore made the
+old binary settle only one of 400,000 available collateral units and leave the final reward budget
+unused. This could suppress COIN-point distribution; it could not cross the reserved insurance floor,
+redirect collateral, or take bidder principal.
+
+The retained real-SBF LiteSVM regression proves the old one-unit settlement, then requires the fixed
+path to exclude and fully refund the tiny bid, buy all `399,998` COIN for `400,000` collateral, drain
+the holding, and pay each bidder's owner-bound accounts exactly. The existing 32-slot Fibonacci and
+eight-pass repricing probes also remain below their 500,000-CU gates and conserve every escrowed atom.
+
+FIX: preflight reduces each visited positive u64 bid with cached shift/subtract GCD work. It preserves
+a valid maximum nominal allocation, otherwise reserves the largest exact reduced-ratio lot that fits.
+The final uniform-price bidder-limit checks remain unchanged. No signer, authority, recipient, amount
+selector, principal counter, custody path, or admin surface was added.
+
+## Tick - a permissionless reward claim could pay into an attacker-delegated account (surface A/D)
+
+LP, trader, and funding-payer claims are intentionally permissionless so an absent portfolio owner
+cannot strand a frozen epoch. The claim bound the token account's owner to the stake recipient, but
+accepted an SPL delegate. A third-party cranker could therefore select a pre-existing recipient-owned
+COIN account delegated to that cranker, force the victim's reward into it, and immediately spend the
+payout under the delegate authority. The recipient key remained correct while the reward was stolen.
+
+The retained real-SBF LiteSVM regression has the recipient publicly approve an attacker on one empty
+COIN account, then lets that attacker invoke the existing permissionless LP claim. Against the old
+binary the claim succeeds and a real SPL delegated transfer moves the complete payout into the
+attacker's account. The fixed path rejects before changing the stake, vault, or either token balance;
+the same test still rejects an attacker-owned destination and decoy vault, then lets an unaffiliated
+cranker pay the complete reward into a clean recipient-owned account.
+
+FIX: every claim now requires an initialized SPL Token destination with the configured mint and bound
+recipient owner. For permissionless LP, trader, and cumulative funding-payer cohorts it additionally
+rejects any delegate or nonzero delegated allowance. Insurance and backing claims remain owner-signed,
+so their existing owner-selected destination semantics are unchanged. No signer, recipient, amount,
+vault, principal, backing, or admin surface was added.
+
+## Tick - live TWAP custody could make owner principal depend forever on governance (surface A/C)
+
+The fixed pool-to-TWAP handoff closed ordinary Subledger exits until custody returned. Public return
+was available only after the market resolved and became empty; every live return still required the
+Squads vault. Governance could therefore hand off a pool containing owner principal and disappear or
+refuse every recovery proposal. The monotonic floor prevented theft, but no depositor could exercise
+their valid withdrawal claim for the rest of the live market.
+
+A retained full-chain LiteSVM regression uses the real pinned Percolator, Subledger, TWAP, controller,
+and Squads binaries with two depositors and retained protocol insurance. The old SBF rejects a signing
+owner's live recovery with `MissingRequiredSignature`. The final probe also rejects an unsigned first
+handoff, another signer using the owner's position, and the real owner redirecting payout to another
+token owner; each failure leaves the slab, pool, config, and token balances byte-exact. The real owner
+then returns custody and redeems their complete one-unit position atomically. A public crank re-hands
+the reduced pool to the same TWAP config, preserves the second owner's ten units plus the retained
+insurance floor, and consumes the permit. Replaying the exited position and trying to undo a later
+terminal return both fail atomically. The second owner ultimately receives all ten units, while only
+protocol insurance reaches terminal controller custody.
+
+FIX: Subledger tag 13 is an amountless full exit that reuses the ordinary owner signature, canonical
+position, destination-owner, share/loss, pool, vault, and Percolator checks. Current-layout TWAP tag 16
+may return live custody without Squads only when it invokes that full exit in the same instruction;
+any failed payout rolls the three role rotations back, and success consumes the authorizing position.
+Success sets a one-use bit in the existing config's reserved bytes. Unsigned Subledger re-handoff is
+accepted only for that exact pool/config binding while the bit is set, replaces only the recorded
+pool-principal floor component, and clears the bit. A read-only proof was deliberately not retained:
+it would have let a one-unit depositor toggle custody repeatedly without withdrawing. No caller-selectable
+amount, DAO recipient, reusable withdrawal authority, first-handoff bypass, or terminal re-handoff was
+added.
+
+## Tick - a frozen controller transit could block every provider return and terminal close (surface A/C)
+
+Provider cleanup preserved the slab-recorded beneficiary and exact amount, and the prior fix made a
+permanently frozen provider ATA replaceable. Every path still required the controller's canonical ATA
+as its temporary Percolator withdrawal destination. A collateral issuer could freeze that empty account
+after backing was deposited and revoke freeze authority while leaving the Percolator vault and provider
+accounts healthy. No cranker could substitute another controller-owned account, so the provider's one
+atom still blocked asset retirement and `CloseSlab`.
+
+The real-Percolator LiteSVM regression now freezes both canonical accounts and revokes the issuer key.
+The previous SBF rejects a fresh controller-owned transit. The retained chain proves frozen accounts,
+an attacker-owned transit, an attacker-owned provider destination, and a delegated provider destination
+all fail atomically. It then returns the exact backing atom through clean controller/provider fallbacks,
+rejects an attacker-owned terminal transit without changing the slab or vault, and completes real
+`CloseSlab` through a fresh controller-owned account.
+
+FIX: external-provider paths accept any initialized same-mint SPL transit owned solely by the controller
+PDA, with no delegate or close authority; exact-amount forwarding prevents unrelated transit value from
+reaching the provider. Governance-signed terminal reclaim accepts a noncanonical controller transit only
+when its pre-close token balance is zero and Percolator's existing fully-wound-down checks pass. Canonical
+transits retain their existing protocol-balance behavior, while an arbitrary funded controller account
+cannot be swept. Public controller-owned protocol-insurance recovery remains pinned to canonical custody,
+and every provider identity, amount, destination owner, Percolator CPI, and governance terminal signer is
+unchanged. No admin or arbitrary withdrawal surface was added.
+
+## Tick - a proposal creator could turn anti-tamper rejection into a permanent genesis DoS (surface B/C)
+
+Genesis-vote snapshotting correctly refused to seal a distribution changed after registration, but
+registration accepted a partially filled declared entry capacity. After a majority locked principal
+behind that proposal, its creator could append one valid entry and disappear. The snapshot mismatch
+then made the only winning proposal permanently unsealable; the unique vote-target PDA could not be
+re-registered, absent voters could not move their ballots, and no public cranker could finish genesis.
+
+A clean-room real Percolator + Subledger + genesis-vote + distribution LiteSVM regression creates a
+two-entry proposal with only one entry written. The old SBF makes it votable. The retained chain requires
+that registration to reject atomically, fills the second slot, registers, deposits real insurance
+principal, casts the quorum vote, proves another supply-valid append cannot fit, and permissionlessly
+seals the exact visible proposal after bootstrap.
+
+FIX: registration now requires `entry_count == capacity != 0`. Creators already choose capacity when
+creating a proposal, so this adds no instruction or authority and does not require allocation of the
+whole COIN supply; unallocated supply still burns. It makes public proposal mutation impossible before
+voters can lock capital. The existing `(entry_count, total_amount)` trigger snapshot remains as a
+defense-in-depth check for corrupted or historical state, and the real-distribution offset canary now
+pins the capacity field as well.
+
+## Tick - a permanently frozen provider ATA could block terminal market close (surface A/C)
+
+All fixed insurance and backing returns preserved the slab-recorded provider and amount, but required
+that provider's canonical token account. A collateral issuer could freeze the healthy ATA after the
+provider deposited, then revoke its freeze authority. The provider principal remained segregated, yet
+neither the provider nor a public cranker could receive it, so one atom could permanently block asset
+retirement or whole-market `CloseSlab` cleanup.
+
+A clean-room real-Percolator LiteSVM regression deposits asset-0 backing, donates lifecycle authority
+to the controller, resolves the empty market, permanently freezes the provider ATA, and proves the old
+SBF rejects a fresh provider-owned destination. The retained chain also rejects the frozen ATA, an
+attacker-owned account, and a provider account delegated to the cranker with byte-atomic failures. It
+then returns the exact slab-derived atom to a clean provider-owned account and completes real `CloseSlab`.
+
+FIX: the shared provider-return validator keeps the provider identity immutable but makes the token
+account replaceable. It accepts only an initialized same-mint SPL account owned solely by the recorded
+provider, with no delegate or close authority; a cranker can create such an account without the provider
+signing. Amounts, role rotations, controller transit, and every Percolator withdrawal remain unchanged.
+This adds no DAO recipient, provider impersonation, arbitrary amount, or withdrawal authority and applies
+uniformly to shutdown and resolved insurance/backing returns.
+
+## Tick - post-placement collateral freeze could permanently settle-lock the auction (surface C)
+
+Placement required a healthy canonical bidder collateral ATA, but collateral mints such as stablecoins
+can retain an external freeze authority. The issuer could freeze that ATA after the bid committed and
+then revoke its authority. Auction execution still settled into the shared USD account, but every
+permissionless claim was hard-pinned to the now-permanently-frozen address. One occupied slot therefore
+kept the singleton book settled forever and blocked all future buyback rounds.
+
+A clean-room real-SBF LiteSVM regression places a valid full-fill bid, freezes its canonical USD ATA
+only after placement, revokes the freeze key, and executes the round. The old SBF cannot claim either
+to the frozen ATA or to a fresh account owned by the same bidder. The retained test also rejects an
+attacker-owned fallback and a bidder-owned fallback delegated to the cranker, then pays all settled USD
+to a clean bidder-owned account and proves a new bid can enter the reopened book.
+
+FIX: the slot's recorded bidder remains the immutable beneficiary, but claim may pay USD to any
+initialized SPL account for the collateral mint owned solely by that bidder. Frozen, wrong-owner,
+delegated, close-authority, and wrong-mint accounts reject atomically. The COIN refund remains pinned to
+its recorded canonical account. This adds no admin, bidder signature, amount, beneficiary, or collateral
+withdrawal surface; a cranker can create and claim through a fresh owner-bound account atomically.
+
+## Tick - an absent one-unit genesis voter could block terminal market close (surface B/C)
+
+Every genesis deposit is segregated behind the principal pool, and ordinary withdrawal correctly
+requires the position owner. That made a one-unit public deposit a permanent cleanup veto: after
+voting for the winning distribution, the depositor could disappear with the position still locked.
+Even after the complete COIN supply was sealed and the real Percolator market was resolved and
+empty, no public instruction could retire that atom. Protocol-insurance recovery and `CloseSlab`
+therefore remained blocked forever.
+
+A clean-room LiteSVM regression deposits one base unit, casts the sole quorum vote, seals all supply
+through the permissionless genesis trigger, resolves the pinned Percolator binary through real
+Squads, and drops the voter signer. The old SBF rejects the required terminal return. The retained
+test proves live-market, unexecuted-proposal, attacker-owned destination, and poisoned canonical-ATA
+attempts are byte-atomic failures; then a public cranker returns the complete loss-adjusted position
+to a clean token account owned only by the depositor and completes real `CloseSlab`.
+
+FIX: genesis-vote exposes a read-only attestation for its canonical current-layout config and exact
+executed proposal. Subledger's fixed terminal return accepts only a current principal-policy genesis
+pool and canonical owner position, requires that attestation plus a resolved-and-empty bound market,
+and always retires the full position. It has no amount, admin, governance signer, or beneficiary
+parameter. The supplied token account must be initialized for the pool mint, owned by the depositor,
+and have no delegate or close authority; a cranker can permissionlessly create a fresh such account,
+so the depositor cannot preserve the DoS by poisoning an old ATA. Vote lock, principal, and shares
+are cleared only in the same atomic transaction that transfers the payout.
+
+## Tick - pool-to-TWAP handoff could cross controller governance seeds (surface A/C)
+
+A canonical Subledger pool binds its market and Percolator program but intentionally has no
+governance key. Squads C could therefore hand that pool to TWAP C after market lifecycle had already
+been donated to a controller derived from governance B. TWAP's terminal insurance recovery derives
+controller C from its config, while Percolator permanently records controller B as `marketauth`.
+Neither constrained controller can donate its PDA-held authority again, so retained protocol
+insurance and terminal `CloseSlab` could be stranded.
+
+A clean-room LiteSVM regression creates the canonical principal pool and real Squads-C/TWAP-C config,
+donates lifecycle to a differently seeded controller B through the real controller and pinned
+Percolator binary, and deposits owner principal. The old TWAP SBF accepts the mismatched handoff. The
+retained test requires byte-atomic rejection across the slab, pool, and config, then proves the owner
+still withdraws every deposited atom through the unchanged Subledger path.
+
+FIX: the shared TWAP custody acceptor now re-reads `marketauth` from the pinned slab. It accepts only
+the two valid lifecycle phases: the config's own Squads vault before controller donation, or the exact
+controller PDA derived from that vault, market, and Percolator program afterward. No account, signer,
+instruction, destination, amount, authority mutation, or value path was added.
+
+## Tick - distinct asset-0 providers could retain an unusable rotation key (surface A/C)
+
+The delegated-admin donation guard covered funded insurance or backing only when the outgoing
+market authority itself held that value role and the handoff therefore had to restore it. A creator
+could instead rotate insurance authority/operator or backing authority to a distinct external
+provider, delegate `asset_admin` to a third key, let the provider fund through Percolator's public
+API, and donate `marketauth`. `UpdateAuthority` left the already-distinct provider unchanged, so the
+old guard accepted the handoff. After public stale resolution, the fixed asset-0 returns still needed
+the absent third key to rotate the provider role, and the provider balance could block `CloseSlab`.
+The same class was reachable from an empty handoff: a surviving delegated admin could later rotate
+both insurance roles to itself, deposit one atom through Percolator, and disappear.
+
+Two clean-room pinned-Percolator + controller LiteSVM regressions extend the existing donation
+fixture. The creator co-signs each real role rotation with a distinct provider, delegates the cold
+admin, and that provider funds either insurance or backing. The PR126 SBF accepts both unsafe
+handoffs. The retained tests require byte-atomic rejection and prove that each original provider's
+ordinary signed withdrawal remains live and receives every atom. The existing empty delegated-admin
+probe now rejects at handoff, and a new public-init canary proves that a canonical TWAP config for a
+different real market cannot attest the target market.
+
+FIX: donation requires `asset_admin` to be the outgoing market authority (which Percolator migrates)
+or the controller, regardless of current balances. The only exception accepts a read-only canonical
+current-layout Subledger pool or TWAP config that rederives to this market and Percolator program,
+matches the live admin, and already owns both insurance roles. The TWAP proof additionally binds the
+Squads governance vault and custody mode; the Subledger proof binds the complete pool PDA schedule and
+canonical Percolator vault. Existing fixed wrappers can therefore supply every terminal signature.
+No instruction, writable account, signer, destination, amount, withdrawal path, or authority mutation
+was added.
+
+## Tick - preserved asset-0 backing could retain an unusable rotation key (surface A/C)
+
+The asset-0 backing return already handled an absent provider after resolution, but it requires the
+current `asset_admin` to authorize the fixed backing-role rotation. A creator could delegate that admin,
+fund backing as the still-recorded provider, and then donate market lifecycle to the controller. The
+handoff preserved the creator's backing as intended while leaving the external admin unchanged. If both
+keys disappeared before public stale resolution, the backing balance permanently blocked `CloseSlab`.
+
+A clean-room real-Percolator + controller LiteSVM regression shares the delegated-admin fixture with
+the insurance prevention test, funds asset-0 backing through the public API, and attempts market
+donation. The PR125 controller accepts the unsafe handoff. The retained probe requires byte-atomic
+rejection and then proves the original provider can still withdraw every backing atom directly.
+
+FIX: donation reads both backing domains from the pinned slab. When the outgoing market authority is
+the recorded provider and either domain has principal or earnings, the handoff is rejected unless
+Percolator will also move `asset_admin` to the controller. Empty-role donations and existing
+Subledger/TWAP custodians remain unchanged. This adds no instruction, signer, destination, amount, or
+authority mutation; it prevents entry into a state the existing provider-bound terminal return cannot
+safely unwind.
+
+## Tick - preserved external asset-0 insurance could block terminal cleanup (surface A/C)
+
+Market donation correctly preserved creator-funded asset-0 insurance instead of giving it to the
+controller, but the fixed resolved-insurance return accepted external providers only for secondary
+assets. After governance enabled public stale resolution, an unaffiliated cranker could resolve the
+donated market before the creator withdrew. Percolator then required the recorded insurance authority
+to withdraw, while `CloseSlab` required the balance to be zero. If that provider disappeared, its
+segregated balance and the whole market remained permanently stuck.
+
+A fresh pinned-Percolator + controller LiteSVM regression funds asset-0 insurance through the real
+public API, donates lifecycle control while preserving the provider, enables and triggers public stale
+resolution, and invokes the provider-bound resolved return. The old controller rejects tag 9 with
+`InvalidAccountData`. The retained chain requires every atom to reach the provider's canonical ATA and
+then completes real `CloseSlab` cleanup.
+
+A companion probe delegates asset-0 `asset_admin` before funding. The old controller accepts the market
+donation even though its PDA cannot later rotate the external insurance role without that delegated
+signer. The retained regression requires the unsafe handoff to reject byte-atomically and proves the
+original provider's direct withdrawal remains live.
+
+FIX: market donation now rejects restoring either outgoing funded insurance role when Percolator's
+handoff would leave a separately delegated `asset_admin`. Existing Subledger/TWAP custody, where the
+outgoing market authority is not being restored as provider, remains composable. The resolved-insurance
+instruction may then handle asset 0 exactly like a secondary external provider: it requires the
+controller to remain the live asset admin, derives the complete amount and outgoing authority from the
+pinned slab, rotates only insurance authority, and forwards exactly that amount to the provider's
+canonical ATA. Controller-owned protocol insurance keeps its separate canonical-controller path. No
+caller-selected amount, recipient, signer, generic authority setter, or governance withdrawal surface
+was added.
+
+## Tick - pool-less TWAP custody could strand asset-0 backing (surface A/C)
+
+The controller's resolved asset-0 cleanup derives both backing-domain balances and the recorded
+provider, but it requires the current `asset_admin` to sign before rotating the backing role. A
+genesis pool already had a fixed Subledger signer wrapper. A pool-less compatibility config left
+`asset_admin` on the TWAP PDA and exposed no equivalent instruction, so an absent external provider
+could leave its backing and whole-market close permanently stuck after public stale resolution.
+
+A fresh real-binary LiteSVM regression performs the empty TWAP handoff through a timelocked Squads
+vault, deposits real backing from that vault through pinned Percolator, donates market lifecycle to
+the controller, and resolves permissionlessly. It first proves an external caller cannot forge the
+TWAP signer. The old TWAP binary then rejects the required fixed wrapper with
+`InvalidInstructionData`. The fixed test also attempts an attacker destination and verifies the
+failed transaction preserves the slab and vault byte-exact.
+
+FIX: TWAP tag 20 is an amountless CPI wrapper around only controller tag 7. It validates the
+config-bound market, executable Percolator program, Squads governance vault, derived controller,
+TWAP PDA, controller program, and token program, and it is unavailable when a current config records
+a Subledger custody pool. The controller still derives the provider and both principal/earnings
+amounts from the pinned slab and validates canonical token accounts. The regression proves backing
+reaches only that provider while previously recovered protocol insurance remains in controller
+custody. The wrapper never moves insurance or accepts an admin-selected recipient or amount, so it
+is also safe for historical no-pool layouts.
+
+## Tick - pool-less TWAP protocol insurance had no terminal recovery (surface A/C)
+
+The compatibility TWAP handoff intentionally accepted only an empty asset-0 insurance balance, and
+every later atom entered through TWAP's inbound-only donation instruction without an owner claim.
+After market lifecycle moved to the controller, an unaffiliated stale resolver could end the market,
+but terminal insurance recovery unconditionally required a Subledger pool. Pool-less protocol
+insurance therefore remained under the TWAP PDA forever and prevented whole-market close.
+
+A fresh real-binary LiteSVM regression performs the empty handoff through a timelocked Squads vault,
+donates insurance through TWAP, donates market authority to the constrained controller, and resolves
+through Percolator's public stale path. The old TWAP binary rejects the canonical terminal recovery
+with `IllegalOwner`. An attacker-selected token destination also fails and rolls back the market
+byte-exact.
+
+FIX: current-layout pool-less handoff now records explicit proof that insurance was zero when TWAP
+accepted custody. After resolution, any cranker may pass the System program as the no-pool sentinel;
+TWAP derives the controller and canonical token accounts and moves the exact slab insurance there.
+There is no caller-supplied amount, owner, or admin. Historical layouts and current-layout configs
+without the marker remain untrusted, so an upgrade cannot relabel legacy external insurance as
+protocol-owned. Pool-bound recovery still requires the exact Subledger pool and its zero-principal
+attestation.
+
+## Tick - zero-principal TWAP custody could strand absent asset-0 backing (surface A/C)
+
+A principal pool may legitimately re-hand custody to TWAP after every owner exits so retained
+protocol insurance can continue through buyback rounds. After resolution, the existing public path
+correctly moved that protocol insurance to the canonical controller account. It nevertheless kept
+`asset_admin` on the TWAP PDA because public return to an empty pool was unconditionally forbidden.
+Asset-0 has no per-asset shutdown override, so an absent backing provider then depended on Squads to
+return that role before the pool could invoke the fixed provider-bound backing cleanup. If Squads
+disappeared, the provider's backing and whole-market close remained stuck despite zero insurance.
+
+The clean-room full-chain LiteSVM regression funds asset-0 backing through a real timelocked Squads
+vault transaction, moves owner principal through TWAP, resolves, returns the principal, re-hands off
+with zero principal, and recovers retained protocol insurance to the controller. The old TWAP binary
+then fails the unaffiliated role return with `InvalidAccountData`, so the existing asset-0 cleanup
+cannot execute.
+
+FIX: the no-Squads return still requires the config-bound executable Percolator program and a
+resolved, empty slab. While asset-local insurance is nonzero, the canonical pool must still attest
+live owner principal. Once that insurance is zero, returning `asset_admin` and the two insurance
+roles moves no value; the downstream Subledger CPI still revalidates the exact config-bound pool PDA.
+The same unaffiliated cranker can then invoke the existing amountless asset-0 cleanup, which derives
+both backing domains and the recipient from Percolator. The regression proves asset-0 backing reaches
+only its recorded provider while retained protocol insurance stays isolated in controller custody.
+
+## Tick - owner-only closed-witness recovery could strand PDA-owned rewards (surface C/D)
+
+Percolator portfolios may be owned by program PDAs: the owner program signs initialization and
+trading CPIs, while residual claims are intentionally permissionless and pay only the stake's bound
+recipient. The interim dematerialized-account fallback required that portfolio owner to sign. A
+public maintenance or resolved cleanup could therefore turn an otherwise permissionless frozen
+claim into one that an absent or non-claim-capable owner program could never execute.
+
+The clean-room real-binary maintenance regression closes the organically loss-bearing portfolio and
+then claims without the trader key. The owner-only residual binary fails solely with
+`MissingRequiredSignature`. The final path remains permissionless: exact stake/config/account-key
+binding, zero lamports plus zero data, frozen points and denominator, immutable vault, and the bound
+recipient still constrain every output. A self-close can at worst avoid a later points cap within the
+fixed cohort allocation; it cannot redirect COIN, change supply, or touch collateral.
+
+## Tick - reward-witness governance guard could lock insurance/backing exits (surface A/C/D)
+
+The interim controller guard preserved any portfolio with monotonic reward counters unless
+governance signed its cleanup. In resolved mode, pinned Percolator refuses every insurance and
+backing withdrawal while `materialized_portfolio_count != 0`. An absent reward owner could therefore
+be paid permissionlessly, leave its otherwise empty account behind, and make external backing plus
+subledger insurance principal depend forever on a surviving DAO. The guard protected COIN points by
+putting segregated principal at risk, contrary to the custody priority.
+
+The clean-room regression extends the organic real-trade fixture: an external provider deposits
+backing, a trader takes and settles a real loss, the residual epoch crystallizes/freezes, and the
+market resolves. A third party pays the reward to its bound recipient without either owner or DAO.
+The old controller then fails the exact public cleanup with `MissingRequiredSignature`, leaving
+Percolator's resolved withdrawal gate armed.
+
+FIX: terminal controller cleanup no longer interprets reward telemetry. Pinned Percolator still
+proves resolved mode and zero collateral, PnL, positions, receipts, and capital before it accepts
+`ClosePortfolio`; the wrapper still exposes no amount or destination. The residual distributor's
+owner-signed dematerialized-account path preserves a frozen allocation if cleanup happened before
+claim. The regression permissionlessly retires both absent portfolios and returns the provider's
+exact backing atom through the real controller and Percolator binaries. Thus a cleanup bug can affect
+only fixed-supply reward points, never hold insurance or backing principal hostage.
+
+## Tick - public maintenance sync could erase a frozen residual witness (surface C/D)
+
+Pinned Percolator intentionally lets unsigned `SyncMaintenanceFee` consume a flat portfolio's final
+capital and immediately dematerialize it. Its empty predicate excludes monotonic reward counters.
+After residual crystallization/freeze, any caller could therefore wait for accrued maintenance to
+cover a dust balance, sync the victim, erase the LP/trader live-cap witness, and leave every claim
+failing on the now-empty account. The controller guard from the prior tick cannot intercept this
+direct Percolator instruction.
+
+A clean-room LiteSVM regression uses the pinned Percolator SBF binary to initialize a real market,
+open a real long/short trade, move the authenticated mark, permissionlessly settle an organic loss,
+crystallize the trader counter, flatten by trading, and owner-withdraw to one atom. After freeze, an
+unaffiliated maintenance sync consumes that atom and closes the portfolio. The old residual binary
+then fails the valid claim with `AccountDataTooSmall`.
+
+FIX: a live Percolator account keeps the existing permissionless live-cap path unchanged. For the
+exact stake-linked account only, zero lamports plus zero data under Percolator or the system program
+is treated as terminal dematerialization and pays only already-frozen points to the already-bound
+recipient. A close can at worst bypass a later points cap within the fixed cohort allocation; it
+cannot redirect COIN, increase the cohort supply, or touch collateral.
+
+## Tick - public terminal cleanup could erase frozen reward claims (surface C/D, interim fix superseded)
+
+Percolator intentionally excludes monotonic reward telemetry from its empty-portfolio predicate.
+That permits terminal dematerialization after every collateral, PnL, position, and receipt exits,
+but the residual distributor still needs the same portfolio account to live-cap LP and trader
+claims. The controller's new permissionless empty-portfolio wrapper therefore let any caller close
+an otherwise empty reward-bearing portfolio after crystallization/freeze and before claim. Closing
+returned rent to the slab and erased the only authenticated claim witness, permanently locking that
+backer's COIN allocation in the reward vault.
+
+A fresh LiteSVM regression initializes the real pinned Percolator and residual-distributor binaries,
+opens a real trade, moves the oracle, permissionlessly settles a real loss, and crystallizes/freezes
+the resulting trader points. It then hands the market to the real controller, resolves it, and pays
+the trader through public `CloseResolved`, leaving an economically empty portfolio with its organic
+loss counter intact. Against the old controller binary, an unaffiliated tag-11 cleanup succeeds and
+the regression fails because the portfolio disappears before claim.
+
+INTERIM FIX (superseded): a pinned-layout reader required governance to close reward-bearing
+portfolios. The next audit tick showed that this could freeze segregated principal because
+Percolator gates resolved withdrawals on every materialized account. The final construction moves
+closed-witness recovery into the residual distributor and keeps controller cleanup permissionless.
+
+## Tick - resolved owner principal depended on a surviving DAO (surface A/C)
+
+After the genesis pool handed asset-0 custody to TWAP, subledger exits correctly remained closed
+until custody returned. The only TWAP return instruction, however, always required the Squads vault
+signature. Even after anyone resolved and fully cranked the bound Percolator market empty, a missing
+or hostile DAO could refuse the fixed return forever. Every owner-bound position then retained a
+valid principal claim with no public path able to restore its withdrawal authority: persistent
+liveness failure and effective loss of funds without any market loss.
+
+A fresh full-chain LiteSVM regression uses the real pinned Percolator, subledger, TWAP, controller,
+Squads, genesis-vote, and distribution binaries. It deposits owner principal, hands custody to TWAP,
+and proves an unaffiliated return against the live market rejects with the market and pool
+byte-exact. It then resolves through the real controller lifecycle and uses the same unaffiliated
+caller to return custody, redeem all protected principal to the owner's destination, re-handoff the
+remaining protocol insurance, and complete the existing canonical terminal cleanup. The old TWAP
+binary fails the post-resolution return with `MissingRequiredSignature`.
+
+FIX: TWAP tag 16 still requires the bound Squads vault signature while the market is live. Without
+that signature it now additionally requires the config-bound executable Percolator program, a slab
+owned by that program, Percolator's resolved-and-empty predicate, and a read-only subledger
+attestation that the bound principal-only insurance pool still has owner principal. Current
+share-bearing layouts must also have shares; deployed pre-share layouts use their nonzero aggregate
+principal, and a dedicated real-Percolator LiteSVM fixture proves that attestation still leads to the
+historical owner's successful exit.
+The instruction still accepts no amount or destination and can rotate custody only through
+subledger's immutable pool derivation. The regression then re-hands off with zero principal and
+proves the same public call rejects byte-exact while terminal protocol insurance remains, preventing
+a caller from moving that value into an empty pool. A later audit permits only the value-less role
+return after canonical protocol recovery so asset-0 backing cannot become DAO-dependent. User exits
+are restored without adding a governance or public withdrawal surface.
+
+## Tick - abandoned empty portfolio could block terminal market close (surface C)
+
+Any user could fund and initialize an empty Percolator portfolio, which increments the market's
+`materialized_portfolio_count`. After resolution, Percolator allows either the portfolio owner or
+`marketauth` to close that empty account, but the controller PDA permanently holds `marketauth` and
+its generic proxy intentionally rejects portfolio instructions. If the owner disappeared, public
+`CloseResolved` could not deregister the account and `CloseSlab` remained blocked forever despite no
+user value being owed. One attacker-paid rent account was enough for persistent terminal DoS.
+
+A fresh LiteSVM regression initializes a controller-owned market permissionlessly, creates the
+attacker's portfolio through the System Program, materializes it with the real pinned Percolator
+binary, and also deposits one collateral atom into an independent victim portfolio. It resolves
+through the existing controller proxy and proves both an unaffiliated direct `ClosePortfolio` and
+terminal `CloseSlab` fail. Before the fix, the only proposed bounded cleanup fails at the controller
+with `InvalidInstructionData`.
+
+FIX: controller instruction 11 is a permissionless, stateless wrapper around only pinned Percolator
+`ClosePortfolio`. It derives the controller from the governance, market, and executable Percolator
+program; accepts no amount, token account, or destination; and lets Percolator enforce resolved mode
+and an actually empty portfolio. Portfolio rent goes only into the slab. The regression also proves
+the same crank rejects atomically while the market is live and while resolved collateral remains
+owed. Public `CloseResolved` first pays the victim's atom only to its canonical account; only then
+can the wrapper deregister that empty portfolio. It finally deregisters the abandoned account and
+allows the existing terminal reclaim to close the slab.
+
+## Tick - provider cleanup could sweep retained protocol insurance (surface A/C)
+
+The controller used one canonical token account per market and mint for both protocol custody and
+temporary external-provider returns. Resolved TWAP cleanup could correctly leave retained protocol
+insurance in that account, but every later provider-bound insurance or backing cleanup forwarded
+the account's complete balance. Cleanup order therefore determined ownership: an external provider
+could receive its own attributed return plus protocol insurance retained by an earlier TWAP round.
+
+A fresh full-chain LiteSVM regression uses the real Percolator, subledger, TWAP, controller, Squads,
+genesis-vote, and distribution binaries. It deposits three atoms of external secondary backing,
+runs a real 50/50 TWAP buyback/retention round, resolves the market, lets the genesis owner exit,
+and routes five atoms of retained protocol insurance into the controller account. The old
+permissionless secondary-backing cleanup then gives the provider eight atoms instead of three.
+
+FIX: all five provider-bound shutdown and resolved cleanup paths now checked-sum the amount
+attributed by the pinned Percolator slab, transfer exactly that amount, and close the controller
+account only if it is empty. Any pre-existing protocol value or dust remains under the controller
+PDA for fixed terminal reclaim; it neither blocks the provider's return nor leaks to that provider.
+The regression proves the provider receives exactly three atoms, the five protocol atoms remain in
+controller custody, and terminal market cleanup sends those five atoms only to governance. Existing
+canonical-recipient, reassigned-ATA, and asset-0 backing return regressions remain green.
+
+## Tick - retained TWAP insurance floor could block resolved market close (surface A/C)
+
+Every TWAP round can intentionally ratchet protocol insurance into the monotonic reserved floor.
+After resolution, custody could return to the canonical pool so every depositor recovered their
+owner-bound principal, and a zero-principal re-handoff correctly removed only that principal from
+the floor. The retained protocol component remained protected, however: the auction saw zero
+surplus forever, while CloseSlab required all insurance to be zero. No fixed path could distinguish
+that terminal protocol insurance from user principal, so a normal 50/50 retain/buyback lifecycle
+could permanently block whole-market closure after all users had exited.
+
+A fresh full-chain LiteSVM regression uses real Percolator, subledger, TWAP, controller, Squads,
+genesis-vote, and distribution binaries. It deposits user principal, hands custody to TWAP, donates
+surplus, and runs a real permissionless 50/50 round that moves half to the buyback budget and
+ratchets half into insurance. It then resolves, proves terminal recovery rejects while user
+principal exists, returns custody for the owner's resolved withdrawal, and re-hands off with zero
+principal. The prior binaries fail with `InvalidInstructionData` at the missing terminal instruction
+after the retained floor is shown to block CloseSlab.
+
+FIX: subledger exposes a read-only CPI attestation that succeeds only for the canonical principal
+insurance pool with zero outstanding principal and zero shares. TWAP's new permissionless resolved
+path requires that attestation, a resolved/empty controller-owned market, all three asset-0 custody
+roles on the config PDA, and exact config/market/program bindings. It derives the controller from
+the bound Squads vault, withdraws the exact slab-derived asset-0 remainder to the canonical TWAP
+ATA, forwards the complete transit balance only to the canonical controller ATA, and closes the
+transit. The regression proves a caller-selected destination rejects atomically and the existing
+terminal close then forwards the protocol atom; no governance withdrawal or user-principal path is
+added.
+
+## Tick - public stale resolution could strand controller-owned insurance (surface A/C)
+
+The controller's public insurance-donation path could add asset-0 insurance while its PDA remained
+the recorded authority. If governance enabled Percolator's permissionless stale-resolution policy,
+any cranker could then resolve the market. CloseSlab still required that insurance to be zero, the
+generic proxy denied both insurance-withdrawal tags, and the fixed resolved-insurance return rejected
+asset 0 and controller-owned authority. A one-atom public donation could therefore become permanently
+stranded after the public resolution transition and block whole-market closure.
+
+A fresh real Percolator + controller LiteSVM regression initializes the market through the public
+controller wrapper, configures stale resolution through the governance allowlist, donates one atom
+through the public fixed path, and resolves through Percolator's public stale cranker. The old
+controller then fails with `InvalidArgument` at the only bounded cleanup path.
+
+FIX: the existing resolved-insurance instruction now recognizes insurance whose slab-recorded
+authority is the controller. It withdraws only the exact slab-derived amount into the same canonical
+controller ATA, leaves the ATA open, and relies on the existing governance-signed terminal reclaim
+to forward it after CloseSlab succeeds. It does not rotate an already-controller-owned role and still
+rejects externally owned asset-0 insurance. The LiteSVM regression proves an attacker-selected token
+account is rejected atomically, the valid recovery zeros insurance, and terminal close delivers the
+one atom only through the existing governance destination. External-provider and malicious-governance
+regressions remain green.
+
+## Tick - provider-owned canonical ATA mutation could block terminal cleanup (surface A/C)
+
+Every fixed controller return pinned external backing and insurance to the provider's canonical ATA, but also
+required the token account's mutable owner field to remain the provider. After depositing one atom through the
+public Percolator API, the provider could use SPL Token `SetAuthority(AccountOwner)` to assign that initialized
+ATA to a dead key and disappear. The address remained allocated, so no cranker could recreate it, while every
+shutdown and resolved return rejected before moving value. The provider's one atom could therefore block asset
+retirement or whole-market closure indefinitely.
+
+A fresh real Percolator + controller LiteSVM regression initializes and backs asset 0, permissionlessly donates
+the market to its controller, resolves it through the governance proxy, reassigns the exact canonical provider
+ATA through the real SPL Token program, and then exercises the public resolved two-domain cleanup. The old
+controller fails with `InvalidAccountData` at the destination check.
+
+FIX: the exact canonical address, SPL ownership, initialized state, and mint remain mandatory, but cleanup no
+longer treats the destination token owner as immutable. Only the provider can authorize that field change, and
+the controller still cannot select or accept another address, so the change restores liveness without creating
+a redirect or governance withdrawal surface. The regression returns the atom to the same canonical address and
+closes the controller transit account; the existing noncanonical-recipient and atomic-return tests stay green.
+
+SUPERSEDED: the later permanent-freeze probe showed that address pinning itself was the liveness defect and
+that paying a reassigned account did not preserve provider control. Current code instead requires a clean
+replaceable account whose token owner is the immutable slab-recorded provider.
+
 ## Checkpoint — CURRENT session (latest; supersedes the prior checkpoint below)
 STATE: 302 standalone tests GREEN (subledger 75, genesis-vote 22, distribution 36, residual-distributor 52,
 twap-program 114, sim 3); all 5 deployables build-sbf clean; deployment-ready.
@@ -11794,3 +12684,912 @@ overpull_the_floor FAILS at "must reject auction+savings > 10000 (would overpull
 112/112 chain green, src clean. SHARP. (The reconfigure direction 530 is separately pinned by
 reconfigure_must_hold_the_auction_plus_savings_invariant + reconfigure_rejects_a_bps_above_the_denominator.)
 The principal-protection joint cap is load-bearing + mutation-pinned on the savings-setting path. No code change.
+
+## Tick — fixed recovery/re-handoff left exited principal in the TWAP floor (fee-surplus DoS) (surface A/C)
+
+Fresh LiteSVM lifecycle probe extended the real Squads + subledger + TWAP + SPL Token + pinned Percolator chain
+through a path the prior recovery test stopped before: TWAP custody -> permissionless fee donation -> protected
+buffer -> fixed return to the canonical pool -> owner withdrawals -> pool-to-TWAP re-handoff -> public execute.
+The old re-handoff only applied `max(reserved_floor, live_outstanding)`. The first clean-room probe withdrew all
+`999,999` principal, leaving a `1,199,999` floor over `500,000` live insurance; `saturating_sub(insurance, floor)`
+made all fee surplus unavailable forever. The probe failed exactly at that stale-floor assertion, then was
+strengthened to leave principal live across the public crank before completing the final recovery.
+
+FIX: new TWAP configs persist the pool-principal component separately. Only the fixed, pool-signed re-handoff
+may replace that component with current `outstanding_principal`; the DAO floor setter remains monotonic and has
+no new lowering surface. Retained insurance and DAO-raised buffers are preserved exactly. The LiteSVM regression
+keeps `100,000` principal live across re-handoff, proves a public crank preserves that principal plus a `200,000`
+buffer, returns custody again so the owner recovers the final principal, and verifies the next re-handoff removes
+only that final principal. The predecessor 264-byte config remains readable and uses its conservative legacy
+behavior; new 272-byte configs carry the principal snapshot.
+
+## Tick — share-value genesis handoff socialized TWAP surplus pulls into user principal (surface A/C)
+
+The grand-unified LiteSVM test previously stopped after the buy/burn winner claimed USD. Extending that same
+real Squads + genesis-vote + distribution + subledger + TWAP + pinned Percolator chain through fixed recovery,
+vote retract, and owner withdrawal exposed a principal loss: the genesis pool used POLICY_WITH_SURPLUS, a user
+deposited `1,000,000` behind `500,000` pre-existing protocol insurance, and TWAP auctioned `400,000`. Although
+live insurance remained healthy at `1,100,000` against `1,000,000` outstanding, share redemption returned only
+`733,333`. Pricing shares against the pre-existing balance correctly prevented the user from capturing protocol
+surplus, but removing that surplus later reduced the value of every user share and crossed into principal.
+
+FIX: TWAP handoff is now accepted only from POLICY_PRINCIPAL insurance pools. Canonical genesis and the 45-day
+continuous-reward E2E use that policy; both policies still mint the same tenure-fair shares for vote/reward
+accounting. Standalone POLICY_WITH_SURPLUS remains supported and keeps its intended pro-rata rewards, but it can
+never enter a custody regime that removes protocol surplus from its share-value balance. A separate real-binary
+probe proves the rejected handoff leaves the with-surplus owner able to withdraw directly. The completed genesis
+E2E now returns the full `1,000,000` and leaves exactly `100,000` retained protocol insurance. No new authority,
+admin path, or asset-moving instruction was added.
+
+## Tick — raw controller CloseSlab stranded terminal vault dust and account rent (surface A/C)
+
+The controller's generic proxy allow-listed Percolator CloseSlab even though Percolator requires its current
+`marketauth` to receive all raw vault dust, vault rent, and slab rent. Here `marketauth` is the stateless controller
+PDA, which had no post-close signer path. A fresh real Squads + controller + subledger + pinned-Percolator LiteSVM
+probe completed the full permissionless-create/deposit/shutdown/resolve/owner-exit lifecycle, injected raw terminal
+vault dust, and proved the old generic close succeeded while leaving both tokens and lamports inaccessible under
+the controller PDA.
+
+FIX: raw CloseSlab is no longer accepted by the generic proxy. A single fixed terminal instruction invokes the
+exact pinned CloseSlab, then atomically forwards its controller-owned token destinations and all recovered lamports
+to the governance signer. Percolator still requires resolved mode, zero insurance, zero collateral, and zero
+materialized portfolios before any transfer occurs, so this adds no live-market withdrawal authority. The retained
+LiteSVM lifecycle proves the old route is rejected, live-market close is rejected without moving either vault,
+omitting a configured secondary collateral vault rolls back atomically, both primary and secondary terminal dust
+are forwarded, temporary accounts close, and controller/vault/slab rent is conserved exactly. The temporary
+destination is pinned to the controller's canonical ATA for the Percolator-validated collateral mint; its complete
+balance is forwarded, so a public one-atom transfer during the Squads timelock cannot DoS cleanup while governance
+still cannot select and sweep an arbitrary controller-owned token account. The same full lifecycle now splits an
+external provider's backing exit across live shutdown and resolved mode, proving controller-mediated resolve does
+not rotate, confiscate, or strand the provider's remaining backing before terminal cleanup.
+
+## Tick — externally closable TWAP savings sink could stall every surplus round (surface A)
+
+`set_economics` previously checked only that a nonzero savings sink account was owned by the SPL Token program.
+A fresh real System + SPL Token + Squads + TWAP LiteSVM probe created a collateral account under an attacker,
+assigned the attacker as close authority, then rotated the token owner to the TWAP PDA. SPL owner rotation clears
+delegates but preserves a non-native account's explicit close authority. The old timelocked setter accepted that
+otherwise-correct sink, after which the attacker could close it and make every permissionless savings-enabled
+`execute` revert until another one-week governance update replaced the account.
+
+FIX: `set_economics` now unpacks the sink before committing it and requires initialized state, the exact TWAP
+authority owner, no delegate/delegated balance, and no close authority. The retained LiteSVM regression builds the
+attack state through the real SPL program, proves the vulnerable setter accepted it before the fix, proves the
+fixed setter rejects it without changing bps or sink identity, and independently exercises the attacker's live
+close path. Valid savings-only and full four-way rounds remain green. No signer, withdrawal, or admin surface was
+added; the check only removes an external liveness key.
+
+## Tick — externally mutable bought-COIN sink could stall settlement (surface A)
+
+The book's SEND-mode COIN sink is intentionally allowed to be an external DAO/reward destination. Both
+`init_book` and `set_coin_sink` previously accepted a valid COIN account that retained an attacker close authority,
+and even an account with no separate close key remains closable by its external token owner while empty. Three
+fresh real Squads + SPL Token + TWAP LiteSVM probes reproduced the complete class: the old init and setter each
+accepted a Squads-owned account whose attacker close key survived owner rotation, and a normally configured
+external owner closed its sink before a filled round, causing the old permissionless `execute` to revert at the
+sink transfer.
+
+FIX: both configuration doors now require initialized, correct-mint sinks with no delegate or close authority.
+Execution still requires the exact configured account key, but if that authoritative account later becomes closed,
+frozen, malformed, or non-SPL, its requested share deterministically joins the burn amount. A cranker cannot select
+or redirect this fallback. The impact regression closes the sink through real SPL, fills a real auction, and proves
+the whole bought-COIN amount burns while winner settlement remains fully funded. This changes only COIN routing;
+insurance pulls, the principal floor, bids, and user collateral are unchanged, and no admin surface was added.
+
+## Tick — Squads `config_authority` spoof could seize funded TWAP custody (surface A/C)
+
+TWAP init previously treated `multisig.config_authority == metadao_futarchy` as proof that MetaDAO
+controlled Squads vault transactions. Squads does not require that key to sign multisig creation. A
+fresh real-Squads LiteSVM probe created a 1-of-1 multisig with the victim MetaDAO merely named as
+`config_authority` and the attacker as the sole all-permissions member; the old TWAP accepted it. The
+impact probe then deposited `1,000,000` real base units through the canonical owner-bound subledger and
+proved the attacker could clear the one-week Squads flow and make that pool hand custody to the
+attacker-bound TWAP PDA without any MetaDAO signature. The imported principal floor still prevented a
+direct deposit drain, but the attacker acquired fee, reward-routing, shutdown, and custody-transition
+control and could indefinitely deny the intended futarchy.
+
+FIX: init now parses the real Squads v4 member vector and accepts only the minimal governance wrapper:
+threshold 1, exactly one member, and that member is the named MetaDAO with initiate, vote, and execute
+permissions. `config_authority`, the existing minimum one-week timelock, real-program ownership, and
+discriminator checks remain required. The retained funded-chain regression rejects both an attacker-only
+multisig and a threshold-1 mixed MetaDAO/attacker multisig, proves neither attacker TWAP config is created,
+and leaves Percolator insurance plus subledger outstanding principal byte-exact. No new signer, setter,
+withdrawal path, or custody authority was added.
+
+## Tick — market-wide insurance read crossed asset-local custody boundaries (surface A/C)
+
+TWAP and the insurance subledger both read Percolator's market-wide `header.insurance` while their
+withdrawal CPI used asset-local tag 57. A fresh real Percolator + Squads + TWAP LiteSVM probe activated
+asset 1 through governance, let its external authority publicly deposit `500,000` through
+`TopUpInsuranceDomain`, and executed an empty TWAP round. Asset 0 held `1,500,000` behind a `1,000,000`
+floor. The old global quote treated the foreign balance as surplus, pulled `800,000` instead of
+`400,000`, and left only `700,000` in asset 0. Percolator kept the provider's asset-1 balance segregated,
+but the Meta accounting had used it to authorize a withdrawal from the wrong asset, crossing protected
+principal through a permissionless crank.
+
+The same root caused an owner-exit DoS after an asset-0-only loss: global insurance remained above the
+subledger's outstanding principal because asset 1 was healthy, so the subledger requested full principal
+and tag 57 rejected it against asset 0's smaller capacity. The retained real-binary regression now pays
+the exact asset-0 pro-rata remainder and leaves external asset insurance untouched.
+
+FIX: a small shared read-only crate derives the pinned slab offsets from the exact engine structs and
+returns one asset's `long budget - spent + short budget - spent`, capped by global insurance, matching
+Percolator's own insurance-ledger observation. TWAP surplus and subledger haircuts now use that value.
+Temporary source-credit reservations remain enforced by the Percolator CPI and delay rather than
+crystallize an exit. No counter, signer, setter, token destination, withdrawal instruction, or admin
+authority was added.
+
+## Tick — abandoned external backing could permanently block market cleanup (surface A/C)
+
+A permissionless asset provider can deposit backing and disappear. Percolator correctly refuses to retire
+or close a slab while principal or provider earnings remain. It gives `marketauth` a narrowly timed override
+after the asset shutdown delay and empty-state checks pass, but only before market resolution. The stateless
+controller denied backing tags 50/52 through its generic proxy and exposed no fixed use of that override. A
+one-atom public deposit could therefore make a controller-owned market impossible for futarchy to retire or
+close unless the provider returned.
+
+The red real Percolator + Squads + controller LiteSVM lifecycle deposited external long-domain backing,
+shut the asset down through the one-week-timelocked governance path, and then required a permissionless
+return of the provider's abandoned remainder. The old controller rejected the new operation with
+`InvalidInstructionData`. The retained probe also funds the short domain, covers provider self-service
+withdrawal before and after resolution, and reaches final `CloseSlab` cleanup.
+
+FIX: controller tag 6 reads the backing authority from the pinned asset profile, requires canonical token
+accounts for that provider and the controller, invokes Percolator's earnings withdrawal before principal,
+forwards the complete transient balance and rent to the provider, and closes the transient account. It is
+permissionless and adds no DAO-selected recipient. The generic proxy still rejects tags 50/52. Percolator
+itself remains the shutdown-delay, empty-asset, available-balance, and pre-resolution authority gate.
+
+Safety probes prove the fixed path is byte-atomic and unusable before shutdown, rejects a canonical
+DAO-owned recipient after shutdown, rolls back the earnings CPI and ledger initialization when a subsequent
+oversized principal CPI fails, and stops working after resolution while the recorded provider remains able
+to exit. The earnings fixture mirrors the aggregate and domain state produced by the pinned public backing-
+fee path; all withdrawal, authorization, token movement, and cleanup run through the real SBF binaries. The
+shared read-only profile offset is asserted against the exact Cargo-pinned wrapper struct in the chain test.
+
+## Tick — owner-signed subledger exits could redirect principal (surface C)
+
+Both subledger withdrawal handlers bound the signer to the position but passed the caller-supplied
+`owner_ata` directly into a pool-PDA-signed SPL transfer without checking that the token account belonged
+to that owner. A malicious transaction builder could preserve the victim's required signature, replace
+only the destination with an attacker-owned same-mint account, and receive the victim's own-vault backing
+or real Percolator insurance payout while the program retired the victim's principal. The insurance path
+also accepted its pool holding as both transfer source and destination; SPL Token treats an authorized
+self-transfer as a successful no-op, so the position was retired while its payout remained stranded.
+
+Two fresh LiteSVM probes went red against the old SBF: a real own-vault withdrawal and a real Percolator
+insurance withdrawal each succeeded with the victim signing and the attacker token account substituted.
+The retained insurance probe also attempts the holding-to-itself payout. Every rejected attempt snapshots
+the pool, position, market slab, vault, and holding as applicable, proves byte-exact rollback, and then
+completes the honest owner's exit.
+
+FIX: one shared validator now requires each withdrawal destination to be an initialized SPL Token account
+of the pool mint whose token authority is the signing position owner. It permits any owner-controlled token
+account, preserving historical exits and PDA owners, while structurally excluding attacker destinations,
+pool vaults, and insurance holding accounts. No signer, admin, policy, amount, share, or custody authority
+was added.
+
+## Tick — owner-signed genesis claims could redirect or consume COIN (surface C)
+
+The distribution claim authenticated the recipient named at an entry but passed its caller-supplied token
+destination directly into a distribution-PDA-signed transfer. A malicious transaction builder could obtain
+the recipient's valid signature on a claim naming an attacker-owned same-mint account, receive the allocation,
+and zero the victim's entry. Naming the distribution vault itself was worse: SPL Token accepts an authorized
+self-transfer as a successful no-op, after which the program still zeroed the entry and left the allocation
+to burn as unclaimed.
+
+A fresh LiteSVM probe used two live entries for one recipient. Against the old SBF, both the owner-signed
+attacker redirect and vault-to-itself claim succeeded. The retained regression requires both to reject,
+asserts the proposal and vault remain byte-exact, and then claims both entries normally to the recipient.
+
+FIX: distribution now requires the payout to be an initialized SPL Token account of the configured COIN mint
+whose token authority is the signing recipient. Arbitrary recipient-owned accounts and historical claims stay
+supported; attacker accounts and the config-owned vault cannot pass. No signer, mint, admin, custody, amount,
+or claim authority was added.
+
+## Tick — market donation could absorb the creator's asset-0 backing authority (surface A/C)
+
+Percolator initializes asset 0 with the permissionless creator as both `marketauth` and backing provider. Its
+`UpdateAuthority` instruction intentionally rewrites every asset-0 role still equal to the outgoing market key.
+The controller's public `accept_market_authority` used that instruction without restoring backing, so a creator
+who funded the long or short backing bucket and then donated lifecycle control silently changed the recorded
+provider to the stateless controller. The creator's normal withdrawal became unauthorized, the generic controller
+proxy denied backing withdrawals and authority mutation, and the fixed abandoned-backing path could not attribute
+the controller-owned bucket back to the creator.
+
+A fresh real Percolator + controller LiteSVM reproduction initialized a market through the public API, deposited
+`500,000` asset-0 backing units as the creator, donated the market, and observed the old SBF replace the provider
+with the controller. The retained regression requires the creator to remain recorded and withdraw the complete
+bucket after the handoff. A symmetric real-binary probe first rotates backing to a distinct provider and proves
+the handoff leaves that provider unchanged.
+
+FIX: the creator-signed donation snapshots whether the outgoing market authority is the recorded asset-0 backing
+provider. After Percolator moves `marketauth` to the controller, one atomic fixed CPI restores only that exact
+outgoing provider; an unrelated provider takes no CPI and cannot be overwritten. The generic tag-65 proxy remains
+denied, governance cannot choose a recipient, and any failure rolls back the market-authority handoff with the
+restoration. No withdrawal, token destination, DAO signer, or reusable admin surface was added.
+
+## Tick — asset-0 backing could block terminal market cleanup (surface A/C)
+
+Percolator's marketauth shutdown override deliberately excludes asset 0 and ends at whole-market resolution.
+The controller's permissionless abandoned-backing return therefore worked for secondary assets only: a direct
+asset-0 probe reached the pinned binary after resolution and failed authorization. If the recorded provider had
+disappeared, its remaining long/short principal or earnings kept the market vault nonzero forever, so the fixed
+`CloseSlab` path could never complete even after every portfolio and insurance depositor exited.
+
+A fresh real-binary LiteSVM regression initialized a permissionless creator market, funded both asset-0 backing
+domains, included the separately covered reachable earnings state on both sides, donated marketauth without
+donating backing, handed asset-admin custody to the canonical genesis pool, and resolved the empty market. The
+old controller/subledger binaries failed the required return with `InvalidInstructionData`. The retained test
+also proves a live crank changes nothing and that the former controller admin cannot bypass the pool after
+custody moves.
+
+FIX: a read-only pinned-layout parser derives the market authority, resolved/empty state, and complete
+withdrawable principal/earnings for both asset-0 domains. A new fixed controller operation requires the named
+controller to remain marketauth, accepts no recipient or amount, atomically rotates only backing from the current
+asset admin to the controller, executes every withdrawal through Percolator, and forwards the complete transit
+balance only to the outgoing provider's canonical ATA. Before handoff the controller can supply the current-admin
+signature; after TWAP recovery the canonical market-bound insurance pool has a parameter-free wrapper that signs
+only this exact controller instruction. Generic authority and value-moving proxies remain denied.
+
+The late-failure probe supplies a valid long earnings ledger and malformed short earnings ledger. It reaches the
+short CPI only after long earnings/principal and the authority rotation, then requires Solana to roll back the
+market, vault, transit, destination, and both ledgers byte-for-byte. Replacing the bad ledger permits a public
+retry that pays both principals and both earnings totals. No DAO destination, amount, withdrawal key, or
+reusable asset-admin surface was added.
+
+A compatibility subprobe replaces the current pool fixture with a legitimately deployed predecessor PDA whose
+nonzero metadata `asset_id` still routed every insurance CPI to asset 0. Rejecting that metadata would strand the
+same resolved cleanup after an upgrade. The wrapper therefore accepts every supported historical insurance-pool
+seed schema, while still requiring its immutable market/program/domain binding, PDA signature, and Percolator's
+live current-admin check; the stale metadata cannot select an asset, controller, recipient, or amount.
+
+## Tick — secondary-asset insurance could block retirement (surface A/C)
+
+Percolator lets a secondary asset's market authority withdraw asset-local insurance only after the configured
+shutdown delay and empty-state checks pass. That override ends at resolution, and retirement requires both
+insurance-domain budgets to be zero. The stateless controller denied insurance withdrawal tag 57 through its
+generic proxy but exposed no fixed use of the shutdown override. If an external insurance authority disappeared
+after funding either domain, the asset could therefore remain permanently unretirable.
+
+A fresh real Percolator + Squads + controller LiteSVM reproduction activated asset 1 with an external insurance
+authority/operator, deposited `50,000` and `30,000` units through the public long/short insurance top-up API,
+and shut the asset down through the timelocked governance lifecycle. The old controller rejected the required
+post-delay return with `InvalidInstructionData`. The retained regression also proves the operation is byte-atomic
+while live, rejects a canonical DAO-owned destination after shutdown, records the exact controller-ledger
+withdrawal, closes its transient account, and continues through backing cleanup, resolution, user exits, and
+real `CloseSlab` terminal cleanup.
+
+FIX: controller tag 8 accepts only an asset index. A shared pinned-layout parser derives the market authority,
+recorded insurance authority/operator, and complete remaining asset-local insurance. The controller requires a
+secondary asset, remains bound as marketauth, rejects itself as the live insurance operator, routes only through
+Percolator's delayed shutdown override, and forwards tokens and transit rent only to the recorded authority's
+canonical ATA. The caller, DAO, and governance message select neither amount nor recipient. Generic tag 57 and
+all insurance-role mutations remain denied, and every failed CPI rolls back atomically. No reusable withdrawal
+key, new signer, DAO destination, or custody authority was added.
+
+## Tick — market donation could absorb creator-funded asset-0 insurance (surface A/C)
+
+Percolator's `UpdateAuthority` rewrites every asset-0 role still equal to the outgoing market authority. The
+controller's permissionless market-donation path already restored the outgoing backing provider, but left the
+insurance authority and operator rewritten to the controller. A creator who publicly funded asset-0 insurance
+before donating lifecycle control immediately lost its withdrawal key. Governance could then grant those
+nonzero units to the genesis pool, permanently converting external capital into pool custody without a depositor
+position or redemption claim.
+
+A fresh real Percolator + controller + subledger LiteSVM reproduction initialized a creator market, deposited
+`500,000` units through `TopUpInsuranceDomain`, and donated marketauth. The old controller SBF replaced the
+recorded creator with the controller. The retained regression initializes a valid canonical genesis pool and
+proves its signed grant is byte-atomic and rejected while the external balance remains; the creator then exits
+through Percolator's public withdrawal, and the identical grant succeeds with empty custody.
+
+FIX: before accepting marketauth, the controller snapshots whether nonzero asset-0 insurance is owned or
+operated by the outgoing signer. After Percolator's authority handoff, it atomically restores only those exact
+roles, alongside the existing exact backing-provider restoration. The genesis-pool grant now accepts nonzero
+insurance only when both recorded roles are already the controller; protocol donations remain adoptable, while
+external balances must exit first. No caller-selected key, destination, amount, withdrawal instruction, or new
+admin authority was added, and any restoration or grant CPI failure rolls the whole transaction back.
+
+## Tick — public stale resolution could strand secondary provider capital (surface A/C)
+
+Percolator's secondary-asset shutdown override lets marketauth return abandoned insurance and backing only while
+the market is live. Its configured global stale resolver is public and signerless; once it resolves the whole
+market, that override ends and only the recorded asset-local provider can withdraw. A cranker could therefore
+win the race against cleanup after an external provider disappeared, permanently blocking terminal market
+closure with that provider's insurance, backing principal, or earnings still in the vault.
+
+A fresh pinned-Percolator + Squads + controller LiteSVM regression activated asset 1, funded both insurance
+domains and both backing sides, shut the asset down, and left fresh short-side principal, earnings, and insurance
+after exercising the live return. It then invoked public `ResolveStalePermissionless` without a DAO or provider
+signature. The old controller SBF failed the required post-resolution return with `InvalidInstructionData`.
+The retained test rejects both paths while live, rejects DAO-owned destinations after resolution, proves the old
+shutdown path is dead, recovers every atom to the recorded provider, and continues through depositor exit and
+real `CloseSlab` cleanup.
+
+FIX: controller tags 9 and 10 require a secondary asset in a resolved, empty controller-owned market. They read
+the outgoing insurance or backing authority and exact complete balances from the pinned slab, use the
+controller's existing asset-admin role to rotate only that value role, invoke Percolator's resolved withdrawal,
+and atomically forward and close the transit account to the outgoing provider's canonical ATA. Backing handles
+both domains and earnings before principal. No governance signer, caller-selected amount, DAO recipient, generic
+authority mutation, or reusable withdrawal key was added; a failed CPI rolls the role change and all transfers
+back.
+
+## Tick — donating a live secondary asset orphaned its asset admin (surface A/C)
+
+Percolator's `UpdateAuthority` migrates marketauth and matching asset-0 roles only. A creator could activate and
+fund asset 1, then publicly donate marketauth to the controller while asset 1 kept the creator as its
+`asset_admin`. The controller could still shut the asset down through marketauth, but a signerless public stale
+resolution ends that live shutdown override. If the creator then disappeared, the controller could not rotate
+the secondary insurance or backing role for resolved provider cleanup, leaving provider capital able to block
+terminal market closure.
+
+A fresh pinned-Percolator + controller LiteSVM test configured public stale resolution, activated asset 1 with a
+creator admin and external provider, deposited `11,000` insurance units through the real public API, and attempted
+the ordinary permissionless market donation. The old controller SBF accepted the unsafe handoff, making the
+retained rejection assertion fail. The fixed test requires byte-atomic rejection, proves the external provider's
+normal withdrawal remains live, retires the now-empty secondary slot through Percolator, and then proves the
+identical donation succeeds.
+
+FIX: the pinned read-only accounting view compares Percolator's configured-slot count with its canonical
+`free_market_slot_count`. Controller market donation now proceeds only when asset 0 is the sole non-retired slot;
+the check is O(1) even though Percolator market slots are dynamically sized. Multi-asset markets remain
+permissionlessly deployable by initializing them under the controller before activation. No new signer, admin
+instruction, authority mutation, value destination, or custody path was added.
+
+A follow-up bypass probe set Percolator's `permissionless_market_init_fee` on the now-retired creator market. The
+first guard then accepted donation even though any caller could append a new asset afterward and become its
+external `asset_admin`; the retained fee-gate assertion failed against that SBF. Donation now also requires the
+pinned fee field to be zero, and tag 59 is removed from the controller governance allow-list so it cannot be
+reopened after handoff. The real-binary test proves nonzero-fee rejection, creator disable-and-retry, and a failed
+governance-signed proxy attempt with market bytes unchanged. Whole-market initialization remains permissionless;
+secondary activation is governance-approved and can still name external insurance, backing, and oracle roles
+while setting the constrained controller as activator/admin.
+
+## Tick - a late principal deposit could recapitalize an earlier insurance loss (surface B)
+
+Principal-policy insurance withdrawals used the pool-wide ratio `insurance * amount / outstanding` even though
+current deposits already mint shares at the live insurance price. If Alice deposited `1,000,000`, the market
+lost half before Bob arrived, and Bob then deposited `1,000,000` during the still-open genesis window, the ratio
+treated both positions as if they had entered before the loss. The current SBF paid Alice `750,000` instead of
+her pre-Bob value `500,000`, transferring `250,000` of Bob's fresh principal to the older position. Reversing
+withdrawal order still split the loss equally, so Bob could not protect himself by exiting first.
+
+A retained real-Percolator LiteSVM regression performs both public deposits and withdrawals around a valid
+asset-local impairment and exercises both exit orders. It failed against the old SBF at the `750,000` transfer.
+Current share-accounted principal positions now receive `min(requested principal, live share redemption)`, with
+shares priced and redeemed against `min(asset insurance, outstanding principal)`. The latter excludes protocol
+surplus: the first full-workspace probe caught raw insurance pricing misclassifying a legitimate TWAP surplus
+pull as a depositor loss in both the genesis-to-buyback and 45-day continuous-reward chains. With the loss-bearing
+base, Alice receives `500,000` (within the existing one-atom share-floor bound), Bob receives `1,000,000` (same
+bound), their sum equals the complete remaining insurance in either order, and both full chains return healthy
+principal exactly. Historical pre-share positions retain the old owner-bound pool-wide haircut so an upgrade
+cannot lock their funds. No signer, authority, destination, custody transition, or admin surface was added.
+
+## Tick - controller activation could give governance an external provider's withdrawal key (surface A/C)
+
+Percolator's secondary-asset activation wire accepts separate insurance authority and insurance operator
+keys. The controller generically proxied that lifecycle call without constraining the pair. Governance could
+therefore activate asset 1 with an external provider as the top-up authority and itself as operator, wait for
+the provider to deposit, then use Percolator's ordinary live withdrawal to send the complete balance to a
+governance-owned token account. The timelock delayed the theft but did not prevent it.
+
+A fresh controller + pinned-Percolator LiteSVM regression initialized a controller-owned appendable market,
+activated the split roles through the public proxy, deposited `700,000` units from the external provider, and
+proved the old SBF let governance withdraw all `700,000`. The retained test executes that drain before failing
+if the unsafe activation ever regresses. It also requires rejected activation to leave the slab byte-identical,
+then activates with both insurance roles bound to the provider, proves a governance withdrawal fails atomically,
+and returns every unit through the provider's live exit.
+
+FIX: the controller validates the exact pinned tag-40 activation wire before CPI and requires
+`insurance_authority == insurance_operator`. Backing and oracle providers remain independently selectable, and
+non-activation lifecycle actions remain unchanged. This adds no signer, authority, destination, withdrawal path,
+or admin surface; it removes governance's ability to construct split custody in the first place.
+
+## Tick - delegated asset-0 roles could drain inbound controller donations (surface A/C)
+
+Percolator's market-authority handoff rewrites only asset-0 roles still equal to the outgoing market key.
+A permissionless creator could delegate the empty asset's cold admin or insurance operator, donate
+`marketauth` to the controller, and leave that external key intact. The controller's public
+`donate_insurance` path checked only that its PDA could top up; it did not prove that no surviving key could
+withdraw or rotate the operator after the donation. Its advertised inbound-only property was therefore false.
+
+A fresh controller + pinned-Percolator LiteSVM regression exercises both public variants. In the stronger
+variant, the creator delegates `asset_admin`, donates the market, an honest caller deposits `600,000`, the
+surviving admin rotates the operator to itself, and it withdraws all `600,000`. The sibling variant leaves an
+external operator through the handoff and can withdraw immediately. Both drains succeeded against the old SBF.
+The retained test requires each unsafe donation to reject before changing the slab, Percolator vault,
+controller holding account, or donor source, and pins the new admin offset to the exact Cargo-pinned profile.
+
+FIX: before moving donor tokens, `donate_insurance` now reads the pinned market and asset-0 profile and requires
+the controller PDA to be the current `marketauth`, insurance authority, insurance operator, and `asset_admin`.
+The canonical controller-owned donation and full genesis-to-reward chain remain live. No repair signer,
+withdrawal destination, role mutation, governance key, or reusable admin surface was added.
+
+## Tick - a frozen canonical bidder account could permanently settle-lock the auction (surface C)
+
+`place_bid` accepted any healthy bidder-owned COIN source and collateral destination, but persisted the
+bidder's canonical ATAs for later refund and settlement. A bidder whose canonical account was already frozen
+could therefore validate a healthy decoy, escrow a bid, and leave a settled or evicted slot whose mandatory
+transfer could never succeed. Unlike a closed ATA, a permanently frozen ATA cannot be permissionlessly
+recreated or thawed, so one poisoned slot could keep the singleton book from reopening.
+
+Two retained real-SBF LiteSVM regressions cover the independent USD-payout and COIN-refund paths. Each creates
+a legitimate externally controlled freeze state, presents a healthy decoy, and proves rejection leaves the
+bidder source and shared escrow unchanged. The COIN case revokes the freeze key after freezing to prove the
+recorded destination would be permanently unusable.
+
+FIX: placement now requires the passed source and destination to be the exact canonical bidder ATAs, owned by
+SPL Token and in `Initialized` state, before burning the fee, refunding an eviction, or moving escrow. The same
+validated keys are persisted into the slot. No cleanup authority, alternate recipient, admin path, or custody
+surface was added.
+
+The same chain now initializes a maximal six-market reward epoch through the real timelocked Squads path and
+checks the serialized legacy transaction against Solana's packet limit. Reusing the sole DAO member as fee
+payer keeps the maximal transaction at 1,188 bytes; a separate fee-payer signature would make it 1,284 bytes
+and non-broadcastable. This is governance-lifecycle coverage, not an additional authority.
+
+## Tick - the pool-less legacy handoff could permanently lock funded insurance (surface A/C)
+
+TWAP tag 3 rotates asset-0 insurance authority, operator, and cold admin from a Squads vault to the constrained
+TWAP PDA. It is the compatibility path for an unfunded market, so it records no owner-bound `custody_pool`.
+The implementation did not enforce the documented empty-balance precondition. A timelocked call could therefore
+move an already-funded market into TWAP custody with the sentinel floor and no public return destination. The
+auction could not pull the sentinel-protected value, and `return_to_subledger` rejected because no pool was bound,
+permanently locking the insurance even though governance never gained a withdrawal key.
+
+A retained pinned-Percolator + real-Squads + TWAP LiteSVM regression tops up `700,000` asset-0 insurance units
+through the public API, executes the legacy handoff through the one-week timelock, and requires rejection with
+the market bytes and canonical vault balance unchanged. It failed against the old SBF because all custody
+rotations succeeded.
+
+FIX: the pool-less handoff now reads the exact asset-local insurance remainder from the pinned accounting view
+and requires zero before the first role mutation. Funded genesis continues to use the subledger handoff, which
+atomically binds the sole recovery pool and live principal floor. Legacy auction fixtures now hand off while
+empty and fund afterward through TWAP's existing inbound-only donation. No recovery signer, destination, role,
+or admin surface was added.
+
+## Tick - post-placement SPL delegates could steal forced TWAP COIN refunds (surface A/C)
+
+TWAP recorded a bidder's canonical COIN account at placement but did not revalidate its mutable SPL
+authority state when paying a settled refund or evicting the weakest bid. A bidder could approve a delegate
+after its COIN entered escrow. Any cranker or better bidder could then force the complete principal refund
+into that account, after which the delegate could transfer it. Merely rejecting the canonical account would
+also let an absent bidder permanently block permissionless claims or full-book eviction.
+
+Two retained real-SBF LiteSVM regressions reproduce the independent public paths. The first settles a losing
+`100,000`-unit bid, adds the cranker as delegate, permissionlessly claims, and proves the old binary lets the
+delegate drain all `100,000`. The second fills all 32 slots, delegates the weakest empty refund account, evicts
+it with a better bid, and proves the old binary lets the evictor steal the returned unit. The fixed tests also
+prove a clean alternate account owned solely by the recorded bidder keeps claims, full-book eviction, and
+owner cancellation live.
+
+FIX: every COIN return now requires an initialized correct-mint account owned solely by the slot's recorded
+bidder, with no delegate, delegated amount, or close authority. The stable slot ABI and canonical recovery hint
+remain unchanged, but address equality is no longer the security boundary. No admin, repair signer, arbitrary
+beneficiary, amount selector, withdrawal authority, or principal-moving program surface was added.
+
+## Tick - per-bid flooring could pay above the TWAP reserve (surface A/C)
+
+The uniform-price settlement first allocated a nominal USD amount, then floored the corresponding COIN to a
+whole atom while leaving the full nominal USD payable. A cheap high-rate bid followed by a marginal reserve bid
+could therefore collect almost two marginal-price units for one delivered atom. Every submitted bid passed the
+reserve, but the executed transfer did not, so repeated rounding could leak insurance surplus to colluding
+bidders.
+
+A retained real-SBF LiteSVM regression sets the DAO reserve to `1 COIN / 500 USD`, submits a `10 / 999` bid and
+a marginal `1 / 500` bid, then runs permissionless settlement and both claims. The old binary burned two COIN
+but paid `1,499` USD, including `999` to the bidder that delivered one atom; the reserve permits at most `1,000`
+for the two delivered atoms. A second retained probe covers the opposite safety edge: if rounding USD down would
+take a whole COIN below the marginal bidder's own limit, that bid is fully refunded rather than underpaid.
+
+FIX: after deriving whole COIN at the marginal rate, settlement derives the executable USD amount back from that
+integer COIN, rounds in the insurance fund's favor, and rechecks both the bidder limit and DAO reserve. Any
+non-executable remainder stays in the canonical holding for a later round. No authority, destination, signer,
+bid-cancellation path, principal counter, or admin surface was added.
+
+## Tick - integer-infeasible bids could indefinitely reserve TWAP budget (surface C)
+
+TWAP selected the marginal rate from nominal USD allocations before checking whether that allocation formed a
+whole-COIN pair within the bidder's own limit. A `801 COIN / 400,001 USD` bid ranks above an exact
+`800 / 400,000` reserve bid, but a 400,000-unit allocation reconciles its 800 COIN to only 399,501 USD and
+therefore violates its own limit. The old binary refunded the top bid after allocation, never considered the
+exact lower bid, bought nothing, and rolled both commitments into every later round.
+
+The first retained real-SBF LiteSVM regression reproduces that two-bid starvation and proves the lower bid now
+sells 800 COIN for exactly 400,000 collateral units while the infeasible bid receives all 801 COIN back. A
+second regression fills all 32 slots with the infeasible rate, proves a lower executable bid cannot evict one,
+permissionlessly refunds every aged slot without spending collateral, reopens the book, and completes the next
+exact settlement from the preserved budget.
+
+FIX: marginal selection now uses the same whole-token reconciliation as final settlement. An infeasible partial
+candidate cannot consume nominal budget or set the uniform price. If positive budget and reserve-eligible bids
+exist but every candidate is infeasible, execute enters a refund-only settled state instead of preserving an
+un-evictable full book. No admin escape, recipient, amount selector, custody authority, principal counter, or
+new signer was added.
+
+## Tick - partial integer repricing remainders could starve marginal TWAP lots (surface C)
+
+Uniform clearing assigned each winner a nominal USD allocation before integer reconciliation. A better-rate
+winner could consume less actual USD than that nominal allocation while remaining partially filled, but only a
+fully refunded winner caused the budget walk to retry. Public bidders could therefore split a bid so the small
+per-slot remainders combined into additional executable marginal lots while execute stranded them every round.
+
+A retained real-SBF LiteSVM regression submits three `2 COIN / 199 USD` better-rate bids followed by an exact
+`4,000 / 400,000` marginal bid. At the `1 / 100` marginal, each better bid spends only 100 of its nominal 199;
+those three 99-unit remainders plus the marginal allocation's 3-unit remainder buy three more marginal COIN.
+The old binary spent only 399,700 of the 400,000-unit budget and bought 3,997 COIN. The fixed binary spends the
+complete budget and buys 4,000, while the existing 32-bid cascade and worst-rate book remain below 500k CU.
+
+FIX: after marginal selection and exclusion converge, execute may use aggregate integer remainder only to
+enlarge allocations that already executed at that same marginal price. It cannot admit an unfilled bid or move
+the marginal rate. The bounded pass mutates the existing 32-slot allocation vector and reuses GCDs cached by
+nominal preflight, preserving heap and compute bounds. Every enlarged pair is capped by escrow, remaining
+budget, and the bidder's submitted limit. No authority, destination, signer, custody path, principal counter,
+or admin surface was added.
+
+## Tick - equal-USD reconciliation could underbuy public TWAP bids (surface C)
+
+TWAP's bounded integer reconciliation maximized USD spend first and COIN purchased second. Its narrow-interval
+branch stopped when an existing candidate already used the same USD denominator, even when another bidder-safe
+candidate delivered more COIN for that exact payment. A public bidder could choose this rounding shape to
+receive the normal collateral payout while suppressing part of the DAO's configured buyback burn.
+
+A retained real-SBF LiteSVM regression funds an exact four-unit public round, submits a skipped `16 COIN / 5 USD`
+bid and a capped `5 / 2` marginal bid, then executes and claims both slots permissionlessly. The old binary spent
+all four USD but burned only ten COIN: it paid two USD for five target COIN even though six target COIN satisfy
+both the `5 / 2` marginal and `16 / 5` bidder limits. The fixed binary burns eleven and preserves every escrow,
+refund, settlement, and holding conservation check. The host-side exhaustive oracle now compares the complete
+`(COIN, USD)` maximum instead of masking equal-USD underbuys.
+
+FIX: equal-USD candidates remain eligible until the solver proves that its current pair also has the largest
+possible COIN numerator. The same tie-break is applied to the bounded denominator projection. This changes no
+authority, destination, signer, custody path, bid cap, principal counter, or admin surface.
+
+## Tick - public shutdown returns could race the stale-resolution snapshot (surface A/C)
+
+Percolator freezes live value withdrawals once whole-market stale resolution becomes permissionless, but its
+empty secondary-asset shutdown branch returned before that freeze. The controller exposed that marketauth-only
+branch through signerless insurance and backing return cranks. A public caller could therefore remove a
+provider's backstop immediately before resolution, changing which balances and losses the terminal snapshot
+contained even though neither the provider nor governance consented to that ordering.
+
+A retained pinned-Percolator + controller LiteSVM regression configures a 50-slot stale threshold and five-slot
+asset shutdown delay, funds an external provider's secondary asset with 100 insurance and 100 backing units,
+shuts it down at slot 101, and reaches the exact global stale boundary at slot 150. Both public controller calls
+succeeded against the old SBF and consumed all 200 units. The fixed test requires byte-identical rejection,
+then permissionlessly resolves and returns the preserved 200 units through the constrained resolved paths.
+
+FIX: both controller shutdown-return instructions now apply the pinned whole-market stale predicate before any
+role rotation or value CPI. The read-only accounting view uses `max(Clock.slot, market.current_slot)` and the
+exact inclusive boundary used by Percolator; layout canaries bind both wrapper offsets to the Cargo-pinned
+program type. This adds no signer, authority, destination, amount selector, or admin surface. Direct calls by
+upstream Percolator role holders remain covered by percolator-prog issue #207 and require an upstream fix.
+
+## Tick - skipped priority bids could suppress TWAP buyback burn (surface C)
+
+TWAP's nominal budget walk preflighted each bid at its own reduced ratio before the final uniform price was
+known. A higher-rate bid whose own integer lot did not fit was skipped. If a lower marginal then consumed the
+complete budget, the final-price remainder pass had no free USD with which to reconsider that priority bid,
+even when a bidder-safe pair existed at the final price. A zero-fee public bidder could repeat that shape to
+reduce every configured buyback without selling COIN or spending collateral.
+
+A retained real-SBF LiteSVM regression funds a two-unit round, submits a `10 COIN / 3 USD` priority bid and a
+`4 / 2` marginal bid, and executes permissionlessly. At the final `4 / 2` price, the valid priority `3 / 1`
+pair and marginal `2 / 1` pair spend the same two USD and buy five COIN. The old SBF refunded the priority bid,
+spent both USD on the marginal, and burned only four. The fixed test claims both allocations and drains every
+escrow exactly.
+
+FIX: when ordinary remainder allocation still leaves a higher-ranked bid absent, execute performs one bounded
+final-price priority replay. It reserves one exact marginal lot, reprices eligible bids from best to worst, and
+adopts the replay only if it improves `(USD spent, COIN bought)` lexicographically. Existing cascade coverage
+keeps the 32-bid path below 500k CU and rechecks every bidder limit, DAO reserve, payout, refund, and escrow
+conservation invariant. This adds no signer, authority, destination, bid slot, custody path, or admin surface.
+
+## Tick - fully spent nominal allocations could retain bidder COIN (surface C)
+
+The ordinary final-price reconciliation ran only when integer flooring left unused USD. A nominal winner could
+therefore spend its complete allocation while still having more bidder-safe COIN available for that identical
+payment. Because no bid was absent and no USD remainder existed, neither reconciliation path reconsidered it.
+A public bidder received the full payout while retaining COIN that its submitted limit and the final marginal
+both made executable.
+
+A retained real-SBF LiteSVM regression funds a two-unit round and submits `3 COIN / 1 USD` followed by a `2 / 1`
+marginal bid. Both `2 / 1` and `3 / 1` priority fills have the same one-USD floored payment and satisfy the
+priority bidder's limit. The old SBF spent both USD but bought only four COIN, refunding one priority COIN. The
+fixed execution buys all five, pays each bidder one USD, and drains both shared escrows exactly.
+
+FIX: the existing bounded reconciliation scan now runs for every stable marginal and continues after its USD
+remainder reaches zero. It can therefore increase any allocated COIN numerator without increasing that bid's
+payment, while the same solver continues to enforce the marginal, bidder limit, escrow cap, and DAO reserve.
+The skipped-priority replay remains separate and unchanged. No signer, authority, destination, custody path,
+bid cap, principal counter, or admin surface was added.
+
+## Tick - unfunded insurance roles could skim post-handoff trade fees (surface A/C)
+
+Market donation required asset-0 insurance authority and operator to match, but accepted any matching third-
+party key when `asset_admin` migrated normally. Percolator's authority handoff leaves those roles unchanged.
+The third party therefore survived as the withdrawal key even with zero insurance principal, while ordinary
+public trades later credited withdrawable fee insurance to the asset.
+
+A retained pinned-Percolator + controller LiteSVM regression rotates both empty-market insurance roles from the
+creator to one unrelated key, donates market authority to the controller, opens and closes a real trader pair,
+and observes 120 fee atoms. The old SBF let the unfunded key withdraw all 120. The fixed test requires the
+handoff to reject atomically before the fee-producing market can enter controller governance.
+
+FIX: donation may preserve insurance roles only when they belong to the consenting outgoing market authority,
+the controller itself, or canonical current-layout Subledger/TWAP custody proven against the exact market.
+Matching arbitrary roles no longer suffice; such a provider must exit before donation. Distinct backing remains
+supported because backing fees require that provider's own deposited capacity. No signer, authority, recipient,
+withdrawal path, or admin instruction was added.
+
+## Tick - exit ordering could transfer floored share claims to the last depositor (surface A/C)
+
+Subledger burned every nominal share even when whole-atom redemption rounded its payout down. That
+raised the live exchange rate for the remaining positions. A depositor could therefore wait while a
+permissionless terminal return retired another position, then collect the earlier position's floor
+remainder. Repeating the shape across identities made exit ordering an allocation mechanism for
+segregated user value. This finding supersedes earlier blocked ticks that treated last-exiter dust as
+harmless conservation.
+
+The retained real-SBF LiteSVM regression deposits three and one base units, opens funded public long
+and short Percolator portfolios, moves the authenticated mark, and permissionlessly cranks a real
+liquidation that spends one insurance atom. After public resolution and portfolio cleanup, the old
+Subledger pays the one-unit position zero and the last three-unit position all three remaining atoms.
+The fixed binary pays the last position only its own floored two-atom claim and leaves one atom in the
+asset-0 insurance ledger. The same reserve semantics are pinned for principal, with-surplus, partial,
+late-entry, and own-vault exits.
+
+FIX: a position still retires all of its nominal shares, but the pool burns only the maximal subset
+that cannot increase the post-withdrawal exchange rate. The difference becomes unowned rounding
+reserve. Principal pools reset it when no principal remains; empty with-surplus pools normalize it to
+the protocol balance so future deposit epochs price final whole-atom insurance without blocking
+minimum deposits.
+Overflow-safe wide division and an exhaustive maximal-burn test cover the full-width arithmetic. No
+account, signer, authority, recipient, amount selector, or administrative withdrawal path was added.
+
+## Tick - withdrawn creator could retain the post-handoff fee key (surface A/C)
+
+Market donation preserved a funded outgoing creator as asset-0 insurance authority and operator.
+After the controller accepted lifecycle authority, the creator could publicly withdraw its complete
+principal while both insurance roles remained unchanged. Ordinary public trades then accrued new fee
+insurance to that same asset, letting the zero-capital former creator withdraw value paid by later
+users without continuing to back the market.
+
+A retained pinned-Percolator + controller LiteSVM regression deposits 100 insurance atoms, proves the
+old funded handoff succeeds, withdraws all 100, opens and closes a real public long/short pair, and
+observes 120 new fee atoms. The old SBF lets the former creator withdraw all 120. The fixed regression
+requires the funded donation to reject byte-atomically, proves the creator can still recover all 100
+through Percolator, repeats the same donation while empty, verifies both roles migrate to the
+controller, and rejects the former creator's withdrawal after the identical fee-producing round trip.
+
+FIX: a raw outgoing market authority must exit nonzero asset-0 insurance before donating lifecycle
+control. Pinned Percolator then migrates its empty insurance authority and operator to the constrained
+controller during the same existing handoff. Canonical Subledger/TWAP custody and the recorded backing
+provider remain supported. No signer, authority setter, destination, amount selector, custody account,
+withdrawal instruction, or administrative surface was added.
+
+## Tick - secondary activation could install an unfunded fee operator (surface A/C)
+
+The controller required secondary insurance authority and operator to match, but governance could
+still name any matching external key while the new asset held zero insurance. The asset became
+immediately tradeable. Two ordinary public round-trip trades accrued 120 insurance atoms before the
+named key deposited anything, and pinned Percolator then let that zero-capital operator withdraw all
+120. Governance could therefore grant a collaborator a direct claim on user-paid fees without any
+insurance at risk.
+
+The retained controller + pinned-Percolator LiteSVM regression first keeps the prior split-role
+principal-drain proof. It then attempts the equal external-role activation, runs two funded public
+trader portfolios through a real asset-1 round trip against the old SBF, and proves the external key
+withdraws the complete 120-atom fee balance. The fixed path rejects both external activation shapes
+byte-atomically, activates with controller-owned insurance plus the same external backing/oracle
+provider, recreates the 120 fee atoms, and rejects the provider's withdrawal without changing the
+market or vault. Existing deployed external-insurance states retain their provider-bound shutdown and
+resolved cleanup coverage as explicit compatibility fixtures.
+
+FIX: secondary activation now requires insurance authority and operator to equal the market's
+constrained controller PDA. Backing and oracle authorities remain independently configurable, so an
+external provider can still deposit backing and earn utilization fees only while that capacity is at
+risk. No instruction, signer, destination, amount selector, custody account, withdrawal path, or
+administrative surface was added.
+
+## Tick - empty with-surplus custody could strand later protocol fees (surface A/C)
+
+A controller-supported with-surplus insurance pool could complete every owner withdrawal and remain
+the asset-0 insurance authority, operator, and admin. An ordinary public maintenance crank could then
+credit a later fee to that empty pool. After permissionless stale resolution, no position owned the
+fee, `CloseSlab` rejected the nonzero insurance balance, and Subledger rejected the only TWAP handoff
+solely because the immutable pool policy was with-surplus. Unlike a principal pool, this configuration
+had no post-resolution path that could ever consume the balance.
+
+The retained real-SBF LiteSVM regression creates a controller market through a real Squads chain,
+grants the supported with-surplus pool, deposits and returns one owner atom, and proves a Squads
+handoff still rejects while that principal is live. A public user then abandons one portfolio atom;
+a permissionless maintenance crank converts it into asset-0 insurance and removes the portfolio, and
+an unaffiliated stale resolver resolves the market. The old Subledger rejects the zero-claim handoff
+after real `CloseSlab` demonstrates the persistent blocker. The fixed chain hands only the unowned
+atom to TWAP, permissionlessly routes it to controller custody, and completes real terminal close.
+
+FIX: the existing handoff accepts with-surplus custody only when Subledger's own accounting proves
+`outstanding_principal == 0`. Its existing terminal attestation treats normalized share-rounding
+reserve as unowned only in that state. Principal pools retain their prior behavior. No instruction,
+signer, recipient, amount selector, authority setter, or withdrawal surface was added; the change
+only reuses the already constrained TWAP and controller terminal path after every user claim is gone.
+
+## Tick - absent with-surplus voter could veto terminal market close (surface A/C)
+
+The permissionless finalized-position return accepted only principal-policy genesis pools even though
+the controller and voting lifecycle also support with-surplus pools. A public user could deposit one
+base unit during the bounded window, vote, and disappear. After the winner was sealed and the real
+market resolved, ordinary withdrawal still correctly required that absent owner, while the fixed
+terminal return rejected solely on the immutable policy byte. The live owner claim prevented both
+empty-pool custody recovery and `CloseSlab`, creating a permanent one-atom cleanup veto.
+
+The retained real-SBF LiteSVM regression runs the existing complete absent-voter lifecycle under a
+second, independently bound with-surplus pool: real Squads custody, deposit, vote lock, 100% supply
+seal, reward registration, governed Percolator resolution, redirect/delegate/amount/unexecuted-
+proposal attacks, permissionless owner-bound return, delayed reward crystallization, and real terminal
+close. The old SBF reaches the canonical return and rejects with `InvalidAccountData`; the fixed SBF
+pays the absent owner, retires the share claim, preserves the frozen reward cap, and closes the slab.
+
+FIX: the existing amountless finalized-position instruction now applies its ordinary policy-specific
+share payout to either valid insurance policy. Every finality, market, pool, position, destination,
+owner, amount, and resolved-empty check is unchanged. No signer, recipient, authority, instruction,
+or withdrawal surface was added, and the cranker still cannot receive any part of the payout.
+
+## Tick - terminal portfolio cleanup could erase uncrystallized rewards (surface A/C)
+
+Percolator correctly excludes monotonic reward telemetry from its empty-portfolio predicate. The
+controller's permissionless resolved-market cleanup nevertheless called `ClosePortfolio` without
+preserving that telemetry. An unaffiliated cranker could therefore wait for a funding payer to flatten,
+permissionlessly resolve and pay out the portfolio, then dematerialize its only authenticated paid-
+funding counters before the reward epoch crystallized them. The fixed COIN allocation became
+unrecoverable even though no collateral remained at risk.
+
+The retained pinned-Percolator LiteSVM regression creates a real funding-enabled market through public
+instructions, registers a 100% funding-payer epoch, opens a real long/short pair, moves the authenticated
+EWMA mark, records nonzero long-paid funding, flattens, donates lifecycle authority, and lets unrelated
+callers resolve and pay the long. It proves the legacy five-account cleanup rejects atomically, then
+uses the extended public cleanup to archive and close in one transaction. It closes the remaining
+portfolio, returns terminal backing dust only to its recorded provider, closes the original slab, then
+crystallizes through the retirement marker. Freeze and claim pay the sole payer all 100 COIN. The full
+genesis-to-45-day-buyback lifecycle and all 91 distributor LiteSVM tests also pass.
+
+FIX: a shared pinned-layout parser authenticates portfolio provenance and reward counters. Nonzero
+reward telemetry requires the controller to CPI a fixed residual-distributor instruction before
+`ClosePortfolio`; Percolator rejection rolls both writes back. The archive is a cumulative PDA scoped
+to Percolator program, market, owner, and portfolio, so address reuse snapshots prior generations
+exactly once. Register/crystallize read archived plus live totals. The archive accepts no token account,
+amount, destination, authority mutation, or value-moving CPI; zero-telemetry cleanup keeps its original
+account shape.
+
+## Tick - public maintenance close could erase uncrystallized rewards (surface C/D)
+
+Pinned Percolator's unsigned `SyncMaintenanceFee` can intentionally consume a flat portfolio's final
+capital atom and dematerialize it. A portfolio-flow reward epoch previously accepted that market even
+when its immutable account maintenance fee was nonzero. An unaffiliated caller could therefore wait
+until a registered user had real residual or funding telemetry but had not crystallized it, consume the
+last atom during the open epoch, and erase the only live counters. The archive cannot recover bytes
+that a direct Percolator instruction deleted before the controller observed them.
+
+The clean-room red LiteSVM probe initialized the pinned real Percolator with a one-atom-per-slot fee,
+registered a real trader, created and settled an organic loss, flattened through public trades, left
+one capital atom, and invoked `SyncMaintenanceFee` at slot 400. The portfolio dematerialized and the
+still-open reward epoch's crystallize call failed with `InvalidAccountData`.
+
+FIX: every LP, trader, or funding-payer registration now supplies the portfolio's market account. The
+distributor authenticates its Percolator owner, key-to-provenance match, non-executable account kind,
+pinned wrapper layout, and zero `maintenance_fee_per_slot` before creating a stake. The fee amount has
+no update instruction in the pinned API, so this one-time rule remains true for the stake lifetime;
+governance can alter only fee routing shares. The retained real-binary regression proves both that a
+valid zero-fee market cannot substitute for the portfolio's provenance market and that the real
+nonzero-fee market creates no stake or portfolio mutation. The paired zero-fee organic-loss and full
+genesis-to-45-day-buyback lifecycles pass. Capital cohorts and all custody/value paths are unchanged.
+
+## Tick - atomic same-key rematerialization could strand archived rewards (surface C/D)
+
+Pinned Percolator's terminal `ClosePortfolio` zeroes and drains a portfolio account but leaves it
+program-owned until transaction completion. Its public `InitPortfolio` requires the incoming owner,
+not the portfolio key, to sign. An unrelated user could therefore append a second instruction to the
+controller's archive-and-close transaction, initialize the transient zero-data key in another live
+market, and make the original stake's next archive-backed crystallization reject on the foreign owner
+or market. Keeping that new portfolio live made the original fixed reward allocation unreachable.
+
+The retained LiteSVM regression uses the pinned binary and only public instructions. It creates two
+real markets, records real long-paid funding, resolves the first, and submits controller cleanup plus
+foreign-market `InitPortfolio` atomically without the victim portfolio key signing. The old residual
+binary accepts the rematerialization and then fails the sole payer's crystallize with `IllegalOwner`.
+The fixed chain reads the completed original archive, freezes the epoch, and pays all 100 COIN.
+
+FIX: portfolio-flow stakes append one byte binding the immutable index of their registration market in
+the epoch allow-list; every prior field offset is unchanged. Crystallize and LP/trader claim derive the
+one canonical archive from that index. A live generation is added only when its authenticated owner and
+market match the binding; once a controller archive exists, a foreign generation at the same key is a
+separate identity and cannot replace or block it. The change adds no signer, authority, token account,
+destination, amount selector, custody CPI, or principal-moving surface.
+
+## Tick - retired slab key reuse bypassed the reward market allow-list (surface C/D)
+
+Pinned Percolator's terminal `CloseSlab` zeroes and drains the slab but leaves the account assigned to
+Percolator. Its public `InitMarket` requires only the new admin to sign, so an unrelated caller could
+reinitialize the retired key in a later transaction. A reward epoch that had selected the original key
+then treated the attacker-controlled replacement as the same allow-listed market and admitted a new
+portfolio-flow stake. Because the market allow-list is the trust boundary for publicly generated
+residual and funding counters, this reopened the fixed COIN allocation to free farming.
+
+The retained real-binary LiteSVM regression selects a permissionlessly initialized controller market in
+a 100% funding-payer epoch, runs real resolved portfolio cleanup and terminal `CloseSlab`, then directly
+reinitializes the same slab under an unrelated authority and creates a replacement portfolio without the
+slab key signing. The old residual binary accepts the attacker's stake. The fixed chain rejects it even
+though pinned Percolator still accepts the replacement market. The regression also prefunds the marker
+PDA, proves a failed close rolls marker creation back, and proves successful governed close adopts the
+prefund without requiring a lamport balance on the Squads vault.
+
+FIX: terminal controller close uses rent already reclaimed from `CloseSlab` to create a permanent PDA
+scoped to the Percolator program and market key, then forwards the remaining rent. Portfolio-flow
+registration and counter reads require that exact read-only PDA. Registration rejects a retired market;
+existing stakes ignore every later live generation and use only their canonical archive. The marker has
+no close path, token account, amount, beneficiary, signer, custody CPI, or authority mutation, and it
+cannot move user insurance, backing, collateral, or Subledger principal.
+
+## Tick - pre-index extra-market stakes could not crystallize after upgrade (surface C/D)
+
+The public binary immediately before immutable market indexing already allowed portfolio-flow stakes
+for configured extra markets, but serialized only 211 bytes and therefore stored no market index. The
+upgraded deserializer treated the absent byte as index zero. A legitimate extra-market stake then paired
+its extra-market portfolio and marker with the primary market, so public crystallization failed with
+`InvalidSeeds` and its fixed COIN allocation could never reach freeze or claim.
+
+The retained real-SBF LiteSVM regressions register through the public extra-market API, convert only
+the appended byte to the exact predecessor layout, advance authenticated residual counters, and prove
+the upgraded crystallize, freeze, and claim lifecycle pays the sole LP its complete cohort. A second
+case dematerializes the live portfolio after freeze with no archive, rejects an unlisted marker/archive
+pair without consuming the stake, then pays through the configured extra-market pair. The legacy stake
+remains 211 bytes, so compatibility does not depend on reallocating deployed state.
+
+FIX: current 212-byte stakes retain the strict stored allow-list index. Only predecessor stakes recover
+their market from the same authenticated live portfolio or canonical cumulative archive that registration
+used. A frozen pre-archive close can instead select one configured market through the already-required
+marker key; the existing exact marker and empty archive PDA checks authenticate that terminal fallback
+before its fixed-recipient payout. The change adds no signer, authority, token account, destination,
+amount selector, custody CPI, or principal-moving surface; it restores access only to already allocated
+COIN rewards.
+
+## Tick - a retired slab marker could block every later market generation's terminal close (surface C)
+
+Pinned Percolator permits a zeroed slab key to be initialized again without the slab key signing, and
+the controller's public market-authority handoff can accept that clean replacement generation. Reward
+identity correctly remains retired forever, but `CloseMarketAndReclaim` previously required the marker
+account to be system-owned and empty on every close. The valid permanent marker from generation one
+therefore made generation two's governed `CloseSlab` unreachable, even after all portfolios and value
+attribution were gone.
+
+The retained real-binary LiteSVM lifecycle creates and resolves a controller market, closes its users and
+slab, and verifies the permanent marker. It then reinitializes the same key through pinned Percolator,
+proves reward registration stays rejected, closes the replacement portfolio, uses the public controller
+handoff, resolves through governance, and closes the replacement slab. The old controller fails the final
+public close with `InvalidAccountData`; the fixed controller closes it and leaves the marker byte-identical.
+
+FIX: terminal close accepts either the uninitialized canonical marker PDA or the exact 72-byte marker this
+controller previously wrote for the same Percolator program and market key. It creates the former once and
+reuses the latter without mutation. Governance signature, controller derivation, token destinations,
+Percolator's resolved-empty `CloseSlab`, and all value forwarding remain unchanged. The marker has no close
+or reset path and continues to retire reward eligibility for every later generation.
+
+## Tick - backing fee policy could globally disable atomic position exits (surface C/D)
+
+Pinned Percolator rejects `BatchTradeNoCpi` and `BatchTradeCpi` whenever any backing-fee policy is
+active, even when the batch does not touch that fee domain. Both Meta governance wrappers exposed the
+policy setter. A normal cross-margined user can require final-state-only execution: in the retained
+LiteSVM probe, a fully collateralized portfolio can hold either one 80-lot leg, but the first
+standalone rotation leg fails initial margin while the two-leg final state is healthy. The old
+controller accepts a 77-bps policy, after which the only atomic exit fails against the real pinned SBF
+with `Custom(9)`.
+
+FIX: controller proxy validation and the post-handoff TWAP setter reject every nonzero backing fee or
+insurance split while retaining exact-zero updates. The controller regression proves the rejected
+policy is byte-atomic and the final-state-only batch succeeds. The Squads-to-TWAP regression starts
+from an exact predecessor market with two active policies, rejects reactivation, clears both policies,
+and independently updates the ordinary trade fee without moving insurance. The upstream batch-safe
+fix is not a descendant of this repo's Percolator security pin, so advancing the dependency would drop
+later liquidation, oracle, OI, and collected-fee fixes. This compatibility guard adds no signer,
+account, authority, recipient, amount, token CPI, or user-value surface.

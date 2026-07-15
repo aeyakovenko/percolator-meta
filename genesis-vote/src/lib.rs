@@ -44,9 +44,15 @@ declare_id!("GenesisVote11111111111111111111111111111111");
 const CONFIG_DISC: [u8; 8] = *b"GVCONFG1";
 const BALLOT_DISC: [u8; 8] = *b"GVBALOT1";
 const PROPOSAL_DISC: [u8; 8] = *b"GVPROPV1";
-const CONFIG_SIZE: usize = 240; // total_cast_weight widened u64->u128 (GG fix)
+const CONFIG_SIZE: usize = 264; // total_cast_weight widened u64->u128 (GG fix)
 const BALLOT_SIZE: usize = 120; // voted_weight widened u64->u128 (GG fix)
 const PROPOSAL_SIZE: usize = 112; // support_weight widened u64->u128 (GG fix)
+const LEGACY_CONFIG_SIZE_U64: usize = 232;
+const LEGACY_CONFIG_SIZE_U128: usize = 240;
+const LEGACY_CONFIG_SIZE_BOOTSTRAP_END: usize = 248;
+const LEGACY_BALLOT_SIZE_U64: usize = 112;
+const DEFAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 38_880_000;
+const DEFAULT_BOOTSTRAP_START_SLOT: u64 = 0;
 
 // Subledger position/pool discriminators + layout (read-only mirror of the
 // subledger program's serialization). Used to read principal/start_slot and the
@@ -65,6 +71,9 @@ pub const SUB_POOL_OUTSTANDING_OFF: usize = 80;
 // Distribution proposal: disc[8], config[8..40]. Used to bind a registered vote to
 // the genesis's OWN distribution config (so a winning vote is always sealable).
 const DIST_PROPOSAL_DISC: [u8; 8] = *b"DISTPRP1";
+pub const DIST_PROPOSAL_CAPACITY_OFF: usize = 80;
+pub const DIST_PROPOSAL_ENTRY_COUNT_OFF: usize = 84;
+pub const DIST_PROPOSAL_TOTAL_AMOUNT_OFF: usize = 88;
 // Distribution config: disc[8], coin_mint[8..40], vault[40..72], authority[72..104].
 const DIST_CONFIG_DISC: [u8; 8] = *b"DISTCFG1";
 // Canonical distribution program (finding IC; the gv dual of residual's HK). init_config must pin the
@@ -86,6 +95,9 @@ const IX_INIT_CONFIG: u8 = 0;
 const IX_REGISTER_PROPOSAL: u8 = 2;
 const IX_VOTE: u8 = 3;
 const IX_TRIGGER: u8 = 4;
+// Read-only finalization attestation used by terminal subledger cleanup. This
+// program owns the proposal layout, so consumers do not duplicate byte offsets.
+const IX_ASSERT_EXECUTED: u8 = 5;
 
 const VOTE_BACK: u8 = 1;
 const VOTE_RETRACT: u8 = 2;
@@ -103,8 +115,13 @@ solana_program::entrypoint!(process_instruction);
 // the wrong pool (DOS). Folding subledger_pool into the seed means the only gv config
 // that can exist at the legit address is bound to the real pool; an attacker's pool
 // lands at a different gv PDA the genesis ignores. (finding R; same class as P/Q.)
-fn config_seeds<'a>(coin_mint: &'a Pubkey, subledger_pool: &'a Pubkey) -> [&'a [u8]; 3] {
-    [b"gv_config", coin_mint.as_ref(), subledger_pool.as_ref()]
+fn config_seeds<'a>(
+    coin_mint: &'a Pubkey,
+    subledger_pool: &'a Pubkey,
+    bootstrap_delay_slots: &'a [u8; 8],
+    bootstrap_start_slot: &'a [u8; 8],
+) -> [&'a [u8]; 5] {
+    [b"gv_config", coin_mint.as_ref(), subledger_pool.as_ref(), bootstrap_delay_slots, bootstrap_start_slot]
 }
 fn ballot_seeds<'a>(config: &'a Pubkey, owner: &'a Pubkey) -> [&'a [u8]; 3] {
     [b"gv_ballot", config.as_ref(), owner.as_ref()]
@@ -146,6 +163,9 @@ struct Config {
     total_cast_weight: u128, // GG fix: widened so summed log-weights cannot overflow
     outstanding_principal: u64,
     bump: u8,
+    bootstrap_end_slot: u64,
+    bootstrap_delay_slots: u64,
+    bootstrap_start_slot: u64,
 }
 
 impl Config {
@@ -164,6 +184,9 @@ impl Config {
             total_cast_weight: u128::from_le_bytes(d[208..224].try_into().unwrap()),
             outstanding_principal: u64::from_le_bytes(d[224..232].try_into().unwrap()),
             bump: d[232],
+            bootstrap_end_slot: u64::from_le_bytes(d[233..241].try_into().unwrap()),
+            bootstrap_delay_slots: u64::from_le_bytes(d[241..249].try_into().unwrap()),
+            bootstrap_start_slot: u64::from_le_bytes(d[249..257].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -178,7 +201,26 @@ impl Config {
         d[208..224].copy_from_slice(&self.total_cast_weight.to_le_bytes());
         d[224..232].copy_from_slice(&self.outstanding_principal.to_le_bytes());
         d[232] = self.bump;
-        d[233..CONFIG_SIZE].fill(0);
+        d[233..241].copy_from_slice(&self.bootstrap_end_slot.to_le_bytes());
+        d[241..249].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        d[249..257].copy_from_slice(&self.bootstrap_start_slot.to_le_bytes());
+        d[257..CONFIG_SIZE].fill(0);
+    }
+}
+
+fn read_bootstrap_schedule(data: &[u8]) -> Result<(u64, u64), ProgramError> {
+    match data.len() {
+        0 => Ok((DEFAULT_BOOTSTRAP_DELAY_SLOTS, DEFAULT_BOOTSTRAP_START_SLOT)),
+        16 => {
+            let delay = u64::from_le_bytes(data[..8].try_into().unwrap());
+            let start = u64::from_le_bytes(data[8..16].try_into().unwrap());
+            if delay == 0 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            start.checked_add(delay).ok_or(ProgramError::ArithmeticOverflow)?;
+            Ok((delay, start))
+        }
+        _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
@@ -306,12 +348,57 @@ pub fn process_instruction<'a>(
         .split_first()
         .ok_or(ProgramError::InvalidInstructionData)?;
     match *tag {
-        IX_INIT_CONFIG => init_config(program_id, accounts),
+        IX_INIT_CONFIG => init_config(program_id, accounts, data),
         IX_REGISTER_PROPOSAL => register_proposal(program_id, accounts),
         IX_VOTE => vote(program_id, accounts, data),
         IX_TRIGGER => trigger(program_id, accounts, data),
+        IX_ASSERT_EXECUTED => assert_executed(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
+}
+
+// assert_executed accounts: [config, proposal_vote]
+// data: none
+//
+// A read-only proof that this exact current-layout genesis config has sealed the
+// supplied proposal. It grants no signer privilege and mutates no state.
+fn assert_executed(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let config_account = next_account_info(iter)?;
+    let proposal_account = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if config_account.owner != program_id || proposal_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let proposal = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
+
+    let delay = config.bootstrap_delay_slots.to_le_bytes();
+    let start = config.bootstrap_start_slot.to_le_bytes();
+    let (expected_config, bump) = Pubkey::find_program_address(
+        &config_seeds(&config.coin_mint, &config.subledger_pool, &delay, &start),
+        program_id,
+    );
+    if expected_config != *config_account.key || bump != config.bump {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let expected_proposal = Pubkey::find_program_address(
+        &proposal_seeds(config_account.key, &proposal.distribution_proposal),
+        program_id,
+    )
+    .0;
+    if expected_proposal != *proposal_account.key
+        || proposal.config != *config_account.key
+        || !proposal.executed
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
 }
 
 // Create a program-owned PDA, tolerating an attacker pre-funding the (deterministic) address.
@@ -352,7 +439,14 @@ fn create_pda<'a>(
 
 // init_config accounts: [payer(s,w), coin_mint, config(pda,w), distribution_program,
 //   distribution_config, subledger_program, subledger_pool, reserved, system]
-fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
+// data: absent = default schedule; otherwise bootstrap_delay_slots(u64),
+// bootstrap_start_slot(u64). The schedule is part of the config PDA so a
+// permissionless first writer cannot shorten or early-start the bootstrap clock.
+fn init_config<'a>(
+    program_id: &Pubkey,
+    accounts: &'a [AccountInfo<'a>],
+    data: &[u8],
+) -> ProgramResult {
     let iter = &mut accounts.iter();
     let payer = next_account_info(iter)?;
     let coin_mint = next_account_info(iter)?;
@@ -363,6 +457,10 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
     let subledger_pool = next_account_info(iter)?;
     let reserved = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
+    let (bootstrap_delay_slots, bootstrap_start_slot) = read_bootstrap_schedule(data)?;
+    let bootstrap_end_slot = bootstrap_start_slot
+        .checked_add(bootstrap_delay_slots)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     if !payer.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -370,13 +468,20 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
     if *system_program.key != solana_program::system_program::ID {
         return Err(ProgramError::IncorrectProgramId);
     }
-    let (expected, bump) =
-        Pubkey::find_program_address(&config_seeds(coin_mint.key, subledger_pool.key), program_id);
+    let delay_bytes = bootstrap_delay_slots.to_le_bytes();
+    let start_bytes = bootstrap_start_slot.to_le_bytes();
+    let (expected, bump) = Pubkey::find_program_address(
+        &config_seeds(coin_mint.key, subledger_pool.key, &delay_bytes, &start_bytes),
+        program_id,
+    );
     if *config_account.key != expected {
         return Err(ProgramError::InvalidSeeds);
     }
     if config_account.data_len() != 0 {
         return Err(ProgramError::AccountAlreadyInitialized);
+    }
+    if bootstrap_end_slot <= Clock::get()?.slot {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
     // Bind the wired dependencies back to THIS config so a genesis can never be
@@ -422,8 +527,7 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
     }
 
     let bump_arr = [bump];
-    let seeds: [&[u8]; 4] =
-        [b"gv_config", coin_mint.key.as_ref(), subledger_pool.key.as_ref(), &bump_arr];
+    let seeds: [&[u8]; 6] = [b"gv_config", coin_mint.key.as_ref(), subledger_pool.key.as_ref(), &delay_bytes, &start_bytes, &bump_arr];
     create_pda(payer, config_account, system_program, program_id, &seeds, CONFIG_SIZE)?;
 
     let config = Config {
@@ -437,6 +541,9 @@ fn init_config<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> Prog
         total_cast_weight: 0,
         outstanding_principal: 0,
         bump,
+        bootstrap_end_slot,
+        bootstrap_delay_slots,
+        bootstrap_start_slot,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?);
     Ok(())
@@ -471,9 +578,9 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
     // rejects (header.config mismatch) — bricking finalize forever. Bind it here so
     // every votable proposal is guaranteed sealable.
     // Snapshot the proposal's (entry_count, total_amount) so the trigger can verify
-    // it is UNCHANGED at seal time — a creator must not append self-allocations after
-    // voters back it (bait-and-switch). Require it non-empty: only a fully-built
-    // proposal can be registered for voting.
+    // it is UNCHANGED at seal time. Registration additionally requires every
+    // declared entry slot to be filled: otherwise the creator could append after
+    // collecting votes and turn the snapshot guard into a permanent finalize DoS.
     let (snapshot_entry_count, snapshot_total_amount) = {
         let pd = distribution_proposal.try_borrow_data()?;
         if pd.len() < 96 || pd[..8] != DIST_PROPOSAL_DISC {
@@ -494,9 +601,22 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         if creator != *payer.key {
             return Err(ProgramError::IllegalOwner);
         }
-        let entry_count = u32::from_le_bytes(pd[84..88].try_into().unwrap());
-        let total_amount = u64::from_le_bytes(pd[88..96].try_into().unwrap());
-        if entry_count == 0 {
+        let capacity = u32::from_le_bytes(
+            pd[DIST_PROPOSAL_CAPACITY_OFF..DIST_PROPOSAL_ENTRY_COUNT_OFF]
+                .try_into()
+                .unwrap(),
+        );
+        let entry_count = u32::from_le_bytes(
+            pd[DIST_PROPOSAL_ENTRY_COUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF]
+                .try_into()
+                .unwrap(),
+        );
+        let total_amount = u64::from_le_bytes(
+            pd[DIST_PROPOSAL_TOTAL_AMOUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if entry_count == 0 || entry_count != capacity {
             return Err(ProgramError::InvalidAccountData);
         }
         (entry_count, total_amount)
@@ -524,6 +644,138 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         snapshot_total_amount,
     };
     pv.serialize(&mut proposal_account.try_borrow_mut_data()?);
+    Ok(())
+}
+
+// Historical configs remain deliberately inert: they cannot accept new backing or
+// trigger a distribution under the current binary. Retraction is the sole exception
+// because the config PDA is also a subledger vote-lock authority; rejecting its old
+// layout would permanently freeze the owner's principal after an upgrade.
+fn retract_legacy_vote<'a>(
+    program_id: &Pubkey,
+    voter: &AccountInfo<'a>,
+    config_account: &AccountInfo<'a>,
+    ballot_account: &AccountInfo<'a>,
+    proposal_account: &AccountInfo<'a>,
+    sub_position: &AccountInfo<'a>,
+    sub_pool: &AccountInfo<'a>,
+    subledger_program: &AccountInfo<'a>,
+) -> ProgramResult {
+    let (coin_mint, configured_subledger, configured_pool, bump, coin_only, ballot_size, contribution_end) = {
+        let d = config_account.try_borrow_data()?;
+        let (bump_offset, ballot_size, contribution_end) = match d.len() {
+            LEGACY_CONFIG_SIZE_U64 => (224, LEGACY_BALLOT_SIZE_U64, 88),
+            LEGACY_CONFIG_SIZE_U128 | LEGACY_CONFIG_SIZE_BOOTSTRAP_END => {
+                (232, BALLOT_SIZE, 96)
+            }
+            _ => return Err(ProgramError::InvalidAccountData),
+        };
+        if d[..8] != CONFIG_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let coin_mint = Pubkey::new_from_array(d[8..40].try_into().unwrap());
+        let configured_subledger = Pubkey::new_from_array(d[104..136].try_into().unwrap());
+        let configured_pool = Pubkey::new_from_array(d[136..168].try_into().unwrap());
+        let bump = d[bump_offset];
+        let (pool_key, pool_bump) = Pubkey::find_program_address(
+            &[b"gv_config", coin_mint.as_ref(), configured_pool.as_ref()],
+            program_id,
+        );
+        let pool_match = *config_account.key == pool_key && bump == pool_bump;
+
+        // The 232-byte generation spans the one historical PDA transition: early
+        // configs were keyed by COIN only, then a75b0ab bound the subledger pool.
+        let coin_only = if d.len() == LEGACY_CONFIG_SIZE_U64 {
+            let (coin_key, coin_bump) =
+                Pubkey::find_program_address(&[b"gv_config", coin_mint.as_ref()], program_id);
+            match (*config_account.key == coin_key && bump == coin_bump, pool_match) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => return Err(ProgramError::InvalidSeeds),
+            }
+        } else if pool_match {
+            false
+        } else {
+            return Err(ProgramError::InvalidSeeds);
+        };
+        (coin_mint, configured_subledger, configured_pool, bump, coin_only, ballot_size, contribution_end)
+    };
+
+    if ballot_account.owner != program_id
+        || sub_position.owner != &configured_subledger
+        || sub_pool.owner != &configured_subledger
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *sub_pool.key != configured_pool
+        || *subledger_program.key != configured_subledger
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let (expected_sub_position, _) = Pubkey::find_program_address(
+        &sub_position_seeds(sub_pool.key, voter.key),
+        &configured_subledger,
+    );
+    if *sub_position.key != expected_sub_position {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
+
+    let (expected_ballot, _) =
+        Pubkey::find_program_address(&ballot_seeds(config_account.key, voter.key), program_id);
+    if *ballot_account.key != expected_ballot {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    let voted_proposal = {
+        let ballot = ballot_account.try_borrow_data()?;
+        if ballot.len() != ballot_size || ballot[..8] != BALLOT_DISC {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if Pubkey::new_from_array(ballot[8..40].try_into().unwrap()) != *voter.key {
+            return Err(ProgramError::IllegalOwner);
+        }
+        Pubkey::new_from_array(ballot[40..72].try_into().unwrap())
+    };
+    if voted_proposal == Pubkey::default() || voted_proposal != *proposal_account.key {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let unlock_ix = Instruction {
+        program_id: configured_subledger,
+        accounts: vec![
+            AccountMeta::new_readonly(*config_account.key, true),
+            AccountMeta::new_readonly(*sub_pool.key, false),
+            AccountMeta::new(*sub_position.key, false),
+            AccountMeta::new_readonly(*voter.key, true),
+        ],
+        data: vec![SUB_IX_SET_VOTE_LOCK, 0],
+    };
+    let cpi_accounts = [
+        config_account.clone(),
+        sub_pool.clone(),
+        sub_position.clone(),
+        voter.clone(),
+        subledger_program.clone(),
+    ];
+    let bump_arr = [bump];
+    if coin_only {
+        let seeds: [&[u8]; 3] = [b"gv_config", coin_mint.as_ref(), &bump_arr];
+        invoke_signed(&unlock_ix, &cpi_accounts, &[&seeds])?;
+    } else {
+        let seeds: [&[u8]; 4] = [
+            b"gv_config",
+            coin_mint.as_ref(),
+            configured_pool.as_ref(),
+            &bump_arr,
+        ];
+        invoke_signed(&unlock_ix, &cpi_accounts, &[&seeds])?;
+    }
+
+    // Do not reinterpret or rewrite old global tallies. No current instruction can
+    // use those generations for voting/triggering, while clearing this owner-bound
+    // ballot makes the one recovery action non-replayable.
+    ballot_account.try_borrow_mut_data()?[40..contribution_end].fill(0);
     Ok(())
 }
 
@@ -563,6 +815,25 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if config_account.owner != program_id || proposal_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
+    if action == VOTE_RETRACT
+        && matches!(
+            config_account.data_len(),
+            LEGACY_CONFIG_SIZE_U64
+                | LEGACY_CONFIG_SIZE_U128
+                | LEGACY_CONFIG_SIZE_BOOTSTRAP_END
+        )
+    {
+        return retract_legacy_vote(
+            program_id,
+            voter,
+            config_account,
+            ballot_account,
+            proposal_account,
+            sub_position,
+            sub_pool,
+            subledger_program,
+        );
+    }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     let mut pv = ProposalVote::deserialize(&proposal_account.try_borrow_data()?)?;
     if pv.config != *config_account.key {
@@ -576,6 +847,20 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if pv.executed && action == VOTE_BACK {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Trigger becomes valid at this exact slot, so new support must already be
+    // closed. Otherwise a depositor can wait for the final result, refresh an
+    // old ballot or retract and switch proposals before a cranker lands trigger.
+    // Retraction remains open indefinitely because it is the owner's escape from
+    // the Subledger vote lock and cannot add support to any proposal.
+    let back_slot = if action == VOTE_BACK {
+        let slot = Clock::get()?.slot;
+        if slot >= config.bootstrap_end_slot {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some(slot)
+    } else {
+        None
+    };
 
     // The subledger position + pool must be owned by the configured subledger
     // program and be the canonical PDAs for (pool, voter) / (pool).
@@ -652,12 +937,14 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         ballot.voted_weight = 0;
         ballot.voted_principal = 0;
     } else {
-        let clock = Clock::get()?;
-        let weight = if start_slot == 0 {
-            0
-        } else {
-            vote_weight(principal, clock.slot.saturating_sub(start_slot))
-        };
+        // Slot zero is a valid configured bootstrap start and deposit timestamp. Principal zero
+        // and age below two already produce zero weight, so no timestamp sentinel is needed.
+        let weight = vote_weight(
+            principal,
+            back_slot
+                .ok_or(ProgramError::InvalidInstructionData)?
+                .saturating_sub(start_slot),
+        );
         if weight == 0 {
             msg!("position has no vote weight (unfunded or too recent)");
             return Err(ProgramError::InvalidAccountData);
@@ -680,8 +967,9 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     // pool's vote_authority; it can only toggle the lock, never move funds.
     let lock_val: u8 = if ballot.has_live_ballot() { 1 } else { 0 };
     let bump_arr = [config.bump];
-    let seeds: [&[u8]; 4] =
-        [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &bump_arr];
+    let delay_bytes = config.bootstrap_delay_slots.to_le_bytes();
+    let start_bytes = config.bootstrap_start_slot.to_le_bytes();
+    let seeds: [&[u8]; 6] = [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &delay_bytes, &start_bytes, &bump_arr];
     invoke_signed(
         &Instruction {
             program_id: config.subledger_program,
@@ -734,6 +1022,10 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     if pv.config != *config_account.key || pv.executed {
         return Err(ProgramError::InvalidAccountData);
     }
+    if Clock::get()?.slot < config.bootstrap_end_slot {
+        msg!("bootstrap delay has not elapsed");
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if *distribution_program.key != config.distribution_program
         || *distribution_config.key != config.distribution_config
         || *distribution_proposal.key != pv.distribution_proposal
@@ -747,8 +1039,16 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
     {
         let pd = distribution_proposal.try_borrow_data()?;
         if pd.len() < 96
-            || u32::from_le_bytes(pd[84..88].try_into().unwrap()) != pv.snapshot_entry_count
-            || u64::from_le_bytes(pd[88..96].try_into().unwrap()) != pv.snapshot_total_amount
+            || u32::from_le_bytes(
+                pd[DIST_PROPOSAL_ENTRY_COUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF]
+                    .try_into()
+                    .unwrap(),
+            ) != pv.snapshot_entry_count
+            || u64::from_le_bytes(
+                pd[DIST_PROPOSAL_TOTAL_AMOUNT_OFF..DIST_PROPOSAL_TOTAL_AMOUNT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            ) != pv.snapshot_total_amount
         {
             msg!("distribution proposal changed after registration");
             return Err(ProgramError::InvalidAccountData);
@@ -778,8 +1078,9 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
 
     // Seal the distribution. The config PDA is the distribution's seal authority.
     let bump_arr = [config.bump];
-    let seeds: [&[u8]; 4] =
-        [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &bump_arr];
+    let delay_bytes = config.bootstrap_delay_slots.to_le_bytes();
+    let start_bytes = config.bootstrap_start_slot.to_le_bytes();
+    let seeds: [&[u8]; 6] = [b"gv_config", config.coin_mint.as_ref(), config.subledger_pool.as_ref(), &delay_bytes, &start_bytes, &bump_arr];
     invoke_signed(
         &Instruction {
             program_id: *distribution_program.key,
@@ -828,6 +1129,9 @@ mod tests {
             total_cast_weight: 70,
             outstanding_principal: 12,
             bump: 250,
+            bootstrap_end_slot: 1234,
+            bootstrap_delay_slots: 100,
+            bootstrap_start_slot: 1134,
         };
         let mut b = [0u8; CONFIG_SIZE];
         c.serialize(&mut b);
@@ -835,6 +1139,9 @@ mod tests {
         assert_eq!(d.total_voted_principal, 7);
         assert_eq!(d.outstanding_principal, 12);
         assert_eq!(d.bump, 250);
+        assert_eq!(d.bootstrap_end_slot, 1234);
+        assert_eq!(d.bootstrap_delay_slots, 100);
+        assert_eq!(d.bootstrap_start_slot, 1134);
         assert_eq!(d.subledger_program, sub_program);
         assert_eq!(d.subledger_pool, sub_pool);
 

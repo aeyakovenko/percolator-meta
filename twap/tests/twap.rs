@@ -6,20 +6,17 @@
 // copied byte-for-byte from the reference; only the crate import path was changed
 // from `percolator_genesis::` to `twap::`.
 
-use twap::percolator_v16::{
-    encode_update_asset_authority, encode_withdraw_insurance_domain,
-    update_market_0_insurance_operator_by_asset_admin_ix, ASSET_AUTH_INSURANCE_OPERATOR,
-    IX_WITHDRAW_INSURANCE_DOMAIN, MARKET_0_ASSET_INDEX,
-};
+use solana_program::pubkey::Pubkey;
+use twap::percolator_v16::{encode_withdraw_insurance_domain, IX_WITHDRAW_INSURANCE_DOMAIN};
 use twap::surplus::{
     derive_associated_token_address, derive_bid_escrow_pda, BidBook, BidRefundAtaSnapshot,
-    Market0Insurance, PermissionlessBuyBurnRequest, RegisteredBid, SurplusError, TwapAuthorityChain,
-    TwapBuyBurnSchedule, TwapBuyBurnState, TwapProgramConfig, TwapWithdrawAccounts,
-    MARKET_0_SURPLUS_BUY_BURN_BPS, MAX_TWAP_BIDS_PER_EXECUTION, MAX_TWAP_INTERVAL_COUNT,
-    TWAP_AUTHORITY_SEED, TWAP_INTERVAL_COUNT, TWAP_INTERVAL_SLOTS, TWAP_TOTAL_SLOTS,
+    Market0Insurance, PermissionlessBuyBurnRequest, RegisteredBid, SurplusError,
+    TwapAuthorityChain, TwapBuyBurnSchedule, TwapBuyBurnState, TwapProgramConfig,
+    TwapWithdrawAccounts, MARKET_0_SURPLUS_BUY_BURN_BPS, MAX_TWAP_BIDS_PER_EXECUTION,
+    MAX_TWAP_INTERVAL_COUNT, TWAP_AUTHORITY_SEED, TWAP_INTERVAL_COUNT, TWAP_INTERVAL_SLOTS,
+    TWAP_TOTAL_SLOTS,
 };
 use twap::twap_program::ReusableTwapProgram;
-use solana_program::pubkey::Pubkey;
 
 fn key() -> Pubkey {
     Pubkey::new_unique()
@@ -968,39 +965,6 @@ fn squads_can_rotate_twap_program_out_and_rebind_market0_operator_pda() {
     assert_eq!(cfg.authority_chain, expected_new_chain);
     assert_eq!(cfg.withdraw_accounts, new_withdraw_accounts);
 
-    let replace_operator_ix = cfg.replace_current_operator_from_squads_ix();
-    assert_eq!(
-        replace_operator_ix.program_id,
-        old_withdraw_accounts.percolator_program
-    );
-    assert_eq!(replace_operator_ix.accounts[0].pubkey, squads);
-    assert!(replace_operator_ix.accounts[0].is_signer);
-    assert_eq!(
-        replace_operator_ix.accounts[1].pubkey,
-        expected_new_chain.twap_pda
-    );
-    assert!(replace_operator_ix.accounts[1].is_signer);
-    assert_eq!(replace_operator_ix.accounts[2].pubkey, market);
-    assert_eq!(
-        replace_operator_ix.data,
-        encode_update_asset_authority(
-            MARKET_0_ASSET_INDEX,
-            ASSET_AUTH_INSURANCE_OPERATOR,
-            expected_new_chain.twap_pda
-        )
-    );
-    assert_eq!(
-        replace_operator_ix,
-        update_market_0_insurance_operator_by_asset_admin_ix(
-            old_withdraw_accounts.percolator_program,
-            squads,
-            expected_new_chain.twap_pda,
-            market,
-        )
-    );
-    assert_ne!(replace_operator_ix.accounts[0].pubkey, old_twap_pda);
-    assert_ne!(replace_operator_ix.accounts[1].pubkey, old_twap_pda);
-
     let mut rejected_insurance = Market0Insurance::new(1_000, 600).unwrap();
     let rejected_schedule =
         TwapBuyBurnSchedule::new_interval(100, 100, 1, rejected_insurance).unwrap();
@@ -1084,35 +1048,6 @@ fn twap_authority_chain_routes_futarchy_through_squads_to_pda_for_permissionless
         SurplusError::UnauthorizedController
     );
     let mut cfg = TwapProgramConfig::initialize(chain, squads, 0, withdraw_accounts).unwrap();
-    let install_ix = cfg.install_current_operator_from_squads_ix();
-    assert_eq!(install_ix.program_id, percolator_program);
-    assert_eq!(install_ix.accounts[0].pubkey, squads);
-    assert!(install_ix.accounts[0].is_signer);
-    assert_eq!(install_ix.accounts[1].pubkey, chain.twap_pda);
-    assert!(
-        install_ix.accounts[1].is_signer,
-        "Percolator UpdateAssetAuthority requires the incoming nonzero PDA to co-sign via TWAP CPI"
-    );
-    assert_eq!(install_ix.accounts[2].pubkey, market);
-    assert_eq!(
-        install_ix.data,
-        encode_update_asset_authority(
-            MARKET_0_ASSET_INDEX,
-            ASSET_AUTH_INSURANCE_OPERATOR,
-            chain.twap_pda
-        )
-    );
-    let retire_ix = cfg.retire_current_operator_to_squads_ix();
-    assert_eq!(retire_ix.program_id, percolator_program);
-    assert_eq!(retire_ix.accounts[0].pubkey, chain.twap_pda);
-    assert!(retire_ix.accounts[0].is_signer);
-    assert_eq!(retire_ix.accounts[1].pubkey, squads);
-    assert!(retire_ix.accounts[1].is_signer);
-    assert_eq!(retire_ix.accounts[2].pubkey, market);
-    assert_eq!(
-        retire_ix.data,
-        encode_update_asset_authority(MARKET_0_ASSET_INDEX, ASSET_AUTH_INSURANCE_OPERATOR, squads)
-    );
     assert_eq!(
         cfg.reconfigure_domain(metadao_futarchy, 1).unwrap_err(),
         SurplusError::UnauthorizedController

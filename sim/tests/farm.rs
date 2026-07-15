@@ -35,9 +35,33 @@ const LP_BPS: u16 = 4_000; // trader = remainder = 4_000
 const FEE_BPS: u16 = 2_000; // anti-wash fee (finding NZ) skimmed from LP/trader claims
 
 fn perc_id() -> Pubkey { percolator_prog::id() }
-fn perc_so() -> String { format!("{}/../../percolator-prog/target/deploy/percolator_prog.so", env!("CARGO_MANIFEST_DIR")) }
+fn perc_so() -> String { format!("{}/../target/deploy/percolator_prog.so", env!("CARGO_MANIFEST_DIR")) }
 fn so_deploy(name: &str) -> String { format!("{}/../target/deploy/{}.so", env!("CARGO_MANIFEST_DIR"), name) }
 fn rd_id() -> Pubkey { Pubkey::from_str("Res1dua1Distr1butor111111111111111111111111").unwrap() }
+fn rd_stake_pda(config: &Pubkey, owner: &Pubkey, linked: &Pubkey, cohort: u8) -> Pubkey {
+    let family = if cohort == 3 { 2 } else { cohort };
+    Pubkey::find_program_address(&[b"rd_stake", config.as_ref(), owner.as_ref(), linked.as_ref(), &[family]], &rd_id()).0
+}
+fn rd_portfolio_archive_pda(market: &Pubkey, owner: &Pubkey, portfolio: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"rd_portfolio_archive",
+            perc_id().as_ref(),
+            market.as_ref(),
+            owner.as_ref(),
+            portfolio.as_ref(),
+        ],
+        &rd_id(),
+    )
+    .0
+}
+fn retired_market_pda(market: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[b"retired-market", perc_id().as_ref(), market.as_ref()],
+        &solana_sdk::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9"),
+    )
+    .0
+}
 fn dist_id() -> Pubkey { Pubkey::from_str("D1str1but1on11111111111111111111111111111111").unwrap() }
 fn sub_id() -> Pubkey { Pubkey::from_str("Sub1edger1111111111111111111111111111111111").unwrap() }
 const ATA_PROGRAM_ID: Pubkey = solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -79,14 +103,39 @@ fn perc_vault_authority(slab: &Pubkey) -> Pubkey { Pubkey::find_program_address(
 fn canonical_insurance_vault(va: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[va.as_ref(), spl_token::ID.as_ref(), mint.as_ref()], &ATA_PROGRAM_ID).0
 }
-// Asset-0 domain insurance budget, read straight from the market slab (offset 448+301=749, u128).
-// This is the figure the twap surplus pull reads (subledger PERC_INSURANCE_OFFSET / twap INSURANCE_OFFSET).
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
 fn read_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
-    let acc = svm.get_account(market).unwrap();
-    u128::from_le_bytes(acc.data[749..765].try_into().unwrap())
+    let data = svm.get_account(market).unwrap().data;
+    percolator_prog::state::read_market(&data).unwrap().1.insurance
 }
 fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &dist_id()).0
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[b"dist_config", coin_mint.as_ref(), authority.as_ref(), &claim_window],
+        &dist_id(),
+    )
+    .0
+}
+
+fn modeled_subledger_position(
+    pool: &Pubkey,
+    owner: &Pubkey,
+    principal: u64,
+    start_slot: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8; subledger_program::POS_SHARES_OFF + 16];
+    data[..8].copy_from_slice(b"SUBPOS01");
+    data[subledger_program::POS_POOL_OFF..subledger_program::POS_POOL_OFF + 32]
+        .copy_from_slice(pool.as_ref());
+    data[subledger_program::POS_OWNER_OFF..subledger_program::POS_OWNER_OFF + 32]
+        .copy_from_slice(owner.as_ref());
+    data[subledger_program::POS_PRINCIPAL_OFF..subledger_program::POS_PRINCIPAL_OFF + 8]
+        .copy_from_slice(&principal.to_le_bytes());
+    data[subledger_program::POS_START_SLOT_OFF..subledger_program::POS_START_SLOT_OFF + 8]
+        .copy_from_slice(&start_slot.to_le_bytes());
+    data[subledger_program::POS_SHARES_OFF..subledger_program::POS_SHARES_OFF + 16]
+        .copy_from_slice(&(principal as u128).to_le_bytes());
+    data
 }
 
 #[test]
@@ -168,7 +217,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     let plen = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
     let posq = (percolator::POS_SCALE / 2) as i128;
     // (owner, cohort, portfolio, coin_ata)
-    let mut stakes: Vec<(Keypair, u8, Pubkey, Pubkey)> = Vec::new();
+    let mut stakes: Vec<(Keypair, u8, Pubkey, Pubkey, Pubkey)> = Vec::new();
     for (market, pv) in &markets {
         let long = Keypair::new(); let short = Keypair::new();
         svm.airdrop(&long.pubkey(), 1_000_000_000).unwrap(); svm.airdrop(&short.pubkey(), 1_000_000_000).unwrap();
@@ -184,14 +233,17 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
         }
         // register BEFORE the loss (snapshot = 0): long -> TRADER, short -> LP.
         for (o, cohort, pf) in [(&long, 3u8, long_pf), (&short, 2u8, short_pf)] {
-            let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+            let stake = rd_stake_pda(&rd_config, &o.pubkey(), &pf, cohort);
             send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(o.pubkey(), true),
                 AccountMeta::new_readonly(o.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
                 AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), &pf), false),
+                AccountMeta::new_readonly(*market, false),
+                AccountMeta::new_readonly(retired_market_pda(market), false),
             ], data: vec![1u8, cohort] }], &[o]).expect("register");
             let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &o.pubkey(), 0);
-            stakes.push((o.insecure_clone(), cohort, pf, ata));
+            stakes.push((o.insecure_clone(), cohort, pf, ata, *market));
         }
         // open the delta-neutral pair: size_q negative -> owner_a(short) short, owner_b(long) long.
         send(&mut svm, &[pix(vec![
@@ -203,11 +255,11 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     // ---- the NEUTRAL oracle moves each market (miner does NOT sign), then a permissionless crank
     //      crystallizes the long's loss (trader) and the short's gain (received -> LP) ----
     svm.set_sysvar(&Clock { slot: 110, unix_timestamp: 110, ..Default::default() });
-    let crank = |svm: &mut LiteSVM, market: &Pubkey, pf: &Pubkey, action: u8| {
+    let crank = |svm: &mut LiteSVM, market: &Pubkey, pf: &Pubkey| {
         svm.expire_blockhash(); let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(&[pix(
             vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { action, asset_index: 0, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 },
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
         )], Some(&payer.pubkey()), &[&payer], bh))
     };
     let mut market_cryst = 0u128; let mut market_recv = 0u128; let mut market_spent = 0u128;
@@ -216,17 +268,19 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
         let long_pf = stakes[2 * i].2; let short_pf = stakes[2 * i + 1].2;
         send(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(*market, false)],
             PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 })], &[&oracle]).expect("neutral oracle moves the mark");
-        for pf in [&short_pf, &long_pf] { crank(&mut svm, market, pf, 2).expect("settle B"); crank(&mut svm, market, pf, 0).expect("refresh"); }
+        for pf in [&short_pf, &long_pf] { crank(&mut svm, market, pf).expect("auto-crank settlement"); crank(&mut svm, market, pf).expect("auto-crank refresh"); }
         market_cryst += read_crystallized(&svm, &long_pf);
         market_spent += read_spent(&svm, &long_pf);     // finding NZ: stays 0 -> spent-netting does NOT catch the delta-neutral wash
         market_recv += read_received(&svm, &short_pf);
     }
 
     // ---- crystallize every miner stake (Δ), freeze, claim ----
-    for (o, _cohort, pf, _ata) in &stakes {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+    for (o, cohort, pf, _ata, market) in &stakes {
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, *cohort);
         send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(market), false),
         ], data: vec![2u8] }], &[]).expect("crystallize");
     }
     svm.set_sysvar(&Clock { slot: 2_101, unix_timestamp: 2_101, ..Default::default() });
@@ -235,12 +289,14 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     ], data: vec![4u8] }], &[]).expect("freeze");
     let mut miner_coin = 0u64;
     let mut lp_coin = 0u64; let mut trader_coin = 0u64;
-    for (o, cohort, pf, ata) in &stakes {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+    for (o, cohort, pf, ata, market) in &stakes {
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, *cohort);
         send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(*pf, false), // LP/trader live-cap portfolio (stake.backing_ledger)
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(market), false),
         ], data: vec![5u8] }], &[]).expect("claim");
         let got = token_amount(&svm, ata);
         miner_coin += got;
@@ -284,7 +340,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
     // tell a delta-neutral farmer's wash-loss from a normal directional trader's REAL loss (both are just
     // crystallized loss), so 9 normal traders' real backing dilutes the 1 farmer to 1/10 — and to beat the
     // dilution the farmer must Sybil into more accounts, each needing its OWN locked capital + per-trade fee.
-    let trader_stakes: Vec<u64> = stakes.iter().filter(|(_, c, _, _)| *c == 3).map(|(_, _, _, a)| token_amount(&svm, a)).collect();
+    let trader_stakes: Vec<u64> = stakes.iter().filter(|(_, c, _, _, _)| *c == 3).map(|(_, _, _, a, _)| token_amount(&svm, a)).collect();
     let n = trader_stakes.len();
     let lone_farmer = trader_stakes.first().copied().unwrap_or(0);
     println!("================ 9 NORMAL TRADERS vs 1 FARMER ================");
@@ -375,9 +431,9 @@ fn churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder() {
         tx(svm, &[pix(vec![AccountMeta::new(short.pubkey(), true), AccountMeta::new(long.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(short_pf, false), AccountMeta::new(long_pf, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price, fee_bps: 0 })], &[&short, &long]).expect("open pair");
         (market, long_pf, short_pf, long, short)
     };
-    let crank = |svm: &mut LiteSVM, market: &Pubkey, pf: &Pubkey, action: u8| {
+    let crank = |svm: &mut LiteSVM, market: &Pubkey, pf: &Pubkey| {
         tx(svm, &[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { action, asset_index: 0, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 })], &[]).expect("crank");
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] })], &[]).expect("crank");
     };
 
     let (h_market, h_long, h_short, _hl, _hs) = setup_pair(&mut svm);
@@ -387,7 +443,7 @@ fn churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder() {
     svm.set_sysvar(&Clock { slot: 110, unix_timestamp: 110, ..Default::default() });
     for (m, lpf, spf) in [(h_market, h_long, h_short), (c_market, c_long, c_short)] {
         tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(m, false)], PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 })], &[&oracle]).expect("drop mark");
-        for pf in [spf, lpf] { crank(&mut svm, &m, &pf, 2); crank(&mut svm, &m, &pf, 0); }
+        for pf in [spf, lpf] { crank(&mut svm, &m, &pf); crank(&mut svm, &m, &pf); }
     }
     let h_cryst = read_crystallized(&svm, &h_long);
     let c_cryst = read_crystallized(&svm, &c_long);
@@ -399,7 +455,7 @@ fn churn_raises_own_spent_and_collapses_the_net_reward_vs_a_holder() {
     // margin on the long, which SPENDS its own crystallized budget -> spent rises.
     tx(&mut svm, &[pix(vec![AccountMeta::new(c_sk.pubkey(), true), AccountMeta::new(c_lk.pubkey(), true), AccountMeta::new(c_market, false), AccountMeta::new(c_short, false), AccountMeta::new(c_long, false)], PIx::TradeNoCpi { asset_index: 0, size_q: posq, exec_price: initial_price / 2, fee_bps: 0 })], &[&c_sk, &c_lk]).expect("close");
     tx(&mut svm, &[pix(vec![AccountMeta::new(c_sk.pubkey(), true), AccountMeta::new(c_lk.pubkey(), true), AccountMeta::new(c_market, false), AccountMeta::new(c_short, false), AccountMeta::new(c_long, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price / 2, fee_bps: 0 })], &[&c_sk, &c_lk]).expect("reopen");
-    crank(&mut svm, &c_market, &c_long, 2); crank(&mut svm, &c_market, &c_long, 0);
+    crank(&mut svm, &c_market, &c_long); crank(&mut svm, &c_market, &c_long);
 
     let h_spent = read_spent(&svm, &h_long);
     let c_spent = read_spent(&svm, &c_long);
@@ -511,9 +567,10 @@ fn genesis_market_3bps_fee_accrues_to_asset0_insurance_on_a_real_trade_redirect_
 //    half WIN and earn nothing from the loss-rewarding trader cohort.
 //  - The farmer opens a long AND a short on ONE market (2 Sybil accounts, 1M each) -> whichever way it moves,
 //    one leg loses risk-free; it captures that loss as trader points for ~0 net market risk.
-//  - insurance/backing cohorts read ONLY the subledger Position share value (rd does no CPI), so they are
-//    modeled at exactly that quantity: 10 depositors x 1M shares in each pool (= "1M insurance + 1M backing
-//    per asset"). Equal shares -> equal pro-rata COIN. The TRADER/LP economy is full real-percolator.
+//  - insurance/backing cohorts read the subledger Position's live base-unit principal (rd does no CPI), so
+//    they are modeled at exactly that quantity: 10 depositors x 1M principal in each pool (= "1M insurance
+//    + 1M backing per asset"). Equal principal and tenure -> equal pro-rata COIN. The TRADER/LP economy is
+//    full real-percolator.
 const SIM_N_RATIONAL: usize = 99;
 const SIM_N_INS: usize = 10;   // 1M insurance per asset
 const SIM_N_BACK: usize = 10;  // 1M backing per asset
@@ -599,19 +656,16 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     ], &[&coin_auth]).expect("freeze COIN");
 
 
-    // ---- insurance + backing cohorts: 10 depositors x 1M shares each (modeled subledger positions) ----
+    // ---- insurance + backing cohorts: 10 depositors x 1M principal each (modeled positions) ----
     let mut ins_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();  // (owner, position, coin_ata)
     let mut back_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();
     for (cohort, pool, parts, n) in [(0u8, sub_pool, &mut ins_parts, SIM_N_INS), (1u8, back_pool, &mut back_parts, SIM_N_BACK)] {
         for _ in 0..n {
             let owner = Keypair::new(); svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
             let pos = Pubkey::new_unique();
-            // modeled subledger Position: pool@8, owner@40, withdrawn@88, shares@104 = 1M (= 1M deposit).
-            let mut d = vec![0u8; 160];
-            d[8..40].copy_from_slice(pool.as_ref()); d[40..72].copy_from_slice(owner.pubkey().as_ref());
-            d[104..120].copy_from_slice(&(SIM_DEPOSIT as u128).to_le_bytes());
+            let d = modeled_subledger_position(&pool, &owner.pubkey(), SIM_DEPOSIT, 100);
             svm.set_account(pos, Account { lamports: 1_000_000_000, data: d, owner: sub_id(), executable: false, rent_epoch: 0 }).unwrap();
-            let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+            let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pos, cohort);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
                 AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pos, false), AccountMeta::new(stake, false),
@@ -646,11 +700,14 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             tx(&mut svm, &[pix(vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(mm.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(pf, false), AccountMeta::new(mm_pf, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price, fee_bps: 0 })], &[&owner, mm]).expect("open short");
         }
         total_notional += (posq.unsigned_abs()) * initial_price as u128 / percolator::POS_SCALE;
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register trader");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         rational.push((owner, pf, ata, mi, is_long));
@@ -673,11 +730,14 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             tx(&mut svm, &[pix(vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(fmm.pubkey(), true), AccountMeta::new(fm, false), AccountMeta::new(pf, false), AccountMeta::new(fmm_pf, false)], PIx::TradeNoCpi { asset_index: 0, size_q: -posq, exec_price: initial_price, fee_bps: 0 })], &[&owner, fmm]).expect("farmer short");
         }
         total_notional += (posq.unsigned_abs()) * initial_price as u128 / percolator::POS_SCALE;
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&fm, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(fm, false),
+            AccountMeta::new_readonly(retired_market_pda(&fm), false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register farmer leg");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         farmer.push((owner, pf, ata));
@@ -689,29 +749,33 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         let new_mark = if i % 2 == 0 { initial_price / 2 } else { initial_price + initial_price / 2 };
         tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(*market, false)], PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: new_mark })], &[&oracle]).expect("oracle move");
     }
-    let crank = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, market: &Pubkey, pf: &Pubkey, action: u8| {
+    let crank = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, market: &Pubkey, pf: &Pubkey| {
         tx(svm, &[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(*market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { action, asset_index: 0, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 })], &[]).map(|_| ())
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] })], &[]).map(|_| ())
     };
     let tx_unit = |svm: &mut LiteSVM, ixs: &[Instruction], extra: &[&Keypair]| tx(svm, ixs, extra).map(|_| ());
-    for (_o, pf, _a, mi, _l) in &rational { let m = markets[*mi].0; let _ = crank(&mut svm, &tx_unit, &m, pf, 2); let _ = crank(&mut svm, &tx_unit, &m, pf, 0); }
-    for (_o, pf, _a) in &farmer { let _ = crank(&mut svm, &tx_unit, &fm, pf, 2); let _ = crank(&mut svm, &tx_unit, &fm, pf, 0); }
+    for (_o, pf, _a, mi, _l) in &rational { let m = markets[*mi].0; let _ = crank(&mut svm, &tx_unit, &m, pf); let _ = crank(&mut svm, &tx_unit, &m, pf); }
+    for (_o, pf, _a) in &farmer { let _ = crank(&mut svm, &tx_unit, &fm, pf); let _ = crank(&mut svm, &tx_unit, &fm, pf); }
 
     // ---- crystallize every TRADER stake (rational + farmer), freeze, claim all ----
-    let cryst = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, pf: &Pubkey| {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+    let cryst = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, market: &Pubkey, pf: &Pubkey| {
+        let stake = rd_stake_pda(&rd_config, &owner.pubkey(), pf, 3);
         tx(svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &owner.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(market), false),
         ], data: vec![2u8] }], &[]).map(|_| ())
     };
-    for (o, pf, _a, _mi, _l) in &rational { let _ = cryst(&mut svm, &tx_unit, o, pf); }
-    for (o, pf, _a) in &farmer { let _ = cryst(&mut svm, &tx_unit, o, pf); }
-    // share-value cohorts (insurance/backing): crystallize sets points = live shares; cranker MUST be the owner.
-    for (o, pos, _a) in ins_parts.iter().chain(back_parts.iter()) {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
-        tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
-        ], data: vec![2u8] }], &[o]).expect("crystallize share-value");
+    for (o, pf, _a, mi, _l) in &rational { let market = markets[*mi].0; let _ = cryst(&mut svm, &tx_unit, o, &market, pf); }
+    for (o, pf, _a) in &farmer { let _ = cryst(&mut svm, &tx_unit, o, &fm, pf); }
+    // Capital cohorts: crystallize sets points from live principal and tenure; cranker MUST be the owner.
+    for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
+        for (o, pos, _a) in parts {
+            let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, cohort);
+            tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
+                AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
+            ], data: vec![2u8] }], &[o]).expect("crystallize capital");
+        }
     }
 
     svm.set_sysvar(&Clock { slot: 2_101, unix_timestamp: 2_101, ..Default::default() });
@@ -719,33 +783,36 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new_readonly(coin_mint, false), AccountMeta::new(rd_vault, false),
     ], data: vec![4u8] }], &[]).expect("freeze");
 
-    // claims: share-value (ins/back) sign as owner + append the position; trader permissionless + append the portfolio.
+    // Claims: capital cohorts sign as owner + append the position; trader is permissionless + appends the portfolio.
     let mut ins_coin = 0u64; let mut back_coin = 0u64;
     for (o, pos, ata) in &ins_parts {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, 0);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(o.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pos, false),
         ], data: vec![5u8] }], &[o]); ins_coin += token_amount(&svm, ata);
     }
     for (o, pos, ata) in &back_parts {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, 1);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(o.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pos, false),
         ], data: vec![5u8] }], &[o]); back_coin += token_amount(&svm, ata);
     }
-    let claim_trader = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, pf: &Pubkey, ata: &Pubkey| {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+    let claim_trader = |svm: &mut LiteSVM, tx: &dyn Fn(&mut LiteSVM, &[Instruction], &[&Keypair]) -> Result<(), litesvm::types::FailedTransactionMetadata>, owner: &Keypair, market: &Pubkey, pf: &Pubkey, ata: &Pubkey| {
+        let stake = rd_stake_pda(&rd_config, &owner.pubkey(), pf, 3);
         let _ = tx(svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &owner.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(market), false),
         ], data: vec![5u8] }], &[]);
     };
     let mut rational_winner_coin = 0u64; let mut rational_loser_coin = 0u64;
     let mut n_winners = 0usize; let mut n_losers = 0usize; let mut loser_examples: Vec<u64> = Vec::new();
     for (o, pf, ata, mi, is_long) in &rational {
-        claim_trader(&mut svm, &tx_unit, o, pf, ata);
+        let market = markets[*mi].0;
+        claim_trader(&mut svm, &tx_unit, o, &market, pf, ata);
         let got = token_amount(&svm, ata);
         // even market -50% (long loses); odd market +50% (short loses).
         let lost = if mi % 2 == 0 { *is_long } else { !*is_long };
@@ -753,7 +820,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         else if lost { n_losers += 1; } else { n_winners += 1; }
     }
     let mut farmer_coin = 0u64;
-    for (o, pf, ata) in &farmer { claim_trader(&mut svm, &tx_unit, o, pf, ata); farmer_coin += token_amount(&svm, ata); }
+    for (o, pf, ata) in &farmer { claim_trader(&mut svm, &tx_unit, o, &fm, pf, ata); farmer_coin += token_amount(&svm, ata); }
 
     let trader_bps = 10_000 - INS_BPS - BACK_BPS - LP_BPS;
     let supply = SUPPLY as u128;
@@ -804,7 +871,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     // The farmer is NOT disproportionate: its take <= the whole trader cohort, and per-leg it is bounded by the
     // same per-loss share an honest loser gets (the rd treats manufactured and real loss identically).
     assert!(farmer_coin as u128 <= trader_supply, "farmer cannot exceed the trader cohort");
-    assert_eq!(ins_coin as u128, ins_supply, "insurance cohort fully claimed (all depositors live, equal shares)");
+    assert_eq!(ins_coin as u128, ins_supply, "insurance cohort fully claimed (all depositors live, equal principal)");
     assert_eq!(back_coin as u128, back_supply, "backing cohort fully claimed");
     let _ = total_collateral; let _ = loser_examples; let _ = rational_loser_coin;
 }
@@ -892,18 +959,16 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
         spl_token::instruction::set_authority(&spl_token::ID, &coin_mint, None, spl_token::instruction::AuthorityType::MintTokens, &coin_auth.pubkey(), &[]).unwrap(),
     ], &[&coin_auth]).expect("freeze COIN");
 
-    // ---- insurance + backing cohorts: 10 depositors x 1M shares each ----
+    // ---- insurance + backing cohorts: 10 depositors x 1M principal each ----
     let mut ins_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();
     let mut back_parts: Vec<(Keypair, Pubkey, Pubkey)> = Vec::new();
     for (cohort, pool, parts, n) in [(0u8, sub_pool, &mut ins_parts, 10usize), (1u8, back_pool, &mut back_parts, 10usize)] {
         for _ in 0..n {
             let owner = Keypair::new(); svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
             let pos = Pubkey::new_unique();
-            let mut d = vec![0u8; 160];
-            d[8..40].copy_from_slice(pool.as_ref()); d[40..72].copy_from_slice(owner.pubkey().as_ref());
-            d[104..120].copy_from_slice(&(XM_DEPOSIT as u128).to_le_bytes());
+            let d = modeled_subledger_position(&pool, &owner.pubkey(), XM_DEPOSIT, 100);
             svm.set_account(pos, Account { lamports: 1_000_000_000, data: d, owner: sub_id(), executable: false, rent_epoch: 0 }).unwrap();
-            let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+            let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pos, cohort);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
                 AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pos, false), AccountMeta::new(stake, false),
@@ -945,11 +1010,14 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             total_positions += 1;
             legs.push((a, is_long));
         }
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register trader");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         rational.push((owner, pf, ata, legs));
@@ -976,11 +1044,14 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             total_positions += 1;
             assets.push(a);
         }
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), owner.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
             AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![1u8, 3u8] }], &[&owner]).expect("register farmer leg");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         farmer.push((owner, pf, ata, assets));
@@ -992,32 +1063,38 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
         let new_mark = if a % 2 == 0 { initial_price / 2 } else { initial_price + initial_price / 2 };
         tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false)], PIx::PushAuthMark { asset_index: a, now_slot: 110, mark_e6: new_mark })], &[&oracle]).expect("oracle move");
     }
-    let crank = |svm: &mut LiteSVM, pf: &Pubkey, a: u16, action: u8| {
+    let crank = |svm: &mut LiteSVM, pf: &Pubkey, a: u16| {
         svm.expire_blockhash(); let bh = svm.latest_blockhash();
         let _ = svm.send_transaction(Transaction::new_signed_with_payer(&[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(*pf, false)],
-            PIx::PermissionlessCrank { action, asset_index: a, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 })], Some(&payer.pubkey()), &[&payer], bh));
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: a, oracle_accounts: 0 }] })], Some(&payer.pubkey()), &[&payer], bh));
     };
-    for (_o, pf, _a, legs) in &rational { for (a, _l) in legs { crank(&mut svm, pf, *a, 2); crank(&mut svm, pf, *a, 0); } }
-    for (_o, pf, _a, assets) in &farmer { for a in assets { crank(&mut svm, pf, *a, 2); crank(&mut svm, pf, *a, 0); } }
+    for (_o, pf, _a, legs) in &rational { for (a, _l) in legs { crank(&mut svm, pf, *a); crank(&mut svm, pf, *a); } }
+    for (_o, pf, _a, assets) in &farmer { for a in assets { crank(&mut svm, pf, *a); crank(&mut svm, pf, *a); } }
 
-    // ---- crystallize all trader stakes + share-value stakes, freeze, claim ----
+    // ---- crystallize all trader stakes + capital stakes, freeze, claim ----
     for (o, pf, _a, _l) in &rational {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![2u8] }], &[]);
     }
     for (o, pf, _a, _as) in &farmer {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![2u8] }], &[]);
     }
-    for (o, pos, _a) in ins_parts.iter().chain(back_parts.iter()) {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
-        tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
-            AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
-        ], data: vec![2u8] }], &[o]).expect("crystallize share-value");
+    for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
+        for (o, pos, _a) in parts {
+            let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, cohort);
+            tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
+                AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
+            ], data: vec![2u8] }], &[o]).expect("crystallize capital");
+        }
     }
     svm.set_sysvar(&Clock { slot: 2_101, unix_timestamp: 2_101, ..Default::default() });
     tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
@@ -1026,14 +1103,14 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
 
     let mut ins_coin = 0u64; let mut back_coin = 0u64;
     for (o, pos, ata) in &ins_parts {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, 0);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(o.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pos, false),
         ], data: vec![5u8] }], &[o]); ins_coin += token_amount(&svm, ata);
     }
     for (o, pos, ata) in &back_parts {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, 1);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(o.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pos, false),
@@ -1042,10 +1119,12 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     let mut winner_coin = 0u64; let mut loser_coin = 0u64; let mut n_pure_winners = 0usize; let mut n_any_loss = 0usize;
     let mut loser_real_loss: u128 = 0; // Sigma crystallized over the rational losers (their REAL directional loss)
     for (o, pf, ata, legs) in &rational {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![5u8] }], &[]);
         let got = token_amount(&svm, ata);
         // a leg loses if (even asset & long) or (odd asset & short).
@@ -1055,10 +1134,12 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     let mut farmer_coin = 0u64;
     let mut farmer_gross_loss: u128 = 0; // farmer's GROSS crystallized (its COIN basis); its NET real cost ~0 (delta-neutral)
     for (o, pf, ata, _as) in &farmer {
-        let stake = Pubkey::find_program_address(&[b"rd_stake", rd_config.as_ref(), o.pubkey().as_ref()], &rd_id()).0;
+        let stake = rd_stake_pda(&rd_config, &o.pubkey(), pf, 3);
         let _ = tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new(stake, false),
             AccountMeta::new(rd_vault, false), AccountMeta::new(*ata, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(*pf, false),
+            AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &o.pubkey(), pf), false),
+            AccountMeta::new_readonly(retired_market_pda(&market), false),
         ], data: vec![5u8] }], &[]);
         farmer_coin += token_amount(&svm, ata);
         farmer_gross_loss += read_crystallized(&svm, pf);
@@ -1184,12 +1265,12 @@ fn cross_margin_crystallized_is_gross_not_net_single_portfolio_wash_probe() {
     svm.set_sysvar(&Clock { slot: 110, unix_timestamp: 110, ..Default::default() });
     tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false)], PIx::PushAuthMark { asset_index: 0, now_slot: 110, mark_e6: initial_price / 2 })], &[&oracle]).expect("drop a0");
     tx(&mut svm, &[pix(vec![AccountMeta::new(oracle.pubkey(), true), AccountMeta::new(market, false)], PIx::PushAuthMark { asset_index: 1, now_slot: 110, mark_e6: initial_price + initial_price / 2 })], &[&oracle]).expect("raise a1");
-    let crank = |svm: &mut LiteSVM, a: u16, action: u8| {
+    let crank = |svm: &mut LiteSVM, a: u16| {
         svm.expire_blockhash(); let bh = svm.latest_blockhash();
         let _ = svm.send_transaction(Transaction::new_signed_with_payer(&[pix(vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new(w_pf, false)],
-            PIx::PermissionlessCrank { action, asset_index: a, now_slot: 110, funding_rate_e9: 0, close_q: 0, fee_bps: 0, recovery_reason: 0 })], Some(&payer.pubkey()), &[&payer], bh));
+            PIx::PermissionlessCrank { now_slot: 110, observations: vec![percolator_prog::ix::CrankObservationHint { asset_index: a, oracle_accounts: 0 }] })], Some(&payer.pubkey()), &[&payer], bh));
     };
-    for a in 0..2u16 { crank(&mut svm, a, 2); crank(&mut svm, a, 0); }
+    for a in 0..2u16 { crank(&mut svm, a); crank(&mut svm, a); }
 
     let w_cryst = read_crystallized(&svm, &w_pf).saturating_sub(w_cryst0);
     let w_spent = read_spent(&svm, &w_pf);
@@ -1219,4 +1300,312 @@ fn cross_margin_crystallized_is_gross_not_net_single_portfolio_wash_probe() {
     // corrected/confirmed and future ticks don't re-probe.
     assert_eq!(w_spent, 0, "no churn -> spent stays 0; net-by-spent cannot bound a delta-neutral cross-asset wash");
     let _ = (net_counter, single_leg_loss, pnl_raw);
+}
+
+#[test]
+fn crossed_trade_cannot_self_finance_preexisting_oi_reduction() {
+    const PRICE: u64 = 1;
+    const OPEN_Q: i128 = 13_000 * percolator::POS_SCALE as i128;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let collateral = create_real_mint(&mut svm, &payer, &admin.pubkey());
+    let market = Pubkey::new_unique();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0; market_len],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let vault_authority = perc_vault_authority(&market);
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+
+    let send = |svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]| {
+        svm.expire_blockhash();
+        let blockhash = svm.latest_blockhash();
+        let mut all_signers = vec![&payer];
+        all_signers.extend_from_slice(signers);
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &all_signers,
+            blockhash,
+        ))
+    };
+
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 6_480_000,
+                initial_price: PRICE,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 500,
+                initial_margin_bps: 500,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 24,
+                max_accrual_dt_slots: 20,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 10_000_000,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 27,
+            },
+        ),
+        &[&admin],
+    )
+    .expect("initialize liquidation probe market");
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: PRICE,
+            },
+        ),
+        &[&admin],
+    )
+    .expect("configure authenticated mark");
+
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    svm.airdrop(&owner_a.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&owner_b.pubkey(), 1_000_000_000).unwrap();
+    let portfolio_a = Pubkey::new_unique();
+    let portfolio_b = Pubkey::new_unique();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    for (owner, portfolio, deposit) in [
+        (&owner_a, portfolio_a, 1_000u64),
+        (&owner_b, portfolio_b, 1_189u64),
+    ] {
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+            &[owner],
+        )
+        .expect("initialize portfolio");
+
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral,
+            &owner.pubkey(),
+            deposit,
+        );
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(deposit),
+                },
+            ),
+            &[owner],
+        )
+        .expect("deposit collateral");
+    }
+
+    svm.set_sysvar(&Clock {
+        slot: 8,
+        unix_timestamp: 8,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio_a, false),
+                AccountMeta::new(portfolio_b, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: OPEN_Q,
+                exec_price: PRICE,
+                fee_bps: 0,
+            },
+        ),
+        &[&owner_a, &owner_b],
+    )
+    .expect("open balanced interest");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+            &[],
+        )
+    };
+
+    svm.set_sysvar(&Clock {
+        slot: 27,
+        unix_timestamp: 27,
+        ..Clock::default()
+    });
+    crank(&mut svm, portfolio_a, 27).expect("refresh first side");
+
+    svm.set_sysvar(&Clock {
+        slot: 35,
+        unix_timestamp: 35,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio_b, false),
+            ],
+            PIx::SyncMaintenanceFee { now_slot: 35 },
+        ),
+        &[],
+    )
+    .expect("make second side partially liquidatable");
+    crank(&mut svm, portfolio_b, 35).expect("certify liquidation");
+    crank(&mut svm, portfolio_b, 35).expect("partially liquidate");
+
+    let market_data = svm.get_account(&market).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&market_data).unwrap();
+    let asset = group.assets[0];
+    let portfolio_data_a = svm.get_account(&portfolio_a).unwrap().data;
+    let portfolio_data_b = svm.get_account(&portfolio_b).unwrap().data;
+    let state_a = percolator_prog::state::read_portfolio(&portfolio_data_a).unwrap();
+    let state_b = percolator_prog::state::read_portfolio(&portfolio_data_b).unwrap();
+    let position_q = |state: &percolator::PortfolioAccountV16Account| {
+        state
+            .legs
+            .iter()
+            .filter_map(|leg| leg.try_to_runtime().ok())
+            .find(|leg| leg.active && leg.asset_index == 0)
+            .expect("active asset-0 leg")
+            .basis_pos_q
+    };
+    let survivor_q = position_q(&state_a).unsigned_abs();
+    let liquidated_q = position_q(&state_b).unsigned_abs();
+    assert_eq!(survivor_q, OPEN_Q.unsigned_abs());
+    assert!(
+        liquidated_q > 0 && liquidated_q < survivor_q,
+        "probe requires a partial liquidation, got {liquidated_q} of {survivor_q}"
+    );
+    assert_eq!(asset.oi_eff_long_q, liquidated_q);
+    assert_eq!(asset.oi_eff_short_q, liquidated_q);
+
+    let cross_q = liquidated_q + (survivor_q - liquidated_q) / 2;
+    let market_before = svm.get_account(&market).unwrap();
+    let portfolio_a_before = svm.get_account(&portfolio_a).unwrap();
+    let portfolio_b_before = svm.get_account(&portfolio_b).unwrap();
+    let vault_before = svm.get_account(&vault).unwrap();
+    let result = send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio_b, false),
+                AccountMeta::new(portfolio_a, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: cross_q as i128,
+                exec_price: PRICE,
+                fee_bps: 0,
+            },
+        ),
+        &[&owner_b, &owner_a],
+    );
+    assert!(
+        result.is_err(),
+        "a trade cannot reduce more OI than existed before that same instruction"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before);
+    assert_eq!(svm.get_account(&portfolio_a).unwrap(), portfolio_a_before);
+    assert_eq!(svm.get_account(&portfolio_b).unwrap(), portfolio_b_before);
+    assert_eq!(svm.get_account(&vault).unwrap(), vault_before);
 }

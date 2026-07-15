@@ -19,24 +19,57 @@ use residual_distributor::{
     OFF_PORTFOLIO_RECEIVED, OFF_PORTFOLIO_SPENT, PERC_HEADER_LEN,
 };
 
-// OVERFLOW SAFETY of the pro-rata split: total_supply (u64) * points_i (u128) can exceed u128 when points_i is
-// large; points_to_amount must SATURATE (never panic = brick the cohort's claims, never wrap = drain) and the
-// result must always be bounded by total_supply (points_i <= total_points => share <= total_supply). Pins that the
-// saturating_mul is not "simplified" to an unchecked `*` (a brick/drain regression an ordinary-magnitude test misses).
+#[test]
+fn maintenance_fee_offset_matches_the_pinned_percolator_wrapper() {
+    assert_eq!(
+        percolator_accounting::MAINTENANCE_FEE_PER_SLOT_OFFSET,
+        percolator_accounting::HEADER_LEN
+            + offset_of!(
+                percolator_prog::state::WrapperConfigV16,
+                maintenance_fee_per_slot
+            ),
+        "registration's immutable maintenance-fee gate must track the pinned wrapper layout"
+    );
+}
+
+// OVERFLOW SAFETY + EXACTNESS of the pro-rata split: total_supply (u64) * points_i (u128) can exceed u128 when
+// points_i is large. points_to_amount must never panic/wrap, and must preserve the exact floor quotient rather
+// than saturating the intermediate and permanently locking a claimant's COIN.
 #[test]
 fn points_to_amount_is_overflow_safe_never_panics_and_never_over_allocates() {
-    // Extreme inputs that overflow a naive u64*u128 product: must not panic, and (points_i <= total_points so)
-    // the share is always bounded by total_supply — never an over-allocation/drain.
-    assert!(
-        points_to_amount(u64::MAX, u128::MAX, u128::MAX) <= u64::MAX,
-        "max/max/max: no panic, bounded by supply"
+    assert_eq!(
+        points_to_amount(u64::MAX, u128::MAX, u128::MAX),
+        u64::MAX,
+        "max/max/max sole staker receives the exact full supply"
     );
     let supply = 400_000u64;
-    // Sole staker (points_i == total_points) at a magnitude that saturates total_supply*points_i: still <= supply.
-    let huge = 7e31 as u128; // > u128::MAX / supply -> the product saturates
-    assert!(
-        points_to_amount(supply, huge, huge) <= supply,
-        "even at saturation a sole staker is paid <= the cohort supply (no drain)"
+    let huge = 7e31 as u128;
+    assert_eq!(
+        points_to_amount(supply, huge, huge),
+        supply,
+        "an overflowing sole-staker product remains exact"
+    );
+    let max_principal = u64::MAX as u128;
+    assert_eq!(
+        points_to_amount(u64::MAX, 2 * max_principal, 4 * max_principal),
+        u64::MAX / 2,
+        "an overflowing nontrivial split uses the exact floor quotient"
+    );
+    let third = u128::MAX / 3;
+    assert_eq!(
+        points_to_amount(u64::MAX, third, third * 3),
+        u64::MAX / 3,
+        "an overflowing one-third split remains exact"
+    );
+    assert_eq!(
+        points_to_amount(u64::MAX, u128::MAX - 1, u128::MAX),
+        u64::MAX - 1,
+        "an overflowing near-total split preserves the one-atom floor remainder"
+    );
+    assert_eq!(
+        points_to_amount(10, 11, 10),
+        0,
+        "an invalid numerator above its denominator can never over-allocate"
     );
     // Sole staker below saturation: gets exactly the whole cohort.
     assert_eq!(
@@ -130,9 +163,7 @@ fn pinned_distribution_program_id_matches_the_real_program() {
 
 // The subledger Position offsets residual-distributor reads MUST match the subledger's canonical
 // layout (finding HF: a wrong owner offset slipped past mocked tests). Cross-pinned to the
-// subledger's exported POS_* consts (themselves canaried against Position::serialize there). Only the
-// LIVE share-value reads (pool/owner/withdrawn/shares) remain — the old principal*log-time model reads
-// were removed (finding KO-followup dead-code cleanup).
+// subledger's exported POS_* consts (themselves canaried against Position::serialize there).
 #[test]
 fn subledger_position_offsets_match_the_real_subledger_layout() {
     use residual_distributor as rd;
@@ -147,13 +178,33 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         "Position.owner offset"
     );
     assert_eq!(
+        rd::SUB_POS_PRINCIPAL,
+        subledger_program::POS_PRINCIPAL_OFF,
+        "Position.principal (cross-pool base-unit points) offset"
+    );
+    assert_eq!(
+        rd::SUB_POS_WITHDRAWN_AMOUNT,
+        subledger_program::POS_WITHDRAWN_AMOUNT_OFF,
+        "Position terminal-return principal snapshot offset"
+    );
+    assert_eq!(
         rd::SUB_POS_WITHDRAWN,
         subledger_program::POS_WITHDRAWN_OFF,
         "Position.withdrawn offset"
     );
     assert_eq!(
-        rd::SUB_POS_SHARES,
-        subledger_program::POS_SHARES_OFF,
-        "Position.shares (share-value) offset"
+        rd::SUB_POS_START_SLOT,
+        subledger_program::POS_START_SLOT_OFF,
+        "Position.start_slot (top-up reset clock) offset"
+    );
+    assert_eq!(
+        rd::SUB_POS_TERMINAL_RETURNED,
+        subledger_program::POS_TERMINAL_RETURNED_OFF,
+        "Position permissionless terminal-return marker offset"
+    );
+    assert_eq!(
+        rd::SUB_POS_TERMINAL_RETURN_SLOT,
+        subledger_program::POS_TERMINAL_RETURN_SLOT_OFF,
+        "Position permissionless terminal-return slot offset"
     );
 }

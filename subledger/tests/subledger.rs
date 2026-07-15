@@ -13,6 +13,9 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
+const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
+const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
 fn program_id() -> Pubkey {
     subledger_program::id()
 }
@@ -126,9 +129,14 @@ fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypai
     svm.send_transaction(tx).unwrap();
 }
 
-fn pool_pda(mint: &Pubkey, asset_id: u64) -> Pubkey {
+fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
     // Own-vault pools commit to the default market binding (no percolator market).
     let no_market = Pubkey::default();
+    let domain = [0u8];
+    let policy = [policy];
+    let window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
+    let delay = OWN_VAULT_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
     Pubkey::find_program_address(
         &[
             b"subledger_pool",
@@ -136,6 +144,12 @@ fn pool_pda(mint: &Pubkey, asset_id: u64) -> Pubkey {
             &asset_id.to_le_bytes(),
             no_market.as_ref(),
             no_market.as_ref(),
+            no_market.as_ref(),
+            &policy,
+            &domain,
+            &window,
+            &start,
+            &delay,
         ],
         &program_id(),
     )
@@ -148,6 +162,138 @@ fn position_pda(pool: &Pubkey, owner: &Pubkey) -> Pubkey {
         &program_id(),
     )
     .0
+}
+
+fn legacy_master_pool_pda(mint: &Pubkey, asset_id: u64) -> (Pubkey, u8) {
+    let no_market = Pubkey::default();
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            no_market.as_ref(),
+            no_market.as_ref(),
+        ],
+        &program_id(),
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HistoricalPoolSeeds {
+    Base,
+    Market,
+    Coin,
+    PolicyDomain,
+    Window,
+    Start,
+    Bootstrap,
+}
+
+fn historical_pool_pda(
+    mint: &Pubkey,
+    asset_id: u64,
+    policy: u8,
+    version: HistoricalPoolSeeds,
+) -> (Pubkey, u8) {
+    let asset_id = asset_id.to_le_bytes();
+    let no_market = Pubkey::default();
+    let policy = [policy];
+    let domain = [0u8];
+    let window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
+    let delay = OWN_VAULT_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
+    let mut seeds: Vec<&[u8]> = vec![b"subledger_pool", mint.as_ref(), &asset_id];
+    match version {
+        HistoricalPoolSeeds::Base => {}
+        HistoricalPoolSeeds::Market => {
+            seeds.extend_from_slice(&[no_market.as_ref(), no_market.as_ref()]);
+        }
+        HistoricalPoolSeeds::Coin => {
+            seeds.extend_from_slice(&[no_market.as_ref(), no_market.as_ref(), no_market.as_ref()]);
+        }
+        HistoricalPoolSeeds::PolicyDomain => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+            ]);
+        }
+        HistoricalPoolSeeds::Window => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+                &window,
+            ]);
+        }
+        HistoricalPoolSeeds::Start => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+                &window,
+                &start,
+            ]);
+        }
+        HistoricalPoolSeeds::Bootstrap => {
+            seeds.extend_from_slice(&[
+                no_market.as_ref(),
+                no_market.as_ref(),
+                no_market.as_ref(),
+                &policy,
+                &domain,
+                &window,
+                &start,
+                &delay,
+            ]);
+        }
+    }
+    Pubkey::find_program_address(&seeds, &program_id())
+}
+
+fn historical_pool_data(
+    size: usize,
+    mint: &Pubkey,
+    asset_id: u64,
+    vault: &Pubkey,
+    outstanding: u64,
+    policy: u8,
+    bump: u8,
+) -> Vec<u8> {
+    let mut data = vec![0u8; size];
+    data[..8].copy_from_slice(b"SUBPOOL1");
+    data[8..40].copy_from_slice(mint.as_ref());
+    data[40..48].copy_from_slice(&asset_id.to_le_bytes());
+    data[48..80].copy_from_slice(vault.as_ref());
+    data[80..88].copy_from_slice(&outstanding.to_le_bytes());
+    data[88] = policy;
+    data[89] = bump;
+    data[90] = 0;
+    if size == 216 {
+        data[208..216].copy_from_slice(&u64::MAX.to_le_bytes());
+    } else if size >= 256 {
+        data[240..248].copy_from_slice(&u64::MAX.to_le_bytes());
+        data[248..256].copy_from_slice(&OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes());
+    }
+    data
+}
+
+fn historical_position_data(size: usize, pool: &Pubkey, owner: &Pubkey, principal: u64) -> Vec<u8> {
+    let mut data = vec![0u8; size];
+    data[..8].copy_from_slice(b"SUBPOS01");
+    data[8..40].copy_from_slice(pool.as_ref());
+    data[40..72].copy_from_slice(owner.as_ref());
+    data[72..80].copy_from_slice(&principal.to_le_bytes());
+    if size >= 104 {
+        data[89..97].copy_from_slice(&1u64.to_le_bytes());
+    }
+    data
 }
 
 fn init_pool_ix(env: &Env, pool: &Pubkey, vault: &Pubkey, asset_id: u64, policy: u8) -> Instruction {
@@ -219,6 +365,227 @@ fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
 }
 
+// UPGRADE LOF PROBE: origin/master created 208-byte pools and derived their PDA
+// without the later COIN/policy/schedule seeds. Growing Pool to 272 bytes must not
+// make an existing owner-bound vault impossible to sign for. This constructs the
+// exact master bytes and exercises a real SPL withdrawal against the current SBF.
+#[test]
+fn legacy_master_pool_owner_can_withdraw_after_layout_and_seed_upgrade() {
+    let mut env = Env::new();
+    let asset_id = 77;
+    let amount = 123_456u64;
+    let (pool, bump) = legacy_master_pool_pda(&env.mint, asset_id);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    let (owner, owner_ata) = new_depositor(&mut env, 0);
+    mint_to(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &clone_kp(&env.mint_authority),
+        &vault,
+        amount,
+    );
+
+    let mut pool_data = vec![0u8; 208];
+    pool_data[..8].copy_from_slice(b"SUBPOOL1");
+    pool_data[8..40].copy_from_slice(env.mint.as_ref());
+    pool_data[40..48].copy_from_slice(&asset_id.to_le_bytes());
+    pool_data[48..80].copy_from_slice(vault.as_ref());
+    pool_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    pool_data[88] = 0; // POLICY_PRINCIPAL
+    pool_data[89] = bump;
+    pool_data[90] = 0;
+    env.svm
+        .set_account(
+            pool,
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: pool_data,
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let position = position_pda(&pool, &owner.pubkey());
+    let mut position_data = vec![0u8; 120];
+    position_data[..8].copy_from_slice(b"SUBPOS01");
+    position_data[8..40].copy_from_slice(pool.as_ref());
+    position_data[40..72].copy_from_slice(owner.pubkey().as_ref());
+    position_data[72..80].copy_from_slice(&amount.to_le_bytes());
+    position_data[89..97].copy_from_slice(&1u64.to_le_bytes());
+    env.svm
+        .set_account(
+            position,
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: position_data,
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    env.send(
+        &[withdraw_ix(&pool, &owner.pubkey(), &owner_ata, &vault)],
+        &[&owner],
+    )
+    .expect("legacy owner withdrawal remains live after upgrade");
+    assert_eq!(env.token_amount(&owner_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+    assert_eq!(env.svm.get_account(&pool).unwrap().data.len(), 208);
+}
+
+// Every historical pool layout and both same-size seed transitions must still
+// produce a real PDA signature after upgrade. Each case executes a distinct SPL
+// transfer through the current SBF program; this is a compatibility matrix, not
+// repeated execution of one configuration.
+#[test]
+fn every_historical_pool_seed_schema_preserves_owner_withdrawal() {
+    let cases = [
+        ("base-96", 96, 96, HistoricalPoolSeeds::Base),
+        ("base-160", 160, 104, HistoricalPoolSeeds::Base),
+        ("base-192", 192, 104, HistoricalPoolSeeds::Base),
+        ("market-192", 192, 104, HistoricalPoolSeeds::Market),
+        ("market-208", 208, 120, HistoricalPoolSeeds::Market),
+        ("market-216", 216, 120, HistoricalPoolSeeds::Market),
+        ("coin-240", 240, 120, HistoricalPoolSeeds::Coin),
+        (
+            "policy-domain-240",
+            240,
+            120,
+            HistoricalPoolSeeds::PolicyDomain,
+        ),
+        ("window-256", 256, 120, HistoricalPoolSeeds::Window),
+        ("start-264", 264, 120, HistoricalPoolSeeds::Start),
+        ("bootstrap-272", 272, 120, HistoricalPoolSeeds::Bootstrap),
+    ];
+
+    for (index, (name, pool_size, position_size, seed_version)) in cases.into_iter().enumerate() {
+        let mut env = Env::new();
+        let asset_id = 1_000 + index as u64;
+        let amount = 10_000 + index as u64;
+        let (pool, bump) = historical_pool_pda(&env.mint, asset_id, 0, seed_version);
+        let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+        mint_to(
+            &mut env.svm,
+            &clone_kp(&env.payer),
+            &env.mint,
+            &clone_kp(&env.mint_authority),
+            &vault,
+            amount,
+        );
+        let (owner, owner_ata) = new_depositor(&mut env, 0);
+        env.svm
+            .set_account(
+                pool,
+                solana_sdk::account::Account {
+                    lamports: 10_000_000,
+                    data: historical_pool_data(
+                        pool_size, &env.mint, asset_id, &vault, amount, 0, bump,
+                    ),
+                    owner: program_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        env.svm
+            .set_account(
+                position_pda(&pool, &owner.pubkey()),
+                solana_sdk::account::Account {
+                    lamports: 10_000_000,
+                    data: historical_position_data(position_size, &pool, &owner.pubkey(), amount),
+                    owner: program_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        env.send(
+            &[withdraw_ix(&pool, &owner.pubkey(), &owner_ata, &vault)],
+            &[&owner],
+        )
+        .unwrap_or_else(|error| panic!("{name} owner withdrawal failed: {error}"));
+        assert_eq!(env.token_amount(&owner_ata), amount, "{name}");
+        assert_eq!(env.token_amount(&vault), 0, "{name}");
+        assert_eq!(env.svm.get_account(&pool).unwrap().data.len(), pool_size);
+    }
+}
+
+#[test]
+fn pre_share_surplus_pool_keeps_original_exit_math_and_rejects_new_deposits() {
+    let mut env = Env::new();
+    let asset_id = 9_001;
+    let principal = 100u64;
+    let balance = 150u64;
+    let (pool, bump) = historical_pool_pda(&env.mint, asset_id, 1, HistoricalPoolSeeds::Base);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    mint_to(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &clone_kp(&env.mint_authority),
+        &vault,
+        balance,
+    );
+    let (owner, owner_ata) = new_depositor(&mut env, 0);
+    env.svm
+        .set_account(
+            pool,
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: historical_pool_data(160, &env.mint, asset_id, &vault, principal, 1, bump),
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.svm
+        .set_account(
+            position_pda(&pool, &owner.pubkey()),
+            solana_sdk::account::Account {
+                lamports: 10_000_000,
+                data: historical_position_data(104, &pool, &owner.pubkey(), principal),
+                owner: program_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (late, late_ata) = new_depositor(&mut env, 1);
+    assert!(
+        env.send(
+            &[deposit_ix(
+                &env,
+                &pool,
+                &late.pubkey(),
+                &late_ata,
+                &vault,
+                1,
+            )],
+            &[&late],
+        )
+        .is_err(),
+        "a pre-share pool cannot persist new share attribution"
+    );
+    assert_eq!(env.token_amount(&late_ata), 1);
+    assert_eq!(env.token_amount(&vault), balance);
+
+    env.send(
+        &[withdraw_ix(&pool, &owner.pubkey(), &owner_ata, &vault)],
+        &[&owner],
+    )
+    .expect("the historical with-surplus owner receives the original pro-rata payout");
+    assert_eq!(env.token_amount(&owner_ata), balance);
+    assert_eq!(env.token_amount(&vault), 0);
+}
+
 // DoS PROBE (non-SPL token-shaped vault at init_pool, sweep tick D): init_pool PERSISTS pool.vault
 // (lib.rs:493) after validating its token FIELDS via Account::unpack — but, like the rd freeze just fixed, it
 // did NOT check vault.owner == spl_token::ID. unpack verifies bytes, not the owning program. init_pool is
@@ -230,7 +597,7 @@ fn clone_kp(kp: &Keypair) -> Keypair {
 fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
     let mut env = Env::new();
     let asset_id = 13;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
 
     // SYSTEM-owned account with token-shaped data: mint = env.mint, owner field = the pool PDA. Passes the
     // field checks, fails only on the owning program.
@@ -254,6 +621,70 @@ fn init_pool_rejects_a_non_spl_owned_token_shaped_vault_no_front_run_brick() {
     env.send(&[init_pool_ix(&env, &pool, &real_vault, asset_id, 1)], &[]).expect("real SPL vault accepted");
 }
 
+// DoS PROBE: SPL Token preserves a non-native account's close authority when its owner changes.
+// A front-runner can therefore prepare an empty vault owned by the future pool PDA while retaining
+// a close authority, initialize the deterministic pool against it, and then close the vault. The
+// pool account remains initialized and every later deposit is permanently bound to a missing vault.
+#[test]
+fn init_pool_rejects_a_vault_with_an_external_close_authority() {
+    let mut env = Env::new();
+    let asset_id = 18;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let attacker = Keypair::new();
+    let prepared_vault = create_token_account(
+        &mut env.svm,
+        &clone_kp(&env.payer),
+        &env.mint,
+        &attacker.pubkey(),
+    );
+
+    let set_close = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &prepared_vault,
+        Some(&attacker.pubkey()),
+        spl_token::instruction::AuthorityType::CloseAccount,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    env.send(&[set_close], &[&attacker]).expect("set close authority");
+
+    let set_owner = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &prepared_vault,
+        Some(&pool),
+        spl_token::instruction::AuthorityType::AccountOwner,
+        &attacker.pubkey(),
+        &[],
+    )
+    .unwrap();
+    env.send(&[set_owner], &[&attacker]).expect("transfer token ownership to pool PDA");
+
+    let prepared = spl_token::state::Account::unpack(
+        &env.svm.get_account(&prepared_vault).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(prepared.owner, pool);
+    assert_eq!(prepared.close_authority, COption::Some(attacker.pubkey()));
+
+    assert!(
+        env.send(
+            &[init_pool_ix(&env, &pool, &prepared_vault, asset_id, 1)],
+            &[],
+        )
+        .is_err(),
+        "init_pool must reject a vault an external authority can close"
+    );
+
+    let honest_vault =
+        create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(
+        &[init_pool_ix(&env, &pool, &honest_vault, asset_id, 1)],
+        &[],
+    )
+    .expect("rejected attack must leave the canonical pool available");
+}
+
 // SOURCE-OF-TRUTH OFFSET CANARY (sweep): genesis-vote + residual-distributor read the subledger Position
 // (principal=vote weight, start_slot=tenure, shares=rd share-value points) and Pool (outstanding=quorum
 // denominator) by HARDCODED byte offsets, cross-pinned in their offsets.rs to the subledger's EXPORTED consts
@@ -268,7 +699,7 @@ fn exported_position_and_pool_offset_consts_match_the_real_serialized_layout() {
     let mut env = Env::new();
     env.svm.set_sysvar(&solana_sdk::clock::Clock { slot: 100, unix_timestamp: 100, ..Default::default() });
     let asset_id = 17;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init WITH_SURPLUS pool"); // policy 1 -> shares
     let (alice, alice_ata) = new_depositor(&mut env, 12_345);
@@ -292,7 +723,7 @@ fn exported_position_and_pool_offset_consts_match_the_real_serialized_layout() {
 fn principal_policy_healthy_pays_principal_and_keeps_surplus() {
     let mut env = Env::new();
     let asset_id = 1;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
 
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[])
@@ -327,7 +758,7 @@ fn principal_policy_healthy_pays_principal_and_keeps_surplus() {
 fn with_surplus_policy_returns_yield_pro_rata() {
     let mut env = Env::new();
     let asset_id = 2;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
 
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
@@ -346,10 +777,42 @@ fn with_surplus_policy_returns_yield_pro_rata() {
     // surplus, so shares ∝ principal). alice ~150*60/100 = 90, minus 1 unit of virtual-offset dust.
     env.send(&[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)], &[&alice]).unwrap();
     assert_eq!(env.token_amount(&alice_ata), 89, "alice gets principal + surplus share (1 dust to the inflation offset)");
-    // bob now: ~60.
+    // Bob receives his own floored claim; Alice's remainder cannot accrue to him.
     env.send(&[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)], &[&bob]).unwrap();
-    assert_eq!(env.token_amount(&bob_ata), 60, "bob gets the rest");
-    assert_eq!(env.token_amount(&vault), 1, "1 unit of dust retained by the virtual-offset (inflation defense)");
+    assert_eq!(env.token_amount(&bob_ata), 59, "bob gets his floored surplus share without prior-exit dust");
+    assert_eq!(env.token_amount(&vault), 2, "both floor remainders stay in the protocol pool");
+}
+
+#[test]
+fn with_surplus_rounding_reserve_does_not_block_the_next_minimum_deposit() {
+    let mut env = Env::new();
+    let asset_id = 3;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let (alice, alice_ata) = new_depositor(&mut env, 60);
+    let (bob, bob_ata) = new_depositor(&mut env, 40);
+    env.send(&[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, 60)], &[&alice])
+        .expect("alice deposit");
+    env.send(&[deposit_ix(&env, &pool, &bob.pubkey(), &bob_ata, &vault, 40)], &[&bob])
+        .expect("bob deposit");
+    let auth = clone_kp(&env.mint_authority);
+    mint_to(&mut env.svm, &clone_kp(&env.payer), &env.mint, &auth, &vault, 50);
+    env.send(&[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)], &[&alice])
+        .expect("alice exits");
+    env.send(&[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)], &[&bob])
+        .expect("bob exits");
+    assert_eq!(env.token_amount(&vault), 2, "two floor atoms remain as protocol reserve");
+
+    let (carol, carol_ata) = new_depositor(&mut env, 1);
+    env.send(&[deposit_ix(&env, &pool, &carol.pubkey(), &carol_ata, &vault, 1)], &[&carol])
+        .expect("the empty epoch's reserve cannot block a fresh minimum deposit");
+    env.send(&[withdraw_ix(&pool, &carol.pubkey(), &carol_ata, &vault)], &[&carol])
+        .expect("fresh minimum position remains withdrawable");
+    assert_eq!(env.token_amount(&carol_ata), 1);
+    assert_eq!(env.token_amount(&vault), 2, "protocol reserve remains segregated");
 }
 
 // TENURE-FAIRNESS (finding HT): the branch claims (lib.rs) POLICY_WITH_SURPLUS is SHARE-based so a
@@ -362,7 +825,7 @@ fn with_surplus_policy_returns_yield_pro_rata() {
 fn with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
     let mut env = Env::new();
     let asset_id = 7;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
 
@@ -381,9 +844,10 @@ fn with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
     // give her only 300*100/200 = 150, letting the late bob capture 50 of her surplus.)
     env.send(&[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)], &[&alice]).unwrap();
     assert_eq!(env.token_amount(&alice_ata), 199, "alice keeps her full pre-bob surplus (1 dust to the inflation offset); the late bob cannot capture it");
-    // Bob gets only his principal (no surplus capture) — the 1 dust went to the virtual offset, NOT bob.
+    // Bob cannot absorb Alice's floor remainder by exiting last.
     env.send(&[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)], &[&bob]).unwrap();
-    assert_eq!(env.token_amount(&bob_ata), 100, "the late depositor redeems only its own-tenure surplus (none here)");
+    assert_eq!(env.token_amount(&bob_ata), 99, "the late depositor redeems its own floored claim without prior-exit dust");
+    assert_eq!(env.token_amount(&vault), 2, "both floor remainders stay in the protocol pool");
 }
 
 // FIRST-DEPOSITOR INFLATION ATTACK (finding HU): an own-vault pool's vault is a plain SPL token
@@ -394,7 +858,7 @@ fn with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
 fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
     let mut env = Env::new();
     let asset_id = 9;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
 
@@ -419,6 +883,146 @@ fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
     assert!(victim_out >= victim_deposit - 10, "victim recovers ~its principal, not skimmed: {victim_out}");
 }
 
+// PUBLIC LOF: nonzero shares are not sufficient if their immediate redemption value is zero. A first
+// depositor can donate directly to an own-vault pool, making a later one-atom deposit mint positive dust
+// shares that the program accepts but retires for a zero payout even though no market loss occurred.
+#[test]
+fn a_deposit_with_zero_immediate_share_value_is_rejected_without_moving_principal() {
+    let mut env = Env::new();
+    let asset_id = 10;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let (attacker, attacker_ata) = new_depositor(&mut env, 5);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &attacker.pubkey(),
+            &attacker_ata,
+            &vault,
+            1,
+        )],
+        &[&attacker],
+    )
+    .expect("attacker seeds one atom");
+    let donate = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &attacker_ata,
+        &vault,
+        &attacker.pubkey(),
+        &[],
+        4,
+    )
+    .unwrap();
+    env.send(&[donate], &[&attacker])
+        .expect("attacker donates four atoms through SPL Token");
+    assert_eq!(env.token_amount(&vault), 5);
+
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let deposit = env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            1,
+        )],
+        &[&victim],
+    );
+    assert!(
+        deposit.is_err(),
+        "a share purchase with zero immediate value must reject before transfer"
+    );
+
+    assert_eq!(
+        env.token_amount(&victim_ata),
+        1,
+        "rejected deposit leaves the victim's principal untouched"
+    );
+    assert_eq!(
+        env.token_amount(&vault),
+        5,
+        "rejected deposit does not donate principal into the pool"
+    );
+    assert!(
+        env.svm
+            .get_account(&position_pda(&pool, &victim.pubkey()))
+            .is_none(),
+        "rejected first deposit creates no dead position"
+    );
+}
+
+// PUBLIC LOF: a donation can make a positive share mint materially under-value the new deposit.
+// The attacker cannot recover the donation, but can grief a victim into losing half of a deposit
+// to virtual-share rounding unless the program rejects before moving the victim's principal.
+#[test]
+fn a_deposit_with_material_immediate_rounding_loss_is_rejected_before_transfer() {
+    let mut env = Env::new();
+    let asset_id = 12;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus pool");
+
+    let donation = 100_000_000;
+    let (attacker, attacker_ata) = new_depositor(&mut env, donation + 1);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &attacker.pubkey(),
+            &attacker_ata,
+            &vault,
+            1,
+        )],
+        &[&attacker],
+    )
+    .expect("attacker seeds one atom");
+    let donate = spl_token::instruction::transfer(
+        &spl_token::ID,
+        &attacker_ata,
+        &vault,
+        &attacker.pubkey(),
+        &[],
+        donation,
+    )
+    .unwrap();
+    env.send(&[donate], &[&attacker])
+        .expect("attacker donates through SPL Token");
+    assert_eq!(env.token_amount(&vault), donation + 1);
+
+    // This buys one share whose immediate redemption is only 50 atoms. Positive shares alone do
+    // not keep the accepted deposit within the documented one-atom rounding bound.
+    let (victim, victim_ata) = new_depositor(&mut env, 100);
+    let deposit = env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            100,
+        )],
+        &[&victim],
+    );
+    assert!(
+        deposit.is_err(),
+        "a deposit with material immediate rounding loss must reject"
+    );
+    assert_eq!(env.token_amount(&victim_ata), 100);
+    assert_eq!(env.token_amount(&vault), donation + 1);
+    assert!(
+        env.svm
+            .get_account(&position_pda(&pool, &victim.pubkey()))
+            .is_none(),
+        "rejected deposit creates no dead position"
+    );
+}
+
 // LOF PROBE (finding HB zero-share guard, sweep tick B): the test above pins the SKIM bound (value not
 // stolen); the distinct, UNTESTED safety property is the zero-share REJECT. With a balance >> total_shares
 // (an attacker first-deposits 1 atom then donates to inflate the price), a small victim deposit rounds to 0
@@ -430,7 +1034,7 @@ fn first_depositor_inflation_attack_cannot_skim_a_later_depositor() {
 fn a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silent_loss() {
     let mut env = Env::new();
     let asset_id = 11;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 1);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[]).expect("init pool"); // WITH_SURPLUS
 
@@ -446,11 +1050,27 @@ fn a_deposit_that_rounds_to_zero_shares_is_rejected_before_any_transfer_no_silen
     // CRITICAL LOF pin: the reject is atomic — the victim's 100 atoms never left its ATA.
     assert_eq!(env.token_amount(&victim_ata), 10_000_100, "rejected deposit transfers NOTHING — no principal lost to a 0-share mint");
 
-    // Recoverable + fair: a 1e7-atom deposit clears the threshold (-> ~20_000 shares) and redeems ~principal.
-    env.send(&[deposit_ix(&env, &pool, &victim.pubkey(), &victim_ata, &vault, 10_000_000)], &[&victim]).expect("above-threshold deposit mints shares");
-    assert_eq!(env.token_amount(&victim_ata), 100, "1e7 deposited, 100 dust left");
+    // Recoverable + fair: an amount aligned to the live share price mints 2,000 shares and has an
+    // immediate value of 1,000,000, exactly one atom below the 1,000,001-atom deposit.
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            1_000_001,
+        )],
+        &[&victim],
+    )
+    .expect("bounded-rounding deposit mints shares");
+    assert_eq!(env.token_amount(&victim_ata), 9_000_099);
     env.send(&[withdraw_ix(&pool, &victim.pubkey(), &victim_ata, &vault)], &[&victim]).unwrap();
-    assert!(env.token_amount(&victim_ata) >= 9_900_000, "victim redeems ~its principal (>99%) — bought in at the inflated price, not skimmed");
+    assert_eq!(
+        env.token_amount(&victim_ata),
+        10_000_099,
+        "accepted deposit loses only the documented one atom of entry-rounding dust"
+    );
 }
 
 fn set_token_amount(svm: &mut LiteSVM, account: &Pubkey, amount: u64) {
@@ -465,7 +1085,7 @@ fn set_token_amount(svm: &mut LiteSVM, account: &Pubkey, amount: u64) {
 fn impaired_pool_is_pro_rata_and_order_independent() {
     let mut env = Env::new();
     let asset_id = 3;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
 
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[])
@@ -496,7 +1116,7 @@ fn impaired_pool_is_pro_rata_and_order_independent() {
 fn non_owner_cannot_withdraw_another_position() {
     let mut env = Env::new();
     let asset_id = 4;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
     let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
     env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[]).unwrap();
 
@@ -516,6 +1136,72 @@ fn non_owner_cannot_withdraw_another_position() {
     assert_eq!(env.token_amount(&attacker_ata), 0);
 }
 
+// OWNER-SIGNED PAYOUT REDIRECT: checking the position signer is not enough when
+// the pool PDA signs the SPL transfer. A malicious transaction builder can retain
+// the real owner's signature but substitute an attacker-owned destination unless
+// the program binds the payout token account back to that owner.
+#[test]
+fn owner_signed_withdraw_cannot_redirect_to_a_foreign_token_account() {
+    let mut env = Env::new();
+    let asset_id = 4_004;
+    let amount = 60u64;
+    let pool = pool_pda(&env.mint, asset_id, 0);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 0)], &[])
+        .unwrap();
+
+    let (victim, victim_ata) = new_depositor(&mut env, amount);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+            amount,
+        )],
+        &[&victim],
+    )
+    .unwrap();
+    let (_attacker, attacker_ata) = new_depositor(&mut env, 0);
+    let position = position_pda(&pool, &victim.pubkey());
+    let pool_before = env.svm.get_account(&pool).unwrap();
+    let position_before = env.svm.get_account(&position).unwrap();
+    let vault_before = env.svm.get_account(&vault).unwrap();
+
+    assert!(
+        env.send(
+            &[withdraw_ix(
+                &pool,
+                &victim.pubkey(),
+                &attacker_ata,
+                &vault,
+            )],
+            &[&victim],
+        )
+        .is_err(),
+        "a valid owner signature must not authorize payout to an attacker-owned account"
+    );
+    assert_eq!(env.svm.get_account(&pool).unwrap(), pool_before);
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_before);
+    assert_eq!(env.svm.get_account(&vault).unwrap(), vault_before);
+    assert_eq!(env.token_amount(&victim_ata), 0);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+
+    env.send(
+        &[withdraw_ix(
+            &pool,
+            &victim.pubkey(),
+            &victim_ata,
+            &vault,
+        )],
+        &[&victim],
+    )
+    .expect("owner still exits to their own token account after the rejected redirect");
+    assert_eq!(env.token_amount(&victim_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+}
+
 // Anti-theft boundary: init_pool must reject a vault that is NOT owned by the pool
 // PDA. If it accepted an attacker-owned vault, the attacker could stand up a pool,
 // lure a victim's deposit (tag 1 transfers owner -> pool.vault), and then drain the
@@ -526,7 +1212,7 @@ fn non_owner_cannot_withdraw_another_position() {
 fn init_pool_rejects_a_vault_not_owned_by_the_pool() {
     let mut env = Env::new();
     let asset_id = 0u64;
-    let pool = pool_pda(&env.mint, asset_id);
+    let pool = pool_pda(&env.mint, asset_id, 0);
 
     // A vault owned by an ATTACKER rather than the pool PDA.
     let attacker = Pubkey::new_unique();
@@ -551,10 +1237,10 @@ fn init_pool_rejects_a_vault_not_owned_by_the_pool() {
 fn cannot_drain_a_foreign_pool_with_a_position_from_another_pool() {
     let mut env = Env::new();
     // Two independent own-vault pools (same mint, different asset_ids), each with its own vault.
-    let pool_a = pool_pda(&env.mint, 1);
+    let pool_a = pool_pda(&env.mint, 1, 0);
     let vault_a = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool_a);
     env.send(&[init_pool_ix(&env, &pool_a, &vault_a, 1, 0)], &[]).expect("init pool A");
-    let pool_b = pool_pda(&env.mint, 2);
+    let pool_b = pool_pda(&env.mint, 2, 0);
     let vault_b = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool_b);
     env.send(&[init_pool_ix(&env, &pool_b, &vault_b, 2, 0)], &[]).expect("init pool B");
 
@@ -586,4 +1272,79 @@ fn cannot_drain_a_foreign_pool_with_a_position_from_another_pool() {
     // The attacker's own pool-A position is intact: they can still exit pool-A for exactly their principal.
     env.send(&[withdraw_ix(&pool_a, &attacker.pubkey(), &attacker_ata, &vault_a)], &[&attacker]).expect("attacker exits their OWN pool A");
     assert_eq!(env.token_amount(&attacker_ata), 1_000_000, "attacker recovers only their own pool-A principal, never pool-B's");
+}
+
+// LIVENESS/LOF BOUNDARY: share redemption is mathematically
+// `shares * (balance + 1) / (total_shares + VIRTUAL_SHARES)`. Each input and the
+// final quotient fit their serialized types here, but the direct u128 product does
+// not. A valid deposit must not become permanently unwithdrawable because only an
+// intermediate representation overflows.
+#[test]
+fn large_with_surplus_deposit_can_withdraw_without_intermediate_mul_overflow() {
+    let mut env = Env::new();
+    let asset_id = 21;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus backing pool");
+
+    // First-deposit shares are amount * 1_000_000 and fit u128. Multiplying those
+    // shares by the live balance exceeds u128, although the exact redemption is
+    // simply the original u64 amount.
+    let amount = 20_000_000_000_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    env.send(
+        &[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, amount)],
+        &[&alice],
+    )
+    .expect("large public backing deposit");
+    assert_eq!(env.token_amount(&alice_ata), 0);
+    assert_eq!(env.token_amount(&vault), amount);
+
+    env.send(
+        &[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)],
+        &[&alice],
+    )
+    .expect("representable redemption must not overflow an intermediate product");
+
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
+}
+
+#[test]
+fn large_with_surplus_second_deposit_can_mint_representable_shares() {
+    let mut env = Env::new();
+    let asset_id = 22;
+    let pool = pool_pda(&env.mint, asset_id, 1);
+    let vault = create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(&[init_pool_ix(&env, &pool, &vault, asset_id, 1)], &[])
+        .expect("init with-surplus backing pool");
+
+    let amount = 20_000_000_000_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    env.send(
+        &[deposit_ix(&env, &pool, &alice.pubkey(), &alice_ata, &vault, amount)],
+        &[&alice],
+    )
+    .expect("first large deposit");
+    env.send(
+        &[deposit_ix(&env, &pool, &bob.pubkey(), &bob_ata, &vault, amount)],
+        &[&bob],
+    )
+    .expect("second deposit's representable share quotient must not overflow its product");
+
+    env.send(
+        &[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)],
+        &[&alice],
+    )
+    .expect("first depositor exits");
+    env.send(
+        &[withdraw_ix(&pool, &bob.pubkey(), &bob_ata, &vault)],
+        &[&bob],
+    )
+    .expect("second depositor exits");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&bob_ata), amount);
+    assert_eq!(env.token_amount(&vault), 0);
 }

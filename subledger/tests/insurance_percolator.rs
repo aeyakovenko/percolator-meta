@@ -2,7 +2,7 @@
 //! deposit / vote / exit flow.
 //!
 //! Proves, against the REAL percolator binary
-//! (`../percolator-prog/target/deploy/percolator_prog.so`, loaded into litesvm):
+//! (the Cargo-pinned `target/deploy/percolator_prog.so`, loaded into LiteSVM):
 //!
 //! 1. A user deposits into market-0 INSURANCE through the `subledger` program (the
 //!    subledger pool PDA is asset-0's insurance authority + operator). Funds land in
@@ -42,6 +42,12 @@ use solana_sdk::{
 
 const ATA_PROGRAM_ID: Pubkey =
     solana_sdk::pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+fn gv_init_data(delay_slots: u64, start_slot: u64) -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(&delay_slots.to_le_bytes());
+    data.extend_from_slice(&start_slot.to_le_bytes());
+    data
+}
 
 fn sub_id() -> Pubkey {
     subledger_program::id()
@@ -60,10 +66,9 @@ fn so(name: &str) -> String {
     format!("{}/../target/deploy/{}.so", env!("CARGO_MANIFEST_DIR"), name)
 }
 fn perc_so() -> String {
-    format!(
-        "{}/../../percolator-prog/target/deploy/percolator_prog.so",
-        env!("CARGO_MANIFEST_DIR")
-    )
+    let pinned = format!("{}/../target/deploy/percolator_prog.so", env!("CARGO_MANIFEST_DIR"));
+    assert!(std::path::Path::new(&pinned).exists(), "missing Cargo-pinned Percolator SBF at {pinned}");
+    pinned
 }
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
@@ -71,6 +76,61 @@ fn clone_kp(kp: &Keypair) -> Keypair {
 
 const ASSET_ID: u64 = 0;
 const POLICY_PRINCIPAL: u8 = 0;
+const POLICY_WITH_SURPLUS: u8 = 1;
+const DOMAIN_INSURANCE: u8 = 0;
+const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
+const DEFAULT_GENESIS_DEPOSIT_START_SLOT: u64 = 0;
+const DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS: u64 = 38_880_000;
+const OWN_VAULT_DEPOSIT_WINDOW_SLOTS: u64 = u64::MAX;
+const OWN_VAULT_DEPOSIT_START_SLOT: u64 = 0;
+const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
+
+fn insurance_pool_pda_with_schedule(
+    mint: &Pubkey,
+    coin_mint: &Pubkey,
+    slab: &Pubkey,
+    policy: u8,
+    deposit_window_slots: u64,
+    deposit_start_slot: u64,
+    bootstrap_delay_slots: u64,
+) -> Pubkey {
+    let policy_seed = [policy];
+    let domain_seed = [DOMAIN_INSURANCE];
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            slab.as_ref(),
+            perc_id().as_ref(),
+            coin_mint.as_ref(),
+            &policy_seed,
+            &domain_seed,
+            &deposit_window_slots.to_le_bytes(),
+            &deposit_start_slot.to_le_bytes(),
+            &bootstrap_delay_slots.to_le_bytes(),
+        ],
+        &sub_id(),
+    )
+    .0
+}
+
+fn legacy_master_insurance_pool_pda(
+    mint: &Pubkey,
+    slab: &Pubkey,
+    asset_id: u64,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            slab.as_ref(),
+            perc_id().as_ref(),
+        ],
+        &sub_id(),
+    )
+}
 
 struct Env {
     svm: LiteSVM,
@@ -86,10 +146,48 @@ struct Env {
     vault_authority: Pubkey,
     perc_vault: Pubkey,
     pool: Pubkey,
+    deposit_window_slots: u64,
+    bootstrap_start_slot: u64,
+    bootstrap_delay_slots: u64,
 }
 
 impl Env {
     fn new() -> Self {
+        Self::new_for_policy(POLICY_PRINCIPAL)
+    }
+
+    fn new_for_policy(pool_policy: u8) -> Self {
+        Self::new_for_policy_with_bootstrap_schedule(
+            pool_policy,
+            DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS,
+            DEFAULT_GENESIS_DEPOSIT_START_SLOT,
+            DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS,
+        )
+    }
+
+    fn new_for_policy_with_window(pool_policy: u8, deposit_window_slots: u64) -> Self {
+        Self::new_for_policy_with_schedule(pool_policy, deposit_window_slots, 100)
+    }
+
+    fn new_for_policy_with_schedule(
+        pool_policy: u8,
+        deposit_window_slots: u64,
+        deposit_start_slot: u64,
+    ) -> Self {
+        Self::new_for_policy_with_bootstrap_schedule(
+            pool_policy,
+            deposit_window_slots,
+            deposit_start_slot,
+            DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS,
+        )
+    }
+
+    fn new_for_policy_with_bootstrap_schedule(
+        pool_policy: u8,
+        deposit_window_slots: u64,
+        bootstrap_start_slot: u64,
+        bootstrap_delay_slots: u64,
+    ) -> Self {
         let mut svm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
             heap_size: 256 * 1024,
@@ -112,18 +210,18 @@ impl Env {
         let slab = Pubkey::new_unique();
 
         // The subledger insurance pool PDA: asset-0 insurance authority + operator,
-        // bound to (mint, asset_id, market_slab, percolator_program).
-        let pool = Pubkey::find_program_address(
-            &[
-                b"subledger_pool",
-                mint.as_ref(),
-                &ASSET_ID.to_le_bytes(),
-                slab.as_ref(),
-                perc_id().as_ref(),
-            ],
-            &sub_id(),
-        )
-        .0;
+        // bound to (mint, asset_id, market_slab, percolator_program, coin_mint,
+        // policy, domain, deposit_window_slots, bootstrap_start_slot,
+        // bootstrap_delay_slots).
+        let pool = insurance_pool_pda_with_schedule(
+            &mint,
+            &coin_mint,
+            &slab,
+            pool_policy,
+            deposit_window_slots,
+            bootstrap_start_slot,
+            bootstrap_delay_slots,
+        );
 
         // Build the real Live market-0 slab with marketauth = pool PDA and the
         // deposits-only principal-recovery insurance policy.
@@ -177,7 +275,25 @@ impl Env {
             vault_authority,
             perc_vault,
             pool,
+            deposit_window_slots,
+            bootstrap_start_slot,
+            bootstrap_delay_slots,
         }
+    }
+
+    fn gv_config_pda(&self) -> Pubkey {
+        gv_config_pda_for_schedule(
+            &self.coin_mint,
+            &self.pool,
+            self.bootstrap_delay_slots,
+            self.bootstrap_start_slot,
+        )
+    }
+
+    fn bootstrap_end_slot(&self) -> u64 {
+        self.bootstrap_start_slot
+            .checked_add(self.bootstrap_delay_slots)
+            .expect("test bootstrap schedule must fit")
     }
 
     fn send(&mut self, ixs: &[Instruction], extra: &[&Keypair]) -> Result<(), String> {
@@ -221,9 +337,34 @@ impl Env {
     }
 
     fn init_insurance_pool_policy(&mut self, policy: u8) {
+        self.init_insurance_pool_policy_with_window(policy, None);
+    }
+
+    fn init_insurance_pool_policy_with_window(&mut self, policy: u8, window_slots: Option<u64>) {
+        let start_slot = window_slots.map(|_| 100);
+        self.init_insurance_pool_policy_with_schedule(policy, window_slots, start_slot);
+    }
+
+    fn init_insurance_pool_policy_with_schedule(
+        &mut self,
+        policy: u8,
+        window_slots: Option<u64>,
+        start_slot: Option<u64>,
+    ) {
         let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
         data.extend_from_slice(&ASSET_ID.to_le_bytes());
         data.push(policy);
+        if let Some(window_slots) = window_slots {
+            assert_eq!(window_slots, self.deposit_window_slots);
+            assert_eq!(start_slot, Some(self.bootstrap_start_slot));
+            data.extend_from_slice(&window_slots.to_le_bytes());
+            data.extend_from_slice(
+                &start_slot
+                    .expect("custom deposit window requires an explicit start slot")
+                    .to_le_bytes(),
+            );
+            data.extend_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        }
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -235,7 +376,8 @@ impl Env {
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 // vote_authority = the genesis-vote config PDA (keyed by the COIN).
-                AccountMeta::new_readonly(gv_config_pda(&self.coin_mint, &self.pool), false),
+                AccountMeta::new_readonly(self.gv_config_pda(), false),
+                AccountMeta::new_readonly(self.coin_mint, false),
             ],
             data,
         };
@@ -322,6 +464,76 @@ impl Env {
     }
 }
 
+fn translate_funded_pool_to_legacy(
+    env: &mut Env,
+    owner: &Pubkey,
+    legacy_asset_id: u64,
+) -> Pubkey {
+    let current_pool = env.pool;
+    let current_pool_account = env.svm.get_account(&current_pool).unwrap();
+    let current_position = env.position_pda(owner);
+    let current_position_account = env.svm.get_account(&current_position).unwrap();
+    let (legacy_pool, legacy_bump) =
+        legacy_master_insurance_pool_pda(&env.mint, &env.slab, legacy_asset_id);
+
+    let mut legacy_pool_data = current_pool_account.data[..208].to_vec();
+    legacy_pool_data[40..48].copy_from_slice(&legacy_asset_id.to_le_bytes());
+    legacy_pool_data[89] = legacy_bump;
+    env.svm
+        .set_account(
+            legacy_pool,
+            Account {
+                lamports: current_pool_account.lamports,
+                data: legacy_pool_data,
+                owner: sub_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let legacy_position = Pubkey::find_program_address(
+        &[
+            b"subledger_position",
+            legacy_pool.as_ref(),
+            owner.as_ref(),
+        ],
+        &sub_id(),
+    )
+    .0;
+    let mut legacy_position_data = current_position_account.data;
+    legacy_position_data[8..40].copy_from_slice(legacy_pool.as_ref());
+    env.svm
+        .set_account(
+            legacy_position,
+            Account {
+                lamports: current_position_account.lamports,
+                data: legacy_position_data,
+                owner: sub_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Historical market init copied this pool PDA into all asset-0 authority
+    // fields, regardless of the subledger's unvalidated metadata asset_id.
+    let mut slab_account = env.svm.get_account(&env.slab).unwrap();
+    let mut profile = percolator_prog::state::read_asset_oracle_profile(&slab_account.data, 0)
+        .expect("read asset-0 profile");
+    let legacy_authority = legacy_pool.to_bytes();
+    profile.insurance_authority = legacy_authority;
+    profile.insurance_operator = legacy_authority;
+    profile.backing_bucket_authority = legacy_authority;
+    profile.oracle_authority = legacy_authority;
+    profile.asset_admin = legacy_authority;
+    percolator_prog::state::write_asset_oracle_profile(&mut slab_account.data, 0, &profile)
+        .expect("write historical asset-0 authority");
+    env.svm.set_account(env.slab, slab_account).unwrap();
+    env.pool = legacy_pool;
+    legacy_pool
+}
+
 // "THOSE WHO STAY DECIDE" (intended design; reviewed re: external issue #20, kept by design).
 // The genesis quorum is measured against the LIVE subledger outstanding, deliberately, so that exits during
 // voting recompute it: a non-voter who leaves FORFEITS their share of the decision. alice holds 2% of the
@@ -334,8 +546,8 @@ impl Env {
 // deposit-deadline that would bound BOTH are tracked in SECURITY_LOG as off-harness orchestration work.
 #[test]
 fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
-    let mut env = Env::new();
-    env.init_insurance_pool();
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, 1_200, 0, 1_200);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(1_200), Some(0));
     let ve = setup_vote(&mut env);
 
     let (alice, alice_ata) = new_depositor(&mut env, 20_000); // 2%
@@ -372,6 +584,62 @@ fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
     let dc = env.svm.get_account(&ve.dist_config).unwrap();
     let sealed_to = Pubkey::new_from_array(dc.data[120..152].try_into().unwrap());
     assert_eq!(sealed_to, dist_proposal, "alice's proposal sealed — governance follows the capital that stayed");
+}
+
+// POST-DEADLINE VOTE RACE: trigger becomes permissionless at bootstrap_end_slot,
+// so new backing must be closed at that exact boundary. Otherwise a depositor can
+// wait for the six-month result, refresh old weight or retract and switch proposals
+// before a trigger lands. Retraction must remain live so the vote lock never traps
+// principal after the deadline.
+#[test]
+fn bootstrap_deadline_closes_new_backing_but_keeps_retract_and_exit_live() {
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, 100, 100, 1_000);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(100), Some(100));
+    let ve = setup_vote(&mut env);
+    let (_, proposal_a) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+    let (_, proposal_b) =
+        create_and_register_proposal(&mut env, &ve, 2, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    let (bob, bob_ata) = new_depositor(&mut env, 1);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, 1)
+        .expect("alice deposits during the window");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, 1)
+        .expect("bob deposits during the window");
+
+    env.warp_slot(env.bootstrap_end_slot() - 1);
+    gv_vote(&mut env, &ve, &alice, &proposal_a, 1).expect("alice backs before the deadline");
+    env.warp_slot(env.bootstrap_end_slot());
+
+    gv_vote(&mut env, &ve, &alice, &proposal_a, 2)
+        .expect("post-deadline retract remains the owner escape hatch");
+    assert!(
+        gv_vote(&mut env, &ve, &bob, &proposal_b, 1).is_err(),
+        "a previously idle depositor cannot add support after voting closes"
+    );
+    assert!(
+        gv_vote(&mut env, &ve, &alice, &proposal_b, 1).is_err(),
+        "a depositor cannot retract and switch proposals after voting closes"
+    );
+    assert_eq!(
+        env.svm
+            .get_account(&env.position_pda(&alice.pubkey()))
+            .unwrap()
+            .data[97],
+        0,
+        "the rejected re-back cannot restore alice's vote lock"
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, 1)
+        .expect("alice exits after retracting");
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, 1)
+        .expect("the rejected late voter exits without a lock");
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.token_amount(&bob_ata), 1);
 }
 
 // VOTE-TIME WEIGHT THEFT (free winner-take-all capture): vote weight = floor(log2(age)) * principal, read from
@@ -532,8 +800,8 @@ fn create_holding(env: &mut Env, owner_pool: &Pubkey) -> Pubkey {
 }
 
 /// Slab base offset of the percolator `MarketGroupV16` header
-/// (HEADER_LEN 16 + WRAPPER_CONFIG_LEN 432).
-const MARKET_GROUP_OFF: usize = 448;
+/// from the pinned wrapper API. Never duplicate this number in the canary.
+const MARKET_GROUP_OFF: usize = percolator_prog::constants::MARKET_GROUP_OFF;
 
 /// Drive the live asset-0 insurance down to `new_insurance` *consistently*, exactly as a real
 /// venue loss would: insurance, vault, the per-domain budgets and the remaining-budget total
@@ -549,9 +817,11 @@ fn impair_market(env: &mut Env, new_insurance: u128) {
     // of the pro-rata feature is reading the insurance fund, NOT the (larger) vault total.
     assert_eq!(off_ins, MARKET_GROUP_OFF + 301, "insurance offset drifted from real percolator struct");
     assert_ne!(off_ins, off_vault, "insurance must not alias vault");
+    assert_eq!(subledger_program::PERC_MARKET_GROUP_OFFSET, percolator_prog::constants::MARKET_GROUP_OFF,
+        "Percolator wrapper growth shifted the market-group base");
     // Pin the SUBLEDGER's shipped src constant against the real struct too. The functional haircut tests
     // below set vault == insurance (a consistent loss), so they CANNOT distinguish a src offset that
-    // accidentally reads vault@733 instead of insurance@749 — only this assertion catches a regression of
+    // accidentally reads vault@749 instead of insurance@765 — only this assertion catches a regression of
     // PERC_INSURANCE_OFFSET itself (the canary above only pins offset_of!, not what the program ships).
     assert_eq!(subledger_program::PERC_INSURANCE_OFFSET, off_ins,
         "subledger PERC_INSURANCE_OFFSET drifted from real percolator insurance field (would read vault as insurance)");
@@ -593,7 +863,111 @@ fn impair_market(env: &mut Env, new_insurance: u128) {
     env.svm.set_account(env.slab, acct).unwrap();
 }
 
+fn activate_external_asset(env: &mut Env, authority: &Pubkey) {
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    acct.data.resize(
+        percolator_prog::state::market_account_len_for_capacity(2).unwrap(),
+        0,
+    );
+    let mut profile = percolator_prog::state::activate_dynamic_asset_slot(
+        &mut acct.data,
+        1,
+        101,
+        1_000_000,
+        authority.to_bytes(),
+        authority.to_bytes(),
+        authority.to_bytes(),
+        authority.to_bytes(),
+    )
+    .expect("append asset 1 through the pinned engine transition");
+    profile.asset_admin = authority.to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(&mut acct.data, 1, &profile)
+        .expect("write asset-1 authority profile");
+    env.svm.set_account(env.slab, acct).unwrap();
+}
+
+fn asset_insurance_remaining(env: &Env, asset_index: usize) -> u128 {
+    let data = env.svm.get_account(&env.slab).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&data).unwrap();
+    let long = asset_index * 2;
+    let short = long + 1;
+    group.insurance_domain_budget[long]
+        .checked_sub(group.insurance_domain_spent[long])
+        .unwrap()
+        .checked_add(
+            group.insurance_domain_budget[short]
+                .checked_sub(group.insurance_domain_spent[short])
+                .unwrap(),
+        )
+        .unwrap()
+        .min(group.insurance)
+}
+
+// Model a valid 1M loss isolated to asset 0 while asset 1's 2M insurance remains intact.
+// This mirrors the exact engine counters after both asset-0 domains spend 500k and the paid
+// loss leaves the shared vault; all aggregate invariants continue to reconcile.
+fn impair_asset0_with_external_insurance(env: &mut Env) {
+    use percolator::{EngineAssetSlotV16Account as E, MarketGroupV16HeaderAccount as H};
+    let mut acct = env.svm.get_account(&env.slab).unwrap();
+    let header = MARKET_GROUP_OFF;
+    let engine0 = header
+        + core::mem::size_of::<H>()
+        + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN;
+    let write_u128 = |data: &mut [u8], offset: usize, value: u128| {
+        data[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    };
+
+    write_u128(
+        &mut acct.data,
+        header + core::mem::offset_of!(H, vault),
+        3_000_000,
+    );
+    write_u128(
+        &mut acct.data,
+        header + core::mem::offset_of!(H, insurance),
+        3_000_000,
+    );
+    write_u128(
+        &mut acct.data,
+        header + core::mem::offset_of!(H, insurance_domain_budget_remaining_total),
+        3_000_000,
+    );
+    write_u128(
+        &mut acct.data,
+        engine0 + core::mem::offset_of!(E, insurance_domain_spent_long),
+        500_000,
+    );
+    write_u128(
+        &mut acct.data,
+        engine0 + core::mem::offset_of!(E, insurance_domain_spent_short),
+        500_000,
+    );
+    env.svm.set_account(env.slab, acct).unwrap();
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, 3_000_000),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+}
+
 fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot: u64) -> Vec<u8> {
+    make_live_market_with_public_chunk(slab, mint, marketauth, init_slot, 1)
+}
+
+fn make_live_market_with_public_chunk(
+    slab: &Pubkey,
+    mint: &Pubkey,
+    marketauth: &Pubkey,
+    init_slot: u64,
+    public_b_chunk_atoms: u128,
+) -> Vec<u8> {
     let initial_price = 1_000_000u64;
     let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
     wrapper.marketauth = marketauth.to_bytes();
@@ -626,7 +1000,7 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     cfg.max_account_b_settlement_chunks = 1;
     cfg.max_bankrupt_close_chunks = 1;
     cfg.max_bankrupt_close_lifetime_slots = 1;
-    cfg.public_b_chunk_atoms = 1;
+    cfg.public_b_chunk_atoms = public_b_chunk_atoms;
     percolator_prog::state::init_market_account_zero_copy(
         &mut data,
         &wrapper,
@@ -637,6 +1011,81 @@ fn make_live_market(slab: &Pubkey, mint: &Pubkey, marketauth: &Pubkey, init_slot
     )
     .expect("manual percolator market init");
     data
+}
+
+fn install_public_loss_fixture(env: &mut Env, oracle_authority: &Pubkey) {
+    let mut data = make_live_market_with_public_chunk(
+        &env.slab,
+        &env.mint,
+        &env.pool,
+        100,
+        percolator::MAX_VAULT_TVL,
+    );
+    let (mut wrapper, _) = percolator_prog::state::read_market(&data).unwrap();
+    wrapper.marketauth = oracle_authority.to_bytes();
+    percolator_prog::state::write_wrapper_config(&mut data, &wrapper).unwrap();
+    let mut profile = percolator_prog::state::read_asset_oracle_profile(&data, 0).unwrap();
+    profile.oracle_authority = oracle_authority.to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(&mut data, 0, &profile).unwrap();
+
+    let mut account = env.svm.get_account(&env.slab).unwrap();
+    account.data = data;
+    env.svm.set_account(env.slab, account).unwrap();
+}
+
+fn create_percolator_portfolio(env: &mut Env, owner: &Keypair, capital: u64) -> Pubkey {
+    let portfolio = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![
+                    0u8;
+                    percolator_prog::state::portfolio_account_len_for_market_slots(1)
+                        .unwrap()
+                ],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data: percolator_prog::ix::Instruction::InitPortfolio.encode(),
+        }],
+        &[owner],
+    )
+    .expect("initialize public Percolator portfolio");
+
+    let payer = clone_kp(&env.payer);
+    let mint_auth = clone_kp(&env.mint_auth);
+    let source = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+    mint_to(&mut env.svm, &payer, &env.mint, &mint_auth, &source, capital);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::Deposit { amount: capital as u128 }.encode(),
+        }],
+        &[owner],
+    )
+    .expect("fund public Percolator portfolio");
+    portfolio
 }
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
@@ -737,13 +1186,35 @@ struct VoteEnv {
     coin_vault: Pubkey,
 }
 
-fn gv_config_pda(mint: &Pubkey, subledger_pool: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"gv_config", mint.as_ref(), subledger_pool.as_ref()], &gv_id()).0
+fn gv_config_pda_for_schedule(
+    mint: &Pubkey,
+    subledger_pool: &Pubkey,
+    bootstrap_delay_slots: u64,
+    bootstrap_start_slot: u64,
+) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"gv_config",
+            mint.as_ref(),
+            subledger_pool.as_ref(),
+            &bootstrap_delay_slots.to_le_bytes(),
+            &bootstrap_start_slot.to_le_bytes(),
+        ],
+        &gv_id(),
+    )
+    .0
 }
+const DISTRIBUTION_CLAIM_WINDOW_SLOTS: u64 = 1_000_000;
 fn dist_config_pda(mint: &Pubkey, authority: &Pubkey) -> Pubkey {
     // finding AA: the distribution config PDA binds its seal AUTHORITY (the gv config) into the
-    // seed, so an attacker can't squat a funded config under a different authority.
-    Pubkey::find_program_address(&[b"dist_config", mint.as_ref(), authority.as_ref()], &dist_id()).0
+    // seed, and its claim window, so an attacker can't squat a funded config under a different
+    // authority or deadline.
+    let claim_window = DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes();
+    Pubkey::find_program_address(
+        &[b"dist_config", mint.as_ref(), authority.as_ref(), &claim_window],
+        &dist_id(),
+    )
+    .0
 }
 
 fn revoke_mint_authority(env: &mut Env, mint: &Pubkey) {
@@ -764,7 +1235,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
     // gv + distribution are keyed by the COIN (a fixed-supply mint, distinct from
     // the collateral `env.mint` the subledger pool holds).
     let coin_mint = env.coin_mint;
-    let gv_config = gv_config_pda(&coin_mint, &env.pool);
+    let gv_config = env.gv_config_pda();
     let dist_config = dist_config_pda(&coin_mint, &gv_config);
 
     // distribution InitConfig with seal authority = the gv config PDA. Fund the COIN
@@ -774,7 +1245,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
     mint_to(&mut env.svm, &clone_kp(&env.payer), &coin_mint, &clone_kp(&env.mint_auth), &dist_vault, 100);
     revoke_mint_authority(env, &coin_mint);
     let mut data = vec![0u8];
-    data.extend_from_slice(&1_000_000u64.to_le_bytes()); // claim window
+    data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes()); // claim window
     data.extend_from_slice(&100u64.to_le_bytes()); // total supply
     let ix = Instruction {
         program_id: dist_id(),
@@ -804,7 +1275,7 @@ fn setup_vote(env: &mut Env) -> VoteEnv {
             AccountMeta::new_readonly(Pubkey::default(), false), // reserved
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
-        data: vec![0u8],
+        data: gv_init_data(env.bootstrap_delay_slots, env.bootstrap_start_slot),
     };
     env.send(&[ix], &[]).expect("gv init");
 
@@ -817,7 +1288,7 @@ fn create_and_register_proposal(env: &mut Env, ve: &VoteEnv, id: u64, dest: &Pub
     // create
     let mut data = vec![1u8];
     data.extend_from_slice(&id.to_le_bytes());
-    data.extend_from_slice(&4u32.to_le_bytes());
+    data.extend_from_slice(&1u32.to_le_bytes());
     let create = Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -891,7 +1362,26 @@ fn gv_vote(
 
 // Permissionless winner-take-all trigger: seals the distribution to the winning
 // proposal. One voter holding 100% trivially clears quorum + majority.
-fn gv_trigger(env: &mut Env, ve: &VoteEnv, gv_proposal: &Pubkey, dist_proposal: &Pubkey) -> Result<(), String> {
+fn gv_trigger(
+    env: &mut Env,
+    ve: &VoteEnv,
+    gv_proposal: &Pubkey,
+    dist_proposal: &Pubkey,
+) -> Result<(), String> {
+    // Genesis gates on slots. Keep the fixture's oracle wall-clock fresh because
+    // production cranks update it continuously during the six-month bootstrap.
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.slot = env.bootstrap_end_slot();
+    env.svm.set_sysvar(&clock);
+    gv_trigger_now(env, ve, gv_proposal, dist_proposal)
+}
+
+fn gv_trigger_now(
+    env: &mut Env,
+    ve: &VoteEnv,
+    gv_proposal: &Pubkey,
+    dist_proposal: &Pubkey,
+) -> Result<(), String> {
     let ix = Instruction {
         program_id: gv_id(),
         accounts: vec![
@@ -950,6 +1440,128 @@ fn deposit_into_real_percolator_insurance_records_position() {
     assert_eq!(start_slot, 100, "start_slot = clock at deposit");
     assert!(!withdrawn);
     assert_eq!(env.pool_outstanding(), amount);
+}
+
+// UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
+// market-binding PDA seeds. A program upgrade must preserve its existing owners'
+// exit path, but must not reopen that pre-window genesis pool to new deposits.
+// Build a funded fixture through the real Percolator binary, translate only the
+// subledger account/PDA to its historical wire format, then exercise both sides.
+#[test]
+fn legacy_master_insurance_pool_rejects_new_deposits_but_owner_can_withdraw() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let current_pool = env.pool;
+    let current_holding = create_holding(&mut env, &current_pool);
+    env.insurance_deposit(&alice, &alice_ata, &current_holding, amount)
+        .expect("fund real Percolator insurance before translating the fixture");
+
+    let legacy_pool = translate_funded_pool_to_legacy(&mut env, &alice.pubkey(), ASSET_ID);
+
+    let legacy_holding = create_holding(&mut env, &legacy_pool);
+    let (bob, bob_ata) = new_depositor(&mut env, 1);
+    let bob_holding = create_holding(&mut env, &legacy_pool);
+    assert!(
+        env.insurance_deposit(&bob, &bob_ata, &bob_holding, 1)
+            .is_err(),
+        "an upgrade must not reopen an unbounded legacy genesis deposit period"
+    );
+    assert_eq!(env.token_amount(&bob_ata), 1);
+    assert_eq!(env.token_amount(&bob_holding), 0);
+    assert!(env
+        .svm
+        .get_account(&env.position_pda(&bob.pubkey()))
+        .is_none());
+    assert_eq!(env.token_amount(&env.perc_vault), amount);
+
+    env.insurance_withdraw(&alice, &alice_ata, &legacy_holding, &alice, amount)
+        .expect("legacy owner withdrawal remains live through real Percolator");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.svm.get_account(&legacy_pool).unwrap().data.len(), 208);
+}
+
+// PR #115 COMPATIBILITY PROBE: pre-share insurance pools have live owner
+// principal but no `total_shares` field. The positive read-only attestation used
+// by TWAP's resolved recovery must recognize that legitimate historical claim.
+#[test]
+fn pre_share_insurance_pool_attests_live_principal_and_preserves_owner_exit() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let current_pool = env.pool;
+    let current_holding = create_holding(&mut env, &current_pool);
+    env.insurance_deposit(&alice, &alice_ata, &current_holding, amount)
+        .expect("fund real Percolator insurance before translating the fixture");
+
+    let legacy_pool = translate_funded_pool_to_legacy(&mut env, &alice.pubkey(), ASSET_ID);
+    let mut pool_account = env.svm.get_account(&legacy_pool).unwrap();
+    pool_account.data.truncate(192);
+    env.svm.set_account(legacy_pool, pool_account).unwrap();
+    let legacy_position = env.position_pda(&alice.pubkey());
+    let mut position_account = env.svm.get_account(&legacy_position).unwrap();
+    position_account.data.truncate(104);
+    env.svm.set_account(legacy_position, position_account).unwrap();
+
+    env.send(
+        &[Instruction {
+            program_id: sub_id(),
+            accounts: vec![AccountMeta::new_readonly(legacy_pool, false)],
+            data: vec![11u8], // IX_ASSERT_PRINCIPAL
+        }],
+        &[],
+    )
+    .expect("historical outstanding principal is a live owner claim");
+
+    let legacy_holding = create_holding(&mut env, &legacy_pool);
+    env.insurance_withdraw(&alice, &alice_ata, &legacy_holding, &alice, amount)
+        .expect("the attested historical owner recovers real Percolator principal");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
+// LEGACY UPGRADE LOF PROBE: before commit 4e72483, permissionless insurance
+// init accepted any u64 asset_id even though TopUpInsurance always credited
+// asset 0. The owner must therefore exit from asset 0 as well; using the stale
+// metadata ID in WithdrawInsuranceAsset strands every deposit in that pool.
+#[test]
+fn legacy_nonzero_asset_id_pool_withdraws_from_the_asset_zero_it_funded() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let legacy_asset_id = 7u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let current_pool = env.pool;
+    let current_holding = create_holding(&mut env, &current_pool);
+    env.insurance_deposit(&alice, &alice_ata, &current_holding, amount)
+        .expect("historical deposit funds real Percolator asset-0 insurance");
+
+    let legacy_pool =
+        translate_funded_pool_to_legacy(&mut env, &alice.pubkey(), legacy_asset_id);
+    assert_eq!(
+        u64::from_le_bytes(
+            env.svm.get_account(&legacy_pool).unwrap().data[40..48]
+                .try_into()
+                .unwrap()
+        ),
+        legacy_asset_id,
+        "fixture carries the metadata accepted by the historical public init"
+    );
+    let legacy_holding = create_holding(&mut env, &legacy_pool);
+
+    env.insurance_withdraw(&alice, &alice_ata, &legacy_holding, &alice, amount)
+        .expect("the legacy owner exits from asset 0, matching the deposit domain");
+    assert_eq!(env.token_amount(&alice_ata), amount);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.pool_outstanding(), 0);
 }
 
 // SYBIL/FREE-FARM PROBE (vote-weight tenure gaming, sweep tick B): vote weight = floor(log2(now - start_slot)) *
@@ -1048,6 +1660,143 @@ fn impaired_insurance_exit_is_pro_rata() {
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits with the same haircut");
     assert_eq!(env.token_amount(&bob_ata), 500_000, "late depositor takes the SAME 50% haircut — order-independent");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "impaired insurance fully and fairly distributed");
+}
+
+// PUBLIC LOF: a principal-policy deposit made after an impairment must not recapitalize
+// earlier positions at par. Alice bore the loss before Bob arrived, so Bob's new principal
+// must buy in at the live share price. Otherwise the pool-wide principal ratio lets Alice
+// take part of Bob's deposit while both public withdrawals still appear pro rata.
+#[test]
+fn principal_pool_late_deposit_does_not_socialize_an_earlier_loss() {
+    for bob_exits_first in [false, true] {
+        let mut env = Env::new();
+        env.init_insurance_pool();
+
+        let amount = 1_000_000u64;
+        let (alice, alice_ata) = new_depositor(&mut env, amount);
+        let pool = env.pool;
+        let alice_holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&alice, &alice_ata, &alice_holding, amount)
+            .expect("alice deposits before the loss");
+
+        let impaired = amount / 2;
+        impair_market(&mut env, impaired as u128);
+        env.svm
+            .set_account(
+                env.perc_vault,
+                Account {
+                    lamports: 1_000_000,
+                    data: token_account_data(&env.mint, &env.vault_authority, impaired),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        let (bob, bob_ata) = new_depositor(&mut env, amount);
+        let bob_holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&bob, &bob_ata, &bob_holding, amount)
+            .expect("bob deposits after the loss while the genesis window remains open");
+        assert_eq!(
+            env.token_amount(&env.perc_vault),
+            impaired + amount,
+            "Bob contributes one full unit of fresh principal"
+        );
+
+        if bob_exits_first {
+            env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, amount)
+                .expect("Bob exits first without inheriting Alice's historical loss");
+            env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
+                .expect("Alice realizes only the loss from her own tenure");
+        } else {
+            env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
+                .expect("Alice realizes only the loss from her own tenure");
+            env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, amount)
+                .expect("Bob exits second without inheriting Alice's historical loss");
+        }
+        let alice_received = env.token_amount(&alice_ata);
+        let bob_received = env.token_amount(&bob_ata);
+        assert!(
+            (impaired..=impaired + 1).contains(&alice_received),
+            "Alice cannot recover her historical loss from Bob's later deposit"
+        );
+        assert!(
+            (amount - 1..=amount).contains(&bob_received),
+            "Bob's post-loss capital is protected in either exit order"
+        );
+        let reserve = env.token_amount(&env.perc_vault);
+        assert_eq!(reserve, 1, "the share-floor remainder stays protocol insurance");
+        assert_eq!(
+            alice_received + bob_received + reserve,
+            impaired + amount,
+            "user payouts plus protocol reserve conserve the funded insurance"
+        );
+        assert_eq!(env.pool_outstanding(), 0);
+    }
+}
+
+// CROSS-ASSET EXIT DOS: the market header's `insurance` is global, while tag-57 debits
+// only asset 0. If asset 0 is impaired and an external asset keeps the global total above
+// outstanding principal, a global quote asks Percolator for more than asset 0 owns and the
+// owner's entire exit reverts. The subledger must price the haircut from asset 0's domains.
+#[test]
+fn external_asset_insurance_cannot_hide_asset0_impairment_or_block_owner_exit() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let principal = 2_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, principal);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, principal)
+        .expect("asset-0 principal deposit");
+
+    let external_amount = 2_000_000u64;
+    let (provider, provider_source) = new_depositor(&mut env, external_amount);
+    activate_external_asset(&mut env, &provider.pubkey());
+    let topup = Instruction {
+        program_id: perc_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(provider.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(provider_source, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: percolator_prog::ix::Instruction::TopUpInsuranceDomain {
+            domain: 2,
+            amount: external_amount as u128,
+        }
+        .encode(),
+    };
+    env.send(&[topup], &[&provider])
+        .expect("external provider funds asset 1");
+    assert_eq!(asset_insurance_remaining(&env, 0), principal as u128);
+    assert_eq!(asset_insurance_remaining(&env, 1), external_amount as u128);
+
+    impair_asset0_with_external_insurance(&mut env);
+    assert_eq!(asset_insurance_remaining(&env, 0), 1_000_000);
+    assert_eq!(asset_insurance_remaining(&env, 1), external_amount as u128);
+    let (_, group) = percolator_prog::state::read_market(
+        &env.svm.get_account(&env.slab).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(group.insurance, 3_000_000, "global insurance still exceeds Alice's principal");
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, principal)
+        .expect("asset-local pro-rata exit must not be blocked by foreign insurance");
+    assert_eq!(
+        env.token_amount(&alice_ata),
+        1_000_000,
+        "Alice receives all remaining asset-0 insurance, a 50% pro-rata haircut"
+    );
+    assert_eq!(env.pool_outstanding(), 0, "the impaired position retires");
+    assert_eq!(
+        asset_insurance_remaining(&env, 1),
+        external_amount as u128,
+        "the external provider's segregated asset-1 insurance is untouched"
+    );
 }
 
 // POLICY DISTINCTION (surplus exclusion under POLICY_PRINCIPAL, sweep tick B): the impaired test above pins the
@@ -1160,8 +1909,8 @@ fn principal_policy_partial_insurance_withdraw_burns_proportional_shares_issue_4
 // only covered POLICY_PRINCIPAL). It also confirms the exit does NOT revert when a surplus exists (no DoS).
 #[test]
 fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative_to_principal_only() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (shares; surplus is distributed pro-rata)
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS); // shares; surplus is distributed pro-rata
 
     let amount = 1_000_000u64;
     let (alice, alice_ata) = new_depositor(&mut env, amount);
@@ -1189,12 +1938,12 @@ fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative
         "POLICY_WITH_SURPLUS pays principal + a pro-rata slice of the surplus (~1.5M), unlike POLICY_PRINCIPAL");
     assert_eq!(env.pool_outstanding(), amount, "alice's full principal left the outstanding accounting");
 
-    // Bob exits too and collects the remaining surplus slice. Both depositors share the 1M surplus pro-rata;
-    // together they withdraw ~all 3M (principal + full surplus), leaving only virtual-offset dust in insurance.
+    // Bob exits too and collects his own floored surplus slice. Neither exit may
+    // absorb the other's floor remainder; both atoms stay protocol insurance.
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
-    assert_eq!(env.token_amount(&bob_ata), 1_500_000, "bob collects his principal + the rest of the surplus pro-rata");
+    assert_eq!(env.token_amount(&bob_ata), 1_499_999, "bob collects his own pro-rata surplus slice without prior-exit dust");
     assert_eq!(env.pool_outstanding(), 0, "all principal retired");
-    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "the surplus was distributed pro-rata under POLICY_WITH_SURPLUS (1 atom to the virtual-share offset)");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2, "both whole-atom floor remainders remain protocol insurance");
 }
 
 // FREE-FARM PROBE (late depositor cannot capture pre-existing surplus, sweep tick B): POLICY_WITH_SURPLUS makes
@@ -1208,8 +1957,8 @@ fn policy_with_surplus_distributes_surplus_pro_rata_the_configurable_alternative
 // the risk while it built, not to a last-second joiner. Previously untested on the insurance path.
 #[test]
 fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
 
     let amount = 1_000_000u64;
     let (alice, alice_ata) = new_depositor(&mut env, amount);
@@ -1240,11 +1989,12 @@ fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits");
     assert_eq!(env.token_amount(&bob_ata), 999_999, "the late depositor recovers PRINCIPAL ONLY (1 atom to the offset) — he captured none of the pre-existing surplus");
 
-    // Alice (who bore the risk while the surplus built) exits and collects principal + ~the FULL surplus.
+    // Alice (who bore the risk while the surplus built) exits and collects her
+    // own floored claim without absorbing Bob's prior remainder.
     env.insurance_withdraw(&alice, &alice_ata, &a_hold, &alice, amount).expect("alice exits");
-    assert_eq!(env.token_amount(&alice_ata), 2_000_000, "the early depositor collects principal + ~the full 1M surplus");
+    assert_eq!(env.token_amount(&alice_ata), 1_999_999, "the early depositor collects principal + the floored pre-existing surplus");
     assert_eq!(env.pool_outstanding(), 0, "all principal retired; no surplus leaked to the late joiner");
-    assert_eq!(env.token_amount(&env.perc_vault.clone()), 1, "only 1 atom of virtual-offset dust remains; the surplus went to the early backer, never the late joiner");
+    assert_eq!(env.token_amount(&env.perc_vault.clone()), 2, "both users' floor remainders stay protocol insurance");
 }
 
 // POLICY_WITH_SURPLUS under a DOWNSIDE impairment — share-redemption haircut is ORDER-INDEPENDENT + CONSERVES
@@ -1258,8 +2008,8 @@ fn policy_with_surplus_late_depositor_cannot_capture_pre_existing_surplus() {
 // the impaired balance. Real percolator slab + subledger .so.
 #[test]
 fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (share redemption)
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS); // share redemption
 
     let amount = 1_000_000u64;
     let (alice, alice_ata) = new_depositor(&mut env, amount);
@@ -1296,6 +2046,111 @@ fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
     assert_eq!(env.pool_outstanding(), 0, "all principal retired");
 }
 
+#[test]
+fn with_surplus_split_exit_cannot_capture_a_codepositors_yield() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+
+    let principal = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, principal);
+    let (bob, bob_ata) = new_depositor(&mut env, principal);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, principal)
+        .expect("alice deposits");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, principal)
+        .expect("bob deposits");
+
+    let live_balance = 3_000_003u64;
+    impair_market(&mut env, live_balance as u128);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, live_balance),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Exercise both tiny floor-heavy exits and a final full-share retirement.
+    for amount in [1u64, 2, 3, 7, 11, 101, 999_875] {
+        env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, amount)
+            .expect("split with-surplus exit");
+    }
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, principal)
+        .expect("co-depositor exits");
+
+    let alice_paid = env.token_amount(&alice_ata);
+    let bob_paid = env.token_amount(&bob_ata);
+    let reserve = env.token_amount(&env.perc_vault);
+    assert!(
+        alice_paid <= bob_paid,
+        "splitting cannot take yield from the unsplit co-depositor: alice={alice_paid}, bob={bob_paid}"
+    );
+    assert_eq!(
+        alice_paid + bob_paid + reserve,
+        live_balance,
+        "all yield remains conserved between owners and protocol reserve"
+    );
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
+// LOSS-OF-FUNDS/LIVENESS PROBE: repeated recapitalization after market losses can make a
+// valid position's share count much larger than its principal. The full-exit fraction is still
+// exactly `position.shares`, but computing `shares * amount / principal` must not require the
+// overflowing product to fit in u128.
+#[test]
+fn large_insurance_share_position_can_exit_after_repeated_impairment() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+
+    let tranche = 1_000_000_000u64;
+    let total_deposit = tranche * 3;
+    let (owner, owner_ata) = new_depositor(&mut env, total_deposit);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    for cycle in 0..3 {
+        env.insurance_deposit(&owner, &owner_ata, &holding, tranche)
+            .expect("recapitalize insurance");
+        if cycle < 2 {
+            // A real venue loss can consume the insurance while the position's principal/share
+            // attribution remains. Mirror that loss in the slab and canonical SPL vault.
+            impair_market(&mut env, 0);
+            env.svm
+                .set_account(
+                    env.perc_vault,
+                    Account {
+                        lamports: 1_000_000,
+                        data: token_account_data(&env.mint, &env.vault_authority, 0),
+                        owner: spl_token::ID,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    let shares = env.position_shares(&owner.pubkey());
+    assert!(
+        shares.checked_mul(total_deposit as u128).is_none(),
+        "fixture must cross the old u128 intermediate-overflow boundary"
+    );
+    assert_eq!(env.read_position(&owner.pubkey()).0, total_deposit);
+
+    env.insurance_withdraw(&owner, &owner_ata, &holding, &owner, total_deposit)
+        .expect("a bounded full exit must not depend on an overflowing intermediate");
+    assert!(env.token_amount(&owner_ata) > 0, "the remaining live insurance is returned");
+    assert_eq!(env.pool_outstanding(), 0, "the owner's full principal attribution retires");
+    assert_eq!(env.pool_total_shares(), 0, "the full exit burns every real share");
+}
+
 // SHARE-INFLATION FIRST-DEPOSITOR THEFT (finding HB, surface B). The classic ERC4626 attack: a dust first
 // depositor DONATES into the fund to inflate the live share PRICE (balance >> total_shares) so a later
 // depositor's shares round toward ZERO; that principal then lands in the fund for 0 shares and the attacker's
@@ -1311,8 +2166,8 @@ fn policy_with_surplus_impaired_exit_is_order_independent_and_conserves() {
 // deposit through — verified), so HB is the SOLE rejecter, not a slab-shape CPI error. Previously untested.
 #[test]
 fn share_inflation_first_depositor_donation_cannot_strand_a_later_depositor_finding_hb() {
-    let mut env = Env::new();
-    env.init_insurance_pool_policy(1); // POLICY_WITH_SURPLUS (share-priced)
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS); // share-priced
 
     // Attacker is the FIRST (dust) depositor: 2 atoms -> 2*VIRTUAL_SHARES = 2e6 shares, insurance = 2.
     let (attacker, attacker_ata) = new_depositor(&mut env, 2);
@@ -1471,8 +2326,8 @@ fn cannot_redeposit_into_a_retired_position() {
 // sophisticated exiter could try to beat their pro-rata share — or drain a co-depositor — by
 // splitting their exit into many small partial withdraws, hoping the per-chunk rounding accumulates
 // in their favour. Because each chunk FLOORS, splitting can only ever round DOWN: the splitter can
-// never exceed their single-shot share, and the rounding dust is left in the insurance fund for
-// whoever stays — never extracted. With an odd insurance (1,000,001) the dust is a real atom, so a
+// never exceed their single-shot share, and the rounding dust remains unowned protocol insurance
+// rather than becoming an exit-order reward. With an odd insurance (1,000,001) the dust is a real atom, so a
 // round-UP regression would let the splitter cross 500_000 and the vault would be over-drawn (the
 // co-depositor drained or the percolator CPI failing). Pins finding-L's conservation under the
 // realistic split attack — the existing test only does single lump-sum exits.
@@ -1505,6 +2360,207 @@ fn cannot_over_withdraw_to_drain_a_codepositor() {
     // bob can still exit with his full principal — it was never drained.
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits his own principal");
     assert_eq!(env.token_amount(&bob_ata), amount, "bob recovers his full 1M — not drained");
+}
+
+// PUBLIC LOF: whole-atom share redemption must not let the last exiter absorb every earlier
+// depositor's fractional claim. The venue loss below is produced entirely through the pinned
+// Percolator public interface; only the initial authority wiring is fixture state.
+#[test]
+fn impaired_exit_order_cannot_transfer_rounding_value_to_the_last_depositor() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    env.svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_insurance_pool();
+
+    let (attacker, attacker_ata) = new_depositor(&mut env, 3);
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let pool = env.pool;
+    let attacker_holding = create_holding(&mut env, &pool);
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, 3)
+        .expect("attacker deposits three insurance atoms");
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, 1)
+        .expect("victim deposits one insurance atom");
+    assert_eq!(asset_insurance_remaining(&env, 0), 4);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the legitimate authenticated mark");
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
+    let short_portfolio = create_percolator_portfolio(&mut env, &short, 200);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (2 * percolator::POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open the public long/short pair");
+
+    env.warp_slot(101);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 1_000,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("move the public mark against the undercapitalized short");
+
+    let crank = |env: &mut Env, portfolio: Pubkey, now_slot: u64| {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                data: PIx::PermissionlessCrank {
+                    now_slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                }
+                .encode(),
+            }],
+            &[],
+        )
+    };
+    crank(&mut env, long_portfolio, 101).expect("crank the winning side");
+    env.warp_slot(102);
+    crank(&mut env, long_portfolio, 102).expect("refresh the winning side");
+    env.warp_slot(103);
+    for _ in 0..2 {
+        crank(&mut env, short_portfolio, 103)
+            .expect("permissionless liquidation consumes only the funded domain");
+    }
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        3,
+        "the public liquidation spends one atom from its funded domain",
+    );
+
+    // Resolve and remove both public portfolios so the real Percolator withdrawal gate is clear.
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve the publicly impaired market");
+    for (owner, portfolio) in [(&long, long_portfolio), (&short, short_portfolio)] {
+        let payer = clone_kp(&env.payer);
+        let destination = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+        let mut last_resolved = None;
+        let mut last_close = None;
+        for _ in 0..512 {
+            last_resolved = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(env.vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    data: PIx::CloseResolved { fee_rate_per_slot: 0 }.encode(),
+                }],
+                &[owner],
+            ));
+            last_close = Some(env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    data: PIx::ClosePortfolio.encode(),
+                }],
+                &[owner],
+            ));
+            if last_close.as_ref().is_some_and(Result::is_ok) {
+                break;
+            }
+        }
+        assert!(
+            env.svm.get_account(&portfolio).map_or(true, |account| account.lamports == 0),
+            "resolved public portfolio must not remain a withdrawal gate: close_resolved={last_resolved:?}, close={last_close:?}",
+        );
+    }
+
+    // The victim exits first. Their fractional claim rounds down, but the aggregate rounding atom
+    // must become protocol reserve rather than increasing the attacker's later exchange rate.
+    env.insurance_withdraw(&victim, &victim_ata, &victim_holding, &victim, 1)
+        .expect("victim retires the impaired one-atom position");
+    env.insurance_withdraw(&attacker, &attacker_ata, &attacker_holding, &attacker, 3)
+        .expect("attacker retires last");
+    assert_eq!(env.token_amount(&victim_ata), 0);
+    assert_eq!(
+        env.token_amount(&attacker_ata),
+        2,
+        "last-exit ordering cannot transfer the victim's rounded claim to the attacker",
+    );
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        1,
+        "aggregate whole-atom rounding remains protocol insurance",
+    );
 }
 
 #[test]
@@ -1554,8 +2610,8 @@ fn splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor() 
         "a splitter can never exceed her floored 50% pro-rata share (got {alice_total})"
     );
 
-    // Bob, who never split, exits last and is NOT drained — he collects at least as much as the
-    // splitter, and the rounding atom the floor withheld from alice accrues to him.
+    // Bob, who never split, exits last and is NOT drained. Alice's floor remainder
+    // remains protocol insurance rather than becoming an exit-order reward for Bob.
     env.insurance_withdraw(&bob, &bob_ata, &b_hold, &bob, amount).expect("bob exits whole");
     let bob_total = env.token_amount(&bob_ata);
     assert!(
@@ -1563,10 +2619,71 @@ fn splitting_an_impaired_exit_cannot_beat_the_pro_rata_or_drain_a_codepositor() 
         "the co-depositor who stayed is not drained by the splitter (bob {bob_total} >= alice {alice_total})"
     );
 
-    // Conservation: the two exits together distribute EXACTLY the impaired insurance — never more
-    // (no over-extraction) and the vault ends empty (no stranded principal).
-    assert_eq!(alice_total + bob_total, impaired as u64, "exactly the impaired insurance was paid out — no more");
-    assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "vault fully and fairly distributed");
+    let reserve = env.token_amount(&env.perc_vault);
+    assert_eq!(reserve, 1, "the aggregate floor remainder stays protocol insurance");
+    assert_eq!(alice_total + bob_total + reserve, impaired as u64, "payouts plus reserve conserve the impaired insurance");
+}
+
+// The share-redemption policy has a different partial-exit path from the principal policy above:
+// every chunk retires proportional position shares, while the pool burns only enough shares to keep
+// its post-exit exchange rate from increasing. Exercise that branch repeatedly so a splitter cannot
+// turn per-chunk floor remainders into value taken from the depositor who remains in the pool.
+#[test]
+fn with_surplus_split_exit_cannot_capture_a_codepositors_rounding() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, amount)
+        .expect("alice deposits");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, amount)
+        .expect("bob deposits");
+
+    let impaired = 1_000_001u64;
+    impair_market(&mut env, impaired as u128);
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.vault_authority, impaired),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    for chunk in [400_000u64, 300_000, 300_000] {
+        env.insurance_withdraw(&alice, &alice_ata, &alice_holding, &alice, chunk)
+            .expect("split share exit remains live");
+    }
+    let alice_total = env.token_amount(&alice_ata);
+    assert!(
+        alice_total <= 500_000,
+        "split redemption cannot exceed Alice's floored half, got {alice_total}"
+    );
+
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, amount)
+        .expect("the remaining depositor exits");
+    let bob_total = env.token_amount(&bob_ata);
+    let reserve = env.token_amount(&env.perc_vault);
+    assert!(
+        bob_total >= alice_total,
+        "Alice's split exit cannot drain Bob: alice={alice_total}, bob={bob_total}"
+    );
+    assert_eq!(reserve, 1, "the whole-atom rounding reserve remains unowned");
+    assert_eq!(
+        alice_total + bob_total + reserve,
+        impaired,
+        "all impaired insurance remains with depositors or protocol reserve"
+    );
+    assert_eq!(env.pool_outstanding(), 0, "both principal claims retire");
 }
 
 // OVER-WITHDRAW DRAIN (principal-only cap, per-depositor): insurance_withdraw caps the amount to
@@ -1664,7 +2781,8 @@ fn insurance_pool_cannot_be_reinitialized_after_funding() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -1847,29 +2965,22 @@ fn full_lifecycle_deposit_vote_seal_then_recipient_claims_coin() {
     assert!(env.send(&[reclaim], &[&recipient]).is_err(), "cannot double-claim");
 }
 
-// Anti bait-and-switch: a creator must not be able to change the distribution after
-// voters have backed it. Build a PARTIAL proposal (room to append), register + vote
-// it, then append a self-allocation — the trigger must REFUSE to seal the changed
-// proposal (its entry_count/total_amount snapshot no longer matches).
+// Registration accepts only a proposal whose declared entry shape is complete.
+// This removes creator action before voters can lock capital: a partial proposal
+// cannot become votable, while a registered full proposal has no room to append.
 #[test]
-fn proposal_changed_after_registration_cannot_be_sealed() {
+fn partial_proposal_cannot_be_registered_or_mutated_after_registration() {
     let mut env = Env::new();
     env.init_insurance_pool();
     let ve = setup_vote(&mut env);
     let dist_config = ve.dist_config;
-
-    let amount = 1_000_000u64;
-    let (alice, alice_ata) = new_depositor(&mut env, amount);
-    let pool = env.pool;
-    let holding = create_holding(&mut env, &pool);
-    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
 
     let id = 1u64;
     let dist_proposal =
         Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&2u32.to_le_bytes());
     env.send(&[Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -1900,10 +3011,9 @@ fn proposal_changed_after_registration_cannot_be_sealed() {
     let fair = Pubkey::new_unique();
     append(&mut env, &fair, 40).expect("append fair entry");
 
-    // Register the gv proposal — snapshots (entry_count=1, total_amount=40).
     let gv_proposal =
         Pubkey::find_program_address(&[b"gv_proposal", ve.gv_config.as_ref(), dist_proposal.as_ref()], &gv_id()).0;
-    env.send(&[Instruction {
+    let register = Instruction {
         program_id: gv_id(),
         accounts: vec![
             AccountMeta::new(env.payer.pubkey(), true),
@@ -1913,20 +3023,35 @@ fn proposal_changed_after_registration_cannot_be_sealed() {
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ],
         data: vec![2u8],
-    }], &[]).expect("register");
-
-    // Voters back it to quorum + majority.
-    env.warp_slot(1124);
-    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote");
-
-    // ATTACK: the creator appends a self-allocation AFTER voters committed.
-    let attacker = Pubkey::new_unique();
-    append(&mut env, &attacker, 60).expect("creator can still append (no dist-level lock)");
-
-    // The trigger must refuse to seal the changed proposal.
+    };
     assert!(
-        gv_trigger(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
-        "trigger must reject a proposal changed after registration"
+        env.send(&[register.clone()], &[]).is_err(),
+        "a partial declared shape cannot become votable"
+    );
+    assert!(
+        env.svm
+            .get_account(&gv_proposal)
+            .is_none_or(|account| account.data.is_empty()),
+        "failed registration is atomic"
+    );
+
+    let second = Pubkey::new_unique();
+    append(&mut env, &second, 60).expect("creator completes the declared shape");
+    env.send(&[register], &[])
+        .expect("the complete proposal can be registered");
+    let proposal_after_registration = env.svm.get_account(&dist_proposal).unwrap();
+    let vote_after_registration = env.svm.get_account(&gv_proposal).unwrap();
+    assert!(
+        append(&mut env, &Pubkey::new_unique(), 1).is_err(),
+        "a registered full-capacity proposal has no mutable entry slot"
+    );
+    assert_eq!(
+        env.svm.get_account(&dist_proposal).unwrap(),
+        proposal_after_registration
+    );
+    assert_eq!(
+        env.svm.get_account(&gv_proposal).unwrap(),
+        vote_after_registration
     );
 }
 
@@ -2356,6 +3481,19 @@ fn topping_up_a_voted_position_does_not_inflate_or_unlock_the_vote() {
         "top-up did NOT unlock the live vote — capital still pledged");
     assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).is_err(),
         "the topped-up, still-voted position cannot exit until the vote is retracted");
+
+    // Retraction must back out the ORIGINAL ballot snapshot, not the now-larger
+    // position. It must also release the current position in full; otherwise a
+    // legal top-up while voted would permanently lock the added principal.
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract after top-up");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (0, 0),
+        "retract backs out the stored ballot contribution exactly");
+    assert!(env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap().data[97] == 0,
+        "retract releases the topped-up position");
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 2 * amount)
+        .expect("recover the entire topped-up principal after retracting");
+    assert_eq!(env.token_amount(&alice_ata), 2 * amount,
+        "a stale ballot snapshot cannot strand the top-up or original deposit");
 }
 
 // TARGETED DISENFRANCHISEMENT (lamport-prefund DOS on a voter's ballot, finding AI on the vote path):
@@ -2508,6 +3646,210 @@ fn vote_locked_principal_cannot_exit_until_retracted() {
     env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).expect("exit after retract");
     assert_eq!(env.token_amount(&alice_ata), amount, "principal returned post-retract");
     assert_eq!(env.token_amount(&env.perc_vault.clone()), 0, "insurance drained");
+}
+
+fn exercise_legacy_genesis_retract(config_size: usize, pool_bound: bool, label: &str) {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let amount = 1_000_000u64;
+    let voted_weight = 7_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
+
+    let (legacy_config, legacy_config_bump) = if pool_bound {
+        Pubkey::find_program_address(
+            &[b"gv_config", env.coin_mint.as_ref(), pool.as_ref()],
+            &gv_id(),
+        )
+    } else {
+        Pubkey::find_program_address(&[b"gv_config", env.coin_mint.as_ref()], &gv_id())
+    };
+    let distribution_config = Pubkey::new_unique();
+    let distribution_proposal = Pubkey::new_unique();
+    let (legacy_proposal, _) = Pubkey::find_program_address(
+        &[
+            b"gv_proposal",
+            legacy_config.as_ref(),
+            distribution_proposal.as_ref(),
+        ],
+        &gv_id(),
+    );
+    let (legacy_ballot, _) = Pubkey::find_program_address(
+        &[b"gv_ballot", legacy_config.as_ref(), alice.pubkey().as_ref()],
+        &gv_id(),
+    );
+
+    let mut config_data = vec![0u8; config_size];
+    config_data[..8].copy_from_slice(b"GVCONFG1");
+    config_data[8..40].copy_from_slice(env.coin_mint.as_ref());
+    config_data[40..72].copy_from_slice(dist_id().as_ref());
+    config_data[72..104].copy_from_slice(distribution_config.as_ref());
+    config_data[104..136].copy_from_slice(sub_id().as_ref());
+    config_data[136..168].copy_from_slice(pool.as_ref());
+    config_data[200..208].copy_from_slice(&amount.to_le_bytes());
+    if config_size == 232 {
+        config_data[208..216].copy_from_slice(&voted_weight.to_le_bytes());
+        config_data[216..224].copy_from_slice(&amount.to_le_bytes());
+        config_data[224] = legacy_config_bump;
+    } else {
+        config_data[208..224].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        config_data[224..232].copy_from_slice(&amount.to_le_bytes());
+        config_data[232] = legacy_config_bump;
+        if config_size == 248 {
+            config_data[233..241].copy_from_slice(&38_880_000u64.to_le_bytes());
+        }
+    }
+    env.svm
+        .set_account(
+            legacy_config,
+            Account {
+                lamports: 1_000_000_000,
+                data: config_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let ballot_size = if config_size == 232 { 112 } else { 120 };
+    let contribution_end = if config_size == 232 { 88 } else { 96 };
+    let mut ballot_data = vec![0u8; ballot_size];
+    ballot_data[..8].copy_from_slice(b"GVBALOT1");
+    ballot_data[8..40].copy_from_slice(alice.pubkey().as_ref());
+    ballot_data[40..72].copy_from_slice(legacy_proposal.as_ref());
+    if config_size == 232 {
+        ballot_data[72..80].copy_from_slice(&voted_weight.to_le_bytes());
+        ballot_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    } else {
+        ballot_data[72..88].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        ballot_data[88..96].copy_from_slice(&amount.to_le_bytes());
+    }
+    env.svm
+        .set_account(
+            legacy_ballot,
+            Account {
+                lamports: 1_000_000_000,
+                data: ballot_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let proposal_size = if config_size == 232 { 104 } else { 112 };
+    let mut proposal_data = vec![0u8; proposal_size];
+    proposal_data[..8].copy_from_slice(b"GVPROPV1");
+    proposal_data[8..40].copy_from_slice(legacy_config.as_ref());
+    proposal_data[40..72].copy_from_slice(distribution_proposal.as_ref());
+    if config_size == 232 {
+        proposal_data[72..80].copy_from_slice(&voted_weight.to_le_bytes());
+        proposal_data[80..88].copy_from_slice(&amount.to_le_bytes());
+    } else {
+        proposal_data[72..88].copy_from_slice(&(voted_weight as u128).to_le_bytes());
+        proposal_data[88..96].copy_from_slice(&amount.to_le_bytes());
+    }
+    env.svm
+        .set_account(
+            legacy_proposal,
+            Account {
+                lamports: 1_000_000_000,
+                data: proposal_data,
+                owner: gv_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    // Preserve the exact cross-program state an old successful vote created.
+    let mut pool_account = env.svm.get_account(&pool).unwrap();
+    pool_account.data[160..192].copy_from_slice(legacy_config.as_ref());
+    env.svm.set_account(pool, pool_account).unwrap();
+    let position = env.position_pda(&alice.pubkey());
+    let mut position_account = env.svm.get_account(&position).unwrap();
+    position_account.data[97] = 1;
+    env.svm.set_account(position, position_account).unwrap();
+
+    let config_before = env.svm.get_account(&legacy_config).unwrap().data;
+    let ballot_before = env.svm.get_account(&legacy_ballot).unwrap().data;
+    let proposal_before = env.svm.get_account(&legacy_proposal).unwrap().data;
+    let vote_ix = |voter: Pubkey, action: u8| Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(voter, true),
+            AccountMeta::new(legacy_config, false),
+            AccountMeta::new(legacy_ballot, false),
+            AccountMeta::new(legacy_proposal, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, action],
+    };
+
+    // Compatibility never revives legacy governance: backing still rejects and
+    // cannot mutate the old ballot or release its capital lock.
+    assert!(env.send(&[vote_ix(alice.pubkey(), 1)], &[&alice]).is_err(), "{label}: backing stays disabled");
+    assert_eq!(env.svm.get_account(&legacy_ballot).unwrap().data, ballot_before, "{label}: rejected backing is atomic");
+    assert_eq!(env.svm.get_account(&position).unwrap().data[97], 1, "{label}: rejected backing keeps the lock");
+
+    // A different signer cannot use the recovery path to alter Alice's ballot.
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000).unwrap();
+    assert!(env.send(&[vote_ix(attacker.pubkey(), 2)], &[&attacker]).is_err(), "{label}: non-owner retract rejected");
+    assert_eq!(env.svm.get_account(&legacy_ballot).unwrap().data, ballot_before, "{label}: non-owner changed no ballot state");
+    assert_eq!(env.svm.get_account(&position).unwrap().data[97], 1, "{label}: non-owner cannot release the lock");
+
+    env.send(&[vote_ix(alice.pubkey(), 2)], &[&alice])
+        .unwrap_or_else(|e| panic!("{label}: legacy owner can always retract: {e}"));
+
+    let ballot_after = env.svm.get_account(&legacy_ballot).unwrap().data;
+    assert_eq!(&ballot_after[40..72], Pubkey::default().as_ref(), "live ballot cleared");
+    assert!(ballot_after[40..contribution_end].iter().all(|byte| *byte == 0), "{label}: legacy contribution cleared");
+    assert_eq!(
+        env.svm.get_account(&position).unwrap().data[97],
+        0,
+        "subledger vote-lock released"
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_config).unwrap().data,
+        config_before,
+        "inert legacy governance tallies are not revived or rewritten"
+    );
+    assert_eq!(
+        env.svm.get_account(&legacy_proposal).unwrap().data,
+        proposal_before,
+        "inert legacy proposal tallies are not revived or rewritten"
+    );
+    assert!(env.send(&[vote_ix(alice.pubkey(), 2)], &[&alice]).is_err(), "{label}: cleared ballot cannot replay");
+    assert_eq!(env.svm.get_account(&legacy_ballot).unwrap().data, ballot_after, "{label}: replay changed no state");
+    assert_eq!(env.svm.get_account(&position).unwrap().data[97], 0, "{label}: replay cannot relock principal");
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount)
+        .unwrap_or_else(|e| panic!("{label}: owner recovers the full deposit after legacy retract: {e}"));
+    assert_eq!(env.token_amount(&alice_ata), amount, "{label}: principal returned");
+    assert_eq!(env.token_amount(&env.perc_vault), 0, "{label}: insurance principal exited");
+}
+
+// UPGRADE-INDUCED PRINCIPAL LOCK: the vote-lock spans four exact historical
+// config/PDA generations. Current decoders formerly rejected every one before the
+// SetVoteLock(0) CPI, permanently preventing a signed owner from withdrawing.
+#[test]
+fn every_legacy_genesis_ballot_generation_can_retract_and_recover_real_percolator_principal() {
+    for (config_size, pool_bound, label) in [
+        (232, false, "232-byte coin-only"),
+        (232, true, "232-byte pool-bound"),
+        (240, true, "240-byte widened"),
+        (248, true, "248-byte bootstrap-end"),
+    ] {
+        exercise_legacy_genesis_retract(config_size, pool_bound, label);
+    }
 }
 
 // CROSS-TAG FORFEITURE BYPASS: a voter whose insurance principal is vote-locked is refused the
@@ -2744,6 +4086,41 @@ fn vote_weight_first_becomes_nonzero_at_exactly_age_2() {
     assert_eq!(p, amount, "principal credited once the position is old enough to vote");
 }
 
+// SLOT-ZERO LIVENESS: slot 0 is a valid configured bootstrap start and a valid deposit slot.
+// The position's `start_slot` therefore legitimately serializes as zero; it must acquire ordinary
+// vote weight once it ages instead of being mistaken for an unfunded sentinel forever.
+#[test]
+fn a_slot_zero_deposit_can_vote_after_aging() {
+    let mut env = Env::new();
+    env.warp_slot(0);
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+
+    let amount = 1u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount)
+        .expect("slot-zero deposit through real Percolator");
+    assert_eq!(
+        env.read_position(&alice.pubkey()),
+        (amount, 0, false),
+        "the public deposit path records the valid slot-zero timestamp"
+    );
+
+    let dest = Pubkey::new_unique();
+    let (_dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &dest);
+    env.warp_slot(2);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("a slot-zero position has weight after age two");
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        (amount, amount),
+        "floor(log2(2)) gives one vote-weight unit per deposited base unit"
+    );
+}
+
 // Cross-config binding (finalize-DOS): a vote may only be registered against a
 // distribution proposal that belongs to THIS genesis's distribution config. A
 // proposal owned by the distribution program but under a DIFFERENT config, if it
@@ -2764,7 +4141,7 @@ fn register_rejects_foreign_distribution_proposal() {
     mint_to(&mut env.svm, &clone_kp(&env.payer), &foreign_mint, &clone_kp(&env.mint_auth), &foreign_vault, 100);
     revoke_mint_authority(&mut env, &foreign_mint); // fixed-supply COIN (Safety §4)
     let mut data = vec![0u8]; // IX_INIT_CONFIG
-    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&DISTRIBUTION_CLAIM_WINDOW_SLOTS.to_le_bytes());
     data.extend_from_slice(&100u64.to_le_bytes());
     let init = Instruction {
         program_id: dist_id(),
@@ -2786,7 +4163,7 @@ fn register_rejects_foreign_distribution_proposal() {
         Pubkey::find_program_address(&[b"dist_proposal", foreign_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     env.send(&[Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -2830,8 +4207,8 @@ fn register_rejects_foreign_distribution_proposal() {
 // voters who carried the winning proposal would have their capital frozen forever.
 #[test]
 fn winning_voter_can_retract_and_exit_after_finalize() {
-    let mut env = Env::new();
-    env.init_insurance_pool();
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, 1_200, 0, 1_200);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(1_200), Some(0));
     let ve = setup_vote(&mut env);
 
     let amount = 1_000_000u64;
@@ -2935,19 +4312,20 @@ fn veto_exit_retract_and_withdraw_in_one_atomic_tx() {
     assert_eq!(env.pool_outstanding(), 0, "alice's principal left the pool outstanding accounting");
 }
 
-// Griefing-freeze: init_insurance_pool is permissionless and records vote_authority
-// as-is, so an attacker could front-run pool creation with a hostile vote_authority.
-// That must NOT let them freeze depositors: set_vote_lock requires the position
-// OWNER to sign, so a position can only be (un)locked when its owner is acting on
-// their own vote. Here a hostile authority tries to lock a victim and fails; the
-// victim's funds stay withdrawable.
+// SAME-MARKET INIT SQUAT: init_insurance_pool is permissionless and the canonical
+// genesis pool PDA is first-writer-wins. A hostile vote_authority on the real pool
+// would permanently consume that PDA; genesis-vote then refuses to bind because the
+// pool does not point back at the canonical gv_config. The program must reject that
+// init before creating the account.
 #[test]
-fn hostile_vote_authority_cannot_freeze_a_depositor() {
+fn hostile_vote_authority_cannot_squat_the_genesis_pool() {
     let mut env = Env::new();
     let attacker = Keypair::new();
-    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
 
-    // Pool created with the ATTACKER as vote_authority (the front-run scenario).
+    // ATTACK: initialize the REAL genesis pool PDA for the REAL market, but bind
+    // vote_authority to an attacker key instead of the canonical genesis-vote config.
+    // If this succeeds, the pool PDA is consumed forever and genesis-vote InitConfig
+    // rejects it later because pool.vote_authority != gv_config.
     let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
     data.extend_from_slice(&ASSET_ID.to_le_bytes());
     data.push(POLICY_PRINCIPAL);
@@ -2961,41 +4339,69 @@ fn hostile_vote_authority_cannot_freeze_a_depositor() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(attacker.pubkey(), false), // hostile vote_authority
+            AccountMeta::new_readonly(attacker.pubkey(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
-    env.send(&[init], &[]).expect("init pool with hostile authority");
+    assert!(
+        env.send(&[init], &[]).is_err(),
+        "same-market genesis pool init must reject a noncanonical vote authority"
+    );
+    assert!(
+        env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()),
+        "the rejected hostile init must leave the canonical pool PDA free"
+    );
 
-    let amount = 1_000_000u64;
-    let (victim, victim_ata) = new_depositor(&mut env, amount);
-    let pool = env.pool;
-    let holding = create_holding(&mut env, &pool);
-    env.insurance_deposit(&victim, &victim_ata, &holding, amount).expect("deposit");
-
-    // Attacker signs as the vote_authority and tries to lock the victim's position
-    // WITHOUT the victim's signature (victim passed as a non-signer account).
-    let attack = Instruction {
+    // ATTACK 2: use a fake COIN mint and its matching gv_config while still pointing
+    // at the real pool PDA. This must also reject; otherwise a fake-coin squat could
+    // pass the vote-authority check and consume the real pool address.
+    let fake_coin = Pubkey::new_unique();
+    let fake_vote_authority = gv_config_pda_for_schedule(
+        &fake_coin,
+        &env.pool,
+        env.bootstrap_delay_slots,
+        env.bootstrap_start_slot,
+    );
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let fake_coin_init = Instruction {
         program_id: sub_id(),
         accounts: vec![
-            AccountMeta::new_readonly(attacker.pubkey(), true),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new(env.position_pda(&victim.pubkey()), false),
-            AccountMeta::new_readonly(victim.pubkey(), false), // owner NOT signing
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(fake_vote_authority, false),
+            AccountMeta::new_readonly(fake_coin, false),
         ],
-        data: vec![6u8, 1u8], // IX_SET_VOTE_LOCK, locked=1
+        data,
     };
-    let res = env.send(&[attack], &[&attacker]);
-    assert!(res.is_err(), "cannot lock a position the owner did not sign for");
+    assert!(
+        env.send(&[fake_coin_init], &[]).is_err(),
+        "fake-coin matching gv_config must not squat the real coin's pool PDA"
+    );
+    assert!(
+        env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()),
+        "the rejected fake-coin init must leave the canonical pool PDA free"
+    );
 
-    // The victim is not frozen — their principal is still withdrawable.
-    env.insurance_withdraw(&victim, &victim_ata, &holding, &victim, amount).expect("victim can still exit");
-    assert_eq!(env.token_amount(&victim_ata), amount, "depositor funds were never frozen");
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    assert_eq!(
+        ve.gv_config,
+        env.gv_config_pda(),
+        "the legitimate genesis-vote config still initializes against the canonical pool"
+    );
 }
 
 // SYBIL HOLE (vote outlives capital): set_vote_lock requires BOTH the owner AND the vote_authority
-// (the gv config PDA) to sign. The freeze test above pins the owner-sig half. THIS pins the
-// vote_authority-sig half — the one that stops an owner from SELF-UNLOCKING. The lock is only ever
+// (the gv config PDA) to sign. This pins the vote_authority-sig half — the one that stops an owner
+// from SELF-UNLOCKING. The lock is only ever
 // cleared by the gv vote-RETRACT CPI (which makes the config PDA sign and also removes the ballot's
 // weight/principal). If an owner could clear the lock directly — by naming the gv config as a
 // read-only (unsigned) account — they would withdraw their principal while their ballot stays live:
@@ -3151,6 +4557,61 @@ fn a_non_owner_cannot_withdraw_a_victims_insurance_principal() {
     assert_eq!(env.token_amount(&victim_ata), amount, "owner recovers their full principal");
 }
 
+// OWNER-SIGNED PAYOUT REDIRECT: insurance_withdraw correctly binds the signer to
+// the position, but the pool PDA signs both downstream transfers. The destination
+// must also belong to that owner or a malicious transaction builder can preserve
+// the victim's signature while replacing only the payout account.
+#[test]
+fn owner_signed_insurance_withdraw_cannot_redirect_or_self_alias_the_payout() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let amount = 1_000_000u64;
+    let (victim, victim_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &holding, amount)
+        .expect("victim deposit");
+    let (_attacker, attacker_ata) = new_depositor(&mut env, 0);
+    let position = env.position_pda(&victim.pubkey());
+
+    let pool_before = env.svm.get_account(&env.pool).unwrap();
+    let position_before = env.svm.get_account(&position).unwrap();
+    let slab_before = env.svm.get_account(&env.slab).unwrap();
+    let vault_before = env.svm.get_account(&env.perc_vault).unwrap();
+    let holding_before = env.svm.get_account(&holding).unwrap();
+    assert!(
+        env.insurance_withdraw(&victim, &attacker_ata, &holding, &victim, amount)
+            .is_err(),
+        "a valid owner signature must not authorize insurance payout to an attacker"
+    );
+    assert_eq!(env.svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_before);
+    assert_eq!(env.svm.get_account(&env.slab).unwrap(), slab_before);
+    assert_eq!(env.svm.get_account(&env.perc_vault).unwrap(), vault_before);
+    assert_eq!(env.svm.get_account(&holding).unwrap(), holding_before);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+
+    // SPL Token accepts a fully-authorized self-transfer as a no-op. Naming the
+    // pool holding as both source and payout must not consume the position while
+    // leaving its withdrawn principal stranded in that shared account.
+    assert!(
+        env.insurance_withdraw(&victim, &holding, &holding, &victim, amount)
+            .is_err(),
+        "holding-to-itself payout must reject before principal accounting changes"
+    );
+    assert_eq!(env.svm.get_account(&env.pool).unwrap(), pool_before);
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_before);
+    assert_eq!(env.svm.get_account(&env.slab).unwrap(), slab_before);
+    assert_eq!(env.svm.get_account(&env.perc_vault).unwrap(), vault_before);
+    assert_eq!(env.svm.get_account(&holding).unwrap(), holding_before);
+
+    env.insurance_withdraw(&victim, &victim_ata, &holding, &victim, amount)
+        .expect("victim still exits to their own token account");
+    assert_eq!(env.token_amount(&victim_ata), amount);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+    assert_eq!(env.token_amount(&holding), 0);
+}
+
 // Type-confusion boundary: the own-vault deposit path (tag 1) must REJECT an
 // insurance pool. An insurance pool's `vault` is the percolator insurance vault,
 // owned by the percolator vault_authority — not this pool PDA. Without the guard,
@@ -3233,7 +4694,8 @@ fn init_insurance_pool_rejects_non_canonical_vault() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3340,7 +4802,7 @@ fn only_the_proposal_creator_can_register_it() {
         Pubkey::find_program_address(&[b"dist_proposal", dist_config.as_ref(), &id.to_le_bytes()], &dist_id()).0;
     let mut cd = vec![1u8];
     cd.extend_from_slice(&id.to_le_bytes());
-    cd.extend_from_slice(&4u32.to_le_bytes());
+    cd.extend_from_slice(&1u32.to_le_bytes());
     env.send(&[Instruction {
         program_id: dist_id(),
         accounts: vec![
@@ -3395,9 +4857,9 @@ fn only_the_proposal_creator_can_register_it() {
 // (= f(COIN_mint, asset 0)) FIRST, bound to a percolator market THEY control, with
 // vote_authority set to the predictable real gv config PDA — passing the gv binding
 // check and routing every depositor's principal into the attacker's market (LOF). Now
-// the pool PDA commits to (mint, asset_id, market_slab, percolator_program), so an
-// attacker's pool lands at a DIFFERENT address and the genesis pool PDA — bound to the
-// real market — stays free and untouched.
+// the pool PDA commits to (mint, asset_id, market_slab, percolator_program, coin_mint, policy, domain),
+// so an attacker's pool lands at a DIFFERENT address and the genesis pool PDA — bound
+// to the real market and COIN — stays free and untouched.
 #[test]
 fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
     let mut env = Env::new();
@@ -3423,8 +4885,25 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
 
     // The attacker's pool PDA is bound to THEIR market — a different address from the
     // genesis pool (env.pool), which is bound to the real market (env.slab).
+    let attacker_policy = [POLICY_PRINCIPAL];
+    let attacker_domain = [DOMAIN_INSURANCE];
+    let attacker_window = DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let attacker_start = DEFAULT_GENESIS_DEPOSIT_START_SLOT.to_le_bytes();
+    let attacker_delay = DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
     let attacker_pool = Pubkey::find_program_address(
-        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), attacker_slab.as_ref(), perc_id().as_ref()],
+        &[
+            b"subledger_pool",
+            env.mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            attacker_slab.as_ref(),
+            perc_id().as_ref(),
+            env.coin_mint.as_ref(),
+            &attacker_policy,
+            &attacker_domain,
+            &attacker_window,
+            &attacker_start,
+            &attacker_delay,
+        ],
         &sub_id(),
     ).0;
     assert_ne!(attacker_pool, env.pool, "the market binding is part of the pool PDA");
@@ -3444,7 +4923,16 @@ fn init_insurance_pool_cannot_be_squatted_to_misdirect_the_genesis_pool() {
             AccountMeta::new_readonly(attacker_slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(
+                gv_config_pda_for_schedule(
+                    &env.coin_mint,
+                    &attacker_pool,
+                    env.bootstrap_delay_slots,
+                    env.bootstrap_start_slot,
+                ),
+                false,
+            ),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3486,7 +4974,8 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
             AccountMeta::new_readonly(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(gv_config_pda(&env.coin_mint, &env.pool), false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
         ],
         data,
     };
@@ -3503,14 +4992,416 @@ fn front_running_the_genesis_pool_with_a_bad_policy_is_rejected() {
     assert_eq!(env.token_amount(&alice_ata), 1_000_000, "principal fully recovered — the pool works");
 }
 
+// The genesis insurance pool path is asset-0 only: deposits CPI into Percolator's
+// TopUpInsurance instruction, while exits use the asset-indexed withdraw. Accepting
+// a nonzero asset_id would create a pool whose deposits top up asset 0 but whose
+// exits try to withdraw a different asset, stranding that pool's depositors.
+#[test]
+fn init_insurance_pool_rejects_nonzero_asset_id() {
+    let mut env = Env::new();
+    let asset_id = 1u64;
+    let pool = Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            env.mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            env.slab.as_ref(),
+            perc_id().as_ref(),
+            env.coin_mint.as_ref(),
+            &[POLICY_PRINCIPAL],
+            &[DOMAIN_INSURANCE],
+            &DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes(),
+            &DEFAULT_GENESIS_DEPOSIT_START_SLOT.to_le_bytes(),
+            &DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS.to_le_bytes(),
+        ],
+        &sub_id(),
+    )
+    .0;
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&asset_id.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(
+                gv_config_pda_for_schedule(
+                    &env.coin_mint,
+                    &pool,
+                    env.bootstrap_delay_slots,
+                    env.bootstrap_start_slot,
+                ),
+                false,
+            ),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+
+    assert!(
+        env.send(&[ix], &[]).is_err(),
+        "asset-0 genesis insurance init must reject nonzero asset_id"
+    );
+    assert!(
+        env.svm.get_account(&pool).map_or(true, |a| a.data.is_empty()),
+        "nonzero-asset pool PDA remains uninitialized"
+    );
+
+    env.init_insurance_pool();
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 1_000_000);
+    let hold = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &hold, 1_000_000).expect("asset-0 pool remains usable");
+    env.insurance_withdraw(&alice, &alice_ata, &hold, &alice, 1_000_000).expect("asset-0 exit remains usable");
+}
+
+// FIRST-WRITER POLICY SQUAT (soft-veto bypass): the intended genesis pool is share-based
+// (POLICY_WITH_SURPLUS). If the policy byte is not part of the pool PDA namespace, a front-runner can
+// initialize the exact canonical pool with POLICY_PRINCIPAL, consuming it before the orchestrator creates
+// the share-based pool. Deposits/votes still work, but exits no longer redeem surplus, so the residual
+// distributor's soft-veto design is silently disabled. The wrong in-range policy must land at a different
+// PDA, leaving the intended share-based pool free.
+#[test]
+fn wrong_in_range_policy_cannot_squat_the_share_based_genesis_pool() {
+    let mut env = Env::new_for_policy(POLICY_WITH_SURPLUS);
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    let squat = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+    assert!(
+        env.send(&[squat], &[]).is_err(),
+        "a principal-policy init must not consume the intended share-based genesis pool PDA"
+    );
+    assert!(
+        env.svm.get_account(&env.pool).map_or(true, |a| a.data.is_empty()),
+        "intended share-based genesis pool PDA remains free"
+    );
+
+    env.init_insurance_pool_policy(POLICY_WITH_SURPLUS);
+    let pool_acc = env.svm.get_account(&env.pool).unwrap();
+    assert_eq!(pool_acc.data[88], POLICY_WITH_SURPLUS, "real genesis pool is POLICY_WITH_SURPLUS");
+}
+
+// The genesis deposit window must close on-chain. Without this, late capital can
+// inflate the live outstanding quorum denominator right before trigger without
+// carrying comparable voting tenure, turning the bootstrap into a late-deposit DOS.
+#[test]
+fn genesis_insurance_deposit_window_rejects_late_capital_but_not_exits() {
+    let mut env = Env::new_for_policy_with_window(POLICY_PRINCIPAL, 3);
+    env.init_insurance_pool_policy_with_window(POLICY_PRINCIPAL, Some(3));
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let alice_hold = create_holding(&mut env, &pool);
+
+    env.warp_slot(101);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 10)
+        .expect("deposit before the short genesis window closes");
+    assert_eq!(env.pool_outstanding(), 10);
+
+    let (bob, bob_ata) = new_depositor(&mut env, 10);
+    let bob_hold = create_holding(&mut env, &pool);
+    env.warp_slot(104);
+    assert!(
+        env.insurance_deposit(&bob, &bob_ata, &bob_hold, 10).is_err(),
+        "late capital must not be able to inflate the genesis quorum denominator"
+    );
+    assert_eq!(
+        env.token_amount(&bob_ata),
+        10,
+        "rejected late deposit moved no funds"
+    );
+    assert_eq!(
+        env.pool_outstanding(),
+        10,
+        "late rejected deposit did not change outstanding principal"
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &alice_hold, &alice, 10)
+        .expect("existing depositors can exit after deposits close");
+    assert_eq!(env.token_amount(&alice_ata), 10);
+}
+
+// FIRST-WRITER SCHEDULE SQUAT: a custom window length alone is not enough. If
+// the absolute start is implicit, a permissionless first writer can initialize
+// the otherwise correct pool before launch, starting the deposit clock early and
+// closing it before normal participants arrive. The configured start is now
+// explicit, PDA-bound, and enforced by insurance_deposit.
+#[test]
+fn configured_deposit_start_cannot_be_opened_early_by_permissionless_init() {
+    let start_slot = 110u64;
+    let window = 3u64;
+    let mut env = Env::new_for_policy_with_schedule(POLICY_PRINCIPAL, window, start_slot);
+
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(window), Some(start_slot));
+    let pool = env.pool;
+
+    let (early, early_ata) = new_depositor(&mut env, 10);
+    let early_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start_slot - 1);
+    assert!(
+        env.insurance_deposit(&early, &early_ata, &early_hold, 10)
+            .is_err(),
+        "deposits before the configured start must not open early"
+    );
+    assert_eq!(
+        env.token_amount(&early_ata),
+        10,
+        "rejected pre-start deposit moved no funds"
+    );
+
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let alice_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start_slot);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 10)
+        .expect("deposit succeeds once the configured window opens");
+
+    let (late, late_ata) = new_depositor(&mut env, 10);
+    let late_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start_slot + window);
+    assert!(
+        env.insurance_deposit(&late, &late_ata, &late_hold, 10)
+            .is_err(),
+        "deposits at/after the configured deadline must close"
+    );
+    assert_eq!(env.token_amount(&late_ata), 10);
+}
+
+#[test]
+fn bootstrap_schedule_is_one_pda_bound_contract_across_pool_and_vote() {
+    let window = 3u64;
+    let start = 110u64;
+    let delay = 10u64;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+
+    // A permissionless first writer using a different bootstrap delay derives a
+    // different pool and cannot consume the intended schedule's PDA.
+    let hostile_delay = delay + 1;
+    let mut hostile_data = vec![3u8];
+    hostile_data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    hostile_data.push(POLICY_PRINCIPAL);
+    hostile_data.extend_from_slice(&window.to_le_bytes());
+    hostile_data.extend_from_slice(&start.to_le_bytes());
+    hostile_data.extend_from_slice(&hostile_delay.to_le_bytes());
+    let hostile_vote_authority =
+        gv_config_pda_for_schedule(&env.coin_mint, &env.pool, hostile_delay, start);
+    let hostile_init = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(hostile_vote_authority, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data: hostile_data,
+    };
+    assert!(env.send(&[hostile_init], &[]).is_err());
+    assert!(env
+        .svm
+        .get_account(&env.pool)
+        .map_or(true, |a| a.data.is_empty()));
+
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(window), Some(start));
+    let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        u64::from_le_bytes(pool_data[248..256].try_into().unwrap()),
+        window
+    );
+    assert_eq!(
+        u64::from_le_bytes(pool_data[256..264].try_into().unwrap()),
+        start
+    );
+    assert_eq!(
+        u64::from_le_bytes(pool_data[264..272].try_into().unwrap()),
+        delay
+    );
+    assert_eq!(
+        env.gv_config_pda(),
+        gv_config_pda_for_schedule(&env.coin_mint, &env.pool, delay, start)
+    );
+}
+
+#[test]
+fn deposit_window_cannot_outlive_the_bootstrap() {
+    let window = 11u64;
+    let start = 110u64;
+    let delay = 10u64;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&window.to_le_bytes());
+    data.extend_from_slice(&start.to_le_bytes());
+    data.extend_from_slice(&delay.to_le_bytes());
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+    assert!(
+        env.send(&[ix], &[]).is_err(),
+        "genesis cannot become triggerable while insurance deposits remain open"
+    );
+    assert!(env
+        .svm
+        .get_account(&env.pool)
+        .map_or(true, |a| a.data.is_empty()));
+}
+
+#[test]
+fn exact_schedule_boundaries_complete_real_percolator_genesis_and_return_principal() {
+    let window = 3u64;
+    let start = 110u64;
+    let delay = 10u64;
+    let end = start + delay;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(window), Some(start));
+    let ve = setup_vote(&mut env);
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    let alice_hold = create_holding(&mut env, &pool);
+
+    env.warp_slot(start - 1);
+    assert!(env
+        .insurance_deposit(&alice, &alice_ata, &alice_hold, 1)
+        .is_err());
+    env.warp_slot(start);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 1)
+        .expect("exact bootstrap start accepts the one-base-unit deposit");
+
+    let recipient = Pubkey::new_unique();
+    let (dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &recipient);
+    env.warp_slot(start + 2);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("one base unit gives one principal vote");
+
+    let (late, late_ata) = new_depositor(&mut env, 1);
+    let late_hold = create_holding(&mut env, &pool);
+    env.warp_slot(start + window);
+    assert!(env
+        .insurance_deposit(&late, &late_ata, &late_hold, 1)
+        .is_err());
+    assert_eq!(
+        env.token_amount(&late_ata),
+        1,
+        "deadline rejection moves no funds"
+    );
+
+    env.warp_slot(end - 1);
+    assert!(
+        gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
+        "genesis cannot seal one slot before bootstrap end"
+    );
+    env.warp_slot(end);
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("genesis seals at the exact configured end");
+
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("winner retract releases vote lock");
+    env.insurance_withdraw(&alice, &alice_ata, &alice_hold, &alice, 1)
+        .expect("initial risk capital remains owner-withdrawable");
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
+// FIRST-WRITER DEPOSIT-WINDOW SQUAT: the window is part of the depositor contract.
+// A hostile short window can make normal depositors miss genesis; a hostile long
+// window re-opens the late-capital quorum grief the on-chain window is supposed
+// to close. Permissionless init must therefore not let a wrong-window call
+// consume the intended genesis pool PDA.
+#[test]
+fn wrong_deposit_window_cannot_squat_the_genesis_pool() {
+    let intended_window = 3u64;
+    let hostile_window = 1u64;
+    let mut env = Env::new_for_policy_with_window(POLICY_PRINCIPAL, intended_window);
+
+    let mut data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&hostile_window.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    data.extend_from_slice(&env.bootstrap_delay_slots.to_le_bytes());
+    let squat = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+    assert!(
+        env.send(&[squat], &[]).is_err(),
+        "wrong-window init must not consume the intended genesis pool PDA"
+    );
+    assert!(
+        env.svm
+            .get_account(&env.pool)
+            .map_or(true, |a| a.data.is_empty()),
+        "genesis pool remains free for the intended window"
+    );
+
+    env.init_insurance_pool_policy_with_window(POLICY_PRINCIPAL, Some(intended_window));
+    let pool = env.pool;
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let alice_hold = create_holding(&mut env, &pool);
+    env.warp_slot(101);
+    env.insurance_deposit(&alice, &alice_ata, &alice_hold, 10)
+        .expect("intended-window pool accepts an in-window deposit");
+}
 // CROSS-INSTRUCTION PDA SQUAT (account-confusion/seed-collision): both init_pool (own-vault, tag 0)
 // and init_insurance_pool (tag 3) derive their pool PDA from pool_seeds(mint, asset_id, market_slab,
-// percolator_program). The genesis insurance pool lives at (mint, 0, REAL_market, REAL_program). If
+// percolator_program, coin_mint, policy, domain). The genesis insurance pool lives at
+// (mint, 0, REAL_market, REAL_program, REAL_coin, policy, INSURANCE). If
 // init_pool let the caller supply the market/program seed parts, an attacker could derive that exact
 // address with a BACKING-domain own-vault pool, seize the PDA (legit init then fails
 // AccountAlreadyInitialized), and brick the genesis (genesis-vote needs is_insurance() == true).
 // init_pool defends by HARDCODING the market/program seed components to Pubkey::default() (lib.rs:394),
-// so own-vault pools are confined to the (mint, asset_id, default, default) namespace — provably
+// so own-vault pools are confined to the (mint, asset_id, default, default, default) namespace — provably
 // disjoint from any real-market insurance pool. This pins that isolation: init_pool cannot be pointed
 // at the genesis insurance PDA. (The init_insurance_pool foreign-market + bad-policy squats are pinned
 // separately; this closes the wrong-instruction angle.)
@@ -3520,8 +5411,25 @@ fn own_vault_init_pool_cannot_squat_the_genesis_insurance_pda() {
 
     // The own-vault namespace for the same (mint, asset_id) is a DIFFERENT address than the genesis
     // insurance pool — the market/program seed parts differ (default vs the real market).
+    let own_policy = [POLICY_PRINCIPAL];
+    let own_domain = [1u8]; // DOMAIN_BACKING
+    let own_window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
+    let own_start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
+    let own_delay = OWN_VAULT_BOOTSTRAP_DELAY_SLOTS.to_le_bytes();
     let own_vault_pda = Pubkey::find_program_address(
-        &[b"subledger_pool", env.mint.as_ref(), &ASSET_ID.to_le_bytes(), Pubkey::default().as_ref(), Pubkey::default().as_ref()],
+        &[
+            b"subledger_pool",
+            env.mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            Pubkey::default().as_ref(),
+            Pubkey::default().as_ref(),
+            Pubkey::default().as_ref(),
+            &own_policy,
+            &own_domain,
+            &own_window,
+            &own_start,
+            &own_delay,
+        ],
         &sub_id(),
     ).0;
     assert_ne!(own_vault_pda, env.pool, "own-vault and insurance pool PDAs are structurally disjoint");
@@ -3657,4 +5565,61 @@ fn top_up_resets_the_position_start_slot() {
     assert_eq!(principal, 2_000_000, "principal accumulated across deposits");
     assert_eq!(start1, 1_000, "top-up RESET start_slot to now — the huge late capital earns no early-join age");
     assert!(start1 > start0, "start_slot moved forward (no inherited early-join hold time)");
+}
+
+// LIVENESS BOUNDARY: withdrawn_amount is historical telemetry, not a custody
+// limit. Repeated valid partial exits can saturate it while principal remains.
+// Its representational ceiling must not permanently block that principal exit.
+#[test]
+fn withdrawn_amount_counter_saturation_cannot_trap_remaining_insurance_principal() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let live_limit = u64::try_from(percolator::MAX_VAULT_TVL).unwrap();
+    let chunk = live_limit - 1;
+    let full_cycles = u64::MAX / chunk;
+    let remainder = u64::MAX % chunk;
+    assert!(full_cycles < 2_000, "probe remains bounded");
+    let (alice, alice_ata) = new_depositor(&mut env, live_limit);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+
+    env.insurance_deposit(&alice, &alice_ata, &holding, live_limit)
+        .expect("maximum live-shape insurance deposit");
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, chunk)
+        .expect("first valid partial exit");
+
+    for _ in 1..full_cycles {
+        env.insurance_deposit(&alice, &alice_ata, &holding, chunk)
+            .expect("bounded recycled top-up");
+        env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, chunk)
+            .expect("bounded recycled partial exit");
+    }
+    if remainder > 0 {
+        env.insurance_deposit(&alice, &alice_ata, &holding, remainder)
+            .expect("remainder top-up");
+        env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, remainder)
+            .expect("counter reaches u64::MAX");
+    }
+
+    let position = env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap();
+    assert_eq!(u64::from_le_bytes(position.data[80..88].try_into().unwrap()), u64::MAX);
+    assert_eq!(env.read_position(&alice.pubkey()).0, 1);
+    assert_eq!(env.pool_outstanding(), 1);
+    assert_eq!(env.token_amount(&env.perc_vault), 1);
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 1)
+        .expect("counter saturation must not block the final principal exit");
+
+    let (principal, _, withdrawn) = env.read_position(&alice.pubkey());
+    assert_eq!(principal, 0);
+    assert!(withdrawn);
+    let position = env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(position.data[80..88].try_into().unwrap()),
+        u64::MAX,
+        "historical telemetry remains saturated instead of wrapping"
+    );
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.token_amount(&alice_ata), live_limit);
 }

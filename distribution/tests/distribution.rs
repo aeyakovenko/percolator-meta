@@ -24,6 +24,18 @@ fn so_path() -> String {
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
 }
+fn dist_config_pda(coin_mint: &Pubkey, authority: &Pubkey, claim_window: u64) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"dist_config",
+            coin_mint.as_ref(),
+            authority.as_ref(),
+            &claim_window.to_le_bytes(),
+        ],
+        &pid(),
+    )
+    .0
+}
 
 struct Env {
     svm: LiteSVM,
@@ -46,9 +58,9 @@ impl Env {
         let mint_authority = Keypair::new();
         let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
 
-        // The config PDA binds the authority (anti front-run, finding AA), so derive it after.
+        // The config PDA binds the authority and claim window, so derive it after.
         let authority = Keypair::new();
-        let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.pubkey().as_ref()], &pid()).0;
+        let config = dist_config_pda(&coin_mint, &authority.pubkey(), claim_window);
         let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
         mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, supply);
         // Fixed supply: revoke the mint authority before init (the canonical
@@ -267,6 +279,119 @@ fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypai
     svm.send_transaction(tx).unwrap();
 }
 
+fn translate_sealed_distribution_to_legacy(
+    env: &mut Env,
+    current_proposal: &Pubkey,
+    authority_bound: bool,
+) -> Pubkey {
+    let current_config = env.config;
+    let mut config_account = env.svm.get_account(&current_config).unwrap();
+    let mut proposal_account = env.svm.get_account(current_proposal).unwrap();
+    let proposal_id = u64::from_le_bytes(proposal_account.data[40..48].try_into().unwrap());
+    let (legacy_config, legacy_bump) = if authority_bound {
+        Pubkey::find_program_address(
+            &[
+                b"dist_config",
+                env.coin_mint.as_ref(),
+                env.authority.pubkey().as_ref(),
+            ],
+            &pid(),
+        )
+    } else {
+        Pubkey::find_program_address(&[b"dist_config", env.coin_mint.as_ref()], &pid())
+    };
+    let legacy_proposal = Pubkey::find_program_address(
+        &[
+            b"dist_proposal",
+            legacy_config.as_ref(),
+            &proposal_id.to_le_bytes(),
+        ],
+        &pid(),
+    )
+    .0;
+
+    config_account.data[120..152].copy_from_slice(legacy_proposal.as_ref());
+    config_account.data[160] = legacy_bump;
+    env.svm.set_account(legacy_config, config_account).unwrap();
+
+    proposal_account.data[8..40].copy_from_slice(legacy_config.as_ref());
+    env.svm.set_account(legacy_proposal, proposal_account).unwrap();
+
+    // Historical init made this config PDA the SPL vault authority.
+    let mut vault_account = env.svm.get_account(&env.vault).unwrap();
+    let mut vault_state = spl_token::state::Account::unpack(&vault_account.data).unwrap();
+    vault_state.owner = legacy_config;
+    spl_token::state::Account::pack(vault_state, &mut vault_account.data).unwrap();
+    env.svm.set_account(env.vault, vault_account).unwrap();
+
+    env.config = legacy_config;
+    legacy_proposal
+}
+
+// UPGRADE-INDUCED VAULT LOCK: the safe authority-bound config stayed 168 bytes when
+// claim_window joined its PDA seed. The current decoder accepts that generation,
+// but signing only the latest seeds strands recipient claims and the terminal burn.
+#[test]
+fn authority_bound_historical_distribution_preserves_claim_and_terminal_burn() {
+    let mut env = Env::new(100, 10);
+    let (recipient, recipient_ata) = env.new_recipient();
+    let proposal = env.create_proposal(7, 1);
+    env.append(&proposal, &[(recipient.pubkey(), 40)]).expect("append");
+    let authority = clone_kp(&env.authority);
+    env.seal(&proposal, &authority).expect("seal");
+    let legacy_proposal = translate_sealed_distribution_to_legacy(&mut env, &proposal, true);
+
+    env.claim(&legacy_proposal, &recipient, &recipient_ata, 0)
+        .expect("authority-bound historical recipient claim remains live");
+    assert_eq!(env.token_amount(&recipient_ata), 40, "recipient paid");
+    assert_eq!(env.token_amount(&env.vault), 60, "only the claim left the vault");
+
+    let seal_slot = u64::from_le_bytes(
+        env.svm.get_account(&env.config).unwrap().data[152..160]
+            .try_into()
+            .unwrap(),
+    );
+    env.set_slot(seal_slot + 10);
+    env.burn_unclaimed().expect("authority-bound historical terminal burn remains live");
+    assert_eq!(env.token_amount(&env.vault), 0, "no reward coins stranded");
+    let mint_supply = spl_token::state::Mint::unpack(
+        &env.svm.get_account(&env.coin_mint).unwrap().data,
+    )
+    .unwrap()
+    .supply;
+    assert_eq!(mint_supply, 40, "only the claimed reward remains in supply");
+}
+
+// The mint-only schema was retired by 418ca15 because a first writer could bind a
+// pre-funded vault to an attacker authority. Compatibility must never make that
+// quarantined config a signer again, even if its bytes otherwise decode cleanly.
+#[test]
+fn theft_vulnerable_mint_only_distribution_config_stays_inert() {
+    let mut env = Env::new(100, 10);
+    let (recipient, recipient_ata) = env.new_recipient();
+    let proposal = env.create_proposal(7, 1);
+    env.append(&proposal, &[(recipient.pubkey(), 100)]).expect("append");
+    let authority = clone_kp(&env.authority);
+    env.seal(&proposal, &authority).expect("seal");
+    let legacy_proposal = translate_sealed_distribution_to_legacy(&mut env, &proposal, false);
+
+    assert!(
+        env.claim(&legacy_proposal, &recipient, &recipient_ata, 0).is_err(),
+        "known-unsafe mint-only config must not regain a claim signer"
+    );
+    assert_eq!(env.token_amount(&recipient_ata), 0, "no attacker-directed claim moved coins");
+    assert_eq!(env.token_amount(&env.vault), 100, "quarantined vault unchanged");
+
+    let seal_slot = u64::from_le_bytes(
+        env.svm.get_account(&env.config).unwrap().data[152..160]
+            .try_into()
+            .unwrap(),
+    );
+    env.set_slot(seal_slot + 10);
+    assert!(env.burn_unclaimed().is_err(), "mint-only config must not regain any signer path");
+    assert_eq!(env.token_amount(&env.vault), 100, "quarantine remains atomic after burn attempt");
+}
+
 #[test]
 fn seal_then_recipients_claim_their_entries() {
     let mut env = Env::new(100, 1_000_000);
@@ -439,6 +564,47 @@ fn claim_requires_the_named_recipients_signature_no_third_party_redirect_theft()
     assert_eq!(env.token_amount(&victim_ata), 100, "victim recovers their full entry");
 }
 
+// OWNER-SIGNED PAYOUT REDIRECT: authenticating the named recipient is not enough when the
+// distribution PDA signs the vault transfer. A malicious transaction builder must not be able to
+// obtain the recipient's valid signature on a claim paying an attacker-owned token account. The
+// vault itself is the sharper alias: SPL Token accepts an authorized self-transfer as a no-op, so
+// an unchecked vault destination would consume the entry without paying anyone.
+#[test]
+fn owner_signed_claim_cannot_redirect_or_self_alias_the_payout() {
+    let mut env = Env::new(100, 1_000_000);
+    let proposal = env.create_proposal(1, 2);
+    let (victim, victim_ata) = env.new_recipient();
+    let (_attacker, attacker_ata) = env.new_recipient();
+    env.append(
+        &proposal,
+        &[(victim.pubkey(), 40), (victim.pubkey(), 60)],
+    )
+    .expect("append");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+
+    let proposal_before = env.svm.get_account(&proposal).unwrap();
+    let vault_before = env.svm.get_account(&env.vault).unwrap();
+    let redirected = env.claim(&proposal, &victim, &attacker_ata, 0);
+    let vault = env.vault;
+    let self_aliased = env.claim(&proposal, &victim, &vault, 1);
+
+    assert!(
+        redirected.is_err() && self_aliased.is_err(),
+        "recipient-signed redirects must both fail: foreign={redirected:?}, self-alias={self_aliased:?}"
+    );
+    assert_eq!(env.svm.get_account(&proposal).unwrap(), proposal_before);
+    assert_eq!(env.svm.get_account(&env.vault).unwrap(), vault_before);
+    assert_eq!(env.token_amount(&attacker_ata), 0);
+
+    env.claim(&proposal, &victim, &victim_ata, 0)
+        .expect("victim claims the first entry");
+    env.claim(&proposal, &victim, &victim_ata, 1)
+        .expect("victim claims the second entry");
+    assert_eq!(env.token_amount(&victim_ata), 100);
+    assert_eq!(env.token_amount(&env.vault), 0);
+}
+
 // REINIT A SEALED CONFIG (vault-redirect, finding AJ for distribution): re-initializing a LIVE, sealed
 // config would reset config.sealed_proposal + seal_slot — un-sealing it so an attacker could re-seal to
 // THEIR proposal and redirect the entire COIN vault, or re-open the claim window. End-to-end safety test
@@ -598,7 +764,7 @@ fn seal_rejects_a_proposal_from_a_foreign_config() {
     let mint_auth_b = Keypair::new();
     let coin_b = create_mint(&mut env.svm, &env.payer, &mint_auth_b.pubkey());
     let authority_b = Keypair::new();
-    let config_b = Pubkey::find_program_address(&[b"dist_config", coin_b.as_ref(), authority_b.pubkey().as_ref()], &pid()).0;
+    let config_b = dist_config_pda(&coin_b, &authority_b.pubkey(), 1_000_000);
     let vault_b = create_token_account(&mut env.svm, &env.payer, &coin_b, &config_b);
     mint_to(&mut env.svm, &env.payer, &coin_b, &mint_auth_b, &vault_b, 1_000);
     revoke_mint_authority(&mut env.svm, &env.payer, &coin_b, &mint_auth_b);
@@ -891,6 +1057,36 @@ fn append_entry_count_capacity_cap_and_an_overflowing_batch_reverts_atomically()
     assert_eq!(env.token_amount(&dave_ata), 40, "dave got the second slot cleanly");
 }
 
+// MAX-SHAPE PROGRESS PROBE: the public API advertises 10,000-entry distributions. The
+// maximum-sized proposal must be allocatable, fillable through transaction-sized append chunks,
+// sealable, and able to serve its final index under the normal compute budget.
+#[test]
+fn max_capacity_proposal_can_fill_seal_and_claim_the_last_entry() {
+    const ENTRIES: u32 = 10_000;
+    const CHUNK: usize = 24;
+    let mut env = Env::new(ENTRIES as u64, 1_000_000);
+    let proposal = env.create_proposal(99, ENTRIES);
+    assert_eq!(env.svm.get_account(&proposal).unwrap().data.len(), 104,
+        "creation allocates only the header");
+
+    let (recipient, recipient_ata) = env.new_recipient();
+    let entry = (recipient.pubkey(), 1u64);
+    let mut appended = 0u32;
+    while appended < ENTRIES {
+        let count = core::cmp::min(CHUNK, (ENTRIES - appended) as usize);
+        env.append(&proposal, &vec![entry; count]).expect("append max-capacity chunk");
+        appended += count as u32;
+    }
+    assert_eq!(env.svm.get_account(&proposal).unwrap().data.len(), 104 + ENTRIES as usize * 40,
+        "appends grow to the declared final capacity");
+
+    let authority = clone_kp(&env.authority);
+    env.seal(&proposal, &authority).expect("seal max proposal");
+    env.claim(&proposal, &recipient, &recipient_ata, ENTRIES - 1)
+        .expect("claim final max-capacity index");
+    assert_eq!(env.token_amount(&recipient_ata), 1);
+}
+
 // MALFORMED ENTRIES (zero amount / zero-address recipient): append rejects amount == 0 || pk ==
 // Pubkey::default() (lib.rs:append_entries). A zero-amount entry is permanently unclaimable and just
 // soaks a slot; a default-pubkey (zero address) entry allocates a chunk of the fixed supply to a key NOBODY
@@ -1002,7 +1198,7 @@ fn init_config_rejects_an_underfunded_vault() {
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
 
     let authority = Keypair::new();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.pubkey().as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority.pubkey(), 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     // Fund the vault with only 60, but promise a total_supply of 100.
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 60);
@@ -1054,7 +1250,7 @@ fn init_config_rejects_a_vault_underfunded_below_a_fully_minted_supply() {
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
 
     let authority = Keypair::new();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.pubkey().as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority.pubkey(), 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     // The FULL supply is 100, but the vault holds only 60 — the other 40 are minted to a decoy account
     // (e.g. an attacker's), so the mint's supply == 100 == total_supply (passing the supply-equality check)
@@ -1105,7 +1301,7 @@ fn init_config_rejects_a_non_spl_owned_token_shaped_vault() {
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
 
     let authority = Keypair::new();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.pubkey().as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority.pubkey(), 1_000_000);
 
     // Mint the full supply to a real holder and revoke authority, so the COIN mint itself satisfies
     // the fixed-supply invariants (mint.supply == total_supply, no mint/freeze authority). This
@@ -1179,15 +1375,15 @@ fn init_config_rejects_a_zero_claim_window() {
     let mint_authority = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
     let authority = Keypair::new();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.pubkey().as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority.pubkey(), 0);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100); // fully back supply 100
     revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
 
-    let build = |window: u64, supply: u64| {
+    let build = || {
         let mut data = vec![0u8]; // IX_INIT_CONFIG
-        data.extend_from_slice(&window.to_le_bytes());
-        data.extend_from_slice(&supply.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&100u64.to_le_bytes());
         Instruction {
             program_id: pid(),
             accounts: vec![
@@ -1207,10 +1403,91 @@ fn init_config_rejects_a_zero_claim_window() {
         svm.send_transaction(Transaction::new_signed_with_payer(&[ix], Some(&payer.pubkey()), &[&payer], bh)).map(|_| ()).map_err(|e| format!("{:?}", e))
     };
 
-    // A ZERO claim window would make every claim impossible -> all recipients lose their COIN. Rejected.
-    assert!(send(&mut svm, build(0, 100)).is_err(), "a zero claim window must be rejected (no one could ever claim)");
-    // A valid window + fully-funded supply is accepted (the config PDA was never touched by the reject).
-    send(&mut svm, build(50, 100)).expect("a valid window + fully-funded supply is accepted");
+    // Every other input is valid for the zero-window PDA: without the explicit guard,
+    // this transaction would initialize successfully and make every claim impossible.
+    assert!(send(&mut svm, build()).is_err(), "a zero claim window must be rejected (no one could ever claim)");
+    assert!(svm.get_account(&config).map_or(true, |a| a.data.is_empty()), "the rejected zero-window config must remain uninitialized");
+}
+
+// CLAIM-WINDOW FIRST-WRITER BIND: init_config is permissionless. If the config PDA is only
+// `(coin_mint, authority)`, the first initializer can lock the funded vault into a hostile
+// claim_window_slots value before the intended setup lands. Bind the window into the config PDA so
+// a wrong-window first write hits a different address, while the intended address can still run the
+// full seal -> claim path with PDA signer seeds that include the same window.
+#[test]
+fn init_config_binds_claim_window_into_the_config_pda_and_signer_seeds() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let authority = Keypair::new();
+    let intended_window = 1_000_000u64;
+    let hostile_window = 1u64;
+    let config = dist_config_pda(&coin_mint, &authority.pubkey(), intended_window);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100);
+    revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
+
+    let build_init = |claim_window: u64| {
+        let mut data = vec![0u8];
+        data.extend_from_slice(&claim_window.to_le_bytes());
+        data.extend_from_slice(&100u64.to_le_bytes());
+        Instruction {
+            program_id: pid(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new(config, false),
+                AccountMeta::new_readonly(vault, false),
+                AccountMeta::new_readonly(authority.pubkey(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data,
+        }
+    };
+    let send_init = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+    };
+
+    assert!(
+        send_init(&mut svm, build_init(hostile_window)).is_err(),
+        "a hostile claim window must not initialize the intended config PDA"
+    );
+    assert!(
+        svm.get_account(&config).map_or(true, |a| a.data.is_empty()),
+        "the failed wrong-window attempt left the intended config uninitialized"
+    );
+    send_init(&mut svm, build_init(intended_window)).expect("intended window initializes");
+
+    let mut env = Env {
+        svm,
+        payer,
+        coin_mint,
+        mint_authority,
+        config,
+        vault,
+        authority,
+    };
+    let proposal = env.create_proposal(1, 1);
+    let (recipient, recipient_ata) = env.new_recipient();
+    env.append(&proposal, &[(recipient.pubkey(), 100)])
+        .expect("append recipient");
+    let auth = clone_kp(&env.authority);
+    env.seal(&proposal, &auth).expect("seal");
+    env.claim(&proposal, &recipient, &recipient_ata, 0)
+        .expect("claim signed by the window-bound config PDA");
+    assert_eq!(env.token_amount(&recipient_ata), 100);
 }
 
 // Fixed-supply invariant (README Safety §4): a COIN whose mint authority is NOT
@@ -1225,7 +1502,7 @@ fn init_config_rejects_a_mintable_coin() {
     let mint_authority = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
     let auth = Keypair::new().pubkey();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), auth.as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &auth, 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100);
 
@@ -1293,7 +1570,7 @@ fn init_config_rejects_a_freezable_coin() {
     let coin_mint = mint.pubkey();
 
     let auth = Keypair::new().pubkey();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), auth.as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &auth, 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100); // entire supply -> vault
     // Revoke ONLY the mint authority; leave the freeze authority live (the dangerous case).
@@ -1321,6 +1598,140 @@ fn init_config_rejects_a_freezable_coin() {
     );
 }
 
+// PERMANENT VAULT-FREEZE DOS: revoking a mint's freeze authority does not thaw accounts that were
+// frozen first. The mint then satisfies both fixed-supply authority checks, but the config PDA can
+// never transfer or burn the vault balance. Init must reject the terminal Frozen account state.
+#[test]
+fn init_config_rejects_an_already_frozen_vault_after_freeze_authority_revocation() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(pid(), so_path()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let mint_authority = Keypair::new();
+    let freeze_authority = Keypair::new();
+
+    let mint = Keypair::new();
+    let rent = svm.minimum_balance_for_rent_exemption(spl_token::state::Mint::LEN);
+    let ixs = [
+        system_instruction::create_account(
+            &payer.pubkey(),
+            &mint.pubkey(),
+            rent,
+            spl_token::state::Mint::LEN as u64,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_mint(
+            &spl_token::ID,
+            &mint.pubkey(),
+            &mint_authority.pubkey(),
+            Some(&freeze_authority.pubkey()),
+            6,
+        )
+        .unwrap(),
+    ];
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[&payer, &mint],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).unwrap();
+    let coin_mint = mint.pubkey();
+
+    let authority = Pubkey::new_unique();
+    let config = dist_config_pda(&coin_mint, &authority, 1_000_000);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
+    mint_to(
+        &mut svm,
+        &payer,
+        &coin_mint,
+        &mint_authority,
+        &vault,
+        100,
+    );
+
+    let freeze = spl_token::instruction::freeze_account(
+        &spl_token::ID,
+        &vault,
+        &coin_mint,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke_mint = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &coin_mint,
+        None,
+        spl_token::instruction::AuthorityType::MintTokens,
+        &mint_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let revoke_freeze = spl_token::instruction::set_authority(
+        &spl_token::ID,
+        &coin_mint,
+        None,
+        spl_token::instruction::AuthorityType::FreezeAccount,
+        &freeze_authority.pubkey(),
+        &[],
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[freeze, revoke_mint, revoke_freeze],
+        Some(&payer.pubkey()),
+        &[&payer, &mint_authority, &freeze_authority],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(tx).unwrap();
+
+    let mint_state = spl_token::state::Mint::unpack(&svm.get_account(&coin_mint).unwrap().data)
+        .unwrap();
+    let vault_state = spl_token::state::Account::unpack(&svm.get_account(&vault).unwrap().data)
+        .unwrap();
+    assert!(mint_state.mint_authority.is_none());
+    assert!(mint_state.freeze_authority.is_none());
+    assert_eq!(mint_state.supply, 100);
+    assert_eq!(vault_state.amount, 100);
+    assert_eq!(
+        vault_state.state,
+        spl_token::state::AccountState::Frozen,
+        "revocation leaves the vault permanently frozen"
+    );
+
+    let mut data = vec![0u8];
+    data.extend_from_slice(&1_000_000u64.to_le_bytes());
+    data.extend_from_slice(&100u64.to_le_bytes());
+    let init = Instruction {
+        program_id: pid(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new(config, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data,
+    };
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        &[init],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
+    );
+    assert!(
+        svm.send_transaction(tx).is_err(),
+        "a permanently frozen full-supply vault must not initialize distribution"
+    );
+    assert_eq!(
+        svm.get_account(&config).map(|account| account.data.len()),
+        None,
+        "a rejected frozen vault cannot consume the canonical config PDA"
+    );
+}
+
 // Once the entire COIN supply is the distribution pool (and mint authority revoked),
 // the config is accepted — proving every COIN that exists is in this vault.
 #[test]
@@ -1332,7 +1743,7 @@ fn init_config_accepts_a_fully_in_vault_fixed_supply_coin() {
     let mint_authority = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
     let authority = Pubkey::new_unique();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority, 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100); // entire supply -> vault
     revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
@@ -1374,7 +1785,7 @@ fn lamport_prefund_cannot_brick_config_init() {
     let mint_authority = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
     let authority = Pubkey::new_unique();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority, 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100);
     revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
@@ -1449,7 +1860,7 @@ fn init_config_authority_bound_blocks_funded_vault_hijack() {
 
     // Deployer's legit config + funded vault (vault owned by the LEGIT, authority-bound config PDA).
     let legit_authority = Pubkey::new_unique();
-    let legit_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), legit_authority.as_ref()], &pid()).0;
+    let legit_config = dist_config_pda(&coin_mint, &legit_authority, 1_000_000);
     let vault = create_token_account(&mut svm, &payer, &coin_mint, &legit_config);
     mint_to(&mut svm, &payer, &coin_mint, &mint_authority, &vault, 100);
     revoke_mint_authority(&mut svm, &payer, &coin_mint, &mint_authority);
@@ -1466,7 +1877,7 @@ fn init_config_authority_bound_blocks_funded_vault_hijack() {
 
     // ATTACK: front-run init with authority=attacker pointed at the legit funded vault.
     let attacker = Keypair::new();
-    let attacker_config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), attacker.pubkey().as_ref()], &pid()).0;
+    let attacker_config = dist_config_pda(&coin_mint, &attacker.pubkey(), 1_000_000);
     assert_ne!(attacker_config, legit_config);
     let bh = svm.latest_blockhash();
     assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[init(attacker_config, attacker.pubkey())], Some(&payer.pubkey()), &[&payer], bh)).is_err(),
@@ -1494,7 +1905,7 @@ fn init_config_rejects_a_vault_of_the_wrong_mint_no_bricked_undistributable_gene
     let mint_authority = Keypair::new();
     let coin_mint = create_mint(&mut svm, &payer, &mint_authority.pubkey());
     let authority = Pubkey::new_unique();
-    let config = Pubkey::find_program_address(&[b"dist_config", coin_mint.as_ref(), authority.as_ref()], &pid()).0;
+    let config = dist_config_pda(&coin_mint, &authority, 1_000_000);
 
     // coin_mint's ENTIRE 100 supply is minted (to a decoy) so the supply==total_supply check passes and we
     // REACH the vault.mint guard; then revoke the authority (fixed-supply invariant).
