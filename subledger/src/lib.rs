@@ -46,8 +46,8 @@ declare_id!("Sub1edger1111111111111111111111111111111111");
 const POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // Pool now also carries the Percolator refs (market_slab + percolator_program) so
-// an insurance pool can sign TopUpInsurance / WithdrawInsuranceLimited as the
-// asset-0 insurance authority/operator. Own-vault pools leave them zero. The trailing
+// an insurance pool can sign domain top-ups / asset-wide withdrawals as the asset-0
+// insurance authority/operator. Own-vault pools leave them zero. The trailing
 // vote_authority (the genesis-vote config PDA) may toggle a position's vote-lock.
 // Branch `risidual_genesis_never_push_upstream`: POLICY_WITH_SURPLUS pools are now
 // SHARE-based so exit pays a TENURE-FAIR slice of the surplus (a late depositor cannot
@@ -202,17 +202,17 @@ const IX_RETURN_FINALIZED_POSITION: u8 = 12;
 // position that authorized it.
 const IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 
-// Percolator CPI tags (verified against the pinned v16 program, percolator-prog 624b13d).
-const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
+// Percolator CPI tags (verified against the pinned v16 program, percolator-prog 7eea209).
+const PERC_IX_TOP_UP_INSURANCE_DOMAIN: u8 = 56;
 // tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
-// insurance-operator-gated, during-Live insurance withdraw that REPLACED the removed asset-0 tag-23
-// WithdrawInsuranceLimited (reconcile, finding JX/JS). The percolator caps `amount` to the available
+// insurance-operator-gated, during-Live insurance withdraw that replaced the removed asset-0 tag-23.
+// The percolator caps `amount` to the available
 // insurance; the subledger's own per-owner owed computation is the depositor-principal cap on top.
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const ASSET_AUTH_ADMIN: u8 = 0;
-const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates TopUpInsurance)
-const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates WithdrawInsuranceLimited)
+const ASSET_AUTH_INSURANCE: u8 = 1; // insurance_authority (gates insurance top-ups)
+const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2; // insurance_operator (gates insurance withdrawals)
 const TWAP_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("TwapBuyBurn11111111111111111111111111111111");
 const TWAP_IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
@@ -808,6 +808,149 @@ fn wide_mul_div_floor(a: u128, b: u128, denom: u128) -> Option<u128> {
 fn wide_mul_div_ceil(a: u128, b: u128, denom: u128) -> Option<u128> {
     let (quotient, remainder) = wide_mul_div_rem(a, b, denom)?;
     quotient.checked_add(u128::from(remainder != 0))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InsuranceWithdrawalPlan {
+    gross_withdrawal: u128,
+    redeposit: [u128; 2],
+}
+
+fn balanced_principal_domains(total: u64) -> [u128; 2] {
+    let long = u128::from(total / 2);
+    [long, u128::from(total) - long]
+}
+
+fn insurance_deposit_domain_delta(
+    principal_before: u64,
+    amount: u64,
+) -> Result<[u128; 2], ProgramError> {
+    let principal_after = principal_before
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let before = balanced_principal_domains(principal_before);
+    let after = balanced_principal_domains(principal_after);
+    Ok([
+        after[0]
+            .checked_sub(before[0])
+            .ok_or(ProgramError::InvalidAccountData)?,
+        after[1]
+            .checked_sub(before[1])
+            .ok_or(ProgramError::InvalidAccountData)?,
+    ])
+}
+
+fn insurance_withdraw_domain_delta(
+    principal_before: u64,
+    amount: u64,
+) -> Result<[u128; 2], ProgramError> {
+    let principal_after = principal_before
+        .checked_sub(amount)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let before = balanced_principal_domains(principal_before);
+    let after = balanced_principal_domains(principal_after);
+    Ok([
+        before[0]
+            .checked_sub(after[0])
+            .ok_or(ProgramError::InvalidAccountData)?,
+        before[1]
+            .checked_sub(after[1])
+            .ok_or(ProgramError::InvalidAccountData)?,
+    ])
+}
+
+/// Percolator's asset-wide withdrawal consumes the long domain before the short
+/// domain. Withdraw only far enough to reach this principal tranche's short-domain
+/// debit, then put the excess long-domain amount back. Surplus follows the residual
+/// domain balances. Reservation floors constrain the split only when market risk has
+/// made the ideal debit unavailable.
+fn insurance_withdrawal_plan(
+    balance: percolator_accounting::InsuranceAssetBalance,
+    payout: u128,
+    principal_debit: [u128; 2],
+) -> Result<InsuranceWithdrawalPlan, ProgramError> {
+    let domain_total = balance.domains[0]
+        .remaining_atoms
+        .checked_add(balance.domains[1].remaining_atoms)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let principal_total = principal_debit[0]
+        .checked_add(principal_debit[1])
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if payout == 0
+        || principal_total == 0
+        || payout > balance.remaining_atoms
+        || payout > balance.withdrawable_atoms
+        || domain_total != balance.remaining_atoms
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let long_capacity = core::cmp::min(
+        balance.withdrawable_atoms,
+        balance.domains[0].withdrawable_atoms,
+    );
+    let short_capacity = balance
+        .withdrawable_atoms
+        .checked_sub(long_capacity)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    if short_capacity > balance.domains[1].withdrawable_atoms {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let ideal_long_debit = if payout <= principal_total {
+        wide_mul_div_floor(payout, principal_debit[0], principal_total)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+    } else {
+        let surplus = payout
+            .checked_sub(principal_total)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        let residual_long = balance.domains[0]
+            .remaining_atoms
+            .saturating_sub(principal_debit[0]);
+        let residual_short = balance.domains[1]
+            .remaining_atoms
+            .saturating_sub(principal_debit[1]);
+        let residual_total = residual_long
+            .checked_add(residual_short)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        if surplus > residual_total {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        principal_debit[0]
+            .checked_add(
+                wide_mul_div_floor(surplus, residual_long, residual_total)
+                    .ok_or(ProgramError::ArithmeticOverflow)?,
+            )
+            .ok_or(ProgramError::ArithmeticOverflow)?
+    };
+    let minimum_long_debit = payout.saturating_sub(short_capacity);
+    let maximum_long_debit = core::cmp::min(payout, long_capacity);
+    if minimum_long_debit > maximum_long_debit {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let long_debit = core::cmp::max(
+        minimum_long_debit,
+        core::cmp::min(ideal_long_debit, maximum_long_debit),
+    );
+    let short_debit = payout
+        .checked_sub(long_debit)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let (gross_withdrawal, long_redeposit) = if short_debit == 0 {
+        (long_debit, 0)
+    } else {
+        (
+            long_capacity
+                .checked_add(short_debit)
+                .ok_or(ProgramError::ArithmeticOverflow)?,
+            long_capacity
+                .checked_sub(long_debit)
+                .ok_or(ProgramError::InvalidAccountData)?,
+        )
+    };
+    Ok(InsuranceWithdrawalPlan {
+        gross_withdrawal,
+        redeposit: [long_redeposit, 0],
+    })
 }
 
 /// `(x + y) mod denom` and `floor((x + y) / denom)` for `x,y < denom`.
@@ -1913,8 +2056,8 @@ fn process_init_insurance_pool(
 // data: amount (u64)
 //
 // User -> holding (user-signed). Then the pool PDA (asset-0 insurance authority)
-// signs TopUpInsurance moving holding -> Percolator insurance vault. Records the
-// position (principal += amount, start_slot = now) and bumps outstanding.
+// tops up the two Percolator domains against the pool-wide 50/50 principal target.
+// Records the position (principal += amount, start_slot = now) and bumps outstanding.
 fn process_insurance_deposit(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2002,6 +2145,11 @@ fn process_insurance_deposit(
         priced_balance_before,
         virtual_shares,
     )?;
+    let deposit_domains = insurance_deposit_domain_delta(pool.outstanding_principal, amount)?;
+    let outstanding_after = pool
+        .outstanding_principal
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     // Position PDA (one per owner per pool).
     let pos_seeds = position_seeds(pool_account.key, owner.key);
@@ -2071,38 +2219,42 @@ fn process_insurance_deposit(
         ],
     )?;
 
-    // 2) holding -> Percolator insurance vault, signed by the pool PDA as the
-    //    asset-0 insurance authority (TopUpInsurance, tag 9).
-    let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE];
-    ix_data.extend_from_slice(&(amount as u128).to_le_bytes());
-    invoke_signed_for_pool(
-        &pool,
-        pool_seed_version,
-        &Instruction {
-            program_id: *percolator_program.key,
-            accounts: vec![
-                AccountMeta::new_readonly(*pool_account.key, true),
-                AccountMeta::new(*market_slab.key, false),
-                AccountMeta::new(*holding.key, false),
-                AccountMeta::new(*percolator_vault.key, false),
-                AccountMeta::new_readonly(*token_program.key, false),
+    // 2) holding -> Percolator insurance vault. Splitting against aggregate
+    // outstanding principal makes odd-atom rounding global to the pool: two
+    // separate one-atom deposits fund opposite domains instead of both funding short.
+    for (domain, domain_amount) in deposit_domains.into_iter().enumerate() {
+        if domain_amount == 0 {
+            continue;
+        }
+        let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE_DOMAIN];
+        ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
+        ix_data.extend_from_slice(&domain_amount.to_le_bytes());
+        invoke_signed_for_pool(
+            &pool,
+            pool_seed_version,
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*pool_account.key, true),
+                    AccountMeta::new(*market_slab.key, false),
+                    AccountMeta::new(*holding.key, false),
+                    AccountMeta::new(*percolator_vault.key, false),
+                    AccountMeta::new_readonly(*token_program.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                pool_account.clone(),
+                market_slab.clone(),
+                holding.clone(),
+                percolator_vault.clone(),
+                token_program.clone(),
+                percolator_program.clone(),
             ],
-            data: ix_data,
-        },
-        &[
-            pool_account.clone(),
-            market_slab.clone(),
-            holding.clone(),
-            percolator_vault.clone(),
-            token_program.clone(),
-            percolator_program.clone(),
-        ],
-    )?;
+        )?;
+    }
 
-    pool.outstanding_principal = pool
-        .outstanding_principal
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    pool.outstanding_principal = outstanding_after;
     position.principal = position
         .principal
         .checked_add(amount)
@@ -2131,7 +2283,7 @@ fn process_insurance_deposit(
 // data: amount (u64)
 //
 // Owner-bound, principal-only exit: `amount <= position.principal`. The pool PDA
-// (asset-0 insurance operator) signs WithdrawInsuranceLimited (tag 23). NOTE: the
+// (asset-0 insurance operator) signs WithdrawInsuranceAsset (tag 57). NOTE: the
 // real percolator handler requires the withdraw destination to be owned by the
 // *operator* (the pool PDA), not an arbitrary user, so we withdraw into a
 // pool-PDA-owned holding account and then SPL-transfer holding -> owner's ATA
@@ -2336,7 +2488,21 @@ fn process_insurance_withdraw_impl(
     // at deposit, so losses follow the capital that was present when they happened;
     // equal-entry positions remain pro-rata and exit-order independent. The full
     // requested principal leaves outstanding accounting even when the payout is impaired.
-    let insurance = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
+    let (insurance, live_insurance_balance) = {
+        let market_data = market_slab.try_borrow_data()?;
+        let insurance = read_asset0_insurance(&market_data)?;
+        let live_balance = if percolator_accounting::market_is_live(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            Some(
+                percolator_accounting::read_asset_insurance_balance(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+            )
+        } else {
+            None
+        };
+        (insurance, live_balance)
+    };
     let priced_balance = if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(insurance, pool.outstanding_principal)
     } else {
@@ -2405,6 +2571,7 @@ fn process_insurance_withdraw_impl(
         .outstanding_principal
         .checked_sub(amount)
         .ok_or(ProgramError::InvalidAccountData)?;
+    let principal_debit = insurance_withdraw_domain_delta(pool.outstanding_principal, amount)?;
     let insurance_after = insurance
         .checked_sub(owed)
         .ok_or(ProgramError::InvalidAccountData)?;
@@ -2425,17 +2592,45 @@ fn process_insurance_withdraw_impl(
         )?
     };
 
-    // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceLimited,
+    // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceAsset,
     // moving Percolator insurance -> pool-PDA-owned holding.
     // A fully-impaired exit (owed == 0, insurance wiped) still retires the position below; only
     // move tokens when there is something to pay (percolator rejects a zero-amount withdraw).
     if owed > 0 {
+        // In a live market, an asset-wide Percolator withdrawal debits the long domain first.
+        // Withdrawing only `owed` would let a temporary depositor round-trip principal and move
+        // another owner's protection into the short domain. Atomically withdraw far enough to
+        // reverse this principal tranche's short debit and re-credit the excess long amount.
+        // Any surplus payout follows the residual domain balances. Resolved markets
+        // have no future side risk and reject live domain top-ups, so terminal returns
+        // keep the direct path.
+        let plan = live_insurance_balance
+            .map(|balance| insurance_withdrawal_plan(balance, owed as u128, principal_debit))
+            .transpose()?;
+        if let Some(plan) = plan {
+            if plan.redeposit != [0, 0]
+                && percolator_accounting::read_asset_insurance_authority(
+                    &market_slab.try_borrow_data()?,
+                    0,
+                )
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                    != pool_account.key.to_bytes()
+            {
+                // The compensating domain top-up is authority-gated. Reject before
+                // moving tokens if a predecessor layout split the insurance roles.
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        let gross_withdrawal = plan
+            .map(|plan| plan.gross_withdrawal)
+            .unwrap_or(owed as u128);
+        u64::try_from(gross_withdrawal).map_err(|_| ProgramError::ArithmeticOverflow)?;
         let mut ix_data = vec![PERC_IX_WITHDRAW_INSURANCE_ASSET];
-        // TopUpInsurance has always credited asset 0. Historical public init accepted
-        // nonzero metadata IDs, but those remain PDA seed material only; routing an
-        // exit by that stale value would strand the asset-0 principal it actually funded.
+        // Genesis insurance deposits have always credited asset 0. Historical public
+        // init accepted nonzero metadata IDs, but those remain PDA seed material only;
+        // routing an exit by that stale value would strand the asset-0 principal.
         ix_data.extend_from_slice(&0u16.to_le_bytes());
-        ix_data.extend_from_slice(&(owed as u128).to_le_bytes());
+        ix_data.extend_from_slice(&gross_withdrawal.to_le_bytes());
         invoke_signed_for_pool(
             &pool,
             pool_seed_version,
@@ -2461,6 +2656,40 @@ fn process_insurance_withdraw_impl(
                 percolator_program.clone(),
             ],
         )?;
+
+        if let Some(plan) = plan {
+            for (domain, amount) in plan.redeposit.into_iter().enumerate() {
+                if amount == 0 {
+                    continue;
+                }
+                let mut ix_data = vec![PERC_IX_TOP_UP_INSURANCE_DOMAIN];
+                ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
+                ix_data.extend_from_slice(&amount.to_le_bytes());
+                invoke_signed_for_pool(
+                    &pool,
+                    pool_seed_version,
+                    &Instruction {
+                        program_id: *percolator_program.key,
+                        accounts: vec![
+                            AccountMeta::new_readonly(*pool_account.key, true),
+                            AccountMeta::new(*market_slab.key, false),
+                            AccountMeta::new(*holding.key, false),
+                            AccountMeta::new(*percolator_vault.key, false),
+                            AccountMeta::new_readonly(*token_program.key, false),
+                        ],
+                        data: ix_data,
+                    },
+                    &[
+                        pool_account.clone(),
+                        market_slab.clone(),
+                        holding.clone(),
+                        percolator_vault.clone(),
+                        token_program.clone(),
+                        percolator_program.clone(),
+                    ],
+                )?;
+            }
+        }
 
         // holding -> owner's ATA, signed by the pool PDA. The only path out, bounded by the
         // owner's pro-rata share, so the program can never pay more than is owed.
@@ -2913,6 +3142,147 @@ fn process_assert_principal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insurance_balance(
+        long_remaining: u128,
+        long_withdrawable: u128,
+        short_remaining: u128,
+        short_withdrawable: u128,
+        total_withdrawable: u128,
+    ) -> percolator_accounting::InsuranceAssetBalance {
+        percolator_accounting::InsuranceAssetBalance {
+            domains: [
+                percolator_accounting::InsuranceDomainBalance {
+                    remaining_atoms: long_remaining,
+                    withdrawable_atoms: long_withdrawable,
+                },
+                percolator_accounting::InsuranceDomainBalance {
+                    remaining_atoms: short_remaining,
+                    withdrawable_atoms: short_withdrawable,
+                },
+            ],
+            remaining_atoms: long_remaining + short_remaining,
+            withdrawable_atoms: total_withdrawable,
+        }
+    }
+
+    #[test]
+    fn live_insurance_exit_preserves_balanced_domains() {
+        let plan = insurance_withdrawal_plan(
+            insurance_balance(100, 100, 100, 100, 200),
+            80,
+            [40, 40],
+        )
+        .unwrap();
+        assert_eq!(
+            plan,
+            InsuranceWithdrawalPlan {
+                gross_withdrawal: 140,
+                redeposit: [60, 0],
+            }
+        );
+    }
+
+    #[test]
+    fn live_insurance_exit_reverses_its_principal_split_in_asymmetric_domains() {
+        let plan = insurance_withdrawal_plan(
+            insurance_balance(100, 100, 300, 300, 400),
+            80,
+            [40, 40],
+        )
+        .unwrap();
+        assert_eq!(plan.gross_withdrawal, 140);
+        assert_eq!(plan.redeposit, [60, 0]);
+    }
+
+    #[test]
+    fn live_insurance_exit_respects_domain_reservation_floors() {
+        let plan = insurance_withdrawal_plan(
+            insurance_balance(100, 10, 100, 100, 110),
+            80,
+            [40, 40],
+        )
+        .unwrap();
+        assert_eq!(plan.gross_withdrawal, 80);
+        assert_eq!(plan.redeposit, [0, 0]);
+        assert!(
+            insurance_withdrawal_plan(
+                insurance_balance(100, 10, 100, 100, 110),
+                111,
+                [56, 55],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn live_insurance_exit_honors_the_global_withdraw_capacity() {
+        let plan = insurance_withdrawal_plan(
+            insurance_balance(100, 100, 100, 100, 150),
+            50,
+            [25, 25],
+        )
+        .unwrap();
+        assert_eq!(plan.gross_withdrawal, 125);
+        assert_eq!(plan.redeposit, [75, 0]);
+    }
+
+    #[test]
+    fn pool_wide_odd_atom_splits_reverse_for_every_small_round_trip() {
+        for principal_before in 0..32u64 {
+            for amount in 1..32u64 {
+                let deposit = insurance_deposit_domain_delta(principal_before, amount).unwrap();
+                let withdraw = insurance_withdraw_domain_delta(
+                    principal_before.checked_add(amount).unwrap(),
+                    amount,
+                )
+                .unwrap();
+                assert_eq!(deposit, withdraw);
+                assert_eq!(deposit[0] + deposit[1], u128::from(amount));
+            }
+        }
+    }
+
+    #[test]
+    fn impaired_payout_cannot_debit_beyond_its_nominal_domain_tranche() {
+        for principal_before in 1..32u64 {
+            for requested in 1..=principal_before {
+                let principal_debit =
+                    insurance_withdraw_domain_delta(principal_before, requested).unwrap();
+                for payout in 1..=requested {
+                    let balance = insurance_balance(1_000, 1_000, 1_000, 1_000, 2_000);
+                    let plan = insurance_withdrawal_plan(
+                        balance,
+                        u128::from(payout),
+                        principal_debit,
+                    )
+                    .unwrap();
+                    let gross_long_debit = core::cmp::min(
+                        plan.gross_withdrawal,
+                        balance.domains[0].withdrawable_atoms,
+                    );
+                    let gross_short_debit = plan.gross_withdrawal - gross_long_debit;
+                    let long_debit = gross_long_debit - plan.redeposit[0];
+                    let short_debit = gross_short_debit - plan.redeposit[1];
+                    assert_eq!(long_debit + short_debit, u128::from(payout));
+                    assert!(long_debit <= principal_debit[0]);
+                    assert!(short_debit <= principal_debit[1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_surplus_exit_takes_principal_first_then_residual_yield() {
+        let plan = insurance_withdrawal_plan(
+            insurance_balance(150, 150, 250, 250, 400),
+            120,
+            [40, 40],
+        )
+        .unwrap();
+        assert_eq!(plan.gross_withdrawal, 217);
+        assert_eq!(plan.redeposit, [97, 0]);
+    }
 
     // Authoritative pin for the exported POS_* offsets (finding HF follow-up): a Position serialized
     // with distinct field values must decode those values at exactly the published offsets. If the
