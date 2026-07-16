@@ -2,9 +2,9 @@
 
 use core::mem::{offset_of, size_of};
 use percolator::{
-    BackingBucketV16Account, EngineAssetSlotV16Account, Market, MarketGroupV16HeaderAccount,
-    InsuranceCreditReservationV16Account, PortfolioAccountV16Account,
-    ProvenanceHeaderV16Account, V16ConfigAccount, BOUND_SCALE,
+    BackingBucketV16Account, EngineAssetSlotV16Account, InsuranceCreditReservationV16Account,
+    Market, MarketGroupV16HeaderAccount, PortfolioAccountV16Account, ProvenanceHeaderV16Account,
+    V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -208,6 +208,7 @@ pub struct PortfolioRewardSnapshot {
     pub market_group: [u8; 32],
     pub portfolio: [u8; 32],
     pub owner: [u8; 32],
+    pub portfolio_id: u64,
     pub residual_crystallized_loss: u128,
     pub residual_spent_principal: u128,
     pub residual_received: u128,
@@ -295,6 +296,8 @@ pub fn read_portfolio_reward_snapshot(
         provenance + offset_of!(ProvenanceHeaderV16Account, layout_discriminator),
     )?;
     let owner = bytes(data, base + offset_of!(PortfolioAccountV16Account, owner))?;
+    let portfolio_id = percolator_prog::state::read_portfolio_id(data)
+        .map_err(|_| ReadError::InvalidAccounting)?;
     if recorded_portfolio != *portfolio
         || provenance_owner != owner
         || market_group == [0u8; 32]
@@ -309,6 +312,7 @@ pub fn read_portfolio_reward_snapshot(
         market_group,
         portfolio: recorded_portfolio,
         owner,
+        portfolio_id,
         residual_crystallized_loss: counter(offset_of!(
             PortfolioAccountV16Account,
             residual_crystallized_loss_atoms_total
@@ -405,10 +409,7 @@ pub fn read_permissionless_market_init_fee(data: &[u8]) -> Result<u128, ReadErro
 /// Percolator authenticates instruction-supplied slots against both the Clock sysvar
 /// and its monotonic market slot. Controller value paths must use the same maximum so
 /// they cannot race a resolution snapshot using a lagging Clock or market header.
-pub fn permissionless_resolution_matured(
-    data: &[u8],
-    clock_slot: u64,
-) -> Result<bool, ReadError> {
+pub fn permissionless_resolution_matured(data: &[u8], clock_slot: u64) -> Result<bool, ReadError> {
     validate_market(data)?;
     let stale_slots = read_u64(data, PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET)?;
     if stale_slots == 0 {
@@ -736,12 +737,11 @@ mod tests {
         portfolio: [u8; 32],
         owner: [u8; 32],
     ) -> Vec<u8> {
-        let mut data = vec![0u8; HEADER_LEN + size_of::<PortfolioAccountV16Account>()];
+        let mut data = vec![0u8; percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN];
         data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         data[8..10].copy_from_slice(&VERSION.to_le_bytes());
         data[10] = KIND_PORTFOLIO;
-        let provenance =
-            HEADER_LEN + offset_of!(PortfolioAccountV16Account, provenance_header);
+        let provenance = HEADER_LEN + offset_of!(PortfolioAccountV16Account, provenance_header);
         data[provenance + offset_of!(ProvenanceHeaderV16Account, market_group_id)
             ..provenance + offset_of!(ProvenanceHeaderV16Account, market_group_id) + 32]
             .copy_from_slice(&market);
@@ -759,9 +759,12 @@ mod tests {
             .copy_from_slice(&PORTFOLIO_LAYOUT_DISCRIMINATOR.to_le_bytes());
         let owner_offset = HEADER_LEN + offset_of!(PortfolioAccountV16Account, owner);
         data[owner_offset..owner_offset + 32].copy_from_slice(&owner);
-        let paid = HEADER_LEN
-            + offset_of!(PortfolioAccountV16Account, funding_long_paid_atoms_total);
+        let paid =
+            HEADER_LEN + offset_of!(PortfolioAccountV16Account, funding_long_paid_atoms_total);
         data[paid..paid + 16].copy_from_slice(&42u128.to_le_bytes());
+        data[percolator_prog::constants::PORTFOLIO_ID_OFF
+            ..percolator_prog::constants::PORTFOLIO_ID_OFF + 8]
+            .copy_from_slice(&7u64.to_le_bytes());
         data
     }
 
@@ -975,10 +978,8 @@ mod tests {
                                 [long_withdrawable, short_withdrawable],
                                 total_withdrawable,
                             );
-                            let long_capacity = core::cmp::min(
-                                total_withdrawable,
-                                long_withdrawable,
-                            );
+                            let long_capacity =
+                                core::cmp::min(total_withdrawable, long_withdrawable);
                             let short_capacity = total_withdrawable - long_capacity;
                             for payout in 0..=core::cmp::min(total, total_withdrawable) {
                                 let target_total = total - payout;
@@ -1041,8 +1042,19 @@ mod tests {
         assert_eq!(snapshot.market_group, market);
         assert_eq!(snapshot.portfolio, portfolio);
         assert_eq!(snapshot.owner, owner);
+        assert_eq!(snapshot.portfolio_id, 7);
         assert_eq!(snapshot.funding_long_paid, 42);
         assert!(snapshot.has_reward_telemetry());
+
+        let mut missing_id = data.clone();
+        missing_id[percolator_prog::constants::PORTFOLIO_ID_OFF
+            ..percolator_prog::constants::PORTFOLIO_ID_OFF + 8]
+            .fill(0);
+        assert_eq!(
+            read_portfolio_reward_snapshot(&missing_id, &portfolio),
+            Err(ReadError::InvalidAccounting),
+            "reward telemetry requires a nonzero program-assigned incarnation ID"
+        );
 
         let mut received_only = PortfolioRewardSnapshot::default();
         received_only.funding_long_received = 1;
