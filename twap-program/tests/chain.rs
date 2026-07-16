@@ -33785,6 +33785,59 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         "the first half atom remains owed to the external surplus routes",
     );
 
+    // Raise the protected floor one atom above live insurance, matching an impairment without
+    // injecting impossible Percolator state. A public no-op round must preserve the fractional
+    // entitlement without pulling from either principal domain.
+    let impaired_floor = (one_atom_surplus_floor + 2) as u128;
+    let impair = build_set_reserved_floor_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        impaired_floor,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &impair,
+        &floor_accounts,
+    )
+    .expect("raise the protected floor above live insurance");
+    let domains_before_impaired_round = read_asset_insurance_domains(&svm, &env.slab, 0);
+    let impaired_round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, impaired_round_end);
+    send(
+        &mut svm,
+        &[&first_cranker],
+        execute_ix(
+            &first_cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute with insurance below the protected floor");
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &env.slab, 0),
+        domains_before_impaired_round,
+        "a carried fraction cannot debit either protected insurance domain",
+    );
+    assert_eq!(
+        read_split_remainders_bps(&svm, &env.twap_cfg)[1],
+        5_000,
+        "zero live surplus preserves the half-atom carry",
+    );
+
     let donor = Keypair::new();
     svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
     let donor_source = Pubkey::new_unique();
@@ -33793,14 +33846,14 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         &donor_source,
         &env.collateral_mint,
         &donor.pubkey(),
-        1,
+        2,
     );
     send(
         &mut svm,
         &[&donor],
-        donate_insurance_ix(&donor.pubkey(), &env, &donor_source, &bk.holding, 1),
+        donate_insurance_ix(&donor.pubkey(), &env, &donor_source, &bk.holding, 2),
     )
-    .expect("inject the next round's one-atom surplus");
+    .expect("restore the floor and inject the next round's one-atom surplus");
 
     let second_round_end = {
         let book = svm.get_account(&bk.book).unwrap();
@@ -33838,8 +33891,8 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
     );
     assert_eq!(
         read_reserved_floor(&svm, &env.twap_cfg),
-        (one_atom_surplus_floor + 1) as u128,
-        "only one of the two atoms belongs to protected insurance",
+        impaired_floor,
+        "the carried pull consumes only the atom above the raised floor",
     );
 
     // Continue with a 50/50 auction-versus-savings policy. The combined share is 100%, so each
@@ -33872,7 +33925,7 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         &env.multisig,
         &env.dao,
         &payer,
-        8,
+        9,
         &economics,
         &economics_accounts,
     )
@@ -33924,7 +33977,7 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
     assert_eq!(token_amount(&svm, &savings_sink), 1);
     assert_eq!(
         read_reserved_floor(&svm, &env.twap_cfg),
-        (one_atom_surplus_floor + 1) as u128,
+        impaired_floor,
         "a 100% external policy cannot ratchet route-rounding dust into insurance",
     );
 }
