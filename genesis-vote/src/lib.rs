@@ -83,6 +83,8 @@ pub const DIST_PROPOSAL_ENTRY_COUNT_OFF: usize = 84;
 pub const DIST_PROPOSAL_TOTAL_AMOUNT_OFF: usize = 88;
 // Distribution config: disc[8], coin_mint[8..40], vault[40..72], authority[72..104].
 const DIST_CONFIG_DISC: [u8; 8] = *b"DISTCFG1";
+const DIST_CONFIG_TOTAL_SUPPLY_OFF: usize = 112;
+const DIST_CONFIG_REQUIRED_SIZE: usize = DIST_CONFIG_TOTAL_SUPPLY_OFF + 8;
 // Canonical distribution program (finding IC; the gv dual of residual's HK). init_config must pin the
 // wired distribution_program to THIS id — without it an attacker could deploy a fake "distribution
 // program", craft a config owned by it that passes every byte check (disc/coin/authority), and
@@ -315,6 +317,31 @@ fn read_sub_pool_outstanding(data: &[u8]) -> Result<u64, ProgramError> {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(u64::from_le_bytes(data[SUB_POOL_OUTSTANDING_OFF..SUB_POOL_OUTSTANDING_OFF + 8].try_into().unwrap()))
+}
+
+fn read_bound_distribution_supply(
+    distribution_config: &AccountInfo<'_>,
+    config_account: &AccountInfo<'_>,
+    config: &Config,
+) -> Result<u64, ProgramError> {
+    if *distribution_config.key != config.distribution_config
+        || distribution_config.owner != &config.distribution_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let data = distribution_config.try_borrow_data()?;
+    if data.len() < DIST_CONFIG_REQUIRED_SIZE
+        || data[..8] != DIST_CONFIG_DISC
+        || Pubkey::new_from_array(data[8..40].try_into().unwrap()) != config.coin_mint
+        || Pubkey::new_from_array(data[72..104].try_into().unwrap()) != *config_account.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(u64::from_le_bytes(
+        data[DIST_CONFIG_TOTAL_SUPPLY_OFF..DIST_CONFIG_REQUIRED_SIZE]
+            .try_into()
+            .unwrap(),
+    ))
 }
 
 fn terminal_refund_start_slot(data: &[u8], config: &Config) -> Result<u64, ProgramError> {
@@ -810,13 +837,14 @@ fn init_config<'a>(
 }
 
 // register_proposal accounts: [payer(s,w), config, proposal_vote(pda,w),
-//   distribution_proposal, system]
+//   distribution_proposal, distribution_config, system]
 fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let payer = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let proposal_account = next_account_info(iter)?;
     let distribution_proposal = next_account_info(iter)?;
+    let distribution_config = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
 
     if !payer.is_signer {
@@ -826,6 +854,7 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
         return Err(ProgramError::IllegalOwner);
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let total_supply = read_bound_distribution_supply(distribution_config, config_account, &config)?;
     // The proposal must be a real distribution proposal owned by the distribution
     // program (so votes can only target genuine distributions).
     if distribution_proposal.owner != &config.distribution_program {
@@ -876,7 +905,8 @@ fn register_proposal<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>]) -
                 .try_into()
                 .unwrap(),
         );
-        if entry_count == 0 || entry_count != capacity {
+        if entry_count == 0 || entry_count != capacity || total_amount != total_supply {
+            msg!("genesis proposal must allocate the entire fixed supply");
             return Err(ProgramError::InvalidAccountData);
         }
         (entry_count, total_amount)
@@ -1295,6 +1325,14 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
         || *distribution_config.key != config.distribution_config
         || *distribution_proposal.key != pv.distribution_proposal
     {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Genesis is stricter than the reusable Distribution program: a winning
+    // genesis proposal must allocate all fixed COIN, never burn headroom.
+    if read_bound_distribution_supply(distribution_config, config_account, &config)?
+        != pv.snapshot_total_amount
+    {
+        msg!("genesis proposal does not allocate the entire fixed supply");
         return Err(ProgramError::InvalidAccountData);
     }
     // Anti bait-and-switch: the distribution proposal must be UNCHANGED since it was

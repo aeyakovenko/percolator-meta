@@ -16587,6 +16587,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
             AccountMeta::new_readonly(gv_config, false),
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(dist_config, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: vec![2u8],
@@ -18407,6 +18408,7 @@ fn register_proposal(
             AccountMeta::new_readonly(env.gv_config, false),
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(env.dist_config, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: vec![2u8],
@@ -18421,6 +18423,124 @@ fn register_proposal(
     ))
     .expect("create+register");
     (dist_proposal, gv_proposal)
+}
+
+// GENESIS SUPPLY CONSERVATION: the generic distribution program intentionally permits
+// partial allocations and burns their unallocated headroom. Genesis is stricter: its
+// winning proposal defines the initial ownership of COIN, so all fixed supply must be
+// allocated before the proposal can absorb any depositor votes.
+#[test]
+fn e2e_underallocated_genesis_proposal_never_becomes_votable() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_genesis(&mut svm, &payer);
+
+    let proposal_id = 1u64;
+    let dist_proposal = Pubkey::find_program_address(
+        &[
+            b"dist_proposal",
+            env.dist_config.as_ref(),
+            &proposal_id.to_le_bytes(),
+        ],
+        &dist_id_e2e(),
+    )
+    .0;
+    let mut create_data = vec![1u8];
+    create_data.extend_from_slice(&proposal_id.to_le_bytes());
+    create_data.extend_from_slice(&1u32.to_le_bytes());
+    let create = Instruction {
+        program_id: dist_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(env.dist_config, false),
+            AccountMeta::new(dist_proposal, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: create_data,
+    };
+    let mut append_data = vec![2u8];
+    append_data.extend_from_slice(&1u32.to_le_bytes());
+    append_data.extend_from_slice(Pubkey::new_unique().as_ref());
+    append_data.extend_from_slice(&99u64.to_le_bytes());
+    let append = Instruction {
+        program_id: dist_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(env.dist_config, false),
+            AccountMeta::new(dist_proposal, false),
+        ],
+        data: append_data,
+    };
+    svm.expire_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[create, append],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
+    ))
+    .expect("create a complete but underallocated distribution proposal");
+
+    let gv_proposal = Pubkey::find_program_address(
+        &[
+            b"gv_proposal",
+            env.gv_config.as_ref(),
+            dist_proposal.as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    let register = Instruction {
+        program_id: gv_id_e2e(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(env.gv_config, false),
+            AccountMeta::new(gv_proposal, false),
+            AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(env.dist_config, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: vec![2u8],
+    };
+    svm.expire_blockhash();
+    assert!(
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[register],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .is_err(),
+        "a proposal allocating less than the entire fixed supply must never become votable"
+    );
+    assert_eq!(
+        svm.get_account(&gv_proposal)
+            .map(|account| account.data.len())
+            .unwrap_or(0),
+        0,
+        "rejected registration leaves no vote-absorbing proposal PDA"
+    );
+
+    let recipient = Pubkey::new_unique();
+    let (_full_distribution, full_vote) =
+        register_proposal(&mut svm, &payer, &env, 2, &recipient, 100);
+    assert!(
+        svm.get_account(&full_vote)
+            .is_some_and(|account| !account.data.is_empty()),
+        "an exact-supply proposal remains votable"
+    );
 }
 
 // ATTACK PROBE (vote splitting / double influence): one voter, one proposal. A voter who has
@@ -26545,6 +26665,7 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new_readonly(gv_config, false),
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(dist_config, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: vec![2u8],
@@ -32425,6 +32546,7 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
             AccountMeta::new_readonly(env.gv_config, false),
             AccountMeta::new(gv_proposal, false),
             AccountMeta::new_readonly(dist_proposal, false),
+            AccountMeta::new_readonly(env.dist_config, false),
             AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: vec![2u8],
@@ -32441,9 +32563,8 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
         "failed registration cannot leave a stale vote target"
     );
 
-    // Fill the declared shape before registration. The remaining 25 COIN atoms
-    // are intentionally unallocated and follow the existing terminal burn rule.
-    send(&mut svm, &[&payer], append_entry(attacker_dest, 25)).expect("fill proposal capacity");
+    // Fill both the declared shape and the fixed supply before registration.
+    send(&mut svm, &[&payer], append_entry(attacker_dest, 50)).expect("fill proposal capacity and supply");
     send(&mut svm, &[&payer], register).expect("full proposal becomes votable");
 
     // alice deposits + holds for weight + backs the proposal (meets quorum + majority alone).
@@ -32524,8 +32645,8 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
     ))
     .expect("vote");
 
-    // Another 25-atom entry would remain inside the supply cap, but the full
-    // declared shape makes mutation impossible after voters approve it.
+    // The full declared shape and exact-supply allocation make mutation
+    // impossible after voters approve it.
     assert!(
         send(&mut svm, &[&payer], append_entry(Pubkey::new_unique(), 25)).is_err(),
         "a registered proposal has no append capacity left"

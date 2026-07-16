@@ -14062,3 +14062,25 @@ FIX: `trigger` authenticates the canonical Subledger pool's immutable schedule a
 marker remains the transaction-ordering guard for concurrent returns. Retraction and owner-bound principal
 recovery are unchanged. The change adds no instruction, signer, administrator, recipient, amount, token
 account, authority, CPI, or fund-moving path.
+
+## Tick - Genesis could seal less than the complete fixed COIN supply (surface B/D, PARTIAL LOF)
+
+Generic Distribution deliberately accepts an allocation at or below its fixed supply and burns unallocated
+headroom after the claim window. Genesis requires a stricter invariant: its winning proposal allocates exactly
+100% of initial COIN. The public Genesis registration path checked only that the declared entry capacity was
+full, so a complete proposal allocating 99 of 100 COIN could absorb depositor votes, seal after quorum and
+majority, and permanently burn the omitted governance/reward supply. The outcome required voter approval and
+could not debit insurance, backing, settlement tokens, or any depositor principal, so this is partial LoF rather
+than an external drain of a correctly selected allocation.
+
+The retained real-program LiteSVM regression creates the canonical market, Subledger, Distribution, and
+Genesis wiring, submits a complete 99/100 proposal through public instructions, and proves registration fails
+atomically before a vote PDA exists. Its adjacent 100/100 control remains votable. A separate upgrade regression
+reproduces a publicly reachable legacy partial proposal whose live amount matches its stored Genesis snapshot
+and proves the permissionless trigger still refuses to seal it.
+
+FIX: registration now receives the already-bound Distribution config read-only, authenticates its program,
+mint, authority, and key, and requires the proposal total to equal its immutable `total_supply`. Trigger repeats
+the exact-supply check for pre-upgrade proposal state. Generic Distribution keeps its reusable partial-allocation
+semantics. The change adds no signer, administrator, recipient, writable value account, token instruction, or
+fund-moving CPI; it adds one read-only account to Genesis proposal registration.
