@@ -155,7 +155,7 @@ capital's own tenure.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`567c76c99b117939685269c103b34a5e49284b77` and its engine layout dependency to
+`c8cf4de81951535bc0749bd4b284ad4c8e7d056c` and its engine layout dependency to
 `143e68c4917ed0400a27b952f036a5677047cd84`.
 
 That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
