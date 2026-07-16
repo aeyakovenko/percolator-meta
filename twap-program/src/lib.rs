@@ -408,6 +408,9 @@ struct Config {
     /// Set only after an atomic live owner exit returns roles to `custody_pool`.
     /// It authorizes one permissionless re-handoff to this exact config.
     rehandoff_pending: bool,
+    /// Fractional basis-point numerator carried between settled rounds. This keeps
+    /// public atom-sized fills from repeatedly rounding the reward leg down.
+    buyback_remainder_bps: u16,
 }
 
 impl Config {
@@ -429,7 +432,15 @@ impl Config {
         } else {
             0
         };
-        if custody_mode > CUSTODY_MODE_POOLLESS_EMPTY || rehandoff_pending > 1 {
+        let buyback_remainder_bps = match data.len() {
+            LEGACY_CONFIG_SIZE => u16::from_le_bytes(data[225..227].try_into().unwrap()),
+            CUSTODY_CONFIG_SIZE => u16::from_le_bytes(data[257..259].try_into().unwrap()),
+            _ => u16::from_le_bytes(data[267..269].try_into().unwrap()),
+        };
+        if custody_mode > CUSTODY_MODE_POOLLESS_EMPTY
+            || rehandoff_pending > 1
+            || buyback_remainder_bps >= BPS_DENOMINATOR
+        {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(Self {
@@ -458,6 +469,7 @@ impl Config {
             },
             custody_mode,
             rehandoff_pending: rehandoff_pending == 1,
+            buyback_remainder_bps,
         })
     }
 
@@ -488,12 +500,15 @@ impl Config {
                 data[257..265].copy_from_slice(&self.custody_principal.to_le_bytes());
                 data[265] = self.custody_mode;
                 data[266] = self.rehandoff_pending as u8;
-                data[267..CONFIG_SIZE].fill(0);
+                data[267..269].copy_from_slice(&self.buyback_remainder_bps.to_le_bytes());
+                data[269..CONFIG_SIZE].fill(0);
             } else {
-                data[257..CUSTODY_CONFIG_SIZE].fill(0);
+                data[257..259].copy_from_slice(&self.buyback_remainder_bps.to_le_bytes());
+                data[259..CUSTODY_CONFIG_SIZE].fill(0);
             }
         } else {
-            data[225..LEGACY_CONFIG_SIZE].fill(0);
+            data[225..227].copy_from_slice(&self.buyback_remainder_bps.to_le_bytes());
+            data[227..LEGACY_CONFIG_SIZE].fill(0);
         }
         Ok(())
     }
@@ -676,6 +691,7 @@ fn process_init_config(
         custody_principal: 0,
         custody_mode: CUSTODY_MODE_UNATTESTED,
         rehandoff_pending: false,
+        buyback_remainder_bps: 0,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -3964,11 +3980,13 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     if settled {
         let sink_active = book.sink_mode == SINK_SEND && clock_slot <= book.sink_cutoff_slot;
         let requested_to_sink = if sink_active {
-            mul_div_floor(
-                total_coin,
-                config.buyback_bps as u128,
-                BPS_DENOMINATOR as u128,
-            )?
+            let split_numerator = total_coin
+                .checked_mul(config.buyback_bps as u128)
+                .and_then(|value| value.checked_add(config.buyback_remainder_bps as u128))
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            config.buyback_remainder_bps =
+                (split_numerator % BPS_DENOMINATOR as u128) as u16;
+            split_numerator / BPS_DENOMINATOR as u128
         } else {
             0
         };
@@ -4602,6 +4620,7 @@ mod tests {
             custody_principal: 987_654_321,
             custody_mode: CUSTODY_MODE_POOL_BOUND,
             rehandoff_pending: true,
+            buyback_remainder_bps: 9_999,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf).unwrap();
@@ -4621,6 +4640,7 @@ mod tests {
         assert_eq!(d.custody_principal, c.custody_principal);
         assert_eq!(d.custody_mode, c.custody_mode);
         assert!(d.rehandoff_pending);
+        assert_eq!(d.buyback_remainder_bps, 9_999);
 
         let mut predecessor = [0u8; CUSTODY_CONFIG_SIZE];
         c.serialize(&mut predecessor).unwrap();
@@ -4629,6 +4649,14 @@ mod tests {
         assert_eq!(old.custody_principal, 0);
         assert_eq!(old.custody_mode, CUSTODY_MODE_UNATTESTED);
         assert!(!old.rehandoff_pending);
+        assert_eq!(old.buyback_remainder_bps, 9_999);
+
+        let mut legacy = [0u8; LEGACY_CONFIG_SIZE];
+        c.serialize(&mut legacy).unwrap();
+        assert_eq!(
+            Config::deserialize(&legacy).unwrap().buyback_remainder_bps,
+            9_999
+        );
 
         buf[265] = CUSTODY_MODE_POOLLESS_EMPTY + 1;
         assert!(matches!(
@@ -4637,6 +4665,12 @@ mod tests {
         ));
         buf[265] = CUSTODY_MODE_POOL_BOUND;
         buf[266] = 2;
+        assert!(matches!(
+            Config::deserialize(&buf),
+            Err(ProgramError::InvalidAccountData)
+        ));
+        buf[266] = 1;
+        buf[267..269].copy_from_slice(&BPS_DENOMINATOR.to_le_bytes());
         assert!(matches!(
             Config::deserialize(&buf),
             Err(ProgramError::InvalidAccountData)
