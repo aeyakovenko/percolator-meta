@@ -86,6 +86,9 @@ const CUSTODY_MODE_POOLLESS_EMPTY: u8 = 2;
 // Default surplus share routed to buy/burn (the rest is retained as insurance).
 const DEFAULT_SURPLUS_BUY_BURN_BPS: u16 = 8_000;
 const BPS_DENOMINATOR: u16 = 10_000;
+const REMAINDER_RADIX: u64 = BPS_DENOMINATOR as u64;
+const REMAINDER_RADIX_SQUARED: u64 = REMAINDER_RADIX * REMAINDER_RADIX;
+const PACKED_REMAINDER_LIMIT: u64 = REMAINDER_RADIX_SQUARED * REMAINDER_RADIX;
 
 // Percolator CPI tags (verified against the pinned real v16 program).
 // tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
@@ -411,6 +414,12 @@ struct Config {
     /// Fractional basis-point numerator carried between settled rounds. This keeps
     /// public atom-sized fills from repeatedly rounding the reward leg down.
     buyback_remainder_bps: u16,
+    /// Fractional basis-point numerator for the combined auction+savings pull. Keeping
+    /// one combined carry guarantees the two external routes can never exceed surplus.
+    external_surplus_remainder_bps: u16,
+    /// Fractional numerator used to apportion each combined pull between auction and
+    /// savings. Its denominator is the current auction+savings bps total.
+    auction_split_remainder_bps: u16,
 }
 
 impl Config {
@@ -432,14 +441,26 @@ impl Config {
         } else {
             0
         };
-        let buyback_remainder_bps = match data.len() {
-            LEGACY_CONFIG_SIZE => u16::from_le_bytes(data[225..227].try_into().unwrap()),
-            CUSTODY_CONFIG_SIZE => u16::from_le_bytes(data[257..259].try_into().unwrap()),
-            _ => u16::from_le_bytes(data[267..269].try_into().unwrap()),
+        let remainder_offset = match data.len() {
+            LEGACY_CONFIG_SIZE => 225,
+            CUSTODY_CONFIG_SIZE => 257,
+            _ => 267,
         };
+        let mut packed_remainders_bytes = [0u8; 8];
+        packed_remainders_bytes[..5]
+            .copy_from_slice(&data[remainder_offset..remainder_offset + 5]);
+        let packed_remainders = u64::from_le_bytes(packed_remainders_bytes);
+        // Three base-10_000 digits fit in the five reserved bytes because 10_000^3 < 2^40.
+        // The buyback digit stays least-significant so configs written by the predecessor
+        // (a plain little-endian u16 followed by zeroes) decode without migration.
+        let buyback_remainder_bps = (packed_remainders % REMAINDER_RADIX) as u16;
+        let external_surplus_remainder_bps =
+            ((packed_remainders / REMAINDER_RADIX) % REMAINDER_RADIX) as u16;
+        let auction_split_remainder_bps =
+            ((packed_remainders / REMAINDER_RADIX_SQUARED) % REMAINDER_RADIX) as u16;
         if custody_mode > CUSTODY_MODE_POOLLESS_EMPTY
             || rehandoff_pending > 1
-            || buyback_remainder_bps >= BPS_DENOMINATOR
+            || packed_remainders >= PACKED_REMAINDER_LIMIT
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -470,6 +491,8 @@ impl Config {
             custody_mode,
             rehandoff_pending: rehandoff_pending == 1,
             buyback_remainder_bps,
+            external_surplus_remainder_bps,
+            auction_split_remainder_bps,
         })
     }
 
@@ -477,6 +500,12 @@ impl Config {
         if data.len() != LEGACY_CONFIG_SIZE
             && data.len() != CUSTODY_CONFIG_SIZE
             && data.len() < CONFIG_SIZE
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if self.buyback_remainder_bps >= BPS_DENOMINATOR
+            || self.external_surplus_remainder_bps >= BPS_DENOMINATOR
+            || self.auction_split_remainder_bps >= BPS_DENOMINATOR
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -500,16 +529,22 @@ impl Config {
                 data[257..265].copy_from_slice(&self.custody_principal.to_le_bytes());
                 data[265] = self.custody_mode;
                 data[266] = self.rehandoff_pending as u8;
-                data[267..269].copy_from_slice(&self.buyback_remainder_bps.to_le_bytes());
-                data[269..CONFIG_SIZE].fill(0);
             } else {
-                data[257..259].copy_from_slice(&self.buyback_remainder_bps.to_le_bytes());
-                data[259..CUSTODY_CONFIG_SIZE].fill(0);
+                data[257..CUSTODY_CONFIG_SIZE].fill(0);
             }
         } else {
-            data[225..227].copy_from_slice(&self.buyback_remainder_bps.to_le_bytes());
             data[227..LEGACY_CONFIG_SIZE].fill(0);
         }
+        let remainder_offset = match data.len() {
+            LEGACY_CONFIG_SIZE => 225,
+            CUSTODY_CONFIG_SIZE => 257,
+            _ => 267,
+        };
+        let packed_remainders = self.buyback_remainder_bps as u64
+            + (self.external_surplus_remainder_bps as u64) * REMAINDER_RADIX
+            + (self.auction_split_remainder_bps as u64) * REMAINDER_RADIX_SQUARED;
+        data[remainder_offset..remainder_offset + 5]
+            .copy_from_slice(&packed_remainders.to_le_bytes()[..5]);
         Ok(())
     }
 }
@@ -692,6 +727,8 @@ fn process_init_config(
         custody_mode: CUSTODY_MODE_UNATTESTED,
         rehandoff_pending: false,
         buyback_remainder_bps: 0,
+        external_surplus_remainder_bps: 0,
+        auction_split_remainder_bps: 0,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -738,6 +775,10 @@ fn process_reconfigure(
     if (new_bps as u32) + (config.base_unit_savings_bps as u32) > BPS_DENOMINATOR as u32 {
         return Err(ProgramError::InvalidInstructionData);
     }
+    // This remainder's denominator is auction+savings bps. A policy change starts a new
+    // apportionment interval; resetting less than one atom cannot expose principal and avoids
+    // interpreting the old ratio under a different denominator.
+    config.auction_split_remainder_bps = 0;
     config.surplus_buy_burn_bps = new_bps;
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -819,6 +860,9 @@ fn process_set_economics(
             return Err(ProgramError::InvalidAccountData);
         }
     }
+    // See reconfigure: the combined external carry has the fixed 10_000 denominator and remains
+    // valid across policy changes, while this route-level carry uses auction+savings as denominator.
+    config.auction_split_remainder_bps = 0;
     config.base_unit_savings_bps = savings_bps;
     config.buyback_bps = buyback_bps;
     config.base_unit_savings_account = *savings_account.key;
@@ -3435,24 +3479,40 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     .map_err(|_| ProgramError::InvalidAccountData)?;
     let insurance = insurance_balance.remaining_atoms;
     let surplus = insurance.saturating_sub(config.reserved_floor);
-    let burnable = surplus
-        .checked_mul(config.surplus_buy_burn_bps as u128)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        / BPS_DENOMINATOR as u128;
-    // The savings share is the second surplus pull (to the DAO's base-unit/collateral sink). Its bps sum
-    // with the auction is capped to 100% by set_economics, so burnable + savings <= surplus and the
-    // retained (insurance-growth) remainder stays >= 0 — neither pull can reach the reserved principal.
-    let savings = surplus
-        .checked_mul(config.base_unit_savings_bps as u128)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        / BPS_DENOMINATOR as u128;
-    let retained = surplus
-        .checked_sub(burnable)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_sub(savings)
+    // Pull the two external routes as one cumulative share before apportioning it. Independent
+    // per-route floors let public crankers repeatedly ratchet odd atoms into insurance; independent
+    // carries are also unsafe because both routes can mature in one round and exceed that round's
+    // surplus. The combined carry keeps total_pull <= surplus, while the second carry apportions
+    // only those already-bounded atoms between auction and savings.
+    let external_bps = (config.surplus_buy_burn_bps as u128)
+        .checked_add(config.base_unit_savings_bps as u128)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    let total_pull = burnable
-        .checked_add(savings)
+    let external_numerator = surplus
+        .checked_mul(external_bps)
+        .and_then(|value| {
+            value.checked_add(config.external_surplus_remainder_bps as u128)
+        })
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let total_pull = external_numerator / BPS_DENOMINATOR as u128;
+    config.external_surplus_remainder_bps =
+        (external_numerator % BPS_DENOMINATOR as u128) as u16;
+    let burnable = if external_bps == 0 {
+        config.auction_split_remainder_bps = 0;
+        0
+    } else {
+        let auction_numerator = total_pull
+            .checked_mul(config.surplus_buy_burn_bps as u128)
+            .and_then(|value| value.checked_add(config.auction_split_remainder_bps as u128))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let allocation = auction_numerator / external_bps;
+        config.auction_split_remainder_bps = (auction_numerator % external_bps) as u16;
+        allocation
+    };
+    let savings = total_pull
+        .checked_sub(burnable)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let retained = surplus
+        .checked_sub(total_pull)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let floor_after = config
         .reserved_floor
@@ -4621,6 +4681,8 @@ mod tests {
             custody_mode: CUSTODY_MODE_POOL_BOUND,
             rehandoff_pending: true,
             buyback_remainder_bps: 9_999,
+            external_surplus_remainder_bps: 8_888,
+            auction_split_remainder_bps: 7_777,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf).unwrap();
@@ -4641,6 +4703,8 @@ mod tests {
         assert_eq!(d.custody_mode, c.custody_mode);
         assert!(d.rehandoff_pending);
         assert_eq!(d.buyback_remainder_bps, 9_999);
+        assert_eq!(d.external_surplus_remainder_bps, 8_888);
+        assert_eq!(d.auction_split_remainder_bps, 7_777);
 
         let mut predecessor = [0u8; CUSTODY_CONFIG_SIZE];
         c.serialize(&mut predecessor).unwrap();
@@ -4650,13 +4714,24 @@ mod tests {
         assert_eq!(old.custody_mode, CUSTODY_MODE_UNATTESTED);
         assert!(!old.rehandoff_pending);
         assert_eq!(old.buyback_remainder_bps, 9_999);
+        assert_eq!(old.external_surplus_remainder_bps, 8_888);
+        assert_eq!(old.auction_split_remainder_bps, 7_777);
 
         let mut legacy = [0u8; LEGACY_CONFIG_SIZE];
         c.serialize(&mut legacy).unwrap();
-        assert_eq!(
-            Config::deserialize(&legacy).unwrap().buyback_remainder_bps,
-            9_999
-        );
+        let legacy_config = Config::deserialize(&legacy).unwrap();
+        assert_eq!(legacy_config.buyback_remainder_bps, 9_999);
+        assert_eq!(legacy_config.external_surplus_remainder_bps, 8_888);
+        assert_eq!(legacy_config.auction_split_remainder_bps, 7_777);
+
+        // The immediate predecessor wrote a standalone little-endian buyback u16 at the start
+        // of this reserved range. It remains a valid packed value with both new carries zero.
+        buf[267..CONFIG_SIZE].fill(0);
+        buf[267..269].copy_from_slice(&9_999u16.to_le_bytes());
+        let predecessor_buyback_only = Config::deserialize(&buf).unwrap();
+        assert_eq!(predecessor_buyback_only.buyback_remainder_bps, 9_999);
+        assert_eq!(predecessor_buyback_only.external_surplus_remainder_bps, 0);
+        assert_eq!(predecessor_buyback_only.auction_split_remainder_bps, 0);
 
         buf[265] = CUSTODY_MODE_POOLLESS_EMPTY + 1;
         assert!(matches!(
@@ -4670,7 +4745,8 @@ mod tests {
             Err(ProgramError::InvalidAccountData)
         ));
         buf[266] = 1;
-        buf[267..269].copy_from_slice(&BPS_DENOMINATOR.to_le_bytes());
+        let invalid_packed = 1_000_000_000_000u64.to_le_bytes();
+        buf[267..CONFIG_SIZE].copy_from_slice(&invalid_packed[..5]);
         assert!(matches!(
             Config::deserialize(&buf),
             Err(ProgramError::InvalidAccountData)

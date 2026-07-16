@@ -226,7 +226,10 @@ integer-infeasible, the aged book settles for permissionless refunds without spe
 Insurance deposited for other assets is never counted toward that surplus. Bought COIN can be split
 between burn and a canonical dynamic reward vault. Fractional basis-point entitlement carries across
 settled rounds, so repeated atom-sized fills cannot bias the configured cumulative split toward burn.
-Each surplus pull atomically restores the two
+The auction and collateral-savings shares are likewise cumulative across permissionless rounds: TWAP
+first carries the combined external share, then apportions only that bounded pull between the two routes.
+Atom-sized cranks therefore cannot ratchet either configured share into insurance, and the combined pull
+can never exceed current surplus. Each surplus pull atomically restores the two
 asset-0 insurance domains to the 50/50 split of the newly ratcheted floor. The collateral savings
 reserve must be distinct
 from the auction holding; an aliased configuration fails atomically before either surplus pull, so

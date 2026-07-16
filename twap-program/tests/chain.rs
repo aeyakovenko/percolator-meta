@@ -2066,9 +2066,19 @@ fn read_buyback_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
     let d = svm.get_account(config).unwrap().data;
     u16::from_le_bytes(d[191..193].try_into().unwrap())
 }
-fn read_buyback_remainder_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
+fn read_split_remainders_bps(svm: &LiteSVM, config: &Pubkey) -> [u16; 3] {
     let d = svm.get_account(config).unwrap().data;
-    u16::from_le_bytes(d[267..269].try_into().unwrap())
+    let mut packed_bytes = [0u8; 8];
+    packed_bytes[..5].copy_from_slice(&d[267..272]);
+    let packed = u64::from_le_bytes(packed_bytes);
+    [
+        (packed % 10_000) as u16,
+        ((packed / 10_000) % 10_000) as u16,
+        ((packed / 100_000_000) % 10_000) as u16,
+    ]
+}
+fn read_buyback_remainder_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
+    read_split_remainders_bps(svm, config)[0]
 }
 fn read_savings_account(svm: &LiteSVM, config: &Pubkey) -> Pubkey {
     let d = svm.get_account(config).unwrap().data;
@@ -33797,6 +33807,246 @@ fn e2e_ratchet_pulls_fresh_surplus_across_rounds() {
         token_amount(&svm, &env.perc_vault),
         1_200_000,
         "insurance = the grown floor; principal never pulled"
+    );
+}
+
+// PUBLIC LOF PROBE: permissionless execution must not let a cranker choose round boundaries that
+// discard the fractional auction allocation. Two one-atom surplus rounds at 50% collectively owe
+// one atom to the auction; retaining both atoms would permanently redirect the configured buyback
+// share into protected insurance merely because each public execute observed an odd-sized surplus.
+#[test]
+fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let policy = build_twap_reconfigure_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &twap_id(),
+        5_000,
+    );
+    let policy_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &policy,
+        &policy_accounts,
+    )
+    .expect("set cumulative 50/50 auction policy");
+
+    let one_atom_surplus_floor = env.principal + env.surplus - 1;
+    let floor = build_set_reserved_floor_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        one_atom_surplus_floor as u128,
+    );
+    let floor_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &floor,
+        &floor_accounts,
+    )
+    .expect("leave exactly one atom of first-round surplus");
+
+    let first_round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, first_round_end);
+    let first_cranker = Keypair::new();
+    svm.airdrop(&first_cranker.pubkey(), 1_000_000_000)
+        .unwrap();
+    send(
+        &mut svm,
+        &[&first_cranker],
+        execute_ix(
+            &first_cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute first one-atom surplus round");
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+    assert_eq!(
+        read_split_remainders_bps(&svm, &env.twap_cfg)[1],
+        5_000,
+        "the first half atom remains owed to the external surplus routes",
+    );
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&donor],
+        donate_insurance_ix(&donor.pubkey(), &env, &donor_source, &bk.holding, 1),
+    )
+    .expect("inject the next round's one-atom surplus");
+
+    let second_round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, second_round_end);
+    let second_cranker = Keypair::new();
+    svm.airdrop(&second_cranker.pubkey(), 1_000_000_000)
+        .unwrap();
+    send(
+        &mut svm,
+        &[&second_cranker],
+        execute_ix(
+            &second_cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("execute second one-atom surplus round");
+
+    assert_eq!(
+        token_amount(&svm, &bk.holding),
+        1,
+        "two 50% one-atom rounds collectively owe one atom to the auction",
+    );
+    assert_eq!(
+        read_split_remainders_bps(&svm, &env.twap_cfg)[1],
+        0,
+        "the cumulative external carry is consumed exactly once",
+    );
+    assert_eq!(
+        read_reserved_floor(&svm, &env.twap_cfg),
+        (one_atom_surplus_floor + 1) as u128,
+        "only one of the two atoms belongs to protected insurance",
+    );
+
+    // Continue with a 50/50 auction-versus-savings policy. The combined share is 100%, so each
+    // fresh atom must leave insurance immediately, while the route carry alternates the indivisible
+    // atoms without ever requesting two atoms from a one-atom surplus round.
+    let savings_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings_sink,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let economics = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings_sink,
+        5_000,
+        0,
+    );
+    let economics_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &economics,
+        &economics_accounts,
+    )
+    .expect("set cumulative 50/50 auction-versus-savings policy");
+
+    let route_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &route_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        2,
+    );
+    for round in 0..2 {
+        send(
+            &mut svm,
+            &[&donor],
+            donate_insurance_ix(&donor.pubkey(), &env, &route_source, &bk.holding, 1),
+        )
+        .expect("inject one atom for route apportionment");
+        let round_end = {
+            let book = svm.get_account(&bk.book).unwrap();
+            u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&second_cranker],
+            execute_ix_full(
+                &second_cranker.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                Some(savings_sink),
+                None,
+            ),
+        )
+        .expect("execute one-atom route-apportionment round");
+        assert_eq!(
+            read_split_remainders_bps(&svm, &env.twap_cfg)[2],
+            if round == 0 { 5_000 } else { 0 },
+            "the half-atom route carry alternates savings then auction",
+        );
+    }
+    assert_eq!(token_amount(&svm, &bk.holding), 2);
+    assert_eq!(token_amount(&svm, &savings_sink), 1);
+    assert_eq!(
+        read_reserved_floor(&svm, &env.twap_cfg),
+        (one_atom_surplus_floor + 1) as u128,
+        "a 100% external policy cannot ratchet route-rounding dust into insurance",
     );
 }
 
