@@ -14082,3 +14082,26 @@ that remainder, then persists the new remainder. The carry is always below 10,00
 whole COIN beyond the cumulative configured fraction. No account is reallocated, and no instruction, signer,
 authority, recipient, token account, CPI, or custody surface is added. Insurance, backing, bidder escrow, and
 collateral payout logic are unchanged.
+
+## Tick - per-round surplus rounding could starve buyback and savings (surface A, REAL LOF)
+
+TWAP independently floored the auction and savings shares on every permissionless round, then permanently
+ratcheted all rounding residue into the protected insurance floor. An unaffiliated cranker could execute as
+soon as each round had one atom of surplus. Under a normal 50% auction policy, two such rounds routed zero to
+the auction instead of the cumulatively owed one atom; both atoms became protected insurance. Repeating that
+public timing choice made the configured post-launch buyback or savings allocation diverge without bound.
+Depositor principal could not be pulled or redirected, but the continuous reward/burn loop lost its configured
+value share.
+
+The retained real-Percolator LiteSVM regression first runs two one-atom rounds at 50% auction and proves one
+atom reaches the canonical holding while one atom ratchets into insurance. It then changes to a 50/50
+auction-versus-savings policy and runs two more one-atom rounds, proving one atom reaches each bound route,
+the floor does not grow, and no round requests two atoms from one atom of current surplus. The old SBF leaves
+the auction holding at zero in the first phase; the fixed SBF consumes each fractional carry exactly once.
+
+FIX: TWAP computes one cumulative auction-plus-savings pull with a fixed 10,000-denominator remainder, then
+apportions only those already-bounded atoms between auction and savings with a second remainder. Thus the two
+external routes sum to at most current surplus by construction. All three TWAP carries, including the existing
+bought-COIN buyback carry, fit into five bytes previously reserved as zero; predecessor buyback-only state and
+every supported config generation decode without migration or reallocation. No instruction, account, signer,
+authority, destination, CPI, token custody, or principal-moving surface is added.
