@@ -2066,6 +2066,10 @@ fn read_buyback_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
     let d = svm.get_account(config).unwrap().data;
     u16::from_le_bytes(d[191..193].try_into().unwrap())
 }
+fn read_buyback_remainder_bps(svm: &LiteSVM, config: &Pubkey) -> u16 {
+    let d = svm.get_account(config).unwrap().data;
+    u16::from_le_bytes(d[267..269].try_into().unwrap())
+}
 fn read_savings_account(svm: &LiteSVM, config: &Pubkey) -> Pubkey {
     let d = svm.get_account(config).unwrap().data;
     Pubkey::new_from_array(d[193..225].try_into().unwrap())
@@ -28328,6 +28332,145 @@ fn e2e_execute_buyback_retains_fraction_to_sink_and_burns_the_rest() {
         "spent USD parked for the winner"
     );
     let _ = (alice, a_usd);
+}
+
+// PUBLIC LOF: applying the reward/burn fraction independently to every round lets a bidder
+// choose atom-sized fills that always round the reward leg down. Two one-COIN rounds at 50/50
+// must therefore carry the first half atom and cumulatively route one COIN to rewards while
+// burning one, instead of burning both and starving the configured reward cohort.
+#[test]
+fn e2e_fractional_buyback_carries_across_permissionless_rounds() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let reward_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault,
+        &env.coin_mint,
+        &Pubkey::new_unique(),
+        0,
+    );
+    let bk = setup_auction(
+        &mut svm,
+        &payer,
+        &env,
+        10,
+        1,
+        Some(reward_vault),
+        0,
+    );
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &reward_vault, 0, 5_000);
+    let economics_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(reward_vault, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &economics,
+        &economics_accounts,
+    )
+    .expect("DAO configures the cumulative 50/50 reward/burn split");
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    for round in 0..2u64 {
+        let (bidder, coin_source, usd_destination) = new_bidder(&mut svm, &payer, &env, 1);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_source,
+                &usd_destination,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1,
+                1,
+                None,
+            ),
+        )
+        .expect("public bidder escrows one COIN");
+
+        let round_end = {
+            let book = svm.get_account(&bk.book).unwrap();
+            u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&cranker],
+            execute_ix(
+                &cranker.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                Some(reward_vault),
+            ),
+        )
+        .expect("permissionless atom-sized round settles");
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &usd_destination,
+                &coin_source,
+                0,
+            ),
+        )
+        .expect("permissionless claim reopens the next round");
+        assert_eq!(token_amount(&svm, &usd_destination), 1);
+        assert_eq!(token_amount(&svm, &coin_source), 0);
+        assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+        assert_eq!(
+            read_buyback_remainder_bps(&svm, &env.twap_cfg),
+            if round == 0 { 5_000 } else { 0 },
+            "the half-atom remainder carries into exactly the next settled round"
+        );
+    }
+
+    assert_eq!(
+        token_amount(&svm, &reward_vault),
+        1,
+        "two 50% half atoms must cumulatively produce one reward COIN"
+    );
+    assert_eq!(
+        supply_before + 2 - mint_supply(&svm, &env.coin_mint),
+        1,
+        "the other one of the two newly sold COIN burns"
+    );
 }
 
 // MALICIOUS-DAO SCOPE (shutdown can't drain user funds): shutdown is a privileged Squads-gated op

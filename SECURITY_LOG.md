@@ -14084,3 +14084,23 @@ mint, authority, and key, and requires the proposal total to equal its immutable
 the exact-supply check for pre-upgrade proposal state. Generic Distribution keeps its reusable partial-allocation
 semantics. The change adds no signer, administrator, recipient, writable value account, token instruction, or
 fund-moving CPI; it adds one read-only account to Genesis proposal registration.
+
+## Tick - per-round split rounding could starve continuous rewards (surface A/D, REAL LOF)
+
+TWAP applied `buyback_bps` independently to each settled round and assigned every fractional atom to burn.
+A public bidder could therefore sell one COIN per round under a normal 50/50 configuration. Each seller
+received the valid reserve-bounded collateral payout, but the reward vault received zero while every bought
+COIN burned. Repeating the public path made the configured reward share diverge without bound from the
+cumulative split.
+
+The retained real-SBF LiteSVM regression runs two complete permissionless bid, settle, and claim rounds with
+one COIN each. The old binary pays both sellers, sends zero COIN to rewards, and burns both; the fixed binary
+carries the first 5,000 basis-point remainder and finishes with one reward COIN and one burned COIN. The
+existing large-lot split regression remains green.
+
+FIX: every supported TWAP config generation stores a sub-atom basis-point remainder in bytes that its prior
+serializer reserved as zero. Settlement computes the reward allocation from the current bought amount plus
+that remainder, then persists the new remainder. The carry is always below 10,000 and cannot authorize a
+whole COIN beyond the cumulative configured fraction. No account is reallocated, and no instruction, signer,
+authority, recipient, token account, CPI, or custody surface is added. Insurance, backing, bidder escrow, and
+collateral payout logic are unchanged.
