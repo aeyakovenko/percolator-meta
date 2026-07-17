@@ -57,6 +57,9 @@ pub struct BackingDomainBalance {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InsuranceDomainBalance {
+    /// Gross domain budget after top-ups and withdrawals. Market losses increase
+    /// `spent` instead, so this remains the stable routing source of truth.
+    pub budget_atoms: u128,
     pub remaining_atoms: u128,
     pub withdrawable_atoms: u128,
 }
@@ -628,6 +631,7 @@ pub fn read_asset_insurance_balance(
             .checked_add(u128::from(reserved_num % BOUND_SCALE != 0))
             .ok_or(ReadError::InvalidAccounting)?;
         Ok(InsuranceDomainBalance {
+            budget_atoms: budget,
             remaining_atoms: remaining,
             withdrawable_atoms: remaining
                 .saturating_sub(reserved_atoms)
@@ -837,10 +841,12 @@ mod tests {
             Ok(InsuranceAssetBalance {
                 domains: [
                     InsuranceDomainBalance {
+                        budget_atoms: 200,
                         remaining_atoms: 180,
                         withdrawable_atoms: 169,
                     },
                     InsuranceDomainBalance {
+                        budget_atoms: 300,
                         remaining_atoms: 200,
                         withdrawable_atoms: 150,
                     },
@@ -887,10 +893,12 @@ mod tests {
         InsuranceAssetBalance {
             domains: [
                 InsuranceDomainBalance {
+                    budget_atoms: remaining[0],
                     remaining_atoms: remaining[0],
                     withdrawable_atoms: withdrawable[0],
                 },
                 InsuranceDomainBalance {
+                    budget_atoms: remaining[1],
                     remaining_atoms: remaining[1],
                     withdrawable_atoms: withdrawable[1],
                 },
