@@ -26172,8 +26172,8 @@ fn e2e_dao_shutdown_cannot_confiscate_winners_parked_settlement_usd() {
 }
 
 // FULL grand-unified E2E: subledger insurance deposits + genesis vote + COIN distribution
-// + claim, then the DAO->Squads handoff of the insurance operator to the twap, then a real
-// surplus pull. All six real binaries.
+// + claim, then the DAO->Squads handoff of the insurance operator to the twap, three 15-day
+// 50/50 reward/burn rounds, a dynamic reward claim, and principal recovery.
 #[test]
 fn e2e_full_genesis_to_buy_burn() {
     let mut svm =
@@ -26189,6 +26189,7 @@ fn e2e_full_genesis_to_buy_burn() {
         .unwrap();
     svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
         .unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
         .unwrap();
     let payer = Keypair::new();
@@ -26640,6 +26641,27 @@ fn e2e_full_genesis_to_buy_burn() {
         "winner claimed the full COIN supply"
     );
 
+    // The fixed Genesis winner supplies the post-launch auction. Bought COIN is
+    // routed into a dynamic reward epoch whose only cohort is the original
+    // insurance depositor, so this test joins the real Genesis and continuous
+    // halves without replacing either program with a synthetic mint.
+    const SLOTS_PER_DAY: u64 = 216_000;
+    let reward_start = svm.get_sysvar::<Clock>().slot;
+    let round_length = 15 * SLOTS_PER_DAY;
+    let reward_end = reward_start + 3 * round_length;
+    let reward_finalize_window = 100u64;
+    let reward_epoch_id = 1u64;
+    let reward_config = rd_epoch_config_pda(&squads_vault, &coin_mint, reward_epoch_id);
+    let reward_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault,
+        &coin_mint,
+        &reward_config,
+        0,
+    );
+    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
+
     // --- Handoff: DAO configures the TWAP auction share, then hands it custody. ---
     // twap config for this market.
     let twap_init = init_config_ix(
@@ -26733,8 +26755,91 @@ fn e2e_full_genesis_to_buy_burn() {
     )
     .expect("set surplus floor = reserved principal");
 
-    // --- The TWAP runs the buy/burn AUCTION (the final link). The COIN winner sells COIN back
-    //     into the surplus buy/burn and it is BURNED — closing the genesis loop end to end. ---
+    // Keep the real market actionable across the 45-day warp. Oracle pushes are
+    // externally cranked through the same timelocked Squads vault used in production.
+    let oracle_config = build_configure_ewma_mark_message(
+        &squads_vault,
+        &slab,
+        &perc_id(),
+        reward_start,
+        1_000_000,
+        1,
+        0,
+    );
+    let oracle_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        6,
+        &oracle_config,
+        &oracle_remaining,
+    )
+    .expect("futarchy configures externally cranked EWMA marks");
+
+    let reward_init = build_rd_epoch_init_message(
+        &squads_vault,
+        &coin_mint,
+        &perc_id(),
+        &sub_id(),
+        &reward_config,
+        &reward_vault,
+        reward_epoch_id,
+        reward_start,
+        reward_end,
+        0,
+        10_000,
+        0,
+        0,
+        0,
+        reward_finalize_window,
+        0,
+        &[(slab, pool, Pubkey::default())],
+    );
+    let reward_init_remaining = vec![
+        AccountMeta::new(squads_vault, false),
+        AccountMeta::new(reward_config, false),
+        AccountMeta::new_readonly(coin_mint, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(reward_vault, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(rd_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &reward_init,
+        &reward_init_remaining,
+    )
+    .expect("futarchy initializes the dynamic bought-COIN epoch");
+    send(
+        &mut svm,
+        &[&payer, &alice],
+        rd_register_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &alice.pubkey(),
+            &alice.pubkey(),
+            &slab,
+            &position,
+            0,
+        ),
+    )
+    .expect("genesis depositor registers for continuous insurance rewards");
+
+    // --- The TWAP runs three 15-day rounds. The Genesis winner sells real distributed COIN;
+    //     each round routes half to rewards and burns half. ---
     let book = book_pda(&twap_cfg);
     let book_escrow = book_escrow_pda(&twap_cfg);
     let coin_escrow = Pubkey::new_unique();
@@ -26743,8 +26848,26 @@ fn e2e_full_genesis_to_buy_burn() {
     set_token(&mut svm, &coin_escrow, &coin_mint, &book_escrow, 0);
     set_token(&mut svm, &settlement_usd, &collateral_mint, &book_escrow, 0);
     set_token(&mut svm, &holding, &collateral_mint, &twap_authority, 0);
-    svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
-    let ib = build_init_book_message(
+    let economics =
+        build_set_economics_message(&squads_vault, &twap_cfg, &holding, 0, 5_000);
+    let economics_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        8,
+        &economics,
+        &economics_remaining,
+    )
+    .expect("futarchy configures 50% rewards and 50% burn");
+    let ib = build_init_book_message_with_sink_cutoff(
         &squads_vault,
         &book,
         &twap_cfg,
@@ -26756,10 +26879,11 @@ fn e2e_full_genesis_to_buy_burn() {
         &collateral_mint,
         0,
         1,
-        10,
+        round_length,
+        1,
         0,
-        0,
-        None,
+        Some(&reward_vault),
+        Some(reward_end),
     );
     let ib_rem = vec![
         AccountMeta::new(squads_vault, false),
@@ -26772,109 +26896,195 @@ fn e2e_full_genesis_to_buy_burn() {
         AccountMeta::new_readonly(collateral_mint, false),
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(holding, false),
+        AccountMeta::new_readonly(reward_vault, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 6, &ib, &ib_rem)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 9, &ib, &ib_rem)
         .expect("init auction book");
 
-    // The COIN winner bids: offer 50 of the 100 claimed COIN for the surplus USD.
     svm.airdrop(&recipient.pubkey(), 1_000_000_000).unwrap();
-    // The USD payout target is the winner's canonical collateral ATA (pinned by the program).
     let r_usd = coin_ata_of(&recipient.pubkey(), &collateral_mint);
     set_token(&mut svm, &r_usd, &collateral_mint, &recipient.pubkey(), 0);
-    let place = place_bid_ix(
-        &recipient.pubkey(),
-        &twap_cfg,
-        &book,
-        &book_escrow,
-        &coin_escrow,
-        &recipient_ata,
-        &r_usd,
-        &coin_mint,
-        &collateral_mint,
-        50,
-        400_000,
-        None,
-    );
-    send(&mut svm, &[&recipient], place).expect("winner bids COIN into the buy/burn");
-
-    // Round expires; anyone executes. It pulls 80% of the 500k surplus (=400k) as the budget,
-    // ratchets the retained 100k into the principal counter, clears the bid at the uniform price,
-    // and BURNS the bought COIN.
-    let mut c = svm.get_sysvar::<Clock>();
-    c.slot += 20;
-    svm.set_sysvar(&c);
-    let supply_before = mint_supply(&svm, &coin_mint);
-    assert_eq!(
-        supply_before, total_supply,
-        "full COIN supply outstanding before the burn"
-    );
     let cranker = Keypair::new();
     svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
-    let exec = Instruction {
-        program_id: twap_id(),
-        accounts: vec![
-            AccountMeta::new(cranker.pubkey(), true),
-            AccountMeta::new(twap_cfg, false),
-            AccountMeta::new(book, false),
-            AccountMeta::new_readonly(twap_authority, false),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(perc_vault, false),
-            AccountMeta::new_readonly(vault_authority, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new(holding, false),
-            AccountMeta::new(settlement_usd, false),
-            AccountMeta::new_readonly(book_escrow, false),
-            AccountMeta::new(coin_escrow, false),
-            AccountMeta::new(coin_mint, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        data: vec![8u8],
-    };
-    send(&mut svm, &[&cranker], exec).expect("twap executes the buy/burn");
+    let supply_before = mint_supply(&svm, &coin_mint);
+    let round_coin = 20u128;
+    let round_usd = 100_000u128;
+    for round in 0..3u64 {
+        send(
+            &mut svm,
+            &[&recipient],
+            place_bid_ix(
+                &recipient.pubkey(),
+                &twap_cfg,
+                &book,
+                &book_escrow,
+                &coin_escrow,
+                &recipient_ata,
+                &r_usd,
+                &coin_mint,
+                &collateral_mint,
+                round_coin,
+                round_usd,
+                None,
+            ),
+        )
+        .expect("Genesis recipient bids into a continuous round");
 
-    assert_eq!(
-        mint_supply(&svm, &coin_mint),
-        total_supply - 50,
-        "the TWAP bought + BURNED 50 COIN"
-    );
-    assert_eq!(
-        token_amount(&svm, &settlement_usd),
-        400_000,
-        "surplus USD parked for the winner"
-    );
+        let round_end = reward_start + (round + 1) * round_length;
+        warp_to(&mut svm, round_end);
+        let oracle_push = build_push_ewma_mark_message(
+            &squads_vault,
+            &slab,
+            &perc_id(),
+            round_end,
+            1_000_000,
+        );
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            10 + round,
+            &oracle_push,
+            &oracle_remaining,
+        )
+        .expect("external oracle crank keeps the market actionable");
+
+        let reward_before = token_amount(&svm, &reward_vault);
+        let round_supply_before = mint_supply(&svm, &coin_mint);
+        let exec = Instruction {
+            program_id: twap_id(),
+            accounts: vec![
+                AccountMeta::new(cranker.pubkey(), true),
+                AccountMeta::new(twap_cfg, false),
+                AccountMeta::new(book, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(settlement_usd, false),
+                AccountMeta::new_readonly(book_escrow, false),
+                AccountMeta::new(coin_escrow, false),
+                AccountMeta::new(coin_mint, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(reward_vault, false),
+            ],
+            data: vec![8u8],
+        };
+        send(&mut svm, &[&cranker], exec).expect("continuous round executes");
+        assert_eq!(
+            token_amount(&svm, &reward_vault) - reward_before,
+            10,
+            "half of each bought lot reaches the reward epoch"
+        );
+        assert_eq!(
+            round_supply_before - mint_supply(&svm, &coin_mint),
+            10,
+            "half of each bought lot burns"
+        );
+
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &twap_cfg,
+                &book,
+                &book_escrow,
+                &settlement_usd,
+                &coin_escrow,
+                &r_usd,
+                &recipient_ata,
+                0,
+            ),
+        )
+        .expect("permissionless auction claim reopens the next round");
+    }
+
+    assert_eq!(svm.get_sysvar::<Clock>().slot, reward_end);
+    assert_eq!(token_amount(&svm, &reward_vault), 30);
+    assert_eq!(mint_supply(&svm, &coin_mint), supply_before - 30);
+    assert_eq!(token_amount(&svm, &r_usd), 300_000);
+    assert_eq!(token_amount(&svm, &recipient_ata), 40);
     assert_eq!(
         token_amount(&svm, &perc_vault),
         principal + surplus - 400_000,
-        "only the 80% burn-share left insurance"
+        "only surplus entered TWAP custody"
     );
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
         (principal + 100_000) as u128,
-        "retained 20% ratcheted into the principal counter"
+        "the retained surplus ratchets above depositor principal"
     );
 
-    // The winner permissionlessly claims their USD.
     send(
         &mut svm,
-        &[&cranker],
-        claim_ix(
-            &cranker.pubkey(),
-            &twap_cfg,
-            &book,
-            &book_escrow,
-            &settlement_usd,
-            &coin_escrow,
-            &r_usd,
-            &recipient_ata,
+        &[&alice],
+        rd_crystallize_ix(
+            &alice.pubkey(),
+            &reward_config,
+            &alice.pubkey(),
+            &slab,
+            &position,
             0,
         ),
     )
-    .expect("winner claims USD");
+    .expect("Genesis depositor crystallizes continuous insurance points");
+    assert!(
+        send(
+            &mut svm,
+            &[&cranker],
+            rd_freeze_ix(
+                &cranker.pubkey(),
+                &reward_config,
+                &coin_mint,
+                &reward_vault,
+            ),
+        )
+        .is_err(),
+        "the finalize window cannot be skipped"
+    );
+    warp_to(&mut svm, reward_end + reward_finalize_window);
+    send(
+        &mut svm,
+        &[&cranker],
+        rd_freeze_ix(
+            &cranker.pubkey(),
+            &reward_config,
+            &coin_mint,
+            &reward_vault,
+        ),
+    )
+    .expect("permissionless freeze snapshots the three-round reward vault");
+    let alice_coin = Pubkey::new_unique();
+    set_token(&mut svm, &alice_coin, &coin_mint, &alice.pubkey(), 0);
+    send(
+        &mut svm,
+        &[&alice],
+        rd_claim_ix(
+            &alice.pubkey(),
+            &reward_config,
+            &alice.pubkey(),
+            &slab,
+            &position,
+            0,
+            &reward_vault,
+            &alice_coin,
+        ),
+    )
+    .expect("Genesis depositor claims the full insurance reward cohort");
+    assert_eq!(token_amount(&svm, &alice_coin), 30);
+    assert_eq!(token_amount(&svm, &reward_vault), 0);
     assert_eq!(
-        token_amount(&svm, &r_usd),
-        400_000,
-        "winner received the surplus USD at the clearing price"
+        token_amount(&svm, &recipient_ata)
+            + token_amount(&svm, &alice_coin)
+            + (supply_before - mint_supply(&svm, &coin_mint)),
+        total_supply,
+        "Genesis COIN is conserved across seller balance, rewards, and burns"
     );
 
     // Complete the advertised lifecycle: return custody to the canonical pool, retract the sealed
@@ -26904,7 +27114,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        7,
+        13,
         &return_message,
         &return_remaining,
     )
