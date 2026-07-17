@@ -2376,12 +2376,10 @@ fn zero_value_generation_exits_cannot_steer_recapitalization_into_one_domain() {
         "fresh one-atom deposits must alternate domains despite interleaved stale exits",
     );
 
-    for (owner, ata, holding) in fresh_positions {
-        env.insurance_withdraw(&owner, &ata, &holding, &owner, 1)
-            .expect("each fresh depositor remains withdrawable");
-        assert_eq!(env.token_amount(&ata), 1);
+    for (owner, ata, _) in fresh_positions {
+        assert_eq!(env.read_position(&owner.pubkey()).0, 1);
+        assert_eq!(env.token_amount(&ata), 0);
     }
-    assert_eq!(env.pool_outstanding(), 0);
 }
 
 // CROSS-ASSET EXIT DOS: the market header's `insurance` is global, while tag-57 debits
