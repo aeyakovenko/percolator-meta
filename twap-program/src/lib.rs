@@ -860,8 +860,14 @@ fn process_set_economics(
             return Err(ProgramError::InvalidAccountData);
         }
     }
-    // See reconfigure: the combined external carry has the fixed 10_000 denominator and remains
-    // valid across policy changes, while this route-level carry uses auction+savings as denominator.
+    // The combined carry remains valid across ratio changes, but not across savings-destination
+    // epochs: otherwise a replacement sink can receive the prior sink's terminal fraction. Dropping
+    // less than one atom into protected insurance is the only representable epoch boundary.
+    if config.base_unit_savings_account != *savings_account.key {
+        config.external_surplus_remainder_bps = 0;
+    }
+    // See reconfigure: this route-level carry uses auction+savings as its denominator, so every
+    // route policy update starts a fresh apportionment interval.
     config.auction_split_remainder_bps = 0;
     config.base_unit_savings_bps = savings_bps;
     config.buyback_bps = buyback_bps;
