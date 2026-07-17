@@ -1439,7 +1439,7 @@ fn set_coin_sink_rejects_an_external_close_authority() {
     let remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(coin_sink, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -1485,7 +1485,7 @@ fn set_coin_sink_rejects_an_external_close_authority() {
     let remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(safe_sink, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -1698,7 +1698,7 @@ fn setters_reject_non_spl_owned_token_shaped_sinks() {
     let sink_rem = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(fake_coin_sink, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -1762,7 +1762,7 @@ fn setters_reject_non_spl_owned_token_shaped_sinks() {
     let sink_rem = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(real_coin_sink, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -23313,11 +23313,11 @@ fn build_set_coin_sink_send_message(
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
-    m.push(1);
+    m.push(2);
     m.push(5); // signers, w-signers, w-nonsigners, keys
     m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
     m.extend_from_slice(book.as_ref()); // 1 w
-    m.extend_from_slice(config.as_ref()); // 2 ro
+    m.extend_from_slice(config.as_ref()); // 2 w
     m.extend_from_slice(coin_sink.as_ref()); // 3 ro
     m.extend_from_slice(twap_id().as_ref()); // 4 program
     m.push(1);
@@ -28480,6 +28480,191 @@ fn e2e_fractional_buyback_carries_across_permissionless_rounds() {
         supply_before + 2 - mint_supply(&svm, &env.coin_mint),
         1,
         "the other one of the two newly sold COIN burns"
+    );
+}
+
+// PUBLIC LOF: a fractional reward entitlement belongs to the reward sink that was active when
+// the fill created it. Rotating the sink must not let the replacement vault inherit the old
+// vault's half atom. Each sink epoch therefore starts its own cumulative 50/50 split.
+#[test]
+fn e2e_fractional_buyback_carry_does_not_cross_reward_sink_epochs() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let reward_vault_a = Pubkey::new_unique();
+    let reward_vault_b = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault_a,
+        &env.coin_mint,
+        &Pubkey::new_unique(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &reward_vault_b,
+        &env.coin_mint,
+        &Pubkey::new_unique(),
+        0,
+    );
+    let bk = setup_auction(
+        &mut svm,
+        &payer,
+        &env,
+        10,
+        1,
+        Some(reward_vault_a),
+        0,
+    );
+    let economics = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &reward_vault_a,
+        0,
+        5_000,
+    );
+    let economics_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(reward_vault_a, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &economics,
+        &economics_accounts,
+    )
+    .expect("DAO configures the cumulative 50/50 reward/burn split");
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    for round in 0..3u64 {
+        if round == 1 {
+            let rotate = build_set_coin_sink_send_message(
+                &env.squads_vault,
+                &env.twap_cfg,
+                &bk.book,
+                &reward_vault_b,
+            );
+            let rotate_accounts = vec![
+                AccountMeta::new_readonly(env.squads_vault, false),
+                AccountMeta::new(bk.book, false),
+                AccountMeta::new(env.twap_cfg, false),
+                AccountMeta::new_readonly(reward_vault_b, false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ];
+            squads_execute(
+                &mut svm,
+                &env.squads,
+                &env.multisig,
+                &env.dao,
+                &payer,
+                7,
+                &rotate,
+                &rotate_accounts,
+            )
+            .expect("DAO rotates to the next reward-vault epoch");
+        }
+
+        let active_vault = if round == 0 {
+            reward_vault_a
+        } else {
+            reward_vault_b
+        };
+        let (bidder, coin_source, usd_destination) = new_bidder(&mut svm, &payer, &env, 1);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin_source,
+                &usd_destination,
+                &env.coin_mint,
+                &env.collateral_mint,
+                1,
+                1,
+                None,
+            ),
+        )
+        .expect("public bidder escrows one COIN");
+
+        let round_end = {
+            let book = svm.get_account(&bk.book).unwrap();
+            u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&cranker],
+            execute_ix(
+                &cranker.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                Some(active_vault),
+            ),
+        )
+        .expect("permissionless atom-sized round settles");
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.settlement_usd,
+                &bk.coin_escrow,
+                &usd_destination,
+                &coin_source,
+                0,
+            ),
+        )
+        .expect("permissionless claim reopens the next round");
+
+        assert_eq!(
+            token_amount(&svm, &reward_vault_a),
+            0,
+            "vault A's terminal half atom is never materialized after its epoch ends"
+        );
+        assert_eq!(
+            token_amount(&svm, &reward_vault_b),
+            if round < 2 { 0 } else { 1 },
+            "vault B must start a fresh cumulative 50/50 split"
+        );
+    }
+
+    assert_eq!(
+        token_amount(&svm, &reward_vault_a),
+        0,
+        "vault A's terminal half atom is not transferable to another reward epoch"
+    );
+    assert_eq!(
+        token_amount(&svm, &reward_vault_b),
+        1,
+        "two fills under vault B cumulatively route exactly one reward COIN"
     );
 }
 
@@ -35553,7 +35738,7 @@ fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
     let rem = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(treasury, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -36448,7 +36633,7 @@ fn e2e_config_a_cannot_mutate_config_bs_book() {
     let sink_rem = vec![
         AccountMeta::new_readonly(vault_a, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(config_a, false),
+        AccountMeta::new(config_a, false),
         AccountMeta::new_readonly(attacker_sink, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -36714,7 +36899,7 @@ fn e2e_send_sink_cannot_be_the_coin_escrow() {
     let bad_rem = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(bk.coin_escrow, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -36741,7 +36926,7 @@ fn e2e_send_sink_cannot_be_the_coin_escrow() {
     let ok_rem = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(treasury, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -36790,7 +36975,7 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
     let bad_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(bk.settlement_usd, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -36925,7 +37110,7 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
     let holding_alias_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(bk.holding, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
@@ -36962,7 +37147,7 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
     let valid_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new(env.twap_cfg, false),
         AccountMeta::new_readonly(external_sink, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];

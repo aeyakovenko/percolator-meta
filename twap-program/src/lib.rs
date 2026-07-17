@@ -3057,11 +3057,13 @@ fn process_set_reserve(
     Ok(())
 }
 
-// set_coin_sink accounts: [squads_vault(signer), config, book(w), coin_sink?]
+// set_coin_sink accounts: [squads_vault(signer), config(w), book(w), coin_sink?]
 // data: sink_mode (u8) || sink_cutoff_slot? (u64; absent = no cutoff)
 //
 // Futarchy-configurable: burn the bought COIN (mode 0) or send it to an account (mode 1, e.g. a
-// DAO treasury). Squads-vault-gated.
+// DAO treasury). Every successful call starts a new sink epoch and discards the previous epoch's
+// sub-atom carry, so a replacement reward cohort cannot inherit value accrued for its predecessor.
+// Squads-vault-gated.
 fn process_set_coin_sink(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3084,7 +3086,7 @@ fn process_set_coin_sink(
     if config_account.owner != program_id || book_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     require_squads_vault(squads_vault, &config)?;
     let book = load_book_header(&book_account.try_borrow_data()?)?;
     if book.config != *config_account.key {
@@ -3105,6 +3107,9 @@ fn process_set_coin_sink(
     } else {
         Pubkey::default()
     };
+    config.buyback_remainder_bps = 0;
+    config.serialize(&mut config_account.try_borrow_mut_data()?)?;
+
     let mut d = book_account.try_borrow_mut_data()?;
     d[BK_SINK_MODE] = sink_mode;
     d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(sink_key.as_ref());
