@@ -1928,6 +1928,12 @@ fn process_init_insurance_pool(
     let bootstrap_end_slot = deposit_start_slot
         .checked_add(bootstrap_delay_slots)
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    if bootstrap_end_slot
+        .checked_add(deposit_window_slots)
+        .is_none()
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if deposit_deadline_slot <= now
         || bootstrap_end_slot <= now
         || deposit_deadline_slot > bootstrap_end_slot
