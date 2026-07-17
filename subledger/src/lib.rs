@@ -812,40 +812,40 @@ fn wide_mul_div_ceil(a: u128, b: u128, denom: u128) -> Option<u128> {
     quotient.checked_add(u128::from(remainder != 0))
 }
 
-fn insurance_domain_budgets(balance: percolator_accounting::InsuranceAssetBalance) -> [u128; 2] {
+fn insurance_domain_balances(balance: percolator_accounting::InsuranceAssetBalance) -> [u128; 2] {
     [
-        balance.domains[0].budget_atoms,
-        balance.domains[1].budget_atoms,
+        balance.domains[0].remaining_atoms,
+        balance.domains[1].remaining_atoms,
     ]
 }
 
-/// Credit `amount` toward the lower gross domain budget, then split any
-/// remainder evenly. Losses advance `spent`, not `budget`, so stale claim exits
-/// cannot influence this routing source of truth.
-fn insurance_deposit_domain_delta(budgets: [u128; 2], amount: u64) -> [u128; 2] {
+/// Credit `amount` toward the lower live domain balance, then split any
+/// remainder evenly. Zero-value claim exits do not move these Percolator
+/// balances, while market losses are repaired before new capital is split.
+fn insurance_deposit_domain_delta(balances: [u128; 2], amount: u64) -> [u128; 2] {
     let amount = u128::from(amount);
-    if budgets[0] <= budgets[1] {
-        let gap = core::cmp::min(budgets[1] - budgets[0], amount);
+    if balances[0] <= balances[1] {
+        let gap = core::cmp::min(balances[1] - balances[0], amount);
         let remainder = amount - gap;
         [gap + remainder / 2, remainder - remainder / 2]
     } else {
-        let gap = core::cmp::min(budgets[0] - budgets[1], amount);
+        let gap = core::cmp::min(balances[0] - balances[1], amount);
         let remainder = amount - gap;
         [remainder / 2, gap + remainder - remainder / 2]
     }
 }
 
-/// Debit `amount` from the higher gross domain budget, then split any
-/// remainder evenly. On an equal budget the odd atom comes from long, exactly
+/// Debit `amount` from the higher live domain balance, then split any
+/// remainder evenly. On an equal balance the odd atom comes from long, exactly
 /// reversing the deposit tie-break that credits it to short.
-fn insurance_withdraw_domain_delta(budgets: [u128; 2], amount: u64) -> [u128; 2] {
+fn insurance_withdraw_domain_delta(balances: [u128; 2], amount: u64) -> [u128; 2] {
     let amount = u128::from(amount);
-    if budgets[0] >= budgets[1] {
-        let gap = core::cmp::min(budgets[0] - budgets[1], amount);
+    if balances[0] >= balances[1] {
+        let gap = core::cmp::min(balances[0] - balances[1], amount);
         let remainder = amount - gap;
         [gap + remainder - remainder / 2, remainder / 2]
     } else {
-        let gap = core::cmp::min(budgets[1] - budgets[0], amount);
+        let gap = core::cmp::min(balances[1] - balances[0], amount);
         let remainder = amount - gap;
         [remainder - remainder / 2, gap + remainder / 2]
     }
@@ -2048,7 +2048,7 @@ fn process_init_insurance_pool(
 // data: amount (u64)
 //
 // User -> holding (user-signed). Then the pool PDA (asset-0 insurance authority)
-// tops up the two Percolator domains against the pool-wide 50/50 principal target.
+// tops up the two Percolator domains against the pool-wide 50/50 live protection target.
 // Records the position (principal += amount, start_slot = now) and bumps outstanding.
 fn process_insurance_deposit(
     program_id: &Pubkey,
@@ -2144,8 +2144,10 @@ fn process_insurance_deposit(
         priced_balance_before,
         virtual_shares,
     )?;
-    let deposit_domains =
-        insurance_deposit_domain_delta(insurance_domain_budgets(insurance_balance_before), amount);
+    let deposit_domains = insurance_deposit_domain_delta(
+        insurance_domain_balances(insurance_balance_before),
+        amount,
+    );
     let outstanding_after = pool
         .outstanding_principal
         .checked_add(amount)
@@ -2590,7 +2592,7 @@ fn process_insurance_withdraw_impl(
     let principal_debit = live_insurance_balance
         .map(|balance| {
             insurance_withdraw_domain_delta(
-                insurance_domain_budgets(balance),
+                insurance_domain_balances(balance),
                 paid_principal,
             )
         })
@@ -3177,12 +3179,10 @@ mod tests {
         percolator_accounting::InsuranceAssetBalance {
             domains: [
                 percolator_accounting::InsuranceDomainBalance {
-                    budget_atoms: long_remaining,
                     remaining_atoms: long_remaining,
                     withdrawable_atoms: long_withdrawable,
                 },
                 percolator_accounting::InsuranceDomainBalance {
-                    budget_atoms: short_remaining,
                     remaining_atoms: short_remaining,
                     withdrawable_atoms: short_withdrawable,
                 },
@@ -3257,12 +3257,12 @@ mod tests {
     fn pool_wide_odd_atom_splits_reverse_for_every_small_round_trip() {
         for principal_before in 0..32u64 {
             for amount in 1..32u64 {
-                let budgets =
+                let balances =
                     percolator_accounting::balanced_insurance_domains(principal_before.into());
-                let deposit = insurance_deposit_domain_delta(budgets, amount);
+                let deposit = insurance_deposit_domain_delta(balances, amount);
                 let after_deposit = [
-                    budgets[0] + deposit[0],
-                    budgets[1] + deposit[1],
+                    balances[0] + deposit[0],
+                    balances[1] + deposit[1],
                 ];
                 let withdraw = insurance_withdraw_domain_delta(after_deposit, amount);
                 assert_eq!(deposit, withdraw);
@@ -3272,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_budget_routing_cannot_amplify_a_preexisting_skew() {
+    fn live_domain_routing_cannot_amplify_a_preexisting_skew() {
         for long in 0..32u128 {
             for short in 0..32u128 {
                 let before_gap = long.abs_diff(short);
@@ -3302,11 +3302,11 @@ mod tests {
 
     #[test]
     fn impaired_odd_exit_reverses_only_principal_actually_paid() {
-        for budgets in [[100, 100], [100, 101]] {
-            let fresh_deposit = insurance_deposit_domain_delta(budgets, 1);
+        for balances in [[100, 100], [100, 101]] {
+            let fresh_deposit = insurance_deposit_domain_delta(balances, 1);
             let after_deposit = [
-                budgets[0] + fresh_deposit[0],
-                budgets[1] + fresh_deposit[1],
+                balances[0] + fresh_deposit[0],
+                balances[1] + fresh_deposit[1],
             ];
 
             // A stale odd claim retires three nominal atoms but receives only one.
@@ -3315,7 +3315,7 @@ mod tests {
             let stale_exit = insurance_withdraw_domain_delta(after_deposit, 1);
             assert_eq!(stale_exit, fresh_deposit);
 
-            // A fully impaired retirement moves no principal or domain budget.
+            // A fully impaired retirement moves no principal or live domain balance.
             assert_eq!(insurance_withdraw_domain_delta(after_deposit, 0), [0, 0]);
         }
     }
@@ -3327,7 +3327,7 @@ mod tests {
                 for payout in 1..=requested {
                     let balance = insurance_balance(1_000, 1_000, 1_000, 1_000, 2_000);
                     let principal_debit = insurance_withdraw_domain_delta(
-                        insurance_domain_budgets(balance),
+                        insurance_domain_balances(balance),
                         payout,
                     );
                     let plan = insurance_withdrawal_plan(
