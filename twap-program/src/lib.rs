@@ -4031,9 +4031,10 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             }
         }
         // Open the next round regardless.
-        let next_end = clock_slot
-            .checked_add(book.round_length)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        // The terminal clock value is a valid final round boundary. Saturating here lets the
+        // current book settle instead of rolling every payout back solely because no later slot
+        // can be represented; placement is closed once `clock_slot == round_end == u64::MAX`.
+        let next_end = clock_slot.saturating_add(book.round_length);
         d[BK_ROUND_END..BK_ROUND_END + 8].copy_from_slice(&next_end.to_le_bytes());
     }
 
@@ -4290,13 +4291,11 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
             // permissionless no-op roll advances round_end without clearing the committed bid.
             let place_slot = book_rd_u64(&d, o + SL_PLACE_SLOT);
             let now = solana_program::clock::Clock::get()?.slot;
-            let cooldown_slots = book
-                .round_length
-                .checked_mul(2)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            let cooldown_end = place_slot
-                .checked_add(cooldown_slots)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
+            // Current books reject a zero length and bound 2*round_length at init. Saturation also
+            // preserves exits for predecessor books and late placements whose absolute deadline
+            // crosses the finite slot domain: they remain committed until u64::MAX, never forever.
+            let cooldown_slots = book.round_length.saturating_mul(2);
+            let cooldown_end = place_slot.saturating_add(cooldown_slots);
             if now < cooldown_end {
                 return Err(ProgramError::Custom(ERR_ROUND_ACTIVE));
             }

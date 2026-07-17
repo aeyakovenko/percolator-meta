@@ -27213,6 +27213,124 @@ fn cancel_ix(
     }
 }
 
+// PARTIAL LOF / CLOCK-LIVENESS PROBE: init accepts the largest round length whose doubled
+// cooldown fits in u64. A bid placed after slot zero used to make `place_slot + 2*round_length`
+// overflow forever, so even slot u64::MAX could not return its escrow. The same terminal slot made
+// execute roll back while opening its next round. This is an extreme Squads-configured policy, not
+// a permissionless way to attack an ordinary book, but accepted parameters must not create an
+// arithmetic-only custody lock.
+#[test]
+fn e2e_terminal_clock_saturation_preserves_bid_exit_and_round_progress() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(
+        &mut svm,
+        &payer,
+        &env,
+        u64::MAX / 2,
+        0,
+        None,
+        0,
+    );
+
+    let (bidder, coin_source, usd_destination) = new_bidder(&mut svm, &payer, &env, 10);
+    warp_to(&mut svm, 2);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_source,
+            &usd_destination,
+            &env.coin_mint,
+            &env.collateral_mint,
+            10,
+            10,
+            None,
+        ),
+    )
+    .expect("the accepted extreme book escrows a public bid");
+    assert_eq!(token_amount(&svm, &coin_source), 0);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 10);
+
+    // Isolate the book clock transition from Percolator's own terminal-slot clock handling. A
+    // high real floor pauses surplus pulls while leaving the public auction state machine live.
+    let floor = build_set_reserved_floor_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        u128::MAX - 1,
+    );
+    let floor_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &floor,
+        &floor_accounts,
+    )
+    .expect("pause surplus pulls without changing the book cooldown");
+
+    warp_to(&mut svm, u64::MAX);
+    send(
+        &mut svm,
+        &[&bidder],
+        cancel_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_source,
+            0,
+        ),
+    )
+    .expect("a saturated terminal cooldown must release bidder escrow");
+    assert_eq!(token_amount(&svm, &coin_source), 10);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("terminal round advancement must saturate instead of rolling back");
+    let book = svm.get_account(&bk.book).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap()),
+        u64::MAX,
+    );
+}
+
 // CANCEL: an unsettled bid is reclaimable by its owner only AFTER the cooldown (an execute clears
 // the book, or 2*round_length slots pass) — so there is no last-second cancel that could
 // manipulate a pending execute. The escrowed COIN is returned but the anti-spam fee stays burned.
