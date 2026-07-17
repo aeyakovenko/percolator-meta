@@ -14105,3 +14105,24 @@ external routes sum to at most current surplus by construction. All three TWAP c
 bought-COIN buyback carry, fit into five bytes previously reserved as zero; predecessor buyback-only state and
 every supported config generation decode without migration or reallocation. No instruction, account, signer,
 authority, destination, CPI, token custody, or principal-moving surface is added.
+## Tick - pre-ID frozen trader stakes could not claim after upgrade (surface D, REAL LOF)
+
+The portfolio-incarnation upgrade appended a monotonic Percolator portfolio ID to every new reward stake.
+The two published predecessor stake layouts have no such field and deserialize their missing ID as zero.
+Crystallization correctly rejects those unbound stakes so a reused account cannot create new points, but
+claim passed `Some(0)` into the exact-incarnation reader as well. That reader rejects zero before consulting
+an otherwise authenticated live portfolio or archive, so every already-frozen predecessor trader stake lost
+its only public claim path after upgrade. LP stakes happened to use their separate monotonic fallback.
+
+The retained LiteSVM upgrade regression covers both published 211-byte and 212-byte predecessor layouts. It
+registers and crystallizes a real public trader stake, freezes its denominator, applies a post-freeze spent
+increase that halves the live cap, and requires the upgraded public claim to pay exactly half of the fixed
+cohort allocation. Before the fix both cases fail with `InvalidAccountData` and leave the stake and reward
+vault unchanged. Existing real-Percolator regressions still reject current-ID account reinitialization before
+crystallization and after reward consumption.
+
+FIX: claim treats only the two exact predecessor sizes as lacking an incarnation ID. Their frozen points can
+use the authenticated live/archive cap, while current 220-byte stakes still require their exact nonzero ID.
+This does not reopen registration or crystallization and cannot increase a frozen numerator or denominator,
+change a recipient, or move collateral, insurance, backing, or Subledger principal. The compatibility bound
+is reward COIN only.

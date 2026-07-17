@@ -2604,8 +2604,8 @@ fn pre_portfolio_id_stake_cannot_resume_counter_accrual_after_upgrade() {
     );
 }
 
-#[test]
-fn frozen_pre_portfolio_id_trader_stake_preserves_its_live_capped_claim() {
+fn exercise_frozen_pre_portfolio_id_trader_claim(predecessor_size: usize) {
+    assert!(matches!(predecessor_size, 211 | 212));
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     let payer = Keypair::new();
@@ -2664,7 +2664,7 @@ fn frozen_pre_portfolio_id_trader_stake_preserves_its_live_capped_claim() {
     let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_TRADER);
     let mut predecessor = svm.get_account(&stake).unwrap();
     assert_eq!(predecessor.data.len(), 220);
-    predecessor.data.truncate(212);
+    predecessor.data.truncate(predecessor_size);
     svm.set_account(stake, predecessor).unwrap();
 
     set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
@@ -2694,6 +2694,12 @@ fn frozen_pre_portfolio_id_trader_stake_preserves_its_live_capped_claim() {
     .expect("frozen pre-ID trader claim remains live after upgrade");
     assert_eq!(token_amount(&svm, &recipient), supply / 2);
     assert_eq!(token_amount(&svm, &env.vault), supply / 2);
+}
+
+#[test]
+fn frozen_pre_portfolio_id_trader_stake_preserves_its_live_capped_claim() {
+    exercise_frozen_pre_portfolio_id_trader_claim(211);
+    exercise_frozen_pre_portfolio_id_trader_claim(212);
 }
 
 #[test]
