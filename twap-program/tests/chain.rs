@@ -3164,6 +3164,200 @@ fn predecessor_market_fixture_preserves_backing_fee_recovery_state() {
 }
 
 #[test]
+fn e2e_controller_proxy_rejects_trailing_bytes_for_every_allowed_admin_payload() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0;
+                percolator_prog::state::market_account_len_for_capacity(1).unwrap()
+            ],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller market initialization");
+
+    use percolator_prog::ix::Instruction as PIx;
+    let admin_payloads = vec![
+        ("resolve market", PIx::ResolveMarket),
+        (
+            "configure hybrid oracle",
+            PIx::ConfigureHybridOracle {
+                asset_index: 0,
+                now_slot: 100,
+                now_unix_ts: 100,
+                oracle_leg_count: 0,
+                oracle_leg_flags: 0,
+                max_staleness_secs: 1,
+                hybrid_soft_stale_slots: 1,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+                invert: 0,
+                unit_scale: 1,
+                conf_filter_bps: 0,
+                oracle_leg_feeds: [[0; 32]; 3],
+            },
+        ),
+        (
+            "configure EWMA mark",
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+        (
+            "update liquidation fee",
+            PIx::UpdateLiquidationFeePolicy {
+                cranker_share_bps: 0,
+            },
+        ),
+        (
+            "configure permissionless resolve",
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1,
+                force_close_delay_slots: 1,
+            },
+        ),
+        (
+            "drain asset",
+            PIx::UpdateAssetLifecycle {
+                action: 1,
+                asset_index: 0,
+                now_slot: 100,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            },
+        ),
+        (
+            "update maintenance fee",
+            PIx::UpdateMaintenanceFeePolicy {
+                cranker_share_bps: 0,
+            },
+        ),
+        (
+            "clear backing fee",
+            PIx::UpdateBackingFeePolicy {
+                domain: 0,
+                fee_bps: 0,
+                insurance_share_bps: 0,
+            },
+        ),
+        (
+            "update trade fee",
+            PIx::UpdateTradeFeePolicy {
+                trade_fee_base_bps: 0,
+            },
+        ),
+        (
+            "update fee redirect",
+            PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 },
+        ),
+        (
+            "configure authenticated mark",
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+            },
+        ),
+        (
+            "restart asset oracle",
+            PIx::RestartAssetOracle {
+                asset_index: 0,
+                now_slot: 100,
+                initial_price: 1_000_000,
+            },
+        ),
+    ];
+    let expected_tags = [19u8, 34, 35, 37, 38, 40, 49, 51, 55, 58, 62, 69];
+    let baseline = svm.get_account(&market).unwrap();
+
+    for ((name, instruction), expected_tag) in admin_payloads.into_iter().zip(expected_tags) {
+        let mut payload = instruction.encode();
+        assert_eq!(payload[0], expected_tag, "test payload tag for {name}");
+        payload.push(0xa5);
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&payload);
+        let result = send(
+            &mut svm,
+            &[&payer, &governance],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data,
+            },
+        );
+        assert!(result.is_err(), "trailing byte must reject {name}");
+
+        let after = svm.get_account(&market).unwrap();
+        assert_eq!(after.data, baseline.data, "rejected {name} mutated market data");
+        assert_eq!(
+            after.lamports, baseline.lamports,
+            "rejected {name} mutated market lamports"
+        );
+    }
+}
+
+#[test]
 fn controller_can_restart_asset0_after_governed_shutdown() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
