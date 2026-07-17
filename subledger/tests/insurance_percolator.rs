@@ -2310,6 +2310,47 @@ fn post_loss_recapitalization_rebalances_live_insurance_domains() {
     )
     .expect("fresh capital recapitalizes the live market");
     let recapitalized_domains = domains(&env);
+
+    let second_entry = 115u64;
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        second_entry,
+        20,
+    );
+    let second_loss = principal as u128;
+    let second_capital = pnl_atoms_per_price
+        .checked_mul((second_entry - low_entry) as u128)
+        .unwrap()
+        .checked_sub(second_loss)
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap();
+    let (_, second_long_portfolio, second_short, second_short_portfolio) =
+        open_public_pair(&mut env, position_q, second_entry, second_capital);
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        low_entry,
+        300,
+    );
+    liquidate_stale_public_loser(&mut env, second_long_portfolio, slot);
+    let insurance_after_second_loss = asset_insurance_remaining(&env, 0);
+    clear_stale_public_winner(
+        &mut env,
+        &second_short,
+        second_short_portfolio,
+        slot,
+    );
+
+    assert!(
+        insurance_after_second_loss
+            >= (recapitalized_domains[0] + recapitalized_domains[1]) / 2,
+        "one public side loss consumed more than its configured half: before={recapitalized_domains:?} after={insurance_after_second_loss}",
+    );
     assert!(
         recapitalized_domains[0].abs_diff(recapitalized_domains[1]) <= 1,
         "fresh insurance must not inherit a historical domain loss: {recapitalized_domains:?}",
