@@ -272,6 +272,24 @@ pub fn read_portfolio_reward_snapshot(
     data: &[u8],
     portfolio: &[u8; 32],
 ) -> Result<PortfolioRewardSnapshot, ReadError> {
+    read_portfolio_reward_snapshot_inner(data, portfolio, false)
+}
+
+/// Reads a portfolio snapshot for atomic terminal cleanup, including portfolios
+/// created before Percolator assigned monotonic portfolio IDs. Callers must not
+/// use this compatibility view to register or identify a live reward position.
+pub fn read_portfolio_reward_snapshot_for_cleanup(
+    data: &[u8],
+    portfolio: &[u8; 32],
+) -> Result<PortfolioRewardSnapshot, ReadError> {
+    read_portfolio_reward_snapshot_inner(data, portfolio, true)
+}
+
+fn read_portfolio_reward_snapshot_inner(
+    data: &[u8],
+    portfolio: &[u8; 32],
+    allow_legacy_zero_id: bool,
+) -> Result<PortfolioRewardSnapshot, ReadError> {
     validate_header(data, KIND_PORTFOLIO)?;
     let base = HEADER_LEN;
     let provenance = base + offset_of!(PortfolioAccountV16Account, provenance_header);
@@ -296,12 +314,12 @@ pub fn read_portfolio_reward_snapshot(
         provenance + offset_of!(ProvenanceHeaderV16Account, layout_discriminator),
     )?;
     let owner = bytes(data, base + offset_of!(PortfolioAccountV16Account, owner))?;
-    let portfolio_id = percolator_prog::state::read_portfolio_id(data)
-        .map_err(|_| ReadError::InvalidAccounting)?;
+    let portfolio_id = read_u64(data, percolator_prog::constants::PORTFOLIO_ID_OFF)?;
     if recorded_portfolio != *portfolio
         || provenance_owner != owner
         || market_group == [0u8; 32]
         || owner == [0u8; 32]
+        || (portfolio_id == 0 && !allow_legacy_zero_id)
         || account_version != PORTFOLIO_ACCOUNT_VERSION
         || layout_discriminator != PORTFOLIO_LAYOUT_DISCRIMINATOR
     {
@@ -1054,6 +1072,23 @@ mod tests {
             read_portfolio_reward_snapshot(&missing_id, &portfolio),
             Err(ReadError::InvalidAccounting),
             "reward telemetry requires a nonzero program-assigned incarnation ID"
+        );
+        let legacy =
+            read_portfolio_reward_snapshot_for_cleanup(&missing_id, &portfolio).unwrap();
+        assert_eq!(legacy.portfolio_id, 0);
+        assert_eq!(legacy.market_group, market);
+        assert_eq!(legacy.owner, owner);
+        assert_eq!(legacy.funding_long_paid, 42);
+
+        let mut invalid_legacy = missing_id.clone();
+        let provenance_owner = HEADER_LEN
+            + offset_of!(PortfolioAccountV16Account, provenance_header)
+            + offset_of!(ProvenanceHeaderV16Account, owner);
+        invalid_legacy[provenance_owner] ^= 1;
+        assert_eq!(
+            read_portfolio_reward_snapshot_for_cleanup(&invalid_legacy, &portfolio),
+            Err(ReadError::InvalidAccounting),
+            "the cleanup exception does not weaken provenance validation"
         );
 
         let mut received_only = PortfolioRewardSnapshot::default();
