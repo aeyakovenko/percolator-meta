@@ -2249,6 +2249,142 @@ fn one_atom_deposits_balance_globally_and_a_round_trip_cannot_move_the_remainder
     assert_eq!(env.read_position(&victim.pubkey()).0, 1);
 }
 
+// PUBLIC LOF: an attacker can split a fully impaired generation across dust positions, then
+// alternate each zero-value exit with a one-atom recapitalization. If zero exits keep changing
+// the domain-routing parity, every new atom lands on the same side instead of the 50/50 split.
+#[test]
+fn zero_value_generation_exits_cannot_steer_recapitalization_into_one_domain() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let domains = |env: &Env| {
+        let (_, group) = percolator_prog::state::read_market(
+            &env.svm.get_account(&env.slab).unwrap().data,
+        )
+        .unwrap();
+        [
+            group.insurance_domain_budget[0] - group.insurance_domain_spent[0],
+            group.insurance_domain_budget[1] - group.insurance_domain_spent[1],
+        ]
+    };
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64
+        .checked_mul(high_entry)
+        .unwrap();
+    let second_domain_loss = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let first_domain_loss = second_domain_loss.checked_sub(1).unwrap();
+    let old_principal = first_domain_loss
+        .checked_add(second_domain_loss)
+        .unwrap();
+    const STALE_DUST_POSITIONS: u64 = 4;
+    let whale_principal = old_principal
+        .checked_sub(STALE_DUST_POSITIONS)
+        .unwrap();
+    let (old_whale, old_whale_ata) = new_depositor(&mut env, whale_principal);
+    let pool = env.pool;
+    let old_whale_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &old_whale,
+        &old_whale_ata,
+        &old_whale_holding,
+        whale_principal,
+    )
+    .expect("fund the main loss-bearing position");
+    let mut stale_dust = Vec::new();
+    for _ in 0..STALE_DUST_POSITIONS {
+        let (owner, ata) = new_depositor(&mut env, 1);
+        let holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&owner, &ata, &holding, 1)
+            .expect("split the impaired generation across dust positions");
+        stale_dust.push((owner, ata, holding));
+    }
+    assert_eq!(
+        domains(&env),
+        [first_domain_loss as u128, second_domain_loss as u128],
+    );
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+
+    let mut slot = 100;
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_001,
+        high_entry,
+        high_capital,
+        first_domain_loss,
+        0,
+    );
+    assert_eq!(domains(&env), [0, 0]);
+
+    let mut fresh_positions = Vec::new();
+    for (stale_owner, stale_ata, stale_holding) in stale_dust {
+        let (fresh_owner, fresh_ata) = new_depositor(&mut env, 1);
+        let fresh_holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&fresh_owner, &fresh_ata, &fresh_holding, 1)
+            .expect("recapitalize after the complete public loss");
+        env.insurance_withdraw(&stale_owner, &stale_ata, &stale_holding, &stale_owner, 1)
+            .expect("retire one fully impaired dust position");
+        assert_eq!(env.token_amount(&stale_ata), 0);
+        fresh_positions.push((fresh_owner, fresh_ata, fresh_holding));
+    }
+    env.insurance_withdraw(
+        &old_whale,
+        &old_whale_ata,
+        &old_whale_holding,
+        &old_whale,
+        whale_principal,
+    )
+    .expect("retire the final fully impaired position");
+    assert_eq!(env.token_amount(&old_whale_ata), 0);
+    assert_eq!(env.pool_outstanding(), STALE_DUST_POSITIONS);
+    assert_eq!(
+        domains(&env),
+        [2, 2],
+        "fresh one-atom deposits must alternate domains despite interleaved stale exits",
+    );
+
+    for (owner, ata, holding) in fresh_positions {
+        env.insurance_withdraw(&owner, &ata, &holding, &owner, 1)
+            .expect("each fresh depositor remains withdrawable");
+        assert_eq!(env.token_amount(&ata), 1);
+    }
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 // CROSS-ASSET EXIT DOS: the market header's `insurance` is global, while tag-57 debits
 // only asset 0. If asset 0 is impaired and an external asset keeps the global total above
 // outstanding principal, a global quote asks Percolator for more than asset 0 owns and the
