@@ -33982,6 +33982,221 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
     );
 }
 
+// POLICY-EPOCH PROBE: a fractional savings entitlement belongs to the destination that was
+// configured when the surplus created it. Replacing that destination must not let the new sink
+// inherit the old sink's half atom; the replacement starts a fresh cumulative savings interval.
+#[test]
+fn e2e_fractional_surplus_carry_does_not_cross_savings_sink_epochs() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let savings_sink_a = Pubkey::new_unique();
+    let savings_sink_b = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings_sink_a,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &savings_sink_b,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+
+    let policy_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let no_auction = build_twap_reconfigure_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &twap_id(),
+        0,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &no_auction,
+        &policy_accounts,
+    )
+    .expect("disable the auction route");
+
+    let economics_a = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings_sink_a,
+        5_000,
+        0,
+    );
+    let economics_a_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink_a, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &economics_a,
+        &economics_a_accounts,
+    )
+    .expect("configure sink A for half of each surplus interval");
+
+    let initial_floor = env.principal + env.surplus - 1;
+    let floor = build_set_reserved_floor_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        initial_floor as u128,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &floor,
+        &policy_accounts,
+    )
+    .expect("leave sink A exactly one atom of surplus");
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let first_round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, first_round_end);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix_full(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            Some(savings_sink_a),
+            None,
+        ),
+    )
+    .expect("execute sink A's one-atom interval");
+    assert_eq!(token_amount(&svm, &savings_sink_a), 0);
+    assert_eq!(read_split_remainders_bps(&svm, &env.twap_cfg)[1], 5_000);
+
+    let economics_b = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings_sink_b,
+        5_000,
+        0,
+    );
+    let economics_b_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings_sink_b, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        9,
+        &economics_b,
+        &economics_b_accounts,
+    )
+    .expect("rotate to savings sink B");
+    assert_eq!(
+        read_split_remainders_bps(&svm, &env.twap_cfg)[1],
+        0,
+        "sink B cannot inherit sink A's terminal half atom",
+    );
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        2,
+    );
+    for round in 0..2 {
+        send(
+            &mut svm,
+            &[&donor],
+            donate_insurance_ix(&donor.pubkey(), &env, &donor_source, &bk.holding, 1),
+        )
+        .expect("inject one atom under sink B");
+        let round_end = u64::from_le_bytes(
+            svm.get_account(&bk.book).unwrap().data[240..248]
+                .try_into()
+                .unwrap(),
+        );
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&cranker],
+            execute_ix_full(
+                &cranker.pubkey(),
+                &env,
+                &bk.book,
+                &bk.holding,
+                &bk.settlement_usd,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                Some(savings_sink_b),
+                None,
+            ),
+        )
+        .expect("execute one-atom sink B interval");
+        assert_eq!(
+            token_amount(&svm, &savings_sink_b),
+            if round == 0 { 0 } else { 1 },
+            "sink B must accrue only within its own epoch",
+        );
+    }
+
+    assert_eq!(token_amount(&svm, &savings_sink_a), 0);
+    assert_eq!(token_amount(&svm, &savings_sink_b), 1);
+    assert_eq!(read_split_remainders_bps(&svm, &env.twap_cfg)[1], 0);
+    assert_eq!(
+        token_amount(&svm, &env.perc_vault),
+        initial_floor + 2,
+        "each sink epoch's unrepresentable first half atom remains protected insurance",
+    );
+}
+
 // UNCENSORABILITY (full-book eviction): once the 32-slot book is full, a NOT-better bid is rejected
 // (so spam can't push out real bids), but a STRICTLY better bid always gets in — it evicts the
 // weakest and refunds that bidder. This is the core uncensorable-bid guarantee, driven by the
