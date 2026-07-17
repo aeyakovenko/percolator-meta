@@ -2209,6 +2209,113 @@ fn depositor_round_trip_cannot_reassign_another_owners_insurance_domain() {
     );
 }
 
+// PUBLIC LOF: spent domain budget is historical, not live protection. After a
+// one-sided loss, fresh insurance must rebuild the configured 50/50 live allocation
+// instead of balancing gross budgets around atoms that the market already consumed.
+#[test]
+fn post_loss_recapitalization_rebalances_live_insurance_domains() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let domains = |env: &Env| {
+        let (_, group) = percolator_prog::state::read_market(
+            &env.svm.get_account(&env.slab).unwrap().data,
+        )
+        .unwrap();
+        [
+            group.insurance_domain_budget[0] - group.insurance_domain_spent[0],
+            group.insurance_domain_budget[1] - group.insurance_domain_spent[1],
+        ]
+    };
+
+    let domain_tranche = 999_999u64;
+    let principal = domain_tranche.checked_mul(2).unwrap();
+    let (old_owner, old_owner_ata) = new_depositor(&mut env, principal);
+    let pool = env.pool;
+    let old_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&old_owner, &old_owner_ata, &old_holding, principal)
+        .expect("fund the initial balanced insurance generation");
+    assert_eq!(domains(&env), [domain_tranche as u128; 2]);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let low_entry = 100u64;
+    let low_capital = 10_000_001u64;
+    let position_q = 1_000_000_000_000i128;
+    let pnl_atoms_per_price = position_q.unsigned_abs() / percolator::POS_SCALE;
+    let high_target = low_entry
+        .checked_add(
+            u64::try_from(
+                (domain_tranche as u128 + low_capital as u128) / pnl_atoms_per_price,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        (domain_tranche as u128 + low_capital as u128) % pnl_atoms_per_price,
+        0,
+    );
+    let (long, long_portfolio, _, short_portfolio) =
+        open_public_pair(&mut env, position_q, low_entry, low_capital);
+    let mut slot = 100;
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        high_target,
+        300,
+    );
+    liquidate_stale_public_loser(&mut env, short_portfolio, slot);
+    let impaired_domains = domains(&env);
+    assert_eq!(
+        impaired_domains[0] + impaired_domains[1],
+        domain_tranche as u128,
+    );
+    assert!(impaired_domains.contains(&0));
+    clear_stale_public_winner(&mut env, &long, long_portfolio, slot);
+
+    let (fresh_owner, fresh_owner_ata) = new_depositor(&mut env, principal);
+    let fresh_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &fresh_owner,
+        &fresh_owner_ata,
+        &fresh_holding,
+        principal,
+    )
+    .expect("fresh capital recapitalizes the live market");
+    let recapitalized_domains = domains(&env);
+    assert!(
+        recapitalized_domains[0].abs_diff(recapitalized_domains[1]) <= 1,
+        "fresh insurance must not inherit a historical domain loss: {recapitalized_domains:?}",
+    );
+}
+
 #[test]
 fn one_atom_deposits_balance_globally_and_a_round_trip_cannot_move_the_remainder() {
     let mut env = Env::new();
