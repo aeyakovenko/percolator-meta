@@ -6222,6 +6222,47 @@ fn deposit_window_cannot_outlive_the_bootstrap() {
 }
 
 #[test]
+fn bootstrap_schedule_must_leave_a_terminal_trigger_window() {
+    let start = 101u64;
+    let window = 1u64;
+    let delay = u64::MAX - start;
+    let mut env =
+        Env::new_for_policy_with_bootstrap_schedule(POLICY_PRINCIPAL, window, start, delay);
+    let mut data = vec![3u8];
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&window.to_le_bytes());
+    data.extend_from_slice(&start.to_le_bytes());
+    data.extend_from_slice(&delay.to_le_bytes());
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.gv_config_pda(), false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+        ],
+        data,
+    };
+
+    assert!(
+        env.send(&[ix], &[]).is_err(),
+        "an accepted schedule must leave room after bootstrap end for trigger or refund"
+    );
+    assert!(
+        env.svm
+            .get_account(&env.pool)
+            .map_or(true, |account| account.data.is_empty()),
+        "the unusable terminal schedule must not consume the canonical pool PDA"
+    );
+}
+
+#[test]
 fn exact_schedule_boundaries_complete_real_percolator_genesis_and_return_principal() {
     let window = 3u64;
     let start = 110u64;
