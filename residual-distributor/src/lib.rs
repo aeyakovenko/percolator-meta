@@ -2511,9 +2511,10 @@ fn freeze(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
 //   insurance/backing cohorts append one more: the subledger position (for the live HE cap).
 //   LP/trader cohorts append three more: the Percolator portfolio, canonical cumulative archive,
 //   and exact read-only retired-market marker PDA.
-//   A pre-archive direct Percolator close retains the frozen fallback only for LP points, whose
-//   received counter is monotonic. Trader points require live counters or a controller archive so
-//   later residual spending cannot be hidden by dematerializing the portfolio.
+//   LP points are frozen from a monotonic received counter, so claim validates the bound witness
+//   identities but does not depend on mutable live portfolio bytes. Trader points require live
+//   counters or a controller archive so later residual spending cannot be hidden by closing or
+//   replacing the portfolio.
 //
 // PERMISSIONLESS self-service claim (replaces the cranker-assembled seal for the portfolio
 // cohort). Pays the stake's OWN deterministic share —
@@ -2679,7 +2680,8 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             points_to_amount(cohort_supply, pts, frozen_denom)
         }
         COHORT_LP | COHORT_TRADER => {
-            // Residual cohorts: live-cap the frozen points against a post-crystallize net drop.
+            // Residual cohorts retain the three-account witness shape so every claim validates its
+            // bound portfolio key and canonical market/archive/retirement identities.
             let portfolio = next_account_info(iter)?;
             let portfolio_archive = next_account_info(iter)?;
             let retired_market = next_account_info(iter)?;
@@ -2702,7 +2704,44 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 retired_market,
             )?;
             let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
-            if (dematerialized || retired) && portfolio_archive.data_len() == 0 {
+            let replaced_lp_incarnation = if stake.cohort == COHORT_LP
+                && !dematerialized
+                && !retired
+            {
+                if *portfolio.owner != config.percolator_program {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                let live = percolator_accounting::read_portfolio_reward_snapshot(
+                    &portfolio.try_borrow_data()?,
+                    &portfolio.key.to_bytes(),
+                )
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+                live.owner != stake.owner.to_bytes()
+                    || live.market_group != portfolio_market.to_bytes()
+                    || live.portfolio_id != stake.portfolio_id
+            } else {
+                false
+            };
+            if stake.cohort == COHORT_LP
+                && (dematerialized || retired || replaced_lp_incarnation)
+            {
+                // Crystallization authenticated this portfolio incarnation and freeze made both
+                // numerator and denominator immutable. residual_received is monotonic, so a later
+                // close or public same-key rematerialization cannot reduce the earned amount and
+                // must not become a veto over this frozen claim. A still-live exact incarnation
+                // retains the conservative live cap below; malformed same-program data still
+                // rejects while classifying a replacement. Validate the canonical archive identity
+                // before paying without consulting the distinct incarnation's counters.
+                archive_for_identity(
+                    program_id,
+                    portfolio_archive,
+                    &config.percolator_program,
+                    &portfolio_market,
+                    &stake.owner,
+                    portfolio.key,
+                )?;
+                points_to_amount(cohort_supply, stake.points, frozen_denom)
+            } else if (dematerialized || retired) && portfolio_archive.data_len() == 0 {
                 if *portfolio_archive.owner != solana_program::system_program::ID
                     || *portfolio_archive.key
                         != portfolio_archive_address(
@@ -2715,15 +2754,10 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 {
                     return Err(ProgramError::InvalidSeeds);
                 }
-                // LP received-flow is monotonic, so its frozen numerator remains valid after a
-                // pre-archive close. Trader loss is not: later public trades raise `spent` and
-                // lower its live cap. Paying trader points without either live counters or an
-                // authenticated controller archive lets an owner close the portfolio to erase
-                // that cap and claim stale points.
-                if stake.cohort == COHORT_TRADER {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                points_to_amount(cohort_supply, stake.points, frozen_denom)
+                // Trader loss is not monotonic: later public trades raise `spent` and lower its
+                // live cap. Paying without live counters or an authenticated controller archive
+                // lets an owner close the portfolio to erase that cap and claim stale points.
+                return Err(ProgramError::InvalidAccountData);
             } else {
                 let totals = portfolio_totals(
                     program_id,
