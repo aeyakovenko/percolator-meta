@@ -620,13 +620,13 @@ fn invoke_signed_for_pool<'a>(
 struct Position {
     pool: Pubkey,
     owner: Pubkey,
-    /// Live principal (current deposit, less any withdrawal). The genesis-vote
-    /// reads this with `start_slot` to compute `floor(log2(now-start)) * principal`.
+    /// Live principal (current deposit, less any withdrawal). Genesis reads this
+    /// directly: one principal base unit contributes one vote.
     principal: u64,
     withdrawn_amount: u64,
     withdrawn: bool,
-    /// Last-write-time of this position (set on deposit). Topping up resets it, so
-    /// late additions don't earn early-join vote weight.
+    /// Last-write-time of this position (set on deposit). Topping up resets it so
+    /// late additions do not inherit earlier reward tenure.
     start_slot: u64,
     /// Set by the pool's vote_authority while a genesis vote is live on this
     /// position. Blocks insurance-withdraw until the vote is retracted.

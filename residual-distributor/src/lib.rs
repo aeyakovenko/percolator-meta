@@ -424,8 +424,8 @@ fn validate_portfolio_identity(config: &Config, data: &[u8], owner: &Pubkey) -> 
     Ok(())
 }
 
-/// floor(log2(n)); 0 for n < 2. The residual time-weight multiplier (parity with genesis-vote's
-/// floor(log2(hold_time)) and the rd's original GZ design).
+/// floor(log2(n)); 0 for n < 2. The residual time-weight multiplier from the
+/// distributor's original GZ design; Genesis voting is principal-only.
 fn floor_log2(n: u64) -> u128 {
     if n < 2 {
         0

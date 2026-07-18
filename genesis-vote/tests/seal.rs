@@ -600,7 +600,7 @@ fn trigger_seals_the_distribution_cross_program() {
     env.inject_tally(&gv_proposal, 4, 8, 10, 3, 4); // voted 4 of 10 -> 4*2=8 !> 10
     assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "no quorum");
 
-    // Quorum + majority: total_voted 10 of 10 (20>10), support_weight 8 of 8 (16>8).
+    // Quorum + majority: total_voted 10 of 10 and support principal 10 of 10.
     env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "not sealed yet");
     env.trigger(&gv_proposal, &dist_proposal).expect("trigger seals");
@@ -787,7 +787,7 @@ fn trigger_rejects_a_substituted_pool_that_would_collapse_the_quorum() {
     let dist_proposal = env.create_dist_proposal(1, &[(alice, 60), (bob, 40)]);
     let gv_proposal = env.register(&dist_proposal);
 
-    // Real pool: large outstanding (100). A minority (5) voted but holds a clear weighted majority, so
+    // Real pool: large outstanding (100). A minority (5) voted but holds a clear cast majority, so
     // ONLY the principal quorum stands between the attacker and a seal.
     env.set_pool_outstanding(100);
     env.inject_tally(&gv_proposal, 5, 8, 100, 8, 5); // voted 5 of 100 -> 5*2=10 !> 100 (no quorum); majority 8 of 8
@@ -828,10 +828,10 @@ fn trigger_rejects_a_substituted_pool_that_would_collapse_the_quorum() {
 }
 
 // STRICT MAJORITY/QUORUM (a tie is NOT enough): trigger requires total_voted_principal*2 > live_outstanding
-// AND support_weight*2 > total_cast_weight (lib.rs:743,748 — strict `* 2 <= ... -> reject`). The existing
+// AND support_principal*2 > total_voted_principal (strict `* 2 <= ... -> reject`). The existing
 // happy/sad tests use clearly-below (4/10) and clearly-above (10/10); the EXACT-50% boundary was untested.
 // A `>` -> `>=` regression would let a MINORITY that holds exactly half the principal, or a proposal with
-// exactly half the cast weight, capture the entire COIN distribution — winner-take-all on a tie.
+// exactly half the cast principal, capture the entire COIN distribution — winner-take-all on a tie.
 #[test]
 fn trigger_requires_a_strict_majority_and_quorum_not_a_tie() {
     let mut env = Env::new();
@@ -846,13 +846,15 @@ fn trigger_requires_a_strict_majority_and_quorum_not_a_tie() {
     assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "exactly-half principal is NOT a quorum");
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "not sealed on a tie quorum");
 
-    // EXACTLY 50% weighted majority: quorum satisfied (10 of 10), support 4 of cast 8 -> 4*2 == 8, NOT > 8.
-    env.inject_tally(&gv_proposal, 10, 8, 10, 4, 10);
-    assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "exactly-half cast weight is NOT a majority");
+    // EXACTLY 50% principal majority: quorum satisfied (10 of 10), proposal support 5 of 10.
+    // The legacy weight mirrors deliberately say 8 of 8; they must not override principal.
+    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 5);
+    assert!(env.trigger(&gv_proposal, &dist_proposal).is_err(), "exactly-half cast principal is NOT a majority");
     assert_eq!(env.dist_sealed_proposal(), Pubkey::default(), "not sealed on a tie majority");
 
-    // One unit past BOTH ties: voted 6 of 10 (12 > 10) and support 5 of cast 8 (10 > 8) -> seals.
-    env.inject_tally(&gv_proposal, 6, 8, 10, 5, 6);
+    // One unit past BOTH ties: voted 6 of 10 and proposal support 4 of those 6 -> seals.
+    // Zero legacy support weight proves the principal tally is authoritative.
+    env.inject_tally(&gv_proposal, 6, 8, 10, 0, 4);
     env.trigger(&gv_proposal, &dist_proposal).expect("a STRICT majority + quorum seals");
     assert_eq!(env.dist_sealed_proposal(), dist_proposal, "strict majority + quorum seals the winner");
 }
@@ -1180,7 +1182,7 @@ fn a_second_proposal_cannot_reseal_after_a_winner_is_sealed() {
     let gv_b = env.register(&prop_b);
     env.set_pool_outstanding(10);
 
-    // A reaches quorum + weighted majority and seals.
+    // A reaches quorum + principal majority and seals.
     env.inject_tally(&gv_a, 10, 8, 10, 8, 10);
     env.trigger(&gv_a, &prop_a).expect("A triggers + seals");
     assert_eq!(env.dist_sealed_proposal(), prop_a, "A is the sealed winner");

@@ -8,7 +8,7 @@
 //!    subledger pool PDA is asset-0's insurance authority + operator). Funds land in
 //!    the Percolator insurance vault and a subledger position records
 //!    `owner, principal, start_slot`.
-//! 2. `genesis-vote` reads that subledger position (principal + start_slot) and the
+//! 2. `genesis-vote` reads that subledger position principal and the
 //!    pool's `outstanding_principal` to weight a vote.
 //! 3. The user does a principal-only, owner-authorized exit through the subledger
 //!    and gets their principal back. Non-owner exits and over-principal exits fail.
@@ -575,7 +575,7 @@ fn those_who_stay_decide_after_a_nonvoting_majority_forfeits_by_exiting() {
 
     let alice_dest = Pubkey::new_unique();
     let (dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &alice_dest);
-    env.warp_slot(1124); // alice's position has time-weight
+    env.warp_slot(1124);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("alice backs her proposal");
 
     // Before the exit: a 2% voter lacks quorum against the full committed pool.
@@ -656,9 +656,9 @@ fn bootstrap_deadline_closes_new_backing_but_keeps_retract_and_exit_live() {
     assert_eq!(env.token_amount(&bob_ata), 1);
 }
 
-// VOTE-TIME WEIGHT THEFT (free winner-take-all capture): vote weight = floor(log2(age)) * principal, read from
+// VOTE-TIME WEIGHT THEFT (free winner-take-all capture): vote weight is live principal read from
 // the voter's SUBLEDGER POSITION. If the vote bound the position to the voter loosely, a tiny-stake attacker
-// could present a WHALE's position and cast the whale's huge weight onto the attacker's own proposal — seizing
+// could present a WHALE's position and cast the whale's principal onto the attacker's own proposal — seizing
 // the 100%-of-supply mint with someone else's capital, for ~free. The defense is the canonical-PDA bind
 // (lib.rs:588-593): expected_sub_pos = PDA(["subledger_position", config.subledger_pool, VOTER]), so the only
 // position a signer can vote with is THEIR OWN. This pins it end-to-end against the real subledger + gv: mallory
@@ -679,7 +679,7 @@ fn gv_vote_cannot_borrow_another_voters_position_to_steal_weight() {
 
     let mallory_dest = Pubkey::new_unique();
     let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &mallory_dest);
-    env.warp_slot(1124); // give the positions time-weight
+    env.warp_slot(1124);
 
     // ATTACK: mallory signs, but substitutes the WHALE's position account (index 4) to cast the whale's weight.
     let mallory_ballot =
@@ -1887,15 +1887,11 @@ fn legacy_nonzero_asset_id_pool_withdraws_from_the_asset_zero_it_funded() {
     assert_eq!(env.pool_outstanding(), 0);
 }
 
-// SYBIL/FREE-FARM PROBE (vote-weight tenure gaming, sweep tick B): vote weight = floor(log2(now - start_slot)) *
-// principal, and genesis-vote reads the subledger position's start_slot. start_slot is LAST-WRITE-TIME: every
-// deposit stamps it to `now` (lib.rs:1087 insurance / :635 own-vault). The attack the reset blocks: deposit 1
-// DUST atom early to bank a very old start_slot, sit on it while tenure accrues, then TOP UP the real capital
-// right before voting — if start_slot stayed at the dust slot, the freshly-added principal would borrow the full
-// early tenure and mint a huge floor(log2(now-100)) * principal weight for capital that was only just put at
-// risk. The reset dates ALL the capital to the top-up slot, so late capital earns only its own (short) tenure.
+// REWARD-TENURE PROBE: start_slot is last-write-time, so every deposit stamps it to `now`.
+// A one-atom early deposit followed by a large late top-up must not give the late capital the
+// early atom's insurance/backing reward tenure.
 #[test]
-fn a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_early_tenure() {
+fn a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_reward_tenure() {
     let mut env = Env::new();
     env.init_insurance_pool();
 
@@ -1918,8 +1914,7 @@ fn a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_early_tenure() 
     assert_eq!(p2, 2_000_000, "principal accumulates across both deposits");
     assert_eq!(s2, 1124, "start_slot RESET to the top-up slot — the 1_999_999 cannot claim slot-100 tenure");
     assert!(s2 > s1, "the tenure clock moved forward on the top-up; the dust-banked early slot is gone");
-    // The whole 2M is now dated to slot 1124: its vote weight uses floor(log2(now - 1124)) — the late capital
-    // earns only its own (short) tenure, exactly as a fresh deposit would. No early-tenure free-ride.
+    // The whole 2M is now dated to slot 1124 for capital-reward accounting.
 }
 
 // Venue haircut behaviour of the insurance exit, against real percolator (finding L FIXED).
@@ -4271,7 +4266,7 @@ fn partial_proposal_cannot_be_registered_or_mutated_after_registration() {
 }
 
 #[test]
-fn genesis_vote_reads_subledger_position_and_weights() {
+fn genesis_vote_reads_subledger_principal_one_for_one() {
     let mut env = Env::new();
     env.init_insurance_pool();
     let ve = setup_vote(&mut env);
@@ -4281,29 +4276,18 @@ fn genesis_vote_reads_subledger_position_and_weights() {
     let pool = env.pool;
     let holding = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
-    // deposit at slot 100.
-
     let dest = Pubkey::new_unique();
     let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
-
-    // Advance the clock so hold = 1124 - 100 = 1024 -> floor(log2(1024)) = 10.
-    env.warp_slot(1124);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote backs proposal");
 
     let (support_weight, support_principal) = gv_proposal_support(&env, &gv_proposal);
     assert_eq!(support_principal, amount);
-    // weight = floor(log2(hold)) * principal = 10 * 1_000_000.
-    assert_eq!(support_weight, 10 * amount, "weight = floor(log2(hold)) * principal");
+    assert_eq!(support_weight, amount, "one principal base unit contributes one vote");
 }
 
-// REGRESSION for finding GG (FIXED): weight-tally overflow -> vote-freeze DOS. vote_weight =
-// floor(log2(hold)) * principal; the weighted sum Σ(mᵢ·Pᵢ) can legitimately exceed u64::MAX (up to ~30·Σ
-// principal on a large-supply collateral). With the OLD u64 total_cast_weight, once a saturating whale pushed
-// it to u64::MAX, EVERY later vote's checked_add overflowed and was REJECTED — a sub-majority whale could
-// freeze the tally and block all honest voters (genesis bricked); naive saturation would instead let a
-// minority pass the support*2 > total_cast majority. FIX: total_cast_weight / support_weight / voted_weight +
-// vote_weight are now u128. This pins it WITHOUT impossible deposits: inject total_cast_weight = u64::MAX (the
-// old overflow boundary) and confirm a real vote still lands and the tally grows PAST u64::MAX.
+// LEGACY-UPGRADE REGRESSION for finding GG: historical age-weighted configurations can carry a
+// total_cast_weight at the old u64 boundary. The retained u128 layout must still accept a current
+// principal-only vote so an upgraded in-progress configuration cannot freeze honest voters.
 #[test]
 fn a_high_cast_weight_tally_does_not_overflow_and_block_honest_votes() {
     let mut env = Env::new();
@@ -4317,7 +4301,7 @@ fn a_high_cast_weight_tally_does_not_overflow_and_block_honest_votes() {
     env.insurance_deposit(&alice, &a_ata, &holding, amount).expect("deposit");
     let dest = Pubkey::new_unique();
     let (_dp, gv_prop) = create_and_register_proposal(&mut env, &ve, 1, &dest);
-    env.warp_slot(1124); // hold ~1024 -> m = 10
+    env.warp_slot(1124);
 
     // Inject total_cast_weight = u64::MAX — exactly where the OLD u64 tally would overflow on the next vote's
     // checked_add and reject it (the freeze point). With u128 it is far from the ceiling.
@@ -4325,7 +4309,7 @@ fn a_high_cast_weight_tally_does_not_overflow_and_block_honest_votes() {
     cfg.data[208..224].copy_from_slice(&(u64::MAX as u128).to_le_bytes());
     env.svm.set_account(ve.gv_config, cfg).unwrap();
 
-    // Alice's vote adds ~10*amount weight ON TOP of u64::MAX — must NOT be blocked by overflow.
+    // Alice's vote adds `amount` on top of u64::MAX and must not overflow.
     gv_vote(&mut env, &ve, &alice, &gv_prop, 1)
         .expect("an honest vote must not be blocked by a near-u64::MAX cast-weight tally (GG fix)");
 
@@ -4335,9 +4319,8 @@ fn a_high_cast_weight_tally_does_not_overflow_and_block_honest_votes() {
     assert!(cast > u64::MAX as u128, "total_cast_weight exceeded u64::MAX without overflow (= {})", cast);
 }
 
-// FORGED-POSITION SUPPLY THEFT (the single highest-stakes vector): `vote` reads (principal, start_slot)
-// from the subledger position to compute weight = floor(log2(hold))*principal. If an attacker could feed a
-// FORGED position with a u64::MAX principal, they'd mint themselves an astronomical weight + principal,
+// FORGED-POSITION SUPPLY THEFT: `vote` reads principal from the subledger position. If an attacker could feed a
+// FORGED position with a u64::MAX principal, they would mint themselves the same weight and principal,
 // single-handedly clear quorum + majority, and TRIGGER winner-take-all to seize 100% of the COIN supply.
 // Two layered guards block this and BOTH were previously uncovered (every other vote test uses a real,
 // correctly-owned position, so neither guard was ever exercised against a forgery):
@@ -4492,7 +4475,7 @@ fn re_voting_the_same_proposal_does_not_double_count_weight() {
     env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
     let dest = Pubkey::new_unique();
     let (_dist, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
-    env.warp_slot(1124); // hold age 1024 -> floor(log2)=10 -> weight 10*principal
+    env.warp_slot(1124);
 
     let read_cast = |env: &Env| -> u64 {
         u128::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap()) as u64
@@ -4500,20 +4483,20 @@ fn re_voting_the_same_proposal_does_not_double_count_weight() {
 
     // First vote: weight counted once.
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("first vote");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10 * amount, amount), "one vote, weight once");
-    assert_eq!(read_cast(&env), 10 * amount, "global cast = one vote");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (amount, amount), "one vote, weight once");
+    assert_eq!(read_cast(&env), amount, "global cast = one vote");
 
     // ATTACK: vote AGAIN on the SAME proposal. The backout removes the prior contribution before re-adding,
     // so the tallies stay at exactly one vote — they must NOT double.
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("re-vote accepted (idempotent)");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10 * amount, amount),
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (amount, amount),
         "re-vote must NOT double the proposal's weight/principal");
-    assert_eq!(read_cast(&env), 10 * amount, "re-vote must NOT double the global cast weight");
+    assert_eq!(read_cast(&env), amount, "re-vote must NOT double the global cast weight");
 
     // Even a third time stays put.
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("third vote");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal).0, 10 * amount, "weight still counted exactly once");
-    assert_eq!(read_cast(&env), 10 * amount, "global cast still exactly one vote");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal).0, amount, "weight still counted exactly once");
+    assert_eq!(read_cast(&env), amount, "global cast still exactly one vote");
 }
 
 // ANTI-DOUBLE-VOTE via a SECOND (non-canonical) BALLOT (surface B): the per-voter ballot is the PDA
@@ -4588,7 +4571,7 @@ fn cannot_back_a_second_proposal_without_retracting_the_first() {
     env.insurance_deposit(&bob, &bob_ata, &b_hold, amount).expect("bob deposit");
     let (_da, gv_a) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
     let (_db, gv_b) = create_and_register_proposal(&mut env, &ve, 2, &Pubkey::new_unique());
-    env.warp_slot(1124); // both weights = 10*principal
+    env.warp_slot(1124);
     let read_cast = |env: &Env| -> u64 {
         u128::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap()) as u64
     };
@@ -4597,8 +4580,8 @@ fn cannot_back_a_second_proposal_without_retracting_the_first() {
     // not underflow). alice backs A.
     gv_vote(&mut env, &ve, &bob, &gv_b, 1).expect("bob backs B");
     gv_vote(&mut env, &ve, &alice, &gv_a, 1).expect("alice backs A");
-    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "A has alice's vote");
-    assert_eq!(gv_proposal_support(&env, &gv_b), (10 * amount, amount), "B has bob's vote");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (amount, amount), "A has alice's vote");
+    assert_eq!(gv_proposal_support(&env, &gv_b), (amount, amount), "B has bob's vote");
 
     // ATTACK: alice (live on A) backs B WITHOUT retracting A. Must be refused — else her weight would be
     // double-represented across A and B.
@@ -4606,16 +4589,16 @@ fn cannot_back_a_second_proposal_without_retracting_the_first() {
         gv_vote(&mut env, &ve, &alice, &gv_b, 1).is_err(),
         "a voter with a live ballot on A must retract before backing B"
     );
-    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "A's tally intact — no phantom left behind");
-    assert_eq!(gv_proposal_support(&env, &gv_b), (10 * amount, amount), "B's tally unchanged by the rejected cross-vote");
-    assert_eq!(read_cast(&env), 20 * amount, "global cast = exactly the two real votes");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (amount, amount), "A's tally intact — no phantom left behind");
+    assert_eq!(gv_proposal_support(&env, &gv_b), (amount, amount), "B's tally unchanged by the rejected cross-vote");
+    assert_eq!(read_cast(&env), 2 * amount, "global cast = exactly the two real votes");
 
     // The LEGIT switch works: alice retracts A, then backs B. A -> 0, B -> alice + bob.
     gv_vote(&mut env, &ve, &alice, &gv_a, 2).expect("alice retracts A");
     gv_vote(&mut env, &ve, &alice, &gv_b, 1).expect("alice now backs B");
     assert_eq!(gv_proposal_support(&env, &gv_a), (0, 0), "A fully released after retract");
-    assert_eq!(gv_proposal_support(&env, &gv_b), (20 * amount, 2 * amount), "B now holds both votes");
-    assert_eq!(read_cast(&env), 20 * amount, "global cast still exactly two votes — never inflated");
+    assert_eq!(gv_proposal_support(&env, &gv_b), (2 * amount, 2 * amount), "B now holds both votes");
+    assert_eq!(read_cast(&env), 2 * amount, "global cast still exactly two votes — never inflated");
 }
 
 // DOUBLE-RETRACT (tally corruption / underflow): after a voter retracts, the ballot is no longer live, so a SECOND
@@ -4635,14 +4618,14 @@ fn double_retract_is_rejected_and_does_not_double_release_the_tally() {
     let a_hold = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &a_hold, amount).expect("alice deposit");
     let (_da, gv_a) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
-    env.warp_slot(1124); // weight = 10*principal
+    env.warp_slot(1124);
     let read_cast = |env: &Env| -> u64 {
         u128::from_le_bytes(env.svm.get_account(&ve.gv_config).unwrap().data[208..224].try_into().unwrap()) as u64
     };
 
     gv_vote(&mut env, &ve, &alice, &gv_a, 1).expect("alice backs A");
-    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "A has alice's vote");
-    assert_eq!(read_cast(&env), 10 * amount, "global cast = alice's one vote");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (amount, amount), "A has alice's vote");
+    assert_eq!(read_cast(&env), amount, "global cast = alice's one vote");
 
     // First retract: fully releases the tally.
     gv_vote(&mut env, &ve, &alice, &gv_a, 2).expect("alice retracts A");
@@ -4656,16 +4639,15 @@ fn double_retract_is_rejected_and_does_not_double_release_the_tally() {
 
     // The ballot is intact: alice can back again, and the tally returns to exactly one vote.
     gv_vote(&mut env, &ve, &alice, &gv_a, 1).expect("alice re-backs A after the rejected double-retract");
-    assert_eq!(gv_proposal_support(&env, &gv_a), (10 * amount, amount), "re-back restores exactly one vote — ballot not corrupted");
-    assert_eq!(read_cast(&env), 10 * amount, "global cast = one vote again");
+    assert_eq!(gv_proposal_support(&env, &gv_a), (amount, amount), "re-back restores exactly one vote — ballot not corrupted");
+    assert_eq!(read_cast(&env), amount, "global cast = one vote again");
 }
 
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
-// counted weight/principal — that would inject vote power bypassing vote's weight/age/backout path — and
-// (b) NOT unlock the at-risk capital. The only way to count fresh capital is a re-vote, which resets the age
-// clock (top_up_resets... pins that). This interaction (deposit x live ballot) was untested.
+// counted weight/principal — that would inject vote power bypassing vote's exact backout path — and
+// (b) NOT unlock the at-risk capital. The only way to count fresh capital is a re-vote.
 #[test]
 fn topping_up_a_voted_position_does_not_inflate_or_unlock_the_vote() {
     let mut env = Env::new();
@@ -4677,16 +4659,16 @@ fn topping_up_a_voted_position_does_not_inflate_or_unlock_the_vote() {
     let holding = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("first deposit");
     let (_d, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
-    env.warp_slot(1124); // weight 10*principal
+    env.warp_slot(1124);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10 * amount, amount), "vote counted once");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (amount, amount), "vote counted once");
     assert!(env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap().data[97] == 1, "position vote-locked");
 
     // TOP UP while the ballot is live (deposit ignores the lock) — allowed (no DOS on adding capital).
     env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("top-up while voted is allowed");
 
     // (a) The tally is UNCHANGED — the extra capital is NOT counted until a re-vote.
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10 * amount, amount),
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (amount, amount),
         "top-up must NOT inflate the live vote — deposit is not a vote");
     // (b) The position grew but stays LOCKED: the pledged capital can't be exited without retracting.
     let (principal, _start, withdrawn) = env.read_position(&alice.pubkey());
@@ -4756,7 +4738,7 @@ fn dusting_a_voters_ballot_pda_cannot_block_their_vote() {
     assert_eq!(ballot_acc.owner, gv_id(), "ballot created + owned by genesis-vote despite the dust");
     let (support_weight, support_principal) = gv_proposal_support(&env, &gv_proposal);
     assert_eq!(support_principal, amount, "alice's principal counts");
-    assert_eq!(support_weight, 10 * amount, "alice's weight counts — she was not silenced");
+    assert_eq!(support_weight, amount, "alice's weight counts — she was not silenced");
 }
 
 // FINDING-AI for the POSITION PDA (exclusion DOS, higher-stakes than the ballot): the subledger position
@@ -5120,16 +5102,16 @@ fn vote_locked_insurance_position_cannot_be_drained_via_own_vault_withdraw() {
     assert!(!withdrawn, "not marked withdrawn");
 }
 
-// STALE-WEIGHT VOTING (vote-outlives-capital, the partial-withdraw facet of finding B). vote_weight is
-// floor(log2(age)) * principal, read from the LIVE subledger Position each call (genesis-vote never caches
-// a ballot's weight from an earlier vote, and never trusts the position's `withdrawn` flag — it relies on
+// STALE-WEIGHT VOTING (vote-outlives-capital, the partial-withdraw facet of finding B). Vote weight is
+// principal read from the LIVE subledger Position each call (genesis-vote never trusts
+// the position's `withdrawn` flag — it relies on
 // principal being eager-decremented by process_insurance_withdraw, lib.rs:1267). So a voter who reduces
 // their at-risk capital must immediately get reduced voting power on a re-vote — they cannot keep voting
 // with stale-high weight after pulling capital out. The full-withdraw case (principal -> 0 -> weight 0 ->
 // rejected) has cannot_vote_with_a_withdrawn_position, but that drives the REAL tag-23 withdraw (red post-
 // percolator-rebuild); the partial-withdraw RE-VOTE was untested. Here the post-withdraw position state
 // (principal cut 10x, still active) is set directly so the REAL genesis-vote binary is exercised without
-// the broken withdraw CPI. Slot is held fixed, so the ONLY change between the two votes is the principal.
+// the broken withdraw CPI. The only change between the two votes is principal.
 #[test]
 fn a_revote_after_reducing_capital_uses_the_live_principal_not_stale_weight() {
     let mut env = Env::new();
@@ -5144,11 +5126,11 @@ fn a_revote_after_reducing_capital_uses_the_live_principal_not_stale_weight() {
     let (_dist, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
 
     // Vote with the full 1_000_000 at risk.
-    env.warp_slot(1124); // age 1024 -> floor_log2 = 10
+    env.warp_slot(1124);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote with full capital");
     let (w_full, p_full) = gv_proposal_support(&env, &gv_proposal);
     assert_eq!(p_full, 1_000_000, "support principal = full deposit");
-    assert_eq!(w_full, 10_000_000, "weight = 1_000_000 * floor_log2(1024)=10");
+    assert_eq!(w_full, 1_000_000, "weight equals the full live principal");
 
     // Retract to clear the ballot + lock (the only legitimate way to free the principal for a withdraw).
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract");
@@ -5164,11 +5146,11 @@ fn a_revote_after_reducing_capital_uses_the_live_principal_not_stale_weight() {
     assert_eq!(live_principal, 100_000, "live principal reduced 10x");
     assert!(!withdrawn, "still an active (partially-funded) position");
 
-    // RE-VOTE (same slot, so age is unchanged) -> weight must reflect the LIVE 100_000, not the stale 1M.
+    // Re-vote: weight must reflect the live 100_000, not the stale 1M.
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("re-vote with reduced capital");
     let (w_live, p_live) = gv_proposal_support(&env, &gv_proposal);
     assert_eq!(p_live, 100_000, "re-vote records the LIVE principal, not the stale 1_000_000");
-    assert_eq!(w_live, 1_000_000, "weight = 100_000 * 10 (live), 10x less than the stale-capital weight");
+    assert_eq!(w_live, 100_000, "weight equals the reduced live principal");
 }
 
 // CROSS-PROPOSAL TALLY INTEGRITY (quorum/majority manipulation across competing proposals): one voter,
@@ -5203,8 +5185,7 @@ fn switching_a_vote_between_competing_proposals_migrates_the_global_tallies() {
     let (a_dist, a_gv) = create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
     let (_b_dist, b_gv) = create_and_register_proposal(&mut env, &ve, 2, &Pubkey::new_unique());
 
-    // Give the position tenure so its weight is non-zero, then back A.
-    env.warp_slot(1124);
+    // Back A with the live principal.
     gv_vote(&mut env, &ve, &alice, &a_gv, 1).expect("alice backs A");
     let (a_w, a_p) = gv_proposal_support(&env, &a_gv);
     assert!(a_w > 0 && a_p == amount, "A holds alice's full weight+principal");
@@ -5222,7 +5203,7 @@ fn switching_a_vote_between_competing_proposals_migrates_the_global_tallies() {
     assert_eq!(gv_proposal_support(&env, &a_gv), (0, 0), "A drained on retract");
     assert_eq!(read_tallies(&env), (0, 0), "globals zeroed on retract");
 
-    // (3) Back B (no slot change, so weight is identical) -> B holds the weight, A stays zero, and the
+    // (3) Back B -> B holds the weight, A stays zero, and the
     // globals equal exactly ONE contribution (not doubled).
     gv_vote(&mut env, &ve, &alice, &b_gv, 1).expect("alice backs B");
     assert_eq!(gv_proposal_support(&env, &b_gv), (a_w, a_p), "B now holds the full weight+principal");
@@ -5231,15 +5212,11 @@ fn switching_a_vote_between_competing_proposals_migrates_the_global_tallies() {
     let _ = a_dist;
 }
 
-// FLASH-DEPOSIT QUORUM PUMP (Sybil timing): vote weight = floor(log2(hold_age)) * principal, and a
-// position with age < 2 has ZERO weight. The vote handler rejects a weight-0 vote OUTRIGHT. That
-// rejection is load-bearing: a vote ADDS the position's PRINCIPAL to total_voted_principal (the quorum
-// numerator) right after the weight check. If a weight-0 vote were accepted, an attacker could deposit a
-// large sum and vote in the SAME slot — pumping the principal quorum (total_voted_principal*2 > outstanding)
-// toward a premature trigger — while contributing no time-weight at all. So the "too recent" reject is what
-// forces capital to actually sit at risk before it can count toward quorum.
+// GENESIS REQUIREMENT: a same-slot vote contributes exactly the live principal to both support and
+// quorum, and atomically vote-locks that capital. The short deposit window controls admission;
+// the lock prevents the counted principal from leaving while the ballot remains live.
 #[test]
-fn a_too_recent_position_cannot_vote_or_pump_the_quorum() {
+fn a_same_slot_vote_counts_exact_principal_and_locks_it() {
     let mut env = Env::new();
     env.init_insurance_pool();
     let ve = setup_vote(&mut env);
@@ -5252,60 +5229,32 @@ fn a_too_recent_position_cannot_vote_or_pump_the_quorum() {
     let dest = Pubkey::new_unique();
     let (_dp, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
 
-    // ATTACK: vote in the SAME slot as the deposit (age 0 -> weight 0).
-    assert!(
-        gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
-        "a too-recent (age<2) position cannot vote"
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("same-slot principal votes");
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        (amount, amount),
+        "support weight and support principal both equal live principal"
     );
-    let (w, p) = gv_proposal_support(&env, &gv_proposal);
-    assert_eq!((w, p), (0, 0), "the rejected fresh vote credited NO weight and NO principal (no quorum pump)");
-
-    // After holding long enough, the SAME position votes normally; weight grows with log2(age).
-    env.warp_slot(1124); // age 1024 -> floor(log2)=10
-    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("an aged position votes");
-    let (w2, p2) = gv_proposal_support(&env, &gv_proposal);
-    assert_eq!(p2, amount, "the aged vote finally credits the principal");
-    assert_eq!(w2, 10 * amount, "weight = floor(log2(1024)) * principal");
+    let config = env.svm.get_account(&ve.gv_config).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(config.data[200..208].try_into().unwrap()),
+        amount,
+        "same-slot principal counts exactly once toward quorum"
+    );
+    assert_eq!(
+        env.svm
+            .get_account(&env.position_pda(&alice.pubkey()))
+            .unwrap()
+            .data[97],
+        1,
+        "the same transaction locks the counted principal"
+    );
 }
 
-// AGE THRESHOLD EXACTNESS (sweep): vote_weight is 0 for age < 2 and floor(log2(age)) * principal for age >= 2
-// (gv lib.rs). The flash-deposit test covers age 0 (rejected) then jumps to age 1024 (accepted) — it does NOT
-// pin the exact threshold. This pins the off-by-one: age 1 is STILL zero-weight (rejected), and age 2 is the
-// FIRST votable age, with the minimum non-zero weight floor(log2(2)) * principal = 1 * principal. A threshold of
-// 1 instead of 2 would let a 1-slot-old position vote (weakening the Sybil-timing guard); a threshold of 3 would
-// needlessly delay honest voters.
+// SLOT-ZERO LIVENESS: slot 0 is a valid configured bootstrap start and deposit slot. Genesis
+// must read principal directly rather than treating the zero timestamp as an unfunded sentinel.
 #[test]
-fn vote_weight_first_becomes_nonzero_at_exactly_age_2() {
-    let mut env = Env::new();
-    env.init_insurance_pool();
-    let ve = setup_vote(&mut env);
-    let amount = 1_000_000u64;
-    let (alice, alice_ata) = new_depositor(&mut env, amount);
-    let pool = env.pool;
-    let holding = create_holding(&mut env, &pool);
-    env.warp_slot(100); // deterministic start_slot = 100 for the deposit below
-    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
-    let dest = Pubkey::new_unique();
-    let (_dp, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
-
-    // age 1 (start_slot 100, now 101): still below the age<2 cutoff -> weight 0 -> rejected.
-    env.warp_slot(101);
-    assert!(gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(), "age 1 (< 2) still has zero weight -> rejected");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (0, 0), "no weight/principal credited at age 1");
-
-    // age 2 (now 102): floor(log2(2)) = 1 -> the FIRST non-zero weight = 1 * principal -> accepted.
-    env.warp_slot(102);
-    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("age 2 is the first votable age");
-    let (w, p) = gv_proposal_support(&env, &gv_proposal);
-    assert_eq!(w, amount, "weight = floor(log2(2)) * principal = 1 * principal at the exact threshold");
-    assert_eq!(p, amount, "principal credited once the position is old enough to vote");
-}
-
-// SLOT-ZERO LIVENESS: slot 0 is a valid configured bootstrap start and a valid deposit slot.
-// The position's `start_slot` therefore legitimately serializes as zero; it must acquire ordinary
-// vote weight once it ages instead of being mistaken for an unfunded sentinel forever.
-#[test]
-fn a_slot_zero_deposit_can_vote_after_aging() {
+fn a_slot_zero_deposit_can_vote_immediately() {
     let mut env = Env::new();
     env.warp_slot(0);
     env.init_insurance_pool();
@@ -5326,13 +5275,12 @@ fn a_slot_zero_deposit_can_vote_after_aging() {
     let dest = Pubkey::new_unique();
     let (_dist_proposal, gv_proposal) =
         create_and_register_proposal(&mut env, &ve, 1, &dest);
-    env.warp_slot(2);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
-        .expect("a slot-zero position has weight after age two");
+        .expect("a slot-zero position has immediate principal weight");
     assert_eq!(
         gv_proposal_support(&env, &gv_proposal),
         (amount, amount),
-        "floor(log2(2)) gives one vote-weight unit per deposited base unit"
+        "one deposited base unit gives one vote at slot zero"
     );
 }
 
@@ -6798,12 +6746,9 @@ fn own_vault_withdraw_is_rejected_on_an_insurance_pool() {
     assert_eq!(env.pool_outstanding(), amount, "pool outstanding intact");
 }
 
-// TOP-UP RESETS HOLD-TIME (Sybil-resistance: no early-squat-then-top-up). Vote weight is
-// floor(log2(now - start_slot)) * principal. If a top-up did NOT reset start_slot, a whale could
-// deposit 1 atom at genesis start, let the age compound, then top up a huge principal right before
-// voting and have ALL of it earn the early-join age = inflated weight. insurance_deposit resets
-// `position.start_slot = clock` on EVERY deposit, so a late top-up's age clock starts now. The
-// existing coverage only checks start_slot after the FIRST deposit; this pins the top-up reset.
+// TOP-UP RESETS REWARD TENURE. If a top-up did not reset start_slot, a one-atom early
+// position could give much later capital the early atom's insurance/backing reward tenure.
+// Genesis voting itself uses principal only.
 #[test]
 fn top_up_resets_the_position_start_slot() {
     let mut env = Env::new();
@@ -6815,14 +6760,14 @@ fn top_up_resets_the_position_start_slot() {
     env.insurance_deposit(&alice, &alice_ata, &holding, 1).expect("early small deposit");
     let (_p0, start0, _w0) = env.read_position(&alice.pubkey());
 
-    // Age compounds, then a HUGE top-up much later.
+    // Reward tenure accrues, then a large top-up lands much later.
     env.warp_slot(1_000);
     env.insurance_deposit(&alice, &alice_ata, &holding, 1_999_999).expect("late huge top-up");
     let (principal, start1, _w1) = env.read_position(&alice.pubkey());
 
     assert_eq!(principal, 2_000_000, "principal accumulated across deposits");
-    assert_eq!(start1, 1_000, "top-up RESET start_slot to now — the huge late capital earns no early-join age");
-    assert!(start1 > start0, "start_slot moved forward (no inherited early-join hold time)");
+    assert_eq!(start1, 1_000, "top-up resets start_slot to the late capital's own reward start");
+    assert!(start1 > start0, "late capital does not inherit earlier reward tenure");
 }
 
 // LIVENESS BOUNDARY: withdrawn_amount is historical telemetry, not a custody

@@ -18,7 +18,7 @@
 //! decider gets its own isolated config + vault under the exact claim window it
 //! is authorizing. Any signer or program PDA can be a decider; this program never
 //! references `genesis-vote`. Two interchangeable deciders today:
-//!   - **`genesis-vote`** (the default): log-time-weighted insurance quorum vote;
+//!   - **`genesis-vote`** (the default): one vote per live insurance principal unit;
 //!     its config PDA is the `authority` and its `trigger` CPIs `IX_SEAL_WINNER`.
 //!   - **a deterministic points distributor** (e.g. residual-backing points): a
 //!     program whose PDA is the `authority`, which *computes* the entry list from
