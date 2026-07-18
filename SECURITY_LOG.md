@@ -14178,3 +14178,27 @@ FIX: book initialization now selects the maximum bid fee and `set_bid_fee` may o
 the same by-construction rule used for Percolator trade fees whose public wire also lacks a user maximum. The
 change adds no instruction, account, signer, authority, recipient, CPI, or custody surface; a future increase
 requires an explicit maximum-fee field in a new user wire.
+
+## Tick - approved oracle actions crossed asset generations (surface A, PARTIAL DOS)
+
+The controller's Squads proxy committed an asset action only to a slab key and asset index. Percolator keeps
+that slab live while `RestartAssetOracle` assigns the slot a new monotonic market ID. A matured transaction
+approved for generation 1 therefore remained executable against funded generation 2. The clean-room real-SBF
+LiteSVM probe leaves the old EWMA transaction approved, independently shuts down and restarts asset 0, and
+then executes the stale transaction. Before the fix it succeeds, preserves the 17-unit insurance balance, and
+changes generation 2's effective price from `1,000,000` to `2,000,000`.
+
+Percolator accepts oracle reconfiguration only while the target has no position or unresolved loss state, so
+the reproduced path cannot reprice live user exposure or move insurance/backing. The impact is partial denial
+of service and stale policy replay against a funded but empty replacement; current governance can recover by
+approving another timelocked action.
+
+FIX: the controller checks every asset-scoped proxy wire against the current engine market ID. New wires commit
+to a stateless read-only PDA derived from the market, asset index, and ID, which the controller validates and
+strips before CPI. The parser covers lifecycle, restart, hybrid/EWMA/authenticated oracle configuration, and
+backing-fee domains; a first secondary activation uses ID `0`. Asset-0 generation 1 alone retains its atomically
+initialized predecessor wire only while that generation remains current, while every secondary and replacement
+generation is strict. The retained regression proves missing and wrong-generation witnesses reject atomically,
+the correct generation-2 EWMA and hybrid-feed paths remain live, and collateral accounting is unchanged. The
+witness has no state, signer, writable privilege, authority, recipient, token account, value-moving CPI, or
+fund-moving path.
