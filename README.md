@@ -272,6 +272,9 @@ escrow transfer can move. If a freezable collateral issuer freezes the canonical
 placement, claims, eviction refunds, and owner cancellations may instead use a clean account for the
 same mint owned solely by the recorded bidder. Delegates and close authorities are rejected at payout,
 so a cranker can recover liveness but cannot change the beneficiary or expose the refund to a spender.
+Book initialization tolerates unsolicited escrow balances exposed during its Squads timelock. Auction
+movements remain capped by recorded bid obligations; unowned atoms stay segregated and cannot inflate a
+claim or block the book from reopening.
 
 ## Authority Model
 

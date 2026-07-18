@@ -2856,10 +2856,13 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         return Err(ProgramError::IllegalOwner);
     }
     let ce = spl_token::state::Account::unpack(&coin_escrow.try_borrow_data()?)?;
+    // The Squads transaction reveals these pre-created accounts for the mandatory timelock,
+    // and SPL Token destinations cannot reject public transfers. Accept unsolicited balances:
+    // execute, claim, and cancel move only amounts recorded in bidder slots, so untracked atoms
+    // remain segregated just as they do when donated after initialization.
     if ce.state != spl_token::state::AccountState::Initialized
         || ce.owner != expected_escrow
         || ce.mint != *coin_mint.key
-        || ce.amount != 0
         || ce.close_authority.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
@@ -2868,7 +2871,6 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     if su.state != spl_token::state::AccountState::Initialized
         || su.owner != expected_escrow
         || su.mint != *collateral_mint.key
-        || su.amount != 0
         || su.close_authority.is_some()
     {
         return Err(ProgramError::InvalidAccountData);
