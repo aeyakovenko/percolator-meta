@@ -1657,6 +1657,54 @@ fn create_and_register_proposal(env: &mut Env, ve: &VoteEnv, id: u64, dest: &Pub
     (dist_proposal, gv_proposal)
 }
 
+fn legacy_gv_vote_ix(
+    env: &Env,
+    ve: &VoteEnv,
+    voter: &Pubkey,
+    gv_proposal: &Pubkey,
+    action: u8,
+) -> Instruction {
+    let gv_ballot =
+        Pubkey::find_program_address(&[b"gv_ballot", ve.gv_config.as_ref(), voter.as_ref()], &gv_id()).0;
+    Instruction {
+        program_id: gv_id(),
+        accounts: vec![
+            AccountMeta::new(*voter, true),
+            AccountMeta::new(ve.gv_config, false),
+            AccountMeta::new(gv_ballot, false),
+            AccountMeta::new(*gv_proposal, false),
+            AccountMeta::new(env.position_pda(voter), false),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+        data: vec![3u8, action],
+    }
+}
+
+fn gv_vote_ix(
+    env: &Env,
+    ve: &VoteEnv,
+    voter: &Pubkey,
+    gv_proposal: &Pubkey,
+    action: u8,
+) -> Instruction {
+    let mut ix = legacy_gv_vote_ix(env, ve, voter, gv_proposal, action);
+    if action == 2 && env.svm.get_account(&ve.gv_config).unwrap().data.len() == 264 {
+        let ballot = Pubkey::find_program_address(
+            &[b"gv_ballot", ve.gv_config.as_ref(), voter.as_ref()],
+            &gv_id(),
+        )
+        .0;
+        if let Some(account) = env.svm.get_account(&ballot) {
+            if account.data.len() >= 120 {
+                ix.data.extend_from_slice(&account.data[96..104]);
+            }
+        }
+    }
+    ix
+}
+
 fn gv_vote(
     env: &mut Env,
     ve: &VoteEnv,
@@ -1664,22 +1712,7 @@ fn gv_vote(
     gv_proposal: &Pubkey,
     action: u8,
 ) -> Result<(), String> {
-    let gv_ballot =
-        Pubkey::find_program_address(&[b"gv_ballot", ve.gv_config.as_ref(), voter.pubkey().as_ref()], &gv_id()).0;
-    let ix = Instruction {
-        program_id: gv_id(),
-        accounts: vec![
-            AccountMeta::new(voter.pubkey(), true),
-            AccountMeta::new(ve.gv_config, false),
-            AccountMeta::new(gv_ballot, false),
-            AccountMeta::new(*gv_proposal, false),
-            AccountMeta::new(env.position_pda(&voter.pubkey()), false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, action],
-    };
+    let ix = gv_vote_ix(env, ve, &voter.pubkey(), gv_proposal, action);
     env.send(&[ix], &[voter])
 }
 
@@ -4643,6 +4676,99 @@ fn double_retract_is_rejected_and_does_not_double_release_the_tally() {
     assert_eq!(read_cast(&env), amount, "global cast = one vote again");
 }
 
+// PRESIGNED RETRACT REPLAY: the ballot PDA is reused when a voter retracts and later backs the
+// same proposal again. A relayer must not be able to hold the old signed retract until backing
+// closes, then erase the replacement vote and leave the genesis distribution without a winner.
+#[test]
+fn presigned_retract_cannot_remove_a_replacement_vote_after_bootstrap_deadline() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("alice deposits");
+    let (dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let bootstrap_end = env.bootstrap_end_slot();
+    env.warp_slot(bootstrap_end - 4);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("alice backs the winner");
+    let first_support = gv_proposal_support(&env, &gv_proposal);
+    assert!(first_support.0 > 0);
+    assert_eq!(first_support.1, amount);
+
+    // Alice signs a retract through one relayer. Keep that exact transaction off-chain while she
+    // lands a distinct sponsored retract and then re-backs the proposal before the deadline.
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let exact_retract = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2);
+    let withheld_exact_retract = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), exact_retract.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_legacy_retract = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_399_999), exact_retract],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice lands a distinct legitimate retract");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (0, 0));
+
+    let reback = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_399_998), reback],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice re-backs before voting closes");
+    let replacement_support = gv_proposal_support(&env, &gv_proposal);
+    assert!(replacement_support.0 > 0);
+    assert_eq!(replacement_support.1, amount);
+
+    // Once backing closes, replaying the old authorization must not retract the new vote. If it
+    // does, no voter transaction can restore support and the fixed-supply distribution stays stuck.
+    env.warp_slot(bootstrap_end);
+    assert!(
+        env.svm.send_transaction(withheld_exact_retract).is_err(),
+        "an exact retract signature must be bound to one ballot incarnation"
+    );
+    assert!(
+        env.svm.send_transaction(withheld_legacy_retract).is_err(),
+        "a nonce-bearing ballot must reject a predecessor action-only retract"
+    );
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        replacement_support,
+        "the replacement vote remains counted after the stale replay"
+    );
+    assert!(
+        gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+        "the deadline leaves no re-back recovery after a stale retract"
+    );
+
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("the intact replacement vote seals the distribution");
+    assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
@@ -5433,22 +5559,7 @@ fn veto_exit_retract_and_withdraw_in_one_atomic_tx() {
         "a vote-locked position cannot exit without retracting first");
 
     // THE VETO-EXIT: retract + withdraw in ONE transaction.
-    let gv_ballot = Pubkey::find_program_address(
-        &[b"gv_ballot", ve.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id()).0;
-    let retract_ix = Instruction {
-        program_id: gv_id(),
-        accounts: vec![
-            AccountMeta::new(alice.pubkey(), true),
-            AccountMeta::new(ve.gv_config, false),
-            AccountMeta::new(gv_ballot, false),
-            AccountMeta::new(gv_proposal, false),
-            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, 2u8], // vote, action=retract
-    };
+    let retract_ix = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2);
     let mut wdata = vec![5u8]; wdata.extend_from_slice(&amount.to_le_bytes());
     let withdraw_ix = Instruction {
         program_id: sub_id(),
