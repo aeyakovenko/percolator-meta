@@ -9200,6 +9200,7 @@ fn e2e_standing_auction_bid_across_asset0_restart_conserves_value() {
         &perc_id(),
         restart_slot,
         1_000_001,
+        old_market_id,
     );
     squads_execute(
         &mut svm,
@@ -17152,6 +17153,7 @@ fn build_twap_restart_asset0_message(
     percolator_program: &Pubkey,
     now_slot: u64,
     initial_price: u64,
+    expected_market_id: u64,
 ) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1);
@@ -17173,6 +17175,7 @@ fn build_twap_restart_asset0_message(
     let mut data = vec![21u8];
     data.extend_from_slice(&now_slot.to_le_bytes());
     data.extend_from_slice(&initial_price.to_le_bytes());
+    data.extend_from_slice(&expected_market_id.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -19446,6 +19449,11 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
 
     let shutdown_slot = svm.get_sysvar::<Clock>().slot;
     let active_before = svm.get_account(&env.slab).unwrap();
+    let active_market_id = percolator_prog::state::read_market(&active_before.data)
+        .unwrap()
+        .1
+        .assets[0]
+        .market_id;
     let premature_restart = build_twap_restart_asset0_message(
         &env.squads_vault,
         &env.twap_cfg,
@@ -19454,6 +19462,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &perc_id(),
         shutdown_slot,
         2_000_000,
+        active_market_id,
     );
     let twap_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -19529,6 +19538,44 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
 
     svm.warp_to_slot(shutdown_slot + 1);
     let restart_slot = svm.get_sysvar::<Clock>().slot;
+    let stale_restart = build_twap_restart_asset0_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        restart_slot,
+        2_000_000,
+        old_market_id,
+    );
+    let stale_index = 8u64;
+    let stale_transaction = transaction_pda(&env.squads, &env.multisig, stale_index);
+    let stale_proposal = proposal_pda(&env.squads, &env.multisig, stale_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_transaction,
+            &env.dao.pubkey(),
+            &stale_restart,
+        ),
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &env.dao.pubkey(),
+            stale_index,
+        ),
+        proposal_approve_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &env.dao.pubkey(),
+        ),
+    ] {
+        send(&mut svm, &[&env.dao], ix).expect("approve a generation-A TWAP restart");
+    }
+
     let initial_price = 1_000_001;
     let restart = build_twap_restart_asset0_message(
         &env.squads_vault,
@@ -19538,6 +19585,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &perc_id(),
         restart_slot,
         initial_price,
+        old_market_id,
     );
     squads_execute(
         &mut svm,
@@ -19545,7 +19593,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &env.multisig,
         &env.dao,
         &payer,
-        8,
+        9,
         &restart,
         &twap_remaining,
     )
@@ -19586,6 +19634,78 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         ),
         accounting_before,
         "restart changes no collateral or insurance accounting"
+    );
+    assert_eq!(token_amount(&svm, &env.perc_vault), token_insurance_before);
+
+    let generation_b = restarted_group.assets[0].market_id;
+    let generation_witness =
+        market_controller_program::asset_generation_witness_address(&env.slab, 0, generation_b).0;
+    let shutdown_b = build_controller_generation_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &[],
+        &generation_witness,
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 0,
+            now_slot: restart_slot,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    let generation_b_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(generation_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        10,
+        &shutdown_b,
+        &generation_b_remaining,
+    )
+    .expect("independently shut down generation B");
+    let generation_b_recovery = svm.get_account(&env.slab).unwrap();
+
+    let stale_result = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &stale_transaction,
+            &env.dao.pubkey(),
+            &twap_remaining,
+        ),
+    );
+    let after_stale = svm.get_account(&env.slab).unwrap();
+    let (_, after_stale_group) = percolator_prog::state::read_market(&after_stale.data).unwrap();
+    assert!(
+        stale_result.is_err(),
+        "generation-A TWAP restart executed against generation B: result={stale_result:?}, generation {} -> {}, price {} -> {}, insurance {}",
+        generation_b,
+        after_stale_group.assets[0].market_id,
+        initial_price,
+        after_stale_group.assets[0].effective_price,
+        after_stale_group.insurance,
+    );
+    assert_eq!(
+        after_stale, generation_b_recovery,
+        "stale restart rejection must preserve generation-B recovery accounting"
     );
     assert_eq!(token_amount(&svm, &env.perc_vault), token_insurance_before);
 }

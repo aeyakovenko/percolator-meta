@@ -14202,3 +14202,21 @@ generation is strict. The retained regression proves missing and wrong-generatio
 the correct generation-2 EWMA and hybrid-feed paths remain live, and collateral accounting is unchanged. The
 witness has no state, signer, writable privilege, authority, recipient, token account, value-moving CPI, or
 fund-moving path.
+
+## Tick - stale TWAP restart could re-anchor a replacement generation (surface C, PARTIAL DOS)
+
+TWAP's fixed asset-0 restart wrapper was authorized by a Squads proposal bound only to the config and slab.
+A proposal approved while generation A was recovering could remain unexecuted, another proposal could restart
+A as generation B, and the old action could later execute whenever B entered Recovery. The clean-room real-SBF
+LiteSVM regression reproduces the complete path: the stale action advances generation `2` to `3`, changes its
+price from `1,000,001` to `2,000,000`, and preserves all `1,500,000` insurance units.
+
+Percolator requires the asset to be empty before restart, so the reproduced path cannot reprice an open
+position or move insurance/backing. Its impact is partial denial of service and stale policy replay against a
+funded replacement; governance can recover with another timelocked restart.
+
+FIX: the fixed TWAP restart wire now includes the expected current Percolator market ID. TWAP reads asset 0's
+monotonic generation from the pinned slab and rejects a zero or mismatched ID before signing the Percolator
+CPI. The regression proves a correctly bound generation-A restart remains live, a separately authorized action
+shuts down generation B, and the untouched A proposal then rejects with byte-identical B recovery accounting.
+The check adds no account, state, signer, authority, recipient, amount, token path, or value-moving CPI.
