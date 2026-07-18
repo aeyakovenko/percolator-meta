@@ -4209,6 +4209,288 @@ fn e2e_controller_cannot_front_run_a_presigned_trade_with_a_fee_increase() {
     );
 }
 
+// PUBLIC ADMIN DOS: users enter under fixed stale-resolution and force-close deadlines. Once
+// capital is live, governance must not extend either deadline and postpone the permissionless exit
+// users relied on. The pinned Percolator accepts both increases, so the controller has to make the
+// configured deadlines monotonic after their first nonzero value.
+#[test]
+fn e2e_controller_cannot_extend_funded_resolution_deadlines() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const DEPOSIT: u64 = 1_000_000;
+    const START_SLOT: u64 = 100;
+    const STALE_SLOTS: u64 = 5;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    for signer in [&payer, &creator, &governance] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    init_creator_owned_market(
+        &mut svm,
+        &payer,
+        &creator,
+        &collateral_mint,
+        &market,
+    );
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates lifecycle authority to the constrained controller");
+    let proxy = |raw: Vec<u8>| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&raw);
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: STALE_SLOTS,
+                force_close_delay_slots: STALE_SLOTS,
+            }
+            .encode(),
+        ),
+    )
+    .expect("governance publishes the initial bounded-exit policy");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let long = Keypair::new();
+    let short = Keypair::new();
+    let long_portfolio = Keypair::new();
+    let short_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [(&long, &long_portfolio), (&short, &short_portfolio)] {
+        svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            DEPOSIT,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: DEPOSIT as u128,
+                },
+            ),
+        )
+        .expect("public user deposits collateral under the published deadline");
+    }
+    send(
+        &mut svm,
+        &[&payer, &long, &short],
+        pix(
+            vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (percolator::POS_SCALE / 10) as i128,
+                exec_price: 1_000_000,
+                fee_bps: 3,
+            },
+        ),
+    )
+    .expect("independent users open a balanced live position");
+    let expected_payouts = [
+        percolator_prog::state::read_portfolio(
+            &svm.get_account(&long_portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap()
+        .capital
+        .get() as u64,
+        percolator_prog::state::read_portfolio(
+            &svm.get_account(&short_portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap()
+        .capital
+        .get() as u64,
+    ];
+
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT + STALE_SLOTS - 1,
+        unix_timestamp: (START_SLOT + STALE_SLOTS - 1) as i64,
+        ..Clock::default()
+    });
+    let market_before_extension = svm.get_account(&market).unwrap();
+    let extension = send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: percolator_prog::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+                force_close_delay_slots: percolator_prog::constants::MAX_FORCE_CLOSE_DELAY_SLOTS,
+            }
+            .encode(),
+        ),
+    );
+    if extension.is_err() {
+        assert_eq!(
+            svm.get_account(&market).unwrap(),
+            market_before_extension,
+            "a rejected deadline extension is byte-atomic"
+        );
+    }
+
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT + STALE_SLOTS,
+        unix_timestamp: (START_SLOT + STALE_SLOTS) as i64,
+        ..Clock::default()
+    });
+    let resolution = send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![AccountMeta::new(market, false)],
+            PIx::ResolveStalePermissionless { now_slot: 0 },
+        ),
+    );
+    if extension.is_ok() {
+        assert!(
+            resolution.is_err(),
+            "the landed extension must actually postpone the original public exit"
+        );
+        panic!("controller governance extended funded exit deadlines through the public proxy");
+    }
+    resolution.expect("the original hard-stale deadline remains permissionlessly resolvable");
+
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT + 2 * STALE_SLOTS,
+        unix_timestamp: (START_SLOT + 2 * STALE_SLOTS) as i64,
+        ..Clock::default()
+    });
+    let mut paid_total = 0u64;
+    for ((owner, portfolio), expected_payout) in
+        [(&long, &long_portfolio), (&short, &short_portfolio)]
+            .into_iter()
+            .zip(expected_payouts)
+    {
+        let destination = canonical_insurance_vault(&owner.pubkey(), &collateral_mint);
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+        )
+        .expect("the original bounded-exit policy pays each user permissionlessly");
+        assert_eq!(token_amount(&svm, &destination), expected_payout);
+        paid_total += expected_payout;
+    }
+    assert_eq!(
+        token_amount(&svm, &percolator_vault) + paid_total,
+        2 * DEPOSIT,
+        "resolved user payouts and the pre-existing trade fees conserve every deposited atom"
+    );
+}
+
 // PUBLIC POSITION DOS PROBE: the pinned Percolator rejects every atomic batch while any backing
 // fee policy is active. A cross-margined user may need a final-state-only batch because either
 // standalone rotation leg exceeds initial margin. The controller must therefore reject nonzero

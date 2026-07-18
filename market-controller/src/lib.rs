@@ -77,6 +77,7 @@ const RESIDUAL_IX_ARCHIVE_PORTFOLIO: u8 = 7;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
+const PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE: u8 = 38;
 const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
@@ -89,6 +90,7 @@ const ASSET_ACTION_ACTIVATE: u8 = 0;
 const ASSET_ACTION_DRAIN_ONLY: u8 = 1;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
+const CONFIGURE_PERMISSIONLESS_RESOLVE_LEN: usize = 17;
 const UPDATE_TRADE_FEE_POLICY_LEN: usize = 9;
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
 const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
@@ -522,6 +524,38 @@ fn validate_trade_fee_update(data: &[u8], current_trade_fee_base_bps: u64) -> Pr
     Ok(())
 }
 
+fn validate_permissionless_resolve_update(
+    data: &[u8],
+    current_stale_slots: u64,
+    current_force_close_delay_slots: u64,
+) -> ProgramResult {
+    if data.first().copied() != Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE) {
+        return Ok(());
+    }
+    if data.len() != CONFIGURE_PERMISSIONLESS_RESOLVE_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let requested_stale_slots = u64::from_le_bytes(
+        data[1..9]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    let requested_force_close_delay_slots = u64::from_le_bytes(
+        data[9..17]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    // These values are users' bounded-exit contract. The initial nonzero policy remains
+    // configurable, but governance cannot postpone either published deadline afterward.
+    if (current_stale_slots != 0 && requested_stale_slots > current_stale_slots)
+        || (current_force_close_delay_slots != 0
+            && requested_force_close_delay_slots > current_force_close_delay_slots)
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(())
+}
+
 fn restart_asset_index(data: &[u8]) -> Result<Option<usize>, ProgramError> {
     if data.first().copied() != Some(PERC_IX_RESTART_ASSET_ORACLE) {
         return Ok(None);
@@ -607,6 +641,17 @@ fn process_proxy_admin<'a>(
             percolator_accounting::read_trade_fee_base_bps(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
         validate_trade_fee_update(data, current_trade_fee_base_bps)?;
+    }
+    if perc_tag == PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE {
+        let market_data = market.try_borrow_data()?;
+        let (current_stale_slots, current_force_close_delay_slots) =
+            percolator_accounting::read_permissionless_resolve_policy(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        validate_permissionless_resolve_update(
+            data,
+            current_stale_slots,
+            current_force_close_delay_slots,
+        )?;
     }
     if let Some(asset_index) = restart_asset_index(data)? {
         let market_data = market.try_borrow_data()?;
@@ -2747,6 +2792,45 @@ mod tests {
             Err(ProgramError::InvalidInstructionData)
         );
         assert_eq!(validate_trade_fee_update(&[19], 50), Ok(()));
+    }
+
+    #[test]
+    fn permissionless_exit_deadlines_are_monotonic_after_initial_config() {
+        let policy = |stale_slots: u64, force_close_delay_slots: u64| {
+            let mut data = vec![PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE];
+            data.extend_from_slice(&stale_slots.to_le_bytes());
+            data.extend_from_slice(&force_close_delay_slots.to_le_bytes());
+            data
+        };
+
+        assert_eq!(
+            validate_permissionless_resolve_update(&policy(50, 20), 0, 0),
+            Ok(())
+        );
+        assert_eq!(
+            validate_permissionless_resolve_update(&policy(49, 19), 50, 20),
+            Ok(())
+        );
+        assert_eq!(
+            validate_permissionless_resolve_update(&policy(50, 20), 50, 20),
+            Ok(())
+        );
+        for rejected in [policy(51, 20), policy(50, 21), policy(49, 21), policy(51, 19)] {
+            assert_eq!(
+                validate_permissionless_resolve_update(&rejected, 50, 20),
+                Err(ProgramError::InvalidInstructionData)
+            );
+        }
+        let mut malformed = policy(50, 20);
+        malformed.pop();
+        assert_eq!(
+            validate_permissionless_resolve_update(&malformed, 50, 20),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        assert_eq!(
+            validate_permissionless_resolve_update(&[19], 50, 20),
+            Ok(())
+        );
     }
 
     #[test]
