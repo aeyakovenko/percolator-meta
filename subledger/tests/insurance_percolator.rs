@@ -4861,6 +4861,119 @@ fn presigned_back_cannot_restore_a_retracted_vote_at_the_bootstrap_deadline() {
     assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
 }
 
+// PRINCIPAL-UNBOUND BACK REPLAY: a back authorization must commit to the principal
+// it counts. Otherwise a relayer can hold a signed re-back, let the owner top up a
+// live vote, then land the old authorization in the final deposit/backing slot and
+// turn support the owner authorized for one atom into support for the larger balance.
+#[test]
+fn presigned_back_cannot_count_a_later_top_up_at_the_bootstrap_deadline() {
+    let start = 100u64;
+    let delay = 10u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        delay,
+        start,
+        delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(delay), Some(start));
+    let ve = setup_vote(&mut env);
+    let (dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 5);
+    let (bob, bob_ata) = new_depositor(&mut env, 2);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &alice_holding, 1)
+        .expect("alice deposits one authorized vote unit");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, 2)
+        .expect("bob supplies the nonvoting quorum denominator");
+
+    env.warp_slot(start + 1);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("alice backs one unit");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (1, 1));
+
+    env.warp_slot(start + delay - 1);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let exact_back = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    let withheld_exact_back = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), exact_back],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_legacy_back = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    // Land a distinct top-up transaction with the same live blockhash. Deposits
+    // are still open in this final slot, but depositing is deliberately not voting.
+    let mut top_up_data = vec![4u8];
+    top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    let top_up = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(alice_holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: top_up_data,
+    };
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_399_998), top_up],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("the final-slot top-up lands");
+    assert_eq!(env.read_position(&alice.pubkey()).0, 5);
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        (1, 1),
+        "depositing fresh principal does not authorize fresh support",
+    );
+
+    assert!(
+        env.svm.send_transaction(withheld_legacy_back).is_err(),
+        "a principal-unbound predecessor back must not count the top-up",
+    );
+    assert!(
+        env.svm.send_transaction(withheld_exact_back).is_err(),
+        "a back signed for the old principal must not count the top-up",
+    );
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        (1, 1),
+        "both stale authorizations leave the original vote unchanged",
+    );
+
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("a fresh final-slot re-back can authorize all five units");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+
+    env.warp_slot(start + delay);
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("only the freshly authorized quorum seals the distribution");
+    assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
