@@ -335,6 +335,30 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     .expect("pool hands funded custody to TWAP");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
 
+    let owner_exit_ix = || {
+        let mut exit = twap_return_to_subledger_ix(
+            &squads_vault,
+            &pool,
+            &market,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        );
+        exit.accounts[1] = AccountMeta::new(twap_cfg, false);
+        exit.accounts[3] = AccountMeta::new(pool, false);
+        exit.accounts
+            .push(AccountMeta::new_readonly(depositor.pubkey(), true));
+        exit.accounts.push(AccountMeta::new(position, false));
+        exit.accounts.push(AccountMeta::new(depositor_token, false));
+        exit.accounts.push(AccountMeta::new(pool_holding, false));
+        exit.accounts.push(AccountMeta::new(vault, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(vault_authority, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(spl_token::ID, false));
+        exit
+    };
+
     let policy = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 10_000);
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -522,6 +546,40 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         .expect("advance bounded mark");
     }
     assert_eq!(read_asset0_effective_price(&svm, &market), 399);
+
+    // PUBLIC LOF: another portfolio has fully advanced the market-level mark, but the exposed
+    // loser still carries its pre-mark certificate. The pinned Percolator withdrawal gate does
+    // not see that stale account, so returning TWAP custody would let this owner remove the one
+    // insurance atom immediately before public liquidation needs it.
+    let market_before_exposed_exit = svm.get_account(&market).unwrap();
+    let pool_before_exposed_exit = svm.get_account(&pool).unwrap();
+    let position_before_exposed_exit = svm.get_account(&position).unwrap();
+    let config_before_exposed_exit = svm.get_account(&twap_cfg).unwrap();
+    let vault_before_exposed_exit = svm.get_account(&vault).unwrap();
+    let owner_balance_before_exposed_exit = token_amount(&svm, &depositor_token);
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            owner_exit_ix(),
+        )
+        .is_err(),
+        "live insurance must remain locked while a stale exposed portfolio can realize a loss"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_exposed_exit);
+    assert_eq!(svm.get_account(&pool).unwrap(), pool_before_exposed_exit);
+    assert_eq!(
+        svm.get_account(&position).unwrap(),
+        position_before_exposed_exit
+    );
+    assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_exposed_exit);
+    assert_eq!(svm.get_account(&vault).unwrap(), vault_before_exposed_exit);
+    assert_eq!(
+        token_amount(&svm, &depositor_token),
+        owner_balance_before_exposed_exit
+    );
+    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+
     for _ in 0..5 {
         send(
             &mut svm,
@@ -541,6 +599,11 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         .expect("settle and liquidate the long");
     }
     assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+    let protected_loser = percolator_prog::state::read_portfolio(
+        &svm.get_account(&traders[0].1.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(protected_loser.close_progress.insurance_spent.get(), 1);
 
     let direct_exit = Instruction {
         program_id: sub_id(),
@@ -575,36 +638,11 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before);
     assert_eq!(svm.get_account(&market).unwrap(), market_before);
 
-    let mut atomic_exit = twap_return_to_subledger_ix(
-        &squads_vault,
-        &pool,
-        &market,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-    );
-    atomic_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
-    atomic_exit.accounts[3] = AccountMeta::new(pool, false);
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new_readonly(depositor.pubkey(), true));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new(position, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new(depositor_token, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new(pool_holding, false));
-    atomic_exit.accounts.push(AccountMeta::new(vault, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new_readonly(vault_authority, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new_readonly(spl_token::ID, false));
-    send(&mut svm, &[&payer, &depositor], atomic_exit)
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        owner_exit_ix(),
+    )
         .expect("TWAP atomically returns custody and retires the fully impaired owner");
     assert_eq!(
         u64::from_le_bytes(
@@ -27244,6 +27282,155 @@ fn e2e_full_book_duplicate_cannot_self_evict_to_partial_exit() {
         "escrow: alice's 1 out, carol's 50 in"
     );
     let _ = (a_usd, c_src, c_usd);
+}
+
+// PUBLIC LOF: a permissionless round must not remove insurance while live portfolios can still
+// realize a loss. The round remains crankable so exposure cannot wedge auction settlement.
+#[test]
+fn e2e_execute_advances_without_pulling_insurance_while_open_interest_exists() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let mut traders = Vec::new();
+    for _ in 0..2 {
+        let owner = Keypair::new();
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let portfolio = Pubkey::new_unique();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                percolator_prog::ix::Instruction::InitPortfolio,
+            ),
+        )
+        .expect("init exposed portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            2_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                percolator_prog::ix::Instruction::Deposit { amount: 2_000_000 },
+            ),
+        )
+        .expect("fund exposed portfolio");
+        traders.push((owner, portfolio));
+    }
+    send(
+        &mut svm,
+        &[&payer, &traders[0].0, &traders[1].0],
+        pix(
+            vec![
+                AccountMeta::new(traders[0].0.pubkey(), true),
+                AccountMeta::new(traders[1].0.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(traders[0].1, false),
+                AccountMeta::new(traders[1].1, false),
+            ],
+            percolator_prog::ix::Instruction::TradeNoCpi {
+                asset_index: 0,
+                size_q: (percolator::POS_SCALE / 10) as i128,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("open balanced live exposure");
+    let (_, exposed_group) =
+        percolator_prog::state::read_market(&svm.get_account(&env.slab).unwrap().data).unwrap();
+    assert!(
+        exposed_group.assets[0].oi_eff_long_q != 0 || exposed_group.assets[0].oi_eff_short_q != 0,
+        "the withdrawal gate must be exercised with real open interest"
+    );
+
+    let insurance_before = read_asset_insurance_remaining(&svm, &env.slab, 0);
+    let floor_before = read_reserved_floor(&svm, &env.twap_cfg);
+    let round_before = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    warp_to(&mut svm, round_before);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("an exposed round still advances without a fresh insurance pull");
+
+    let round_after = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(
+        round_after > round_before,
+        "the auction cannot be wedged by exposure"
+    );
+    assert_eq!(token_amount(&svm, &bk.holding), 0);
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &env.slab, 0),
+        insurance_before,
+        "open positions keep every insurance atom in Percolator"
+    );
+    assert_eq!(
+        read_reserved_floor(&svm, &env.twap_cfg),
+        floor_before,
+        "a no-pull round cannot ratchet accounting around the live lock"
+    );
 }
 
 // FINDING O (now enforced by execute, the sole puller): execute pulls only the burn-share of the

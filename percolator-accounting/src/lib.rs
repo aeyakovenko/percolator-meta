@@ -2,9 +2,9 @@
 
 use core::mem::{offset_of, size_of};
 use percolator::{
-    BackingBucketV16Account, EngineAssetSlotV16Account, InsuranceCreditReservationV16Account,
-    Market, MarketGroupV16HeaderAccount, PortfolioAccountV16Account, ProvenanceHeaderV16Account,
-    V16ConfigAccount, BOUND_SCALE,
+    AssetStateV16Account, BackingBucketV16Account, EngineAssetSlotV16Account,
+    InsuranceCreditReservationV16Account, Market, MarketGroupV16HeaderAccount,
+    PortfolioAccountV16Account, ProvenanceHeaderV16Account, V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -513,6 +513,89 @@ pub fn market_is_live(data: &[u8]) -> Result<bool, ReadError> {
     Ok(mode == 0)
 }
 
+/// Returns whether one pinned-v16 asset still has open position accounting or
+/// unresolved loss state. A positive live insurance withdrawal is unsafe while
+/// this is true because stale portfolios may not yet have realized their loss.
+pub fn asset_has_position_or_loss_state(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    let engine = asset_engine_offset(asset_index)?;
+    let asset = engine
+        .checked_add(offset_of!(EngineAssetSlotV16Account, asset))
+        .ok_or(ReadError::Truncated)?;
+
+    let u128_fields = [
+        offset_of!(AssetStateV16Account, oi_eff_long_q),
+        offset_of!(AssetStateV16Account, oi_eff_short_q),
+        offset_of!(AssetStateV16Account, b_long_num),
+        offset_of!(AssetStateV16Account, b_short_num),
+        offset_of!(AssetStateV16Account, b_epoch_start_long_num),
+        offset_of!(AssetStateV16Account, b_epoch_start_short_num),
+        offset_of!(AssetStateV16Account, loss_weight_sum_long),
+        offset_of!(AssetStateV16Account, loss_weight_sum_short),
+        offset_of!(AssetStateV16Account, social_loss_remainder_long_num),
+        offset_of!(AssetStateV16Account, social_loss_remainder_short_num),
+        offset_of!(AssetStateV16Account, social_loss_dust_long_num),
+        offset_of!(AssetStateV16Account, social_loss_dust_short_num),
+        offset_of!(AssetStateV16Account, explicit_unallocated_loss_long),
+        offset_of!(AssetStateV16Account, explicit_unallocated_loss_short),
+    ];
+    for field in u128_fields {
+        if read_u128(data, asset.checked_add(field).ok_or(ReadError::Truncated)?)? != 0 {
+            return Ok(true);
+        }
+    }
+
+    let u64_fields = [
+        offset_of!(AssetStateV16Account, stored_pos_count_long),
+        offset_of!(AssetStateV16Account, stored_pos_count_short),
+        offset_of!(AssetStateV16Account, stale_account_count_long),
+        offset_of!(AssetStateV16Account, stale_account_count_short),
+    ];
+    for field in u64_fields {
+        if read_u64(data, asset.checked_add(field).ok_or(ReadError::Truncated)?)? != 0 {
+            return Ok(true);
+        }
+    }
+
+    let mode_long = *data
+        .get(
+            asset
+                .checked_add(offset_of!(AssetStateV16Account, mode_long))
+                .ok_or(ReadError::Truncated)?,
+        )
+        .ok_or(ReadError::Truncated)?;
+    let mode_short = *data
+        .get(
+            asset
+                .checked_add(offset_of!(AssetStateV16Account, mode_short))
+                .ok_or(ReadError::Truncated)?,
+        )
+        .ok_or(ReadError::Truncated)?;
+    let pending_long = read_u64(
+        data,
+        engine
+            .checked_add(offset_of!(
+                EngineAssetSlotV16Account,
+                pending_domain_loss_barrier_long
+            ))
+            .ok_or(ReadError::Truncated)?,
+    )?;
+    let pending_short = read_u64(
+        data,
+        engine
+            .checked_add(offset_of!(
+                EngineAssetSlotV16Account,
+                pending_domain_loss_barrier_short
+            ))
+            .ok_or(ReadError::Truncated)?,
+    )?;
+    Ok(mode_long != 0 || mode_short != 0 || pending_long != 0 || pending_short != 0)
+}
+
 /// Returns the withdrawable principal and provider earnings for both domains of one
 /// asset. Principal is stored as `BOUND_SCALE` numerators by the engine; deposits and
 /// withdrawal deltas are atom-exact, so a non-integral value is invalid accounting.
@@ -695,6 +778,10 @@ mod tests {
 
     fn write_u128_at(data: &mut [u8], offset: usize, value: u128) {
         data[offset..offset + 16].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64_at(data: &mut [u8], offset: usize, value: u64) {
+        data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     fn market_with_insurance_capacity() -> Vec<u8> {
@@ -932,6 +1019,72 @@ mod tests {
         assert_eq!(
             read_asset_insurance_balance(&market, 0),
             Err(ReadError::InvalidAccounting)
+        );
+    }
+
+    #[test]
+    fn position_or_loss_gate_covers_every_pinned_asset_local_blocker() {
+        let mut market = market_with_insurance_capacity();
+        assert_eq!(asset_has_position_or_loss_state(&market, 0), Ok(false));
+
+        let engine = asset_engine_offset(0).unwrap();
+        let asset = engine + offset_of!(EngineAssetSlotV16Account, asset);
+        let u128_fields = [
+            offset_of!(AssetStateV16Account, oi_eff_long_q),
+            offset_of!(AssetStateV16Account, oi_eff_short_q),
+            offset_of!(AssetStateV16Account, b_long_num),
+            offset_of!(AssetStateV16Account, b_short_num),
+            offset_of!(AssetStateV16Account, b_epoch_start_long_num),
+            offset_of!(AssetStateV16Account, b_epoch_start_short_num),
+            offset_of!(AssetStateV16Account, loss_weight_sum_long),
+            offset_of!(AssetStateV16Account, loss_weight_sum_short),
+            offset_of!(AssetStateV16Account, social_loss_remainder_long_num),
+            offset_of!(AssetStateV16Account, social_loss_remainder_short_num),
+            offset_of!(AssetStateV16Account, social_loss_dust_long_num),
+            offset_of!(AssetStateV16Account, social_loss_dust_short_num),
+            offset_of!(AssetStateV16Account, explicit_unallocated_loss_long),
+            offset_of!(AssetStateV16Account, explicit_unallocated_loss_short),
+        ];
+        for field in u128_fields {
+            write_u128_at(&mut market, asset + field, 1);
+            assert_eq!(asset_has_position_or_loss_state(&market, 0), Ok(true));
+            write_u128_at(&mut market, asset + field, 0);
+        }
+
+        let u64_fields = [
+            offset_of!(AssetStateV16Account, stored_pos_count_long),
+            offset_of!(AssetStateV16Account, stored_pos_count_short),
+            offset_of!(AssetStateV16Account, stale_account_count_long),
+            offset_of!(AssetStateV16Account, stale_account_count_short),
+        ];
+        for field in u64_fields {
+            write_u64_at(&mut market, asset + field, 1);
+            assert_eq!(asset_has_position_or_loss_state(&market, 0), Ok(true));
+            write_u64_at(&mut market, asset + field, 0);
+        }
+
+        for field in [
+            offset_of!(AssetStateV16Account, mode_long),
+            offset_of!(AssetStateV16Account, mode_short),
+        ] {
+            market[asset + field] = 1;
+            assert_eq!(asset_has_position_or_loss_state(&market, 0), Ok(true));
+            market[asset + field] = 0;
+        }
+
+        for field in [
+            offset_of!(EngineAssetSlotV16Account, pending_domain_loss_barrier_long),
+            offset_of!(EngineAssetSlotV16Account, pending_domain_loss_barrier_short),
+        ] {
+            write_u64_at(&mut market, engine + field, 1);
+            assert_eq!(asset_has_position_or_loss_state(&market, 0), Ok(true));
+            write_u64_at(&mut market, engine + field, 0);
+        }
+
+        assert_eq!(asset_has_position_or_loss_state(&market, 0), Ok(false));
+        assert_eq!(
+            asset_has_position_or_loss_state(&market, 1),
+            Err(ReadError::InvalidAsset)
         );
     }
 

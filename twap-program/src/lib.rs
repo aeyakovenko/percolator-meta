@@ -3494,7 +3494,21 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     )
     .map_err(|_| ProgramError::InvalidAccountData)?;
     let insurance = insurance_balance.remaining_atoms;
-    let surplus = insurance.saturating_sub(config.reserved_floor);
+    let live_asset_exposed = {
+        let market_data = market_slab.try_borrow_data()?;
+        percolator_accounting::market_is_live(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            && percolator_accounting::asset_has_position_or_loss_state(
+                &market_data,
+                config.market_0_domain as usize,
+            )
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+    let surplus = if live_asset_exposed {
+        0
+    } else {
+        insurance.saturating_sub(config.reserved_floor)
+    };
     // Pull the two external routes as one cumulative share before apportioning it. Independent
     // per-route floors let public crankers repeatedly ratchet odd atoms into insurance; independent
     // carries are also unsafe because both routes can mature in one round and exceed that round's
@@ -3534,7 +3548,7 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         .reserved_floor
         .checked_add(retained)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    let withdrawal_plan = if insurance < config.reserved_floor {
+    let withdrawal_plan = if live_asset_exposed || insurance < config.reserved_floor {
         // An unarmed sentinel or a realized loss leaves no complete floor to rebalance.
         // Preserve its domain provenance and retain the historical no-op execute path.
         percolator_accounting::InsuranceWithdrawalPlan::default()

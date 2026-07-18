@@ -2515,12 +2515,12 @@ fn process_insurance_withdraw_impl(
     // at deposit, so losses follow the capital that was present when they happened;
     // equal-entry positions remain pro-rata and exit-order independent. The full
     // requested principal leaves outstanding accounting even when the payout is impaired.
-    let (insurance, live_insurance_balance) = {
+    let (insurance, live_insurance_balance, live_asset_exposed) = {
         let market_data = market_slab.try_borrow_data()?;
         let insurance = read_asset0_insurance(&market_data)?;
-        let live_balance = if percolator_accounting::market_is_live(&market_data)
-            .map_err(|_| ProgramError::InvalidAccountData)?
-        {
+        let live = percolator_accounting::market_is_live(&market_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let live_balance = if live {
             Some(
                 percolator_accounting::read_asset_insurance_balance(&market_data, 0)
                     .map_err(|_| ProgramError::InvalidAccountData)?,
@@ -2528,7 +2528,10 @@ fn process_insurance_withdraw_impl(
         } else {
             None
         };
-        (insurance, live_balance)
+        let exposed = live
+            && percolator_accounting::asset_has_position_or_loss_state(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        (insurance, live_balance, exposed)
     };
     let priced_balance = if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(insurance, pool.outstanding_principal)
@@ -2594,6 +2597,9 @@ fn process_insurance_withdraw_impl(
             0
         }
     };
+    if owed > 0 && live_asset_exposed {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let outstanding_after = pool
         .outstanding_principal
         .checked_sub(amount)
