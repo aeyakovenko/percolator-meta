@@ -1859,7 +1859,7 @@ fn process_close_resolved_portfolio<'a>(
     )?;
     let snapshot = {
         let portfolio_data = portfolio.try_borrow_data()?;
-        percolator_accounting::read_portfolio_reward_snapshot(
+        percolator_accounting::read_portfolio_reward_snapshot_for_cleanup(
             &portfolio_data,
             &portfolio.key.to_bytes(),
         )

@@ -913,8 +913,8 @@ impl PortfolioArchive {
             &Pubkey::new_from_array(live.owner),
             &Pubkey::new_from_array(live.portfolio),
         )?;
-        if live.portfolio_id == 0
-            || (self.generation != 0 && live.portfolio_id <= self.portfolio_id)
+        if self.generation != 0
+            && (live.portfolio_id == 0 || live.portfolio_id <= self.portfolio_id)
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -1490,7 +1490,7 @@ fn archive_portfolio(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
         return Err(ProgramError::InvalidSeeds);
     }
 
-    let live = percolator_accounting::read_portfolio_reward_snapshot(
+    let live = percolator_accounting::read_portfolio_reward_snapshot_for_cleanup(
         &portfolio.try_borrow_data()?,
         &portfolio.key.to_bytes(),
     )
@@ -2983,6 +2983,37 @@ mod tests {
                 .is_err(),
             "a stale live incarnation cannot be added to newer archived totals"
         );
+    }
+
+    #[test]
+    fn archive_accepts_exactly_one_legacy_zero_id_incarnation() {
+        let percolator_program = Pubkey::new_unique();
+        let market = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let portfolio = Pubkey::new_unique();
+        let mut archive = PortfolioArchive::empty(
+            percolator_program,
+            market,
+            owner,
+            portfolio,
+        );
+        let legacy = reward_snapshot(market, portfolio, owner, 0, 10);
+        archive.add_live(&legacy).unwrap();
+        assert_eq!(archive.generation, 1);
+        assert_eq!(archive.portfolio_id, 0);
+        assert_eq!(archive.residual_received, 10);
+        assert_eq!(
+            archive.add_live(&legacy),
+            Err(ProgramError::InvalidAccountData),
+            "a legacy incarnation cannot be archived twice"
+        );
+
+        archive
+            .add_live(&reward_snapshot(market, portfolio, owner, 7, 4))
+            .unwrap();
+        assert_eq!(archive.generation, 2);
+        assert_eq!(archive.portfolio_id, 7);
+        assert_eq!(archive.residual_received, 14);
     }
 
     #[test]

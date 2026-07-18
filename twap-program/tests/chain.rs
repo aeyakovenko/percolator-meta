@@ -42222,6 +42222,7 @@ enum OrganicRewardCleanup {
     None,
     BeforeCrystallize,
     PostEmissionLoss,
+    LegacyPreIdPortfolioCleanup,
     OwnerReinitializeBeforeCrystallize,
     OwnerCloseAfterRecovery,
     OwnerReinitializeAfterRecovery,
@@ -42243,6 +42244,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         cleanup == OrganicRewardCleanup::OwnerReinitializeAfterRecovery;
     let owner_reinitialize_before_crystallize =
         cleanup == OrganicRewardCleanup::OwnerReinitializeBeforeCrystallize;
+    let legacy_pre_id_cleanup = cleanup == OrganicRewardCleanup::LegacyPreIdPortfolioCleanup;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -43578,6 +43580,21 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         "trader cohort earns the organically-settled residual loss"
     );
 
+    if legacy_pre_id_cleanup {
+        // Exact upgrade fixture: portfolios initialized before the monotonic-ID release have the
+        // same authenticated engine state and telemetry, but this newly appended wrapper word is
+        // still the zero sentinel. All operations after this point use public program instructions.
+        let mut predecessor = svm.get_account(&loser_pf).unwrap();
+        predecessor.data[percolator_prog::constants::PORTFOLIO_ID_OFF
+            ..percolator_prog::constants::PORTFOLIO_ID_OFF + 8]
+            .fill(0);
+        svm.set_account(loser_pf, predecessor).unwrap();
+        assert!(percolator_prog::state::read_portfolio_id(
+            &svm.get_account(&loser_pf).unwrap().data
+        )
+        .is_err());
+    }
+
     if !maintenance_fee_cleanup {
         // Once the bound reward has been paid, an absent portfolio owner or DAO must not leave the
         // materialized account as a permanent gate on resolved insurance/backing withdrawals.
@@ -43785,6 +43802,13 @@ fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
 fn e2e_legacy_reward_end_excludes_post_period_real_trade_loss() {
     run_organic_pnl_loss_real_trade_feeds_reward_cohort(
         OrganicRewardCleanup::PostEmissionLoss,
+    );
+}
+
+#[test]
+fn e2e_pre_id_reward_portfolio_cannot_block_backing_return_and_market_close() {
+    run_organic_pnl_loss_real_trade_feeds_reward_cohort(
+        OrganicRewardCleanup::LegacyPreIdPortfolioCleanup,
     );
 }
 
