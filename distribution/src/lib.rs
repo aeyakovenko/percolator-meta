@@ -61,6 +61,7 @@ declare_id!("D1str1but1on11111111111111111111111111111111");
 const CONFIG_DISC: [u8; 8] = *b"DISTCFG1";
 const PROPOSAL_DISC: [u8; 8] = *b"DISTPRP1";
 const CONFIG_SIZE: usize = 168;
+pub const CONFIG_TOTAL_SUPPLY_OFF: usize = 112;
 const PROPOSAL_HEADER: usize = 104;
 const ENTRY_SIZE: usize = 40; // pubkey(32) + amount(8)
 const MAX_ENTRIES: u32 = 10_000;
@@ -122,7 +123,11 @@ impl Config {
             vault: Pubkey::new_from_array(data[40..72].try_into().unwrap()),
             authority: Pubkey::new_from_array(data[72..104].try_into().unwrap()),
             claim_window_slots: u64::from_le_bytes(data[104..112].try_into().unwrap()),
-            total_supply: u64::from_le_bytes(data[112..120].try_into().unwrap()),
+            total_supply: u64::from_le_bytes(
+                data[CONFIG_TOTAL_SUPPLY_OFF..CONFIG_TOTAL_SUPPLY_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
             sealed_proposal: Pubkey::new_from_array(data[120..152].try_into().unwrap()),
             seal_slot: u64::from_le_bytes(data[152..160].try_into().unwrap()),
             bump: data[160],
@@ -135,7 +140,8 @@ impl Config {
         data[40..72].copy_from_slice(self.vault.as_ref());
         data[72..104].copy_from_slice(self.authority.as_ref());
         data[104..112].copy_from_slice(&self.claim_window_slots.to_le_bytes());
-        data[112..120].copy_from_slice(&self.total_supply.to_le_bytes());
+        data[CONFIG_TOTAL_SUPPLY_OFF..CONFIG_TOTAL_SUPPLY_OFF + 8]
+            .copy_from_slice(&self.total_supply.to_le_bytes());
         data[120..152].copy_from_slice(self.sealed_proposal.as_ref());
         data[152..160].copy_from_slice(&self.seal_slot.to_le_bytes());
         data[160] = self.bump;

@@ -491,6 +491,7 @@ impl Env {
                 AccountMeta::new_readonly(self.gv_config, false),
                 AccountMeta::new(gv_proposal, false),
                 AccountMeta::new_readonly(*dist_proposal, false),
+                AccountMeta::new_readonly(self.dist_config, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: vec![2u8],
@@ -510,6 +511,7 @@ impl Env {
                 AccountMeta::new_readonly(self.gv_config, false),
                 AccountMeta::new(gv_proposal, false),
                 AccountMeta::new_readonly(*dist_proposal, false),
+                AccountMeta::new_readonly(self.dist_config, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ],
             data: vec![2u8],
@@ -937,6 +939,26 @@ fn register_rejects_an_empty_proposal() {
     env.register(&full);
 }
 
+// Genesis voters select the allocation of the complete fixed COIN supply. A
+// proposal that leaves headroom would silently turn that voted portion into a
+// later burn, so it must never become a ballot target.
+#[test]
+fn register_rejects_a_distribution_that_allocates_less_than_the_full_supply() {
+    let mut env = Env::new();
+    let alice = Pubkey::new_unique();
+    let partial = env.create_dist_proposal(1, &[(alice, 60)]);
+    let creator = clone_kp(&env.payer);
+
+    assert!(
+        env.register_as(&partial, &creator).is_err(),
+        "a proposal allocating only 60 of the fixed 100 supply must not become votable"
+    );
+    assert!(
+        env.svm.get_account(&env.gv_proposal_pda(&partial)).is_none(),
+        "rejected partial allocation must not consume the canonical ballot-target PDA"
+    );
+}
+
 // Defense in depth: current registrations require a full declared shape, so no
 // public append can change the proposal afterward. The trigger snapshot still
 // rejects a corrupted or historical proposal whose header changes after registration.
@@ -944,19 +966,19 @@ fn register_rejects_an_empty_proposal() {
 fn trigger_refuses_a_distribution_inflated_after_registration() {
     let mut env = Env::new();
     let alice = Pubkey::new_unique();
-    // Honest distribution voters approve: 60 to alice, the remaining 40 of the 100 supply is burned.
-    let dist_proposal = env.create_dist_proposal(1, &[(alice, 60)]);
-    let gv_proposal = env.register(&dist_proposal); // snapshot frozen at (entry_count=1, total=60)
+    // Honest distribution voters approve the complete fixed supply.
+    let dist_proposal = env.create_dist_proposal(1, &[(alice, 100)]);
+    let gv_proposal = env.register(&dist_proposal); // snapshot frozen at (entry_count=1, total=100)
     env.set_pool_outstanding(10);
     env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10); // quorum + majority on the HONEST proposal
 
     let mut changed = env.svm.get_account(&dist_proposal).unwrap();
     changed.data[84..88].copy_from_slice(&2u32.to_le_bytes());
-    changed.data[88..96].copy_from_slice(&100u64.to_le_bytes());
+    changed.data[88..96].copy_from_slice(&101u64.to_le_bytes());
     env.svm.set_account(dist_proposal, changed).unwrap();
 
-    // The trigger must now REFUSE: the live (entry_count=2, total=100) no longer matches the frozen
-    // snapshot (1, 60). The voters' approved distribution can never be silently inflated.
+    // The trigger must now REFUSE: the live (entry_count=2, total=101) no longer matches the frozen
+    // snapshot (1, 100). The voters' approved distribution can never be silently inflated.
     assert!(
         env.trigger(&gv_proposal, &dist_proposal).is_err(),
         "trigger must refuse a distribution that changed after registration"

@@ -53,3 +53,12 @@ fn pinned_distribution_program_id_matches_the_real_program() {
         "gv's pinned distribution program id must equal the deployed distribution program"
     );
 }
+
+#[test]
+fn distribution_total_supply_offset_matches_the_real_layout() {
+    assert_eq!(
+        genesis_vote_program::DIST_CONFIG_TOTAL_SUPPLY_OFF,
+        distribution_program::CONFIG_TOTAL_SUPPLY_OFF,
+        "Genesis full-allocation registration must read Distribution.total_supply"
+    );
+}
