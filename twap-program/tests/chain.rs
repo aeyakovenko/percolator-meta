@@ -3970,6 +3970,95 @@ fn predecessor_market_fixture_preserves_backing_fee_recovery_state() {
     assert_eq!(group.config.initial_margin_bps, 10_000, "genesis market is 100% initial margin — fully collateralized, no trader bankruptcy -> no insurance draw");
 }
 
+// PUBLIC ACCOUNT DOS: market creation is permissionless, but the payer must not be able to consume
+// another user's preallocated Percolator slab. The fresh slab key consents once at construction;
+// governance still does not sign and has no new custody authority.
+#[test]
+fn e2e_controller_init_requires_the_fresh_market_signer() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let market = Keypair::new();
+    let governance = Pubkey::new_unique();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("victim preallocates a blank Percolator slab");
+    let blank = svm.get_account(&market.pubkey()).unwrap();
+    let controller = controller_pda(&governance, &market.pubkey(), &perc_id());
+    let init_market = |market_signer: bool| {
+        let mut data = vec![1u8]; // controller IX_INIT_MARKET
+        data.extend_from_slice(&controller_init_market_data(1));
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market.pubkey(), market_signer),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market.pubkey(), &perc_id()),
+                    false,
+                ),
+            ],
+            data,
+        }
+    };
+
+    let err = send(&mut svm, &[&payer], init_market(false))
+        .expect_err("an unrelated payer cannot consume the victim's blank slab");
+    assert!(
+        err.contains("MissingRequiredSignature"),
+        "the constructor rejects specifically on missing slab consent: {err}"
+    );
+    let after_rejection = svm.get_account(&market.pubkey()).unwrap();
+    assert_eq!(after_rejection.lamports, blank.lamports);
+    assert_eq!(after_rejection.owner, blank.owner);
+    assert_eq!(after_rejection.data, blank.data);
+
+    send(
+        &mut svm,
+        &[&payer, &market],
+        init_market(true),
+    )
+    .expect("any payer can initialize a fresh slab when its key consents");
+    let initialized = svm.get_account(&market.pubkey()).unwrap();
+    let (config, _, configured_slots, capacity) =
+        percolator_prog::state::read_market_config_mode_and_capacity(&initialized.data).unwrap();
+    assert_eq!(config.marketauth, controller.to_bytes());
+    assert_eq!((configured_slots, capacity), (1, 1));
+}
+
 #[test]
 fn controller_can_restart_asset0_after_governed_shutdown() {
     let mut svm =
