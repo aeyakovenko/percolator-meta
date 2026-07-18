@@ -14149,3 +14149,23 @@ use the authenticated live/archive cap, while current 220-byte stakes still requ
 This does not reopen registration or crystallization and cannot increase a frozen numerator or denominator,
 change a recipient, or move collateral, insurance, backing, or Subledger principal. The compatibility bound
 is reward COIN only.
+## Tick - public escrow dust could veto timelocked book initialization (surface D, PARTIAL DOS)
+
+The approved Squads transaction exposes `init_book`'s pre-created COIN and collateral escrow addresses for
+the mandatory one-week timelock. SPL Token destinations cannot reject transfers, but TWAP required both
+balances to equal zero. An unrelated signer could therefore send one atom to either address after approval
+and make the delayed execution fail. Governance could propose fresh accounts, but the attacker could repeat
+the one-atom action and restart the full delay; no malformed deployment or privileged signer was required.
+
+The clean-room real-Squads LiteSVM regression publishes and approves `init_book`, transfers one COIN atom and
+one collateral atom through the public SPL Token program during the delay, and then executes the same approved
+transaction. The old binary fails inside TWAP with `InvalidAccountData`. The fixed binary initializes, accepts
+an ordinary 100,000-atom bid, settles and claims exactly that recorded obligation, leaves both unsolicited
+atoms in their respective escrows, and reopens the singleton book.
+
+FIX: `init_book` still requires initialized SPL accounts with the exact PDA owner, mint, and no close authority,
+but no longer requires a zero balance. Execute, claim, cancel, and eviction already derive every movement from
+fixed book slots rather than live escrow balances, so unsolicited atoms remain segregated exactly like public
+donations after initialization. No sweep path, instruction, signer, administrator, recipient, token account,
+authority, or CPI was added. The finding is partial because a fresh governance proposal eventually recovers if
+the attacker stops; the old public interface nevertheless allowed cheap, repeatable launch censorship.
