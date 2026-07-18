@@ -8406,6 +8406,362 @@ fn init_creator_owned_market(
         .expect("permissionless creator initializes a real market");
 }
 
+// PUBLIC LOF PROBE: once another account has published a committed mark into the engine, the
+// target/effective lag gate is clear even though the winner has not refreshed its private K
+// snapshot. External backing must not escape in that interval and leave the later source claim
+// under-backed.
+#[test]
+fn e2e_backing_cannot_exit_after_effective_mark_before_winner_refresh() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let oracle = Keypair::new();
+    for signer in [&payer, &creator, &oracle] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    warp_to(&mut svm, 100);
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 3,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: 1,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize leveraged public market");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+            },
+        ),
+    )
+    .expect("configure authenticated mark");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    let backing = 1_000_000u64;
+    let provider_token = Pubkey::new_unique();
+    let provider_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_token,
+        &collateral,
+        &creator.pubkey(),
+        backing,
+    );
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral,
+        &creator.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_token, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: 1,
+                amount: backing as u128,
+                expiry_slot: 10_000,
+            },
+        ),
+    )
+    .expect("external provider funds the short-loss backing domain");
+    send(
+        &mut svm,
+        &[&payer, &creator, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("separate the oracle from the backing provider");
+
+    let governance = Pubkey::new_unique();
+    let controller = controller_pda(&governance, &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance, false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8],
+        },
+    )
+    .expect("hand market lifecycle to the Meta controller");
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        creator.pubkey().to_bytes(),
+        "the external provider retains its segregated withdrawal authority"
+    );
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let mut traders = Vec::new();
+    for capital in [3_000_000u64, 1_100_000, 0] {
+        let owner = Keypair::new();
+        let portfolio = Keypair::new();
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, &portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate portfolio");
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize portfolio");
+        if capital != 0 {
+            let source = Pubkey::new_unique();
+            set_token(&mut svm, &source, &collateral, &owner.pubkey(), capital);
+            send(
+                &mut svm,
+                &[&payer, &owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit {
+                        amount: capital as u128,
+                    },
+                ),
+            )
+            .expect("deposit trader capital");
+        }
+        traders.push((owner, portfolio));
+    }
+    send(
+        &mut svm,
+        &[&payer, &traders[0].0, &traders[1].0],
+        pix(
+            vec![
+                AccountMeta::new_readonly(traders[0].0.pubkey(), true),
+                AccountMeta::new_readonly(traders[1].0.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(traders[0].1.pubkey(), false),
+                AccountMeta::new(traders[1].1.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: percolator::POS_SCALE as i128,
+                exec_price: 1_000_000,
+                fee_bps: 3,
+            },
+        ),
+    )
+    .expect("open leveraged balanced exposure");
+
+    warp_to(&mut svm, 101);
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 3_000_000,
+            },
+        ),
+    )
+    .expect("commit adverse authenticated mark");
+    for slot in [101u64, 102] {
+        warp_to(&mut svm, slot);
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(traders[2].1.pubkey(), false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("a third account advances the bounded mark");
+    }
+    let (_, accrued_group) =
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
+    assert_eq!(accrued_group.assets[0].effective_price, 3_000_000);
+    assert_eq!(accrued_group.assets[0].raw_oracle_target_price, 3_000_000);
+
+    let withdrawal = send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_destination, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::WithdrawBackingBucket {
+                domain: 1,
+                amount: backing as u128,
+            },
+        ),
+    );
+
+    for trader in &traders[..2] {
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(trader.1.pubkey(), false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: 102,
+                    observations: vec![],
+                },
+            ),
+        )
+        .expect("refresh stale trader through the bounded public crank");
+    }
+    let (_, after_group) =
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
+    let claim = after_group.source_credit[1].positive_claim_bound_num;
+    let reserved = after_group.source_credit[1].fresh_reserved_backing_num;
+    assert!(
+        claim > 1_100_000 * percolator::BOUND_SCALE,
+        "the winner's source claim must materially exceed losing principal"
+    );
+    assert!(
+        withdrawal.is_err(),
+        "external backing escaped after the effective mark was current, leaving {} claim atoms unbacked",
+        claim.saturating_sub(reserved) / percolator::BOUND_SCALE
+    );
+    assert_eq!(token_amount(&svm, &provider_destination), 0);
+    assert!(reserved >= claim, "retained backing must cover the source claim");
+}
+
 // PUBLIC LOF: Percolator's market-authority handoff also rewrites every asset-0 role that still
 // equals the outgoing market authority. A permissionless creator is initially the backing provider,
 // so donating a backed market to the stateless controller used to rewrite the provider to the
