@@ -14343,3 +14343,22 @@ checks that snapshot before deriving the complete withdrawal, and TWAP requires 
 its outer owner signature cannot authorize a newly read amount. Predecessor position layouts remain recoverable
 through the same exact wire. No state, account, signer, authority, recipient, token path, or admin surface was
 added.
+
+## Tick - stale signed own-vault exit retired a later backing top-up (surface B, REAL DOS)
+
+Subledger's segregated own-vault exit was owner-signed but amountless. A relayer could hold an exit signed
+when the backing position contained one unit, let the owner add four units, and then submit the old transaction.
+The program derived all five live units at execution, returned them to the owner, and permanently marked the
+one-per-owner position withdrawn. Because a withdrawn position cannot be recreated or re-entered, the owner
+lost that canonical backing identity and its future reward participation even though pool admission stayed open.
+
+The retained clean-room LiteSVM regression uses a real SPL vault and the Subledger SBF backing-domain path with
+one still-valid blockhash. Against parent `bb2c787`, the withheld one-unit exit returns all five live units,
+retires the position, and proves a later deposit through the public interface always rejects. The fixed path
+rejects both the legacy amountless transaction and a correctly encoded stale one-unit snapshot byte-atomically,
+then proves the same live position accepts fresh backing.
+
+FIX: own-vault and live-insurance complete exits now reuse one exact principal/last-deposit-slot verifier.
+Every predecessor position layout remains withdrawable through the exact wire. The change adds no state,
+account, signer, authority, recipient, token path, custody path, or admin surface; tokens were never redirectable
+under the vulnerable path.
