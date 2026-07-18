@@ -336,7 +336,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     .expect("pool hands funded custody to TWAP");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
 
-    let owner_exit_witness = twap_owner_exit_witness(&svm, &position);
+    let owner_exit_witness = subledger_full_exit_witness(&svm, &position);
     let owner_exit_ix = || {
         let mut exit = twap_return_to_subledger_ix(
             &squads_vault,
@@ -8450,17 +8450,17 @@ fn twap_return_to_subledger_ix(
     }
 }
 
-fn bind_twap_owner_exit_witness(
+fn bind_subledger_full_exit_witness(
     svm: &LiteSVM,
     instruction: &mut Instruction,
     position: &Pubkey,
 ) {
     instruction
         .data
-        .extend_from_slice(&twap_owner_exit_witness(svm, position));
+        .extend_from_slice(&subledger_full_exit_witness(svm, position));
 }
 
-fn twap_owner_exit_witness(svm: &LiteSVM, position: &Pubkey) -> [u8; 16] {
+fn subledger_full_exit_witness(svm: &LiteSVM, position: &Pubkey) -> [u8; 16] {
     let position = svm.get_account(position).expect("owner-exit position");
     assert!(position.data.len() >= 97, "current owner-exit position layout");
     let mut witness = [0u8; 16];
@@ -8988,6 +8988,8 @@ fn e2e_public_backing_vault_donation_cannot_be_captured_by_the_next_depositor() 
     .expect("late depositor enters after the donation");
     assert_eq!(token_amount(&svm, &vault), reserve + principal);
 
+    let mut backing_exit_data = vec![2u8]; // IX_WITHDRAW
+    backing_exit_data.extend_from_slice(&subledger_full_exit_witness(&svm, &position));
     send(
         &mut svm,
         &[&payer, &depositor],
@@ -9001,7 +9003,7 @@ fn e2e_public_backing_vault_donation_cannot_be_captured_by_the_next_depositor() 
                 AccountMeta::new(vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            data: vec![2u8], // IX_WITHDRAW
+            data: backing_exit_data,
         },
     )
     .expect("late depositor exits without capturing the reserve");
@@ -21527,7 +21529,7 @@ fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
     owner_exit
         .accounts
         .push(AccountMeta::new_readonly(spl_token::ID, false));
-    bind_twap_owner_exit_witness(&svm, &mut owner_exit, &position);
+    bind_subledger_full_exit_witness(&svm, &mut owner_exit, &position);
 
     let market_before = svm.get_account(&env.slab).unwrap();
     let config_before = svm.get_account(&twap_config).unwrap();
@@ -30879,6 +30881,8 @@ fn e2e_full_genesis_to_buy_burn() {
         surplus - 400_000,
         "the retained protocol insurance remains after principal recovery"
     );
+    let mut backing_exit_data = vec![2u8]; // IX_WITHDRAW
+    backing_exit_data.extend_from_slice(&subledger_full_exit_witness(&svm, &backing_position));
     send(
         &mut svm,
         &[&bob],
@@ -30892,7 +30896,7 @@ fn e2e_full_genesis_to_buy_burn() {
                 AccountMeta::new(backing_vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            data: vec![2u8],
+            data: backing_exit_data,
         },
     )
     .expect("segregated collateral depositor recovers principal");
@@ -45472,6 +45476,9 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         "only Alice's protected principal leaves market insurance"
     );
 
+    let mut backing_withdraw_data = vec![2u8]; // IX_WITHDRAW
+    backing_withdraw_data
+        .extend_from_slice(&subledger_full_exit_witness(&svm, &backing_position));
     let backing_withdraw = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -45482,7 +45489,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new(backing_vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
-        data: vec![2u8], // IX_WITHDRAW
+        data: backing_withdraw_data,
     };
     send(&mut svm, &[&bob], backing_withdraw)
         .expect("backing depositor recovers segregated principal after continuous rewards");
@@ -49276,7 +49283,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     attacker_return
         .accounts
         .push(AccountMeta::new_readonly(spl_token::ID, false));
-    bind_twap_owner_exit_witness(&svm, &mut attacker_return, &exiting_position);
+    bind_subledger_full_exit_witness(&svm, &mut attacker_return, &exiting_position);
     assert!(
         send(&mut svm, &[&payer, &attacker], attacker_return).is_err(),
         "an attacker cannot release custody with another owner's position"
@@ -49309,7 +49316,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     owner_return
         .accounts
         .push(AccountMeta::new_readonly(spl_token::ID, false));
-    bind_twap_owner_exit_witness(&svm, &mut owner_return, &exiting_position);
+    bind_subledger_full_exit_witness(&svm, &mut owner_return, &exiting_position);
     let mut redirected_owner_return = owner_return.clone();
     redirected_owner_return.accounts[9] = AccountMeta::new(attacker_destination, false);
     assert!(

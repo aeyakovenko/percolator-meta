@@ -1667,7 +1667,7 @@ fn process_deposit(
 }
 
 // withdraw accounts: [owner(s,w), pool(w), position(w), owner_ata(w), vault(w), token_program]
-// data: none
+// data: expected_principal(u64) | expected_start_slot(u64)
 fn process_withdraw(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1681,9 +1681,6 @@ fn process_withdraw(
     let vault = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
 
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
     if !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -1702,6 +1699,7 @@ fn process_withdraw(
     if pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
     }
+    require_full_exit_snapshot(data, &position)?;
 
     // Match the exact historical PDA schema implied by this deployed account.
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
@@ -2311,6 +2309,14 @@ fn process_insurance_withdraw_full(
         return Err(ProgramError::IllegalOwner);
     }
     let position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    require_full_exit_snapshot(data, &position)?;
+    let principal = position.principal;
+    let amount_bytes = principal.to_le_bytes();
+    let mut amount_data: &[u8] = &amount_bytes;
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
+}
+
+fn require_full_exit_snapshot(data: &mut &[u8], position: &Position) -> ProgramResult {
     let expected_principal = read_u64(data)?;
     let expected_start_slot = read_u64(data)?;
     if !data.is_empty()
@@ -2319,10 +2325,7 @@ fn process_insurance_withdraw_full(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    let principal = position.principal;
-    let amount_bytes = principal.to_le_bytes();
-    let mut amount_data: &[u8] = &amount_bytes;
-    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
+    Ok(())
 }
 
 // return_finalized_position accounts: [owner, pool(w), position(w), owner_ata(w),

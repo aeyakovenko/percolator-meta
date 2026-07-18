@@ -5648,8 +5648,8 @@ fn every_legacy_genesis_ballot_generation_can_retract_and_recover_real_percolato
 // process_withdraw's is_insurance type guard (lib.rs:670) rejects an insurance pool outright, BEFORE any
 // vault/seed work, so the vote-lock cannot be sidestepped by routing the exit through a different tag.
 // The existing vote_locked test only drives tag 5; this pins tag 2 as the forfeiture-bypass defense.
-// Because every check preceding line 670 passes here (owner signs, token_program ok, pool+position are
-// subledger-owned, data empty), an is_err is PRECISELY the is_insurance guard firing — not incidental.
+// Because every check preceding the type guard passes here (owner signs, token program and exact
+// snapshot are valid, pool+position are subledger-owned), the rejection pins the is_insurance guard.
 #[test]
 fn vote_locked_insurance_position_cannot_be_drained_via_own_vault_withdraw() {
     let mut env = Env::new();
@@ -5672,6 +5672,10 @@ fn vote_locked_insurance_position_cannot_be_drained_via_own_vault_withdraw() {
     assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).is_err(), "tag-5 exit blocked by the lock");
 
     // ATTACK: route the exit through tag 2 (own-vault withdraw) to dodge the vote_locked check.
+    let (snapshot_principal, snapshot_start, _) = env.read_position(&alice.pubkey());
+    let mut tag2_data = vec![2u8];
+    tag2_data.extend_from_slice(&snapshot_principal.to_le_bytes());
+    tag2_data.extend_from_slice(&snapshot_start.to_le_bytes());
     let tag2 = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -5682,7 +5686,7 @@ fn vote_locked_insurance_position_cannot_be_drained_via_own_vault_withdraw() {
             AccountMeta::new(env.perc_vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
-        data: vec![2u8],
+        data: tag2_data,
     };
     assert!(env.send(&[tag2], &[&alice]).is_err(), "tag-2 own-vault withdraw must reject an insurance pool (is_insurance guard)");
 
@@ -7261,6 +7265,10 @@ fn own_vault_withdraw_is_rejected_on_an_insurance_pool() {
     let holding = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &holding, amount).expect("deposit");
 
+    let (snapshot_principal, snapshot_start, _) = env.read_position(&alice.pubkey());
+    let mut attack_data = vec![2u8]; // IX_WITHDRAW (own-vault)
+    attack_data.extend_from_slice(&snapshot_principal.to_le_bytes());
+    attack_data.extend_from_slice(&snapshot_start.to_le_bytes());
     let attack = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -7271,7 +7279,7 @@ fn own_vault_withdraw_is_rejected_on_an_insurance_pool() {
             AccountMeta::new(env.perc_vault, false),
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
-        data: vec![2u8], // IX_WITHDRAW (own-vault)
+        data: attack_data,
     };
     assert!(env.send(&[attack], &[&alice]).is_err(), "own-vault withdraw must be rejected on an insurance pool");
     let (principal, _start, withdrawn) = env.read_position(&alice.pubkey());
