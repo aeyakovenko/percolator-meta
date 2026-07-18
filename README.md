@@ -102,7 +102,9 @@ capital's own tenure.
   failed or redirected exit rolls the role return back; success consumes that position and creates
   one exact-config re-handoff permit. Any cranker can consume that permit, replacing only the exited
   principal component of the floor. It cannot initiate the first handoff or undo a governance or
-  terminal return. After the bound Percolator market is resolved and empty, anyone can crank the
+  terminal return. An ordinary pool exit first proves the pool is still the live insurance operator,
+  even when full impairment makes its token payout zero, so it cannot change principal behind TWAP.
+  After the bound Percolator market is resolved and empty, anyone can crank the
   same fixed return while the pool attests that owner principal remains. Once the bootstrap deadline
   has elapsed, an absent owner also cannot veto terminal cleanup: any cranker may
   return that owner's full loss-adjusted position only to a clean account owned by the depositor,
