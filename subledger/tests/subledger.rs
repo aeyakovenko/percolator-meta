@@ -130,9 +130,13 @@ fn mint_to(svm: &mut LiteSVM, payer: &Keypair, mint: &Pubkey, authority: &Keypai
 }
 
 fn pool_pda(mint: &Pubkey, asset_id: u64, policy: u8) -> Pubkey {
+    pool_pda_for_domain(mint, asset_id, policy, 0)
+}
+
+fn pool_pda_for_domain(mint: &Pubkey, asset_id: u64, policy: u8, domain: u8) -> Pubkey {
     // Own-vault pools commit to the default market binding (no percolator market).
     let no_market = Pubkey::default();
-    let domain = [0u8];
+    let domain = [domain];
     let policy = [policy];
     let window = OWN_VAULT_DEPOSIT_WINDOW_SLOTS.to_le_bytes();
     let start = OWN_VAULT_DEPOSIT_START_SLOT.to_le_bytes();
@@ -297,10 +301,21 @@ fn historical_position_data(size: usize, pool: &Pubkey, owner: &Pubkey, principa
 }
 
 fn init_pool_ix(env: &Env, pool: &Pubkey, vault: &Pubkey, asset_id: u64, policy: u8) -> Instruction {
+    init_pool_ix_for_domain(env, pool, vault, asset_id, policy, 0)
+}
+
+fn init_pool_ix_for_domain(
+    env: &Env,
+    pool: &Pubkey,
+    vault: &Pubkey,
+    asset_id: u64,
+    policy: u8,
+    domain: u8,
+) -> Instruction {
     let mut data = vec![0u8]; // IX_INIT_POOL
     data.extend_from_slice(&asset_id.to_le_bytes());
     data.push(policy);
-    data.push(0u8); // domain = insurance (own-vault behaviour is identical)
+    data.push(domain);
     Instruction {
         program_id: program_id(),
         accounts: vec![
@@ -363,6 +378,122 @@ fn new_depositor(env: &mut Env, amount: u64) -> (Keypair, Pubkey) {
 
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
+}
+
+// STALE BACKING EXIT DOS: own-vault withdraw is owner-signed but amountless. A
+// relayer must not be able to hold a one-unit exit, wait for a later top-up, and
+// retire the larger canonical position. Position PDAs are one-per-owner and a
+// retired position cannot be re-created or re-entered, so this permanently denies
+// that backing depositor's future reward participation even while deposits stay open.
+#[test]
+fn presigned_own_vault_exit_cannot_retire_a_later_backing_top_up() {
+    let mut env = Env::new();
+    let asset_id = 88;
+    let pool = pool_pda_for_domain(&env.mint, asset_id, 1, 1);
+    let vault =
+        create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(
+        &[init_pool_ix_for_domain(
+            &env, &pool, &vault, asset_id, 1, 1,
+        )],
+        &[],
+    )
+    .expect("initialize the segregated backing pool");
+
+    let (alice, alice_ata) = new_depositor(&mut env, 6);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &alice.pubkey(),
+            &alice_ata,
+            &vault,
+            1,
+        )],
+        &[&alice],
+    )
+    .expect("alice deposits the unit covered by the first exit signature");
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let withheld_exit = Transaction::new_signed_with_payer(
+        &[withdraw_ix(&pool, &alice.pubkey(), &alice_ata, &vault)],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let top_up = Transaction::new_signed_with_payer(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &alice.pubkey(),
+            &alice_ata,
+            &vault,
+            4,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    env.svm
+        .send_transaction(top_up)
+        .expect("alice's later four-unit backing top-up lands");
+    let position = position_pda(&pool, &alice.pubkey());
+    let position_after_top_up = env.svm.get_account(&position).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(position_after_top_up.data[72..80].try_into().unwrap()),
+        5,
+    );
+    assert_eq!(position_after_top_up.data[88], 0);
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.token_amount(&vault), 5);
+
+    let stale_result = env.svm.send_transaction(withheld_exit);
+    if stale_result.is_ok() {
+        let retired = env.svm.get_account(&position).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(retired.data[72..80].try_into().unwrap()),
+            5,
+            "the vulnerable exit reads all later principal",
+        );
+        assert_eq!(retired.data[88], 1, "the canonical position is retired");
+        assert_eq!(env.token_amount(&alice_ata), 6);
+        assert!(
+            env.send(
+                &[deposit_ix(
+                    &env,
+                    &pool,
+                    &alice.pubkey(),
+                    &alice_ata,
+                    &vault,
+                    1,
+                )],
+                &[&alice],
+            )
+            .is_err(),
+            "a retired backing position has no public re-entry path",
+        );
+        panic!("a pre-top-up exit authorization retired the later backing position");
+    }
+
+    assert_eq!(env.svm.get_account(&position).unwrap(), position_after_top_up);
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.token_amount(&vault), 5);
+    env.send(
+        &[deposit_ix(
+            &env,
+            &pool,
+            &alice.pubkey(),
+            &alice_ata,
+            &vault,
+            1,
+        )],
+        &[&alice],
+    )
+    .expect("a rejected stale exit leaves the backing position usable");
+    assert_eq!(env.token_amount(&alice_ata), 0);
+    assert_eq!(env.token_amount(&vault), 6);
 }
 
 // UPGRADE LOF PROBE: origin/master created 208-byte pools and derived their PDA
