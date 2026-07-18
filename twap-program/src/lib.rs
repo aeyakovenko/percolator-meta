@@ -1898,6 +1898,7 @@ fn process_set_market_fees(
         return Err(ProgramError::IllegalOwner);
     }
     if *market_slab.key != config.market_slab
+        || market_slab.owner != percolator_program.key
         || *percolator_program.key != config.percolator_program
         || !percolator_program.executable
     {
@@ -1909,6 +1910,15 @@ fn process_set_market_fees(
         .map_err(|_| ProgramError::InvalidSeeds)?;
     if *twap_authority.key != expected_authority {
         return Err(ProgramError::InvalidSeeds);
+    }
+    let current_trade_fee = percolator_accounting::read_trade_fee_base_bps(
+        &market_slab.try_borrow_data()?,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?;
+    // Trades have no user-supplied maximum for the configured fee. A monotonic
+    // decrease is the only local rule that cannot reprice an already-signed trade.
+    if trade_fee > current_trade_fee {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
     let mut trade_data = vec![PERC_IX_UPDATE_TRADE_FEE_POLICY];
