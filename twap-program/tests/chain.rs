@@ -22308,6 +22308,60 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     svm.set_sysvar(&clock);
     vote(&mut svm, &voter_a, position_a, vote_a);
     vote(&mut svm, &voter_b, position_b, vote_b);
+
+    // A live voter may add capital without changing the immutable ballot snapshot. Terminal
+    // recovery must later retire the original one-unit ballot while returning this entire
+    // two-unit position; otherwise the legal top-up becomes either phantom voting power or
+    // permanently stranded principal when the owner is absent.
+    let topup_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &topup_source,
+        &env.collateral_mint,
+        &voter_a.pubkey(),
+        1,
+    );
+    let mut topup_data = vec![4u8];
+    topup_data.extend_from_slice(&1u64.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &voter_a],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(voter_a.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position_a, false),
+                AccountMeta::new(topup_source, false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: topup_data,
+        },
+    )
+    .expect("a voted position accepts a one-unit top-up");
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&position_a).unwrap().data[72..80]
+                .try_into()
+                .unwrap()
+        ),
+        2,
+        "the live position includes the top-up"
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&vote_a).unwrap().data[88..96]
+                .try_into()
+                .unwrap()
+        ),
+        1,
+        "the top-up does not inflate the existing ballot"
+    );
     advance_to_test_bootstrap_end(&mut svm);
     assert!(trigger(&mut svm, vote_a, dist_a).is_err());
     assert!(trigger(&mut svm, vote_b, dist_b).is_err());
@@ -22416,7 +22470,7 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
                 .try_into()
                 .unwrap()
         ),
-        8,
+        2,
         "a nonvoter refund cannot alter either proposal's weight tally"
     );
     assert!(
@@ -22451,7 +22505,11 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
         ),
     )
     .expect("the second tied absent voter cannot block terminal cleanup");
-    assert_eq!(token_amount(&svm, &destination_a), 1);
+    assert_eq!(
+        token_amount(&svm, &destination_a),
+        2,
+        "terminal recovery returns the voted principal and its untallied top-up"
+    );
     assert_eq!(token_amount(&svm, &destination_b), 1);
     let config = svm.get_account(&env.gv_config).unwrap();
     assert_eq!(u64::from_le_bytes(config.data[200..208].try_into().unwrap()), 0);
