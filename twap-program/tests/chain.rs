@@ -16653,6 +16653,31 @@ fn gv_config_pda_e2e(coin_mint: &Pubkey, pool: &Pubkey) -> Pubkey {
 fn gv_id_e2e() -> Pubkey {
     Pubkey::from_str("GenesisVote11111111111111111111111111111111").unwrap()
 }
+
+fn gv_vote_data_e2e(
+    svm: &LiteSVM,
+    ballot: &Pubkey,
+    position: &Pubkey,
+    action: u8,
+) -> Vec<u8> {
+    let vote_nonce = svm
+        .get_account(ballot)
+        .filter(|account| account.data.len() >= 104)
+        .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
+        .unwrap_or(0);
+    let mut data = vec![3u8, action];
+    data.extend_from_slice(&vote_nonce.to_le_bytes());
+    if action == 1 {
+        let principal = svm
+            .get_account(position)
+            .filter(|account| account.data.len() >= 80)
+            .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
+            .unwrap_or(0);
+        data.extend_from_slice(&principal.to_le_bytes());
+    }
+    data
+}
+
 fn dist_id_e2e() -> Pubkey {
     Pubkey::from_str("D1str1but1on11111111111111111111111111111111").unwrap()
 }
@@ -18959,7 +18984,7 @@ fn e2e_fresh_position_gets_one_vote_per_principal_unit() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &gv_ballot, &position, 1),
     };
 
     // A same-slot vote gets one vote per live principal unit.
@@ -20952,12 +20977,6 @@ fn e2e_voter_cannot_back_two_proposals_without_retracting() {
     )
     .0;
     let vote = |svm: &LiteSVM, gv_proposal: &Pubkey, action: u8| {
-        let vote_nonce = svm
-            .get_account(&gv_ballot)
-            .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
-            .unwrap_or(0);
-        let mut data = vec![3u8, action];
-        data.extend_from_slice(&vote_nonce.to_le_bytes());
         Instruction {
             program_id: gv_id_e2e(),
             accounts: vec![
@@ -20970,7 +20989,7 @@ fn e2e_voter_cannot_back_two_proposals_without_retracting() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data,
+            data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
         }
     };
     let send = |svm: &mut LiteSVM, ix: Instruction| {
@@ -21117,7 +21136,7 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -21129,7 +21148,7 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     let withdraw = || Instruction {
         program_id: sub_id(),
@@ -21163,7 +21182,8 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
     };
 
     // alice backs the proposal -> her position is vote-locked (principal pledged to a live ballot).
-    send(&mut svm, &[vote(1)]).expect("back");
+    let back = vote(&svm, 1);
+    send(&mut svm, &[back]).expect("back");
 
     // (1) A BARE withdraw while the ballot is live is rejected — the lock holds the pledge.
     assert!(
@@ -21172,8 +21192,9 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
     );
     // (2) Even bundled, if the withdraw is ordered BEFORE the retract it still sees the lock -> the
     //     whole tx reverts atomically (nothing exits, the ballot stays).
+    let ordered_last_retract = vote(&svm, 2);
     assert!(
-        send(&mut svm, &[withdraw(), vote(2)]).is_err(),
+        send(&mut svm, &[withdraw(), ordered_last_retract]).is_err(),
         "withdraw-before-retract sees the lock; one tx, atomic revert"
     );
     assert_eq!(
@@ -21184,7 +21205,8 @@ fn e2e_voter_veto_exits_one_tx_retract_then_withdraw_else_atomic_fail() {
 
     // (3) The veto: ONE tx `[retract, withdraw]` — retract clears the lock, the withdraw redeems her
     //     shares (principal + any surplus). She exits at will, shrinking the live outstanding.
-    send(&mut svm, &[vote(2), withdraw()])
+    let retract = vote(&svm, 2);
+    send(&mut svm, &[retract, withdraw()])
         .expect("retract-then-withdraw in one tx is the veto exit");
     assert_eq!(
         token_amount(&svm, &alice_ata),
@@ -21288,7 +21310,7 @@ fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(voter.pubkey(), true),
@@ -21300,9 +21322,10 @@ fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &ballot, &position, action),
     };
-    send(&mut svm, &[&payer, &voter], vote(1)).expect("voter backs proposal");
+    let back = vote(&svm, 1);
+    send(&mut svm, &[&payer, &voter], back).expect("voter backs proposal");
     assert!(
         u128::from_le_bytes(
             svm.get_account(&proposal).unwrap().data[72..88]
@@ -21404,8 +21427,9 @@ fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
 
     svm.expire_blockhash();
     let blockhash = svm.latest_blockhash();
+    let retract = vote(&svm, 2);
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[vote(2), owner_exit],
+        &[retract, owner_exit],
         Some(&payer.pubkey()),
         &[&payer, &voter],
         blockhash,
@@ -21538,7 +21562,7 @@ fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -21550,7 +21574,7 @@ fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     // Withdraw builder parameterized by amount (the partial draw is the attack; the full builder above is fixed).
     let withdraw_amt = |amt: u64| Instruction {
@@ -21585,7 +21609,8 @@ fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot
     };
 
     // alice backs the proposal with her full 1_000_000 principal -> weight tallied at 1_000_000, position locked.
-    send(&mut svm, &[vote(1)]).expect("back");
+    let back = vote(&svm, 1);
+    send(&mut svm, &[back]).expect("back");
 
     // THE ATTACK: pull 40% of the capital (400_000) while keeping the 1_000_000-weighted ballot live. The lock
     // rejects it before the amount is even examined -> no capital-less inflated ballot. Nothing moves.
@@ -21601,7 +21626,8 @@ fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot
     // CONTROL: retract first (clears the lock AND removes the weight from the tally), THEN the SAME 400_000
     // partial draw succeeds and the position stays OPEN (not withdrawn) with the residual principal — proving
     // it was the lock, not the amount, that blocked the attack. After retract there is no ballot to inflate.
-    send(&mut svm, &[vote(2), withdraw_amt(partial)])
+    let retract = vote(&svm, 2);
+    send(&mut svm, &[retract, withdraw_amt(partial)])
         .expect("retract clears the lock; the same partial draw is then valid");
     assert_eq!(
         token_amount(&svm, &alice_ata),
@@ -21702,7 +21728,7 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -21714,7 +21740,7 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     let send = |svm: &mut LiteSVM, ix: Instruction| {
         svm.expire_blockhash();
@@ -21735,8 +21761,9 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
     };
 
     // (1) retract WITHOUT ever backing — the ballot account doesn't exist yet -> rejected (gv:611-612).
+    let empty_retract = vote(&svm, 2);
     assert!(
-        send(&mut svm, vote(2)).is_err(),
+        send(&mut svm, empty_retract).is_err(),
         "retract with no live ballot is rejected (nothing to retract)"
     );
     assert_eq!(
@@ -21746,13 +21773,15 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
     );
 
     // Back, then retract once (legitimate). The tally goes principal -> 0.
-    send(&mut svm, vote(1)).expect("back");
+    let back = vote(&svm, 1);
+    send(&mut svm, back).expect("back");
     let (vp, cw) = tally(&svm);
     assert!(
         vp == amount && cw > 0,
         "backing recorded the principal + weight"
     );
-    send(&mut svm, vote(2)).expect("retract once");
+    let retract = vote(&svm, 2);
+    send(&mut svm, retract).expect("retract once");
     assert_eq!(
         tally(&svm),
         (0, 0),
@@ -21761,8 +21790,9 @@ fn e2e_double_retract_and_retract_without_back_cannot_underflow_the_quorum_tally
 
     // (2) DOUBLE retract — the ballot now exists but is not live -> rejected (gv:646-647), NOT a second
     //     subtraction. The u64 tally must NOT wrap to ~2^64 (which would forge quorum).
+    let duplicate_retract = vote(&svm, 2);
     assert!(
-        send(&mut svm, vote(2)).is_err(),
+        send(&mut svm, duplicate_retract).is_err(),
         "double-retract is rejected — no second back-out"
     );
     assert_eq!(
@@ -21883,7 +21913,7 @@ fn e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract() {
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -21895,7 +21925,7 @@ fn e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     let withdraw = Instruction {
         program_id: sub_id(),
@@ -21932,7 +21962,8 @@ fn e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract() {
 
     // alice backs the proposal -> position vote-locked. set_vote_lock (tag 6) accounts:
     // [vote_authority(signer), pool, position(w), owner(signer)]; data [6, locked].
-    send(&mut svm, &[vote(1)], &[&alice]).expect("back");
+    let back = vote(&svm, 1);
+    send(&mut svm, &[back], &[&alice]).expect("back");
     assert_eq!(
         svm.get_account(&position).unwrap().data[97],
         1,
@@ -21985,7 +22016,8 @@ fn e2e_owner_cannot_self_unlock_the_vote_lock_to_bypass_retract() {
     );
 
     // The ONLY clear path is the genesis-vote retract (which signs as gv_config) -> then withdraw succeeds.
-    send(&mut svm, &[vote(2), withdraw], &[&alice])
+    let retract = vote(&svm, 2);
+    send(&mut svm, &[retract, withdraw], &[&alice])
         .expect("retract (via gv) then withdraw is the only unlock");
     assert_eq!(
         token_amount(&svm, &alice_ata),
@@ -22078,7 +22110,7 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -22090,7 +22122,7 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     let withdraw = Instruction {
         program_id: sub_id(),
@@ -22126,7 +22158,8 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
     };
 
     // alice backs -> locked. Then the permissionless trigger SEALS her proposal (she is the whole electorate).
-    send(&mut svm, &[vote(1)], &[&alice]).expect("back");
+    let back = vote(&svm, 1);
+    send(&mut svm, &[back], &[&alice]).expect("back");
     let trigger = Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
@@ -22163,7 +22196,8 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
         send(&mut svm, &[withdraw.clone()], &[&alice]).is_err(),
         "still locked pre-retract -> withdraw blocked"
     );
-    send(&mut svm, &[vote(2), withdraw], &[&alice])
+    let retract = vote(&svm, 2);
+    send(&mut svm, &[retract, withdraw], &[&alice])
         .expect("post-seal retract clears the lock, then withdraw exits");
     assert_eq!(
         token_amount(&svm, &alice_ata),
@@ -22171,8 +22205,9 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
         "the winning voter recovered her full principal — not frozen"
     );
     // The seal itself is immutable — a post-seal re-BACK is still rejected (no un-sealing / re-vote).
+    let post_seal_back = vote(&svm, 1);
     assert!(
-        send(&mut svm, &[vote(1)], &[&alice]).is_err(),
+        send(&mut svm, &[post_seal_back], &[&alice]).is_err(),
         "post-seal re-back is rejected; the win is final"
     );
 }
@@ -22256,7 +22291,7 @@ fn e2e_exited_position_cannot_vote_without_capital_zero_principal_zero_weight() 
         &gv_id_e2e(),
     )
     .0;
-    let vote = |action: u8| Instruction {
+    let vote = |svm: &LiteSVM, action: u8| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -22268,7 +22303,7 @@ fn e2e_exited_position_cannot_vote_without_capital_zero_principal_zero_weight() 
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, action],
+        data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     let withdraw = Instruction {
         program_id: sub_id(),
@@ -22311,13 +22346,15 @@ fn e2e_exited_position_cannot_vote_without_capital_zero_principal_zero_weight() 
     };
 
     // alice backs (has capital + hold-time weight), then EXITS in one tx: [retract, withdraw] -> principal 0.
-    send(&mut svm, &[vote(1)], &[&alice]).expect("back with capital");
+    let back = vote(&svm, 1);
+    send(&mut svm, &[back], &[&alice]).expect("back with capital");
     assert_eq!(
         tvp(&svm),
         amount,
         "her principal is counted while she holds the ballot"
     );
-    send(&mut svm, &[vote(2), withdraw], &[&alice]).expect("veto-exit");
+    let retract = vote(&svm, 2);
+    send(&mut svm, &[retract, withdraw], &[&alice]).expect("veto-exit");
     assert_eq!(
         token_amount(&svm, &alice_ata),
         amount,
@@ -22336,8 +22373,9 @@ fn e2e_exited_position_cannot_vote_without_capital_zero_principal_zero_weight() 
 
     // ATTACK: re-vote with the now-empty position. principal 0 -> weight 0 -> rejected (genesis-vote:661).
     // She cannot re-add ballot weight without re-depositing capital.
+    let empty_back = vote(&svm, 1);
     assert!(
-        send(&mut svm, &[vote(1)], &[&alice]).is_err(),
+        send(&mut svm, &[empty_back], &[&alice]).is_err(),
         "an exited (principal-0) position has zero weight -> vote rejected"
     );
     assert_eq!(
@@ -22439,7 +22477,7 @@ fn e2e_minority_turnout_cannot_reach_quorum() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: gv_vote_data_e2e(svm, &ballot, pos, 1),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -22564,34 +22602,35 @@ fn e2e_voter_cannot_vote_with_another_voters_position() {
     svm.set_sysvar::<Clock>(&c);
 
     // vote ix with an EXPLICIT position account (so we can try substituting bob's).
-    let vote = |who: &Keypair, position: &Pubkey| Instruction {
-        program_id: gv_id_e2e(),
-        accounts: vec![
-            AccountMeta::new(who.pubkey(), true),
-            AccountMeta::new(env.gv_config, false),
-            AccountMeta::new(
-                Pubkey::find_program_address(
-                    &[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()],
-                    &gv_id_e2e(),
-                )
-                .0,
-                false,
-            ),
-            AccountMeta::new(gv_proposal, false),
-            AccountMeta::new(*position, false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, 1u8],
+    let vote = |svm: &LiteSVM, who: &Keypair, position: &Pubkey| {
+        let ballot = Pubkey::find_program_address(
+            &[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()],
+            &gv_id_e2e(),
+        )
+        .0;
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(who.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(gv_proposal, false),
+                AccountMeta::new(*position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: gv_vote_data_e2e(svm, &ballot, position, 1),
+        }
     };
 
     // alice signs but passes BOB's position -> the derived PDA (from alice) mismatches -> rejected.
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let substituted_vote = vote(&svm, &alice, &bob_pos);
     assert!(
         svm.send_transaction(Transaction::new_signed_with_payer(
-            &[vote(&alice, &bob_pos)],
+            &[substituted_vote],
             Some(&payer.pubkey()),
             &[&payer, &alice],
             bh
@@ -22603,8 +22642,9 @@ fn e2e_voter_cannot_vote_with_another_voters_position() {
     // alice voting with HER own position works.
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let own_vote = vote(&svm, &alice, &alice_pos);
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[vote(&alice, &alice_pos)],
+        &[own_vote],
         Some(&payer.pubkey()),
         &[&payer, &alice],
         bh,
@@ -22768,7 +22808,7 @@ fn e2e_vote_rejects_a_position_from_a_foreign_subledger_pool() {
         &gv_id_e2e(),
     )
     .0;
-    let vote = |pool: &Pubkey, pos: &Pubkey| Instruction {
+    let vote = |svm: &LiteSVM, pool: &Pubkey, pos: &Pubkey| Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -22780,7 +22820,7 @@ fn e2e_vote_rejects_a_position_from_a_foreign_subledger_pool() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(svm, &gv_ballot, pos, 1),
     };
     let send = |svm: &mut LiteSVM, ix: Instruction| {
         svm.expire_blockhash();
@@ -22794,11 +22834,13 @@ fn e2e_vote_rejects_a_position_from_a_foreign_subledger_pool() {
     };
 
     // ATTACK: vote with the FOREIGN (own-vault pool_b) position + pool_b -> rejected by the 585 pool bind.
-    assert!(send(&mut svm, vote(&pool_b, &pos_b)).is_err(),
+    let foreign_vote = vote(&svm, &pool_b, &pos_b);
+    assert!(send(&mut svm, foreign_vote).is_err(),
         "a position in a pool other than the gv's bound subledger_pool cannot vote (genesis-vote:585)");
     // CONTROL: the SAME voter votes with her BOUND (genesis insurance pool) position -> succeeds. So 585 is the
     // sole rejector above, not the owner/PDA/weight checks.
-    send(&mut svm, vote(&env.pool, &pos_a))
+    let bound_vote = vote(&svm, &env.pool, &pos_a);
+    send(&mut svm, bound_vote)
         .expect("voting with a position in the gv's bound pool succeeds");
     assert_eq!(
         svm.get_account(&pos_a).unwrap().data[97],
@@ -22902,7 +22944,7 @@ fn e2e_trigger_rejects_a_foreign_low_outstanding_pool_that_would_forge_quorum() 
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &gv_ballot, &a_pos, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -23133,7 +23175,7 @@ fn e2e_only_the_winning_proposal_can_be_claimed() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &ballot, &position, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -23319,7 +23361,7 @@ fn e2e_principal_weight_ignores_hold_time_no_early_squatter_capture() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: gv_vote_data_e2e(svm, &ballot, pos, 1),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -23479,7 +23521,7 @@ fn e2e_dust_squat_and_late_topup_do_not_change_per_unit_vote_weight() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: gv_vote_data_e2e(svm, &ballot, &position, 1),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -23647,12 +23689,6 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
     )
     .0;
     let vote = |svm: &mut LiteSVM, action: u8| {
-        let mut data = vec![3u8, action];
-        let vote_nonce = svm
-            .get_account(&ballot)
-            .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
-            .unwrap_or(0);
-        data.extend_from_slice(&vote_nonce.to_le_bytes());
         let ix = Instruction {
             program_id: gv_id_e2e(),
             accounts: vec![
@@ -23665,7 +23701,7 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data,
+            data: gv_vote_data_e2e(svm, &ballot, &position, action),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -24152,7 +24188,7 @@ fn e2e_cannot_vote_without_a_position() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &ballot, &position, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -24251,7 +24287,7 @@ fn e2e_sybil_splitting_gives_no_vote_advantage() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: gv_vote_data_e2e(&svm, &ballot, position, 1),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -24377,7 +24413,7 @@ fn e2e_exactly_half_capital_does_not_meet_quorum() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: gv_vote_data_e2e(svm, &ballot, pos, 1),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -24651,7 +24687,7 @@ fn e2e_tied_weight_between_proposals_deadlocks_until_broken() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: gv_vote_data_e2e(svm, &ballot, pos, 1),
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -24781,7 +24817,8 @@ fn run_competing_voter_veto_exit_deadlock_boundary(trigger_phase_expired: bool) 
         .expect("deposit");
         (position, ata, holding)
     };
-    let vote_ix = |who: &Keypair, pos: &Pubkey, gv_prop: &Pubkey, action: u8| -> Instruction {
+    let vote_ix =
+        |svm: &LiteSVM, who: &Keypair, pos: &Pubkey, gv_prop: &Pubkey, action: u8| -> Instruction {
         let ballot = Pubkey::find_program_address(
             &[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()],
             &gv_id_e2e(),
@@ -24799,7 +24836,7 @@ fn run_competing_voter_veto_exit_deadlock_boundary(trigger_phase_expired: bool) 
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, action],
+            data: gv_vote_data_e2e(svm, &ballot, pos, action),
         }
     };
     let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
@@ -24840,8 +24877,9 @@ fn run_competing_voter_veto_exit_deadlock_boundary(trigger_phase_expired: bool) 
     {
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
+        let back = vote_ix(&svm, &alice, &a_pos, &gv_a, 1);
         svm.send_transaction(Transaction::new_signed_with_payer(
-            &[vote_ix(&alice, &a_pos, &gv_a, 1)],
+            &[back],
             Some(&payer.pubkey()),
             &[&payer, &alice],
             bh,
@@ -24851,8 +24889,9 @@ fn run_competing_voter_veto_exit_deadlock_boundary(trigger_phase_expired: bool) 
     {
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
+        let back = vote_ix(&svm, &bob, &b_pos, &gv_b, 1);
         svm.send_transaction(Transaction::new_signed_with_payer(
-            &[vote_ix(&bob, &b_pos, &gv_b, 1)],
+            &[back],
             Some(&payer.pubkey()),
             &[&payer, &bob],
             bh,
@@ -24894,8 +24933,9 @@ fn run_competing_voter_veto_exit_deadlock_boundary(trigger_phase_expired: bool) 
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let retract = vote_ix(&svm, &bob, &b_pos, &gv_b, 2);
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[vote_ix(&bob, &b_pos, &gv_b, 2), withdraw],
+        &[retract, withdraw],
         Some(&payer.pubkey()),
         &[&payer, &bob],
         bh,
@@ -25051,7 +25091,7 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
                     AccountMeta::new_readonly(system_program::ID, false),
                     AccountMeta::new_readonly(sub_id(), false),
                 ],
-                data: vec![3u8, 1u8],
+                data: gv_vote_data_e2e(svm, &ballot, &position, 1),
             },
         )
         .expect("back competing proposal");
@@ -25475,7 +25515,7 @@ fn e2e_non_voter_exit_recomputes_quorum_stayers_decide() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &ballot, &a_pos, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -25729,7 +25769,7 @@ fn e2e_no_new_proposal_after_genesis_finalizes() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &ballot, &position, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -29580,7 +29620,7 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &gv_ballot, &position, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -36879,7 +36919,7 @@ fn e2e_registered_distribution_is_immutable_before_voters_can_lock() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 1u8],
+        data: gv_vote_data_e2e(&svm, &gv_ballot, &position, 1),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -48760,6 +48800,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &gv_id_e2e(),
     )
     .0;
+    let depositor_vote_data =
+        gv_vote_data_e2e(&svm, &depositor_ballot, &position, 1);
     send(
         &mut svm,
         &[&payer, &depositor],
@@ -48775,7 +48817,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: depositor_vote_data,
         },
     )
     .expect("remaining depositor locks its principal behind a genesis ballot");
@@ -49196,9 +49238,16 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         ],
         data: interleaved_withdraw_data,
     };
-    let vote_after_return = |action: u8, vote_nonce: u64| {
+    let vote_after_return = |action: u8, vote_nonce: u64, expected_principal: Option<u64>| {
         let mut data = vec![3u8, action];
         data.extend_from_slice(&vote_nonce.to_le_bytes());
+        if action == 1 {
+            data.extend_from_slice(
+                &expected_principal
+                    .expect("a back must commit to its post-transaction principal")
+                    .to_le_bytes(),
+            );
+        }
         Instruction {
             program_id: gv_id_e2e(),
             accounts: vec![
@@ -49224,9 +49273,13 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     let blockhash = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[
-            vote_after_return(2, vote_nonce),
+            vote_after_return(2, vote_nonce, None),
             interleaved_withdraw,
-            vote_after_return(1, next_vote_nonce),
+            vote_after_return(
+                1,
+                next_vote_nonce,
+                Some(principal - interleaved_exit),
+            ),
         ],
         Some(&payer.pubkey()),
         &[&payer, &depositor],
@@ -50229,6 +50282,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
         &gv_id_e2e(),
     )
     .0;
+    let vote_data = gv_vote_data_e2e(&svm, &ballot, &position, 1);
     send(
         &mut svm,
         &[&payer, &absent_voter],
@@ -50244,7 +50298,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, 1u8],
+            data: vote_data,
         },
     )
     .expect("winning depositor votes and locks its principal");

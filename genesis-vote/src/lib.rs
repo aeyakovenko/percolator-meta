@@ -1059,9 +1059,11 @@ fn retract_legacy_vote<'a>(
 
 // vote accounts: [voter(s,w), config(w), ballot(w,pda), proposal_vote(w),
 //   sub_position(w), sub_pool(ro), system_program, subledger_program]
-// data (current): action(u8) || vote_nonce(u64)
-// Predecessor action-only votes remain valid only for a nonce-zero current ballot. Exit-only legacy
-// config generations retain their action-only retract.
+// data (current):
+//   back:    action(u8) || vote_nonce(u64) || expected_principal(u64)
+//   retract: action(u8) || vote_nonce(u64)
+// A nonce-zero current ballot may use the predecessor action-only encoding only to
+// retract. Exit-only legacy config generations retain their action-only retract.
 //
 // After updating the ballot, the config PDA CPIs the subledger to set/clear the
 // position's vote-lock: a live ballot locks the principal (no insurance-withdraw
@@ -1082,17 +1084,21 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     let system_program = next_account_info(iter)?;
     let subledger_program = next_account_info(iter)?;
 
-    if data.len() != 1 && data.len() != 9 {
+    if data.is_empty() {
         return Err(ProgramError::InvalidInstructionData);
     }
     let action = data[0];
-    if action != VOTE_BACK && action != VOTE_RETRACT {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let expected_vote_nonce = if data.len() == 9 {
-        Some(u64::from_le_bytes(data[1..9].try_into().unwrap()))
-    } else {
-        None
+    let (expected_vote_nonce, expected_principal) = match (action, data.len()) {
+        (VOTE_BACK, 17) => (
+            Some(u64::from_le_bytes(data[1..9].try_into().unwrap())),
+            Some(u64::from_le_bytes(data[9..17].try_into().unwrap())),
+        ),
+        (VOTE_RETRACT, 9) => (
+            Some(u64::from_le_bytes(data[1..9].try_into().unwrap())),
+            None,
+        ),
+        (VOTE_RETRACT, 1) => (None, None),
+        _ => return Err(ProgramError::InvalidInstructionData),
     };
     if !voter.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1160,6 +1166,10 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         return Err(ProgramError::InvalidSeeds);
     }
     let principal = read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
+    if action == VOTE_BACK && expected_principal != Some(principal) {
+        msg!("back authorization does not match live principal");
+        return Err(ProgramError::InvalidInstructionData);
+    }
     // Snapshot the live pool outstanding into the config for off-chain visibility. NOTE: this is NOT
     // the quorum denominator — `trigger` deliberately RE-READS the live pool outstanding at seal time
     // (see read_sub_pool_outstanding there), never this stored field, so a late deposit/exit between the

@@ -14282,3 +14282,26 @@ accepted only while a current ballot nonce is zero; every historical live ballot
 exit once under its old client, while any replacement incarnation requires the exact wire. Exit-only legacy
 config generations retain only their historical retract. The change adds no state, account, allocation,
 signer, authority, recipient, CPI, token path, or custody surface.
+
+## Tick - stale signed back counted a later Genesis top-up (surface B, REAL DOS)
+
+The ballot-incarnation fix still committed a back only to its vote nonce. Subledger intentionally permits a
+deposit while a ballot is live but leaves the tally unchanged until the owner re-backs. A relayer could hold a
+back signed for the old principal, let the owner top up, and land the stale authorization in a final slot where
+the configured deposit window and backing phase overlap. Genesis then replaced the old ballot contribution
+with the larger live principal. That unauthorized increase could cross quorum and seal an immutable 100%-supply
+allocation at the deadline.
+
+Retained clean-room LiteSVM test commit `8fa2d6d` reproduces the public path against parent `4f2f21b` with the
+real Genesis Vote, Subledger, Distribution, and pinned Percolator SBF binaries. Alice backs one unit while two
+units abstain, signs both current and predecessor re-backs, then lands a four-unit top-up with the same valid
+blockhash in the final admissible slot. The vulnerable binary accepts the predecessor authorization and counts
+all five units. The fixed probe rejects both stale encodings without changing the one-unit tally, accepts a
+fresh five-unit re-back in that slot, and seals only that freshly authorized quorum.
+
+FIX: every current back now encodes `action || vote_nonce || expected_principal` and compares both witnesses
+with the live ballot and canonical Subledger position before changing any tally. Current exact retracts remain
+`action || vote_nonce`; nonce-zero action-only compatibility is retract-only, and old config generations keep
+their exit-only retract. Atomic retract/withdraw/re-back transactions explicitly commit to the post-withdraw
+principal. The change adds no state, account, allocation, signer, authority, recipient, CPI, token path, or
+custody surface, and obsolete clients cannot trap funds because every recovery wire remains accepted.
