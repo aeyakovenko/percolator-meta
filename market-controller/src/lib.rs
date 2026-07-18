@@ -85,6 +85,7 @@ const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_ACTION_ACTIVATE: u8 = 0;
+const ASSET_ACTION_DRAIN_ONLY: u8 = 1;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
@@ -444,7 +445,7 @@ fn admin_tag_allowed(tag: u8) -> bool {
             | 35 // ConfigureEwmaMark
             | 37 // UpdateLiquidationFeePolicy
             | 38 // ConfigurePermissionlessResolve
-            | 40 // UpdateAssetLifecycle (activate/drain/retire/shutdown)
+            | 40 // UpdateAssetLifecycle (activate/retire/shutdown; DrainOnly rejected below)
             | 49 // UpdateMaintenanceFeePolicy
             | 51 // UpdateBackingFeePolicy
             | 55 // UpdateTradeFeePolicy
@@ -468,6 +469,13 @@ fn validate_admin_instruction_data(data: &[u8], controller: &Pubkey) -> ProgramR
             return Err(ProgramError::InvalidInstructionData);
         }
         return Ok(());
+    }
+    // DrainOnly blocks replacement liquidity but never starts Percolator's permissionless
+    // force-close clock. Governance must use Shutdown so every open position has a bounded exit.
+    if data.first().copied() == Some(PERC_IX_UPDATE_ASSET_LIFECYCLE)
+        && data.get(1).copied() == Some(ASSET_ACTION_DRAIN_ONLY)
+    {
+        return Err(ProgramError::InvalidInstructionData);
     }
     if data.first().copied() != Some(PERC_IX_UPDATE_ASSET_LIFECYCLE)
         || data.get(1).copied() != Some(ASSET_ACTION_ACTIVATE)
@@ -2647,11 +2655,20 @@ mod tests {
             Err(ProgramError::InvalidInstructionData)
         );
 
-        let lifecycle_transition = asset_lifecycle_data(1, provider, Pubkey::new_unique());
+        let drain_only =
+            asset_lifecycle_data(ASSET_ACTION_DRAIN_ONLY, provider, Pubkey::new_unique());
         assert_eq!(
-            validate_admin_instruction_data(&lifecycle_transition, &controller),
-            Ok(())
+            validate_admin_instruction_data(&drain_only, &controller),
+            Err(ProgramError::InvalidInstructionData)
         );
+
+        for action in [2, 3] {
+            let bounded_transition = asset_lifecycle_data(action, provider, Pubkey::new_unique());
+            assert_eq!(
+                validate_admin_instruction_data(&bounded_transition, &controller),
+                Ok(())
+            );
+        }
     }
 
     #[test]

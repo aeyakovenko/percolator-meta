@@ -3443,6 +3443,480 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
 }
 
+// PUBLIC ADMIN DOS: DrainOnly rejects every risk-increasing trade but does not start Percolator's
+// permissionless force-close clock. A compromised governance key could therefore place a healthy
+// live market in DrainOnly, keep the independent oracle honestly fresh, and refuse the separate
+// shutdown forever. An owner whose original counterparty is absent cannot withdraw, cannot close
+// against replacement liquidity, cannot use stale resolution, and cannot be force-closed at any
+// later slot. The controller does not need DrainOnly for its promised lifecycle: fixed shutdown
+// already preserves an exit window and then enables bounded permissionless force-close.
+#[test]
+fn e2e_controller_cannot_strand_positions_in_drain_only() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    let oracle = Keypair::new();
+    let cranker = Keypair::new();
+    for signer in [&payer, &creator, &governance, &oracle, &cranker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public creator allocates the market");
+    let market_key = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("creator initializes a normal fully collateralized market");
+
+    send(
+        &mut svm,
+        &[&payer, &creator, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("creator installs an independent oracle authority");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+            },
+        ),
+    )
+    .expect("independent oracle configures the authenticated mark");
+
+    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates lifecycle control to the constrained controller");
+    assert_eq!(
+        percolator_prog::state::read_asset_oracle_profile(
+            &svm.get_account(&market_key).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .oracle_authority,
+        oracle.pubkey().to_bytes(),
+        "market donation preserves the independent oracle"
+    );
+
+    let proxy = |raw: Vec<u8>| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&raw);
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data,
+        }
+    };
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: percolator_prog::constants::MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS,
+                force_close_delay_slots: 1,
+            }
+            .encode(),
+        ),
+    )
+    .expect("governance configures bounded shutdown and stale-resolution delays");
+
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let victim = Keypair::new();
+    let absent_counterparty = Keypair::new();
+    let replacement_liquidity = Keypair::new();
+    let victim_portfolio = Keypair::new();
+    let absent_portfolio = Keypair::new();
+    let replacement_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&victim, &victim_portfolio),
+        (&absent_counterparty, &absent_portfolio),
+        (&replacement_liquidity, &replacement_portfolio),
+    ] {
+        svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            1_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("public user deposits collateral");
+    }
+
+    let position_q = (percolator::POS_SCALE / 10) as i128;
+    send(
+        &mut svm,
+        &[&payer, &victim, &absent_counterparty],
+        pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(absent_counterparty.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(absent_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: position_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("victim opens against a counterparty that later becomes absent");
+
+    let market_before_drain = svm.get_account(&market_key).unwrap();
+    let drain_only = send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 1, // ASSET_ACTION_DRAIN_ONLY
+                asset_index: 0,
+                now_slot: 0,
+                initial_price: 0,
+                insurance_authority: [0u8; 32],
+                insurance_operator: [0u8; 32],
+                backing_bucket_authority: [0u8; 32],
+                oracle_authority: [0u8; 32],
+            }
+            .encode(),
+        ),
+    );
+
+    let close_with_replacement = || {
+        pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(replacement_liquidity.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(replacement_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -position_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        )
+    };
+    let victim_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_destination,
+        &collateral_mint,
+        &victim.pubkey(),
+        0,
+    );
+    let victim_withdraw = || {
+        pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(victim_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Withdraw { amount: 1_000_000 },
+        )
+    };
+
+    if drain_only.is_ok() {
+        assert!(
+            send(&mut svm, &[&payer, &victim], victim_withdraw()).is_err(),
+            "the open victim cannot withdraw its collateral"
+        );
+        assert!(
+            send(
+                &mut svm,
+                &[&payer, &victim, &replacement_liquidity],
+                close_with_replacement(),
+            )
+            .is_err(),
+            "DrainOnly prevents replacement liquidity from taking the absent owner's side"
+        );
+
+        let far_slot = 100 + percolator_prog::constants::MAX_FORCE_CLOSE_DELAY_SLOTS + 100;
+        svm.set_sysvar(&Clock {
+            slot: far_slot,
+            unix_timestamp: far_slot as i64,
+            ..Clock::default()
+        });
+        send(
+            &mut svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: far_slot,
+                    mark_e6: 1_000_000,
+                },
+            ),
+        )
+        .expect("the independent oracle remains honestly fresh at an arbitrary later slot");
+        assert!(
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![AccountMeta::new(market_key, false)],
+                    PIx::ResolveStalePermissionless { now_slot: far_slot },
+                ),
+            )
+            .is_err(),
+            "an honestly fresh oracle correctly keeps stale resolution unavailable"
+        );
+        assert!(
+            send(
+                &mut svm,
+                &[&payer, &cranker],
+                pix(
+                    vec![
+                        AccountMeta::new(cranker.pubkey(), true),
+                        AccountMeta::new(market_key, false),
+                        AccountMeta::new(victim_portfolio.pubkey(), false),
+                        AccountMeta::new(absent_portfolio.pubkey(), false),
+                    ],
+                    PIx::ForceCloseAbandonedAsset {
+                        asset_index: 0,
+                        now_slot: far_slot,
+                        close_q: position_q as u128,
+                    },
+                ),
+            )
+            .is_err(),
+            "DrainOnly never starts the force-close path, even beyond every configured delay"
+        );
+        panic!(
+            "controller exposed a persistent admin DoS: victim collateral has no bounded public exit"
+        );
+    }
+
+    assert_eq!(
+        svm.get_account(&market_key).unwrap(),
+        market_before_drain,
+        "the rejected admin action is byte-atomic"
+    );
+    send(
+        &mut svm,
+        &[&payer, &victim, &replacement_liquidity],
+        close_with_replacement(),
+    )
+    .expect("replacement liquidity remains able to close the victim in Active mode");
+    send(&mut svm, &[&payer, &victim], victim_withdraw())
+        .expect("the victim withdraws all collateral after the replacement close");
+    assert_eq!(token_amount(&svm, &victim_destination), 1_000_000);
+
+    let shutdown_slot = 101u64;
+    svm.set_sysvar(&Clock {
+        slot: shutdown_slot,
+        unix_timestamp: shutdown_slot as i64,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 3, // ASSET_ACTION_SHUTDOWN
+                asset_index: 0,
+                now_slot: shutdown_slot,
+                initial_price: 0,
+                insurance_authority: [0u8; 32],
+                insurance_operator: [0u8; 32],
+                backing_bucket_authority: [0u8; 32],
+                oracle_authority: [0u8; 32],
+            }
+            .encode(),
+        ),
+    )
+    .expect("the controller retains the bounded shutdown lifecycle");
+    svm.set_sysvar(&Clock {
+        slot: shutdown_slot + 1,
+        unix_timestamp: (shutdown_slot + 1) as i64,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &cranker],
+        pix(
+            vec![
+                AccountMeta::new(cranker.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(replacement_portfolio.pubkey(), false),
+                AccountMeta::new(absent_portfolio.pubkey(), false),
+            ],
+            PIx::ForceCloseAbandonedAsset {
+                asset_index: 0,
+                now_slot: shutdown_slot + 1,
+                close_q: position_q as u128,
+            },
+        ),
+    )
+    .expect("permissionless force-close remains live after the explicit shutdown delay");
+}
+
 // PUBLIC POSITION DOS PROBE: the pinned Percolator rejects every atomic batch while any backing
 // fee policy is active. A cross-margined user may need a final-state-only batch because either
 // standalone rotation leg exceeds initial margin. The controller must therefore reject nonzero
