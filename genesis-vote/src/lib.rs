@@ -255,6 +255,7 @@ struct Ballot {
     voted_proposal: Pubkey, // default() = no live ballot
     voted_weight: u128, // GG fix: widened to match the u128 weight tallies for an exact retract back-out
     voted_principal: u64,
+    vote_nonce: u64,
 }
 
 impl Ballot {
@@ -267,6 +268,7 @@ impl Ballot {
             voted_proposal: Pubkey::new_from_array(d[40..72].try_into().unwrap()),
             voted_weight: u128::from_le_bytes(d[72..88].try_into().unwrap()),
             voted_principal: u64::from_le_bytes(d[88..96].try_into().unwrap()),
+            vote_nonce: u64::from_le_bytes(d[96..104].try_into().unwrap()),
         })
     }
     fn serialize(&self, d: &mut [u8]) {
@@ -275,7 +277,8 @@ impl Ballot {
         d[40..72].copy_from_slice(self.voted_proposal.as_ref());
         d[72..88].copy_from_slice(&self.voted_weight.to_le_bytes());
         d[88..96].copy_from_slice(&self.voted_principal.to_le_bytes());
-        d[96..BALLOT_SIZE].fill(0);
+        d[96..104].copy_from_slice(&self.vote_nonce.to_le_bytes());
+        d[104..BALLOT_SIZE].fill(0);
     }
     fn has_live_ballot(&self) -> bool {
         self.voted_proposal != Pubkey::default()
@@ -1056,7 +1059,9 @@ fn retract_legacy_vote<'a>(
 
 // vote accounts: [voter(s,w), config(w), ballot(w,pda), proposal_vote(w),
 //   sub_position(w), sub_pool(ro), system_program, subledger_program]
-// data: action(u8) — 1 back, 2 retract
+// data: back action(u8); exact retract action(u8) || vote_nonce(u64)
+// Predecessor action-only retracts remain valid only for a nonce-zero current ballot or an exit-only
+// legacy config generation.
 //
 // After updating the ballot, the config PDA CPIs the subledger to set/clear the
 // position's vote-lock: a live ballot locks the principal (no insurance-withdraw
@@ -1077,13 +1082,21 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     let system_program = next_account_info(iter)?;
     let subledger_program = next_account_info(iter)?;
 
-    if data.len() != 1 {
+    if data.len() != 1 && data.len() != 9 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let action = data[0];
     if action != VOTE_BACK && action != VOTE_RETRACT {
         return Err(ProgramError::InvalidInstructionData);
     }
+    let expected_vote_nonce = if data.len() == 9 {
+        if action != VOTE_RETRACT {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some(u64::from_le_bytes(data[1..9].try_into().unwrap()))
+    } else {
+        None
+    };
     if !voter.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -1098,6 +1111,9 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
                 | LEGACY_CONFIG_SIZE_BOOTSTRAP_END
         )
     {
+        if expected_vote_nonce.is_some() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         return retract_legacy_vote(
             program_id,
             voter,
@@ -1174,6 +1190,7 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
             voted_proposal: Pubkey::default(),
             voted_weight: 0,
             voted_principal: 0,
+            vote_nonce: 0,
         }
     } else {
         if ballot_account.owner != program_id {
@@ -1191,6 +1208,15 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         msg!("retract your existing vote before backing another proposal");
         return Err(ProgramError::InvalidInstructionData);
     }
+    if action == VOTE_RETRACT
+        && !matches!(
+            expected_vote_nonce,
+            Some(nonce) if nonce == ballot.vote_nonce
+        )
+        && !(expected_vote_nonce.is_none() && ballot.vote_nonce == 0)
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
     // Back out any prior live contribution from this proposal + the global tallies.
     if ballot.has_live_ballot() {
@@ -1203,6 +1229,10 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     }
 
     if action == VOTE_RETRACT {
+        ballot.vote_nonce = ballot
+            .vote_nonce
+            .checked_add(1)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
         ballot.voted_proposal = Pubkey::default();
         ballot.voted_weight = 0;
         ballot.voted_principal = 0;
@@ -1216,6 +1246,12 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         pv.support_principal = pv.support_principal.checked_add(principal).ok_or(ProgramError::ArithmeticOverflow)?;
         config.total_cast_weight = config.total_cast_weight.checked_add(weight).ok_or(ProgramError::ArithmeticOverflow)?;
         config.total_voted_principal = config.total_voted_principal.checked_add(principal).ok_or(ProgramError::ArithmeticOverflow)?;
+        if ballot.has_live_ballot() {
+            ballot.vote_nonce = ballot
+                .vote_nonce
+                .checked_add(1)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
         ballot.voted_proposal = *proposal_account.key;
         ballot.voted_weight = weight;
         ballot.voted_principal = principal;
@@ -1429,11 +1465,13 @@ mod tests {
             voted_proposal: Pubkey::new_unique(),
             voted_weight: 40,
             voted_principal: 5,
+            vote_nonce: 9,
         };
         let mut pb = [0u8; BALLOT_SIZE];
         p.serialize(&mut pb);
         let dp = Ballot::deserialize(&pb).unwrap();
         assert_eq!(dp.voted_principal, 5);
+        assert_eq!(dp.vote_nonce, 9);
         assert!(dp.has_live_ballot());
 
         let pv = ProposalVote {

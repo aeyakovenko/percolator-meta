@@ -14239,3 +14239,25 @@ legs, and the program compares that tuple with the live slot before refunding or
 reject predecessor slot-only wires. Those wires remain accepted only for old layouts that the upgraded binary
 already treats as exit-only, preserving their owner recovery path. A freshly signed cancellation for B still
 works. The change adds no state, account, signer, authority, recipient, CPI, or custody surface.
+
+## Tick - stale signed retract erased a replacement Genesis vote (surface B, REAL DOS)
+
+The Genesis ballot PDA is reused when a voter retracts and later backs the same proposal. Its retract wire
+committed only to the action and accounts. Near the bootstrap deadline, a relayer could withhold signed retract
+A, let the voter land a distinct sponsored retract and re-back, then submit A after new backing closed. The old
+transaction removed the replacement vote and unlocked the position. With the sole qualifying vote gone, the
+fixed-supply distribution could no longer seal and the voter could not restore support after the deadline.
+
+Retained clean-room test commit `fd214e2` reproduces that complete public path against parent `74630a3` with
+the real Genesis Vote, Subledger, Distribution, and pinned Percolator SBF binaries. Every state transition uses
+one still-valid blockhash; differing compute-budget instructions make the legitimate and withheld retracts
+distinct signatures. The vulnerable binary accepts the withheld action-only retract at the deadline. The fixed
+probe also withholds an exact retract for the old vote; mutation-disabling only the nonce comparison makes it
+erase the replacement vote at the intended assertion.
+
+FIX: current ballots use an existing reserved `u64` as a monotonic vote nonce. A successful retract advances
+the nonce before clearing the ballot, and an in-place re-vote advances it before replacing the contribution.
+Current exact retracts commit to that nonce. The predecessor action-only wire remains accepted only for nonce
+zero, preserving every existing live ballot and first-incarnation exit, while old config generations keep
+their exit-only retract path. The change adds no account, allocation, signer, authority, recipient, CPI, token
+path, or custody surface.

@@ -23635,6 +23635,10 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
     )
     .0;
     let vote = |svm: &mut LiteSVM, action: u8| {
+        let mut data = vec![3u8, action];
+        if action == 2 {
+            data.extend_from_slice(&svm.get_account(&ballot).unwrap().data[96..104]);
+        }
         let ix = Instruction {
             program_id: gv_id_e2e(),
             accounts: vec![
@@ -23647,7 +23651,7 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
-            data: vec![3u8, action],
+            data,
         };
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
@@ -30650,6 +30654,8 @@ fn e2e_full_genesis_to_buy_burn() {
     )
     .expect("return custody for genesis deposit recovery");
 
+    let mut retract_data = vec![3u8, 2u8];
+    retract_data.extend_from_slice(&svm.get_account(&gv_ballot).unwrap().data[96..104]);
     let retract = Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
@@ -30662,7 +30668,7 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
         ],
-        data: vec![3u8, 2u8],
+        data: retract_data,
     };
     let mut withdraw_data = vec![5u8];
     withdraw_data.extend_from_slice(&principal.to_le_bytes());
