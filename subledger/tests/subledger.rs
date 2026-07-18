@@ -686,7 +686,7 @@ fn init_pool_rejects_a_vault_with_an_external_close_authority() {
 }
 
 // SOURCE-OF-TRUTH OFFSET CANARY (sweep): genesis-vote + residual-distributor read the subledger Position
-// (principal=vote weight, start_slot=tenure, shares=rd share-value points) and Pool (outstanding=quorum
+// (principal=vote weight, start_slot=reward tenure, shares=rd share-value points) and Pool (outstanding=quorum
 // denominator) by HARDCODED byte offsets, cross-pinned in their offsets.rs to the subledger's EXPORTED consts
 // (POS_*_OFF / POOL_OUTSTANDING_PRINCIPAL_OFF). But those exported consts are SEPARATE declarations — the actual
 // Position/Pool serialize uses inline offsets. So a serialize reorder that didn't also update the const would

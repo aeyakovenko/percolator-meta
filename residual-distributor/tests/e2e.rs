@@ -3400,8 +3400,8 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
 
 // TIME-WEIGHT FLOOR (floor_log2(tenure) boundary): points = floor_log2(now - start_slot) * netΔ, and
 // floor_log2(n) = 0 for n < 2 (lib.rs). So a stake CRYSTALLIZED at tenure 1 earns ZERO points despite a real
-// residual — the first positive weight requires tenure >= 2 (parity with genesis-vote's age-2 vote-weight floor,
-// pinned there; the rd's floor_log2 is a SEPARATE impl, so pin its boundary too). A tenure-1 stake does not dilute
+// residual — the first positive weight requires tenure >= 2. This is the distributor's own tenure rule,
+// separate from principal-only Genesis voting, so pin its boundary here. A tenure-1 stake does not dilute
 // the cohort (0 points), and a tenure-2 co-staker takes the whole cohort. This also closes a JIT-capture angle:
 // registering + crystallizing in the same/adjacent slot earns nothing.
 #[test]

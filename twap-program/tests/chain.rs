@@ -16345,13 +16345,12 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     );
 }
 
-// ATTACK PROBE (flash-deposit vote): vote weight = floor(log2(age)) * principal, so a
-// freshly-deposited position (age < 2) has ZERO weight and the gv `vote` must reject it.
-// Otherwise a voter could flash-deposit, vote with full principal weight, and exit — buying
-// governance influence with no time-at-risk. Pinned end-to-end: alice deposits and votes in
-// the SAME slot (rejected), then after holding a few slots her vote succeeds.
+// GENESIS REQUIREMENT: each live principal base unit contributes exactly one vote, including
+// immediately after deposit. The short deposit window bounds admission, while the vote lock
+// prevents voted principal from exiting until its ballot is retracted. No additional age gate
+// or multiplier belongs in Genesis voting.
 #[test]
-fn e2e_fresh_position_has_no_vote_weight() {
+fn e2e_fresh_position_gets_one_vote_per_principal_unit() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -16678,24 +16677,7 @@ fn e2e_fresh_position_has_no_vote_weight() {
         data: vec![3u8, 1u8],
     };
 
-    // SAME-SLOT vote: age = 0 -> weight 0 -> rejected.
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    assert!(
-        svm.send_transaction(Transaction::new_signed_with_payer(
-            &[vote.clone()],
-            Some(&payer.pubkey()),
-            &[&payer, &alice],
-            bh
-        ))
-        .is_err(),
-        "a freshly-deposited position (age 0) has zero weight and must not be able to vote"
-    );
-
-    // After holding a few slots, the vote succeeds.
-    let mut c = svm.get_sysvar::<Clock>();
-    c.slot += 8;
-    svm.set_sysvar::<Clock>(&c);
+    // A same-slot vote gets one vote per live principal unit.
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -16704,7 +16686,18 @@ fn e2e_fresh_position_has_no_vote_weight() {
         &[&payer, &alice],
         bh,
     ))
-    .expect("vote succeeds once the position has held");
+    .expect("same-slot principal has immediate vote weight");
+    let ballot = svm.get_account(&gv_ballot).expect("ballot");
+    assert_eq!(
+        u128::from_le_bytes(ballot.data[72..88].try_into().unwrap()),
+        amount as u128,
+        "one deposited base unit contributes one vote"
+    );
+    assert_eq!(
+        u64::from_le_bytes(ballot.data[88..96].try_into().unwrap()),
+        amount,
+        "the ballot records the same live principal used for vote weight"
+    );
 }
 
 // Shared legacy-migration helper: move an empty Squads-admin market into TWAP custody,
@@ -19010,9 +19003,9 @@ fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
     assert_eq!(read_reserved_floor(&svm, &twap_config), 0);
 }
 
-// ATTACK PROBE (stale vote weight via PARTIAL withdraw — capital-less inflated ballot): the vote weight
-// `floor(log2(hold)) * principal` is tallied at back-time from the position's principal. The veto-exit test
-// above only exercises a FULL withdraw while vote-locked. The sharper free-weight attack is a PARTIAL exit:
+// ATTACK PROBE (stale vote weight via PARTIAL withdraw — capital-less inflated ballot): live principal
+// is tallied at back-time. The veto-exit test above only exercises a FULL withdraw while vote-locked.
+// The sharper free-weight attack is a PARTIAL exit:
 // back a proposal with principal=P (weight tallied at P), then withdraw only a fraction (say 0.4*P) WITHOUT
 // retracting — if allowed, the live ballot keeps inflating quorum/weight at P while only 0.6*P stays at risk,
 // i.e. governance power for a fraction of the pledged capital. The guard is that subledger::process_withdraw
@@ -19734,13 +19727,10 @@ fn e2e_winning_voter_can_retract_and_exit_after_seal_no_frozen_capital() {
     );
 }
 
-// ATTACK PROBE (voting without capital — re-vote with an EXITED position): vote weight = floor(log2(age)) *
-// PRINCIPAL, and gv rejects a zero-weight vote (genesis-vote:661). e2e_fresh_position_has_no_vote_weight pins
-// the AGE factor (flash deposit). This pins the PRINCIPAL factor: after a voter exits via [retract, withdraw]
-// their position.principal is 0, so a re-vote has weight 0 and is rejected — a depositor cannot keep (or
-// re-add) ballot weight after pulling their capital out. This is the complement of the vote-lock: the lock
-// stops exit-WHILE-voted (must retract first, removing weight); the zero-weight gate stops vote-WHILE-exited
-// (can't re-add weight without re-depositing). Together, ballot weight always tracks live capital-at-risk.
+// ATTACK PROBE (voting without capital — re-vote with an EXITED position): vote weight is live
+// principal. After a voter exits via [retract, withdraw], position.principal is zero, so re-voting
+// is rejected. The vote lock stops exit while voted; the zero-principal gate stops voting after exit.
+// Together they keep ballot weight backed by live capital at risk.
 #[test]
 fn e2e_exited_position_cannot_vote_without_capital_zero_principal_zero_weight() {
     let mut svm =
@@ -20798,14 +20788,12 @@ fn e2e_only_the_winning_proposal_can_be_claimed() {
     );
 }
 
-// ATTACK PROBE (time-weighting balance / early-squatter capture): weight = floor(log2(age)) *
-// principal. log-time is a SOFT (capped, sub-linear) multiplier while capital is LINEAR — so
-// capital must dominate. Otherwise an early tiny depositor could sit and accumulate enough
-// time-weight to out-vote a later, much larger depositor, capturing governance cheaply. This
-// pins that a later 10x-capital voter out-weighs an early small voter despite less hold time:
-// the two back COMPETING proposals and the big-but-late voter's proposal wins.
+// GENESIS REQUIREMENT (no early-squatter multiplier): vote weight is live principal only.
+// An early small depositor cannot accumulate extra governance power by waiting. Two positions
+// with deliberately different ages record exactly their principal as support, and the later
+// 10x-capital voter's competing proposal wins.
 #[test]
-fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
+fn e2e_principal_weight_ignores_hold_time_no_early_squatter_capture() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -20900,7 +20888,7 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
     let early_pos = deposit(&mut svm, &early, 100_000);
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 128;
-    svm.set_sysvar::<Clock>(&c); // floor(log2(128)) = 7
+    svm.set_sysvar::<Clock>(&c);
     vote(&mut svm, &early, &early_pos, &gv_early);
 
     // Later large voter: 1,000,000 (10x) deposited now, holds only a short time.
@@ -20908,9 +20896,17 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
     let late_pos = deposit(&mut svm, &late, 1_000_000);
     let mut c = svm.get_sysvar::<Clock>();
     c.slot += 16;
-    svm.set_sysvar::<Clock>(&c); // floor(log2(16)) = 4
+    svm.set_sysvar::<Clock>(&c);
     vote(&mut svm, &late, &late_pos, &gv_late);
-    // early weight = 7 * 100k = 700,000; late weight = 4 * 1,000,000 = 4,000,000 (capital wins).
+    let support = |proposal: &Pubkey| {
+        u128::from_le_bytes(
+            svm.get_account(proposal).unwrap().data[72..88]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(support(&gv_early), 100_000, "age does not multiply early principal");
+    assert_eq!(support(&gv_late), 1_000_000, "each late principal unit still gets one vote");
 
     let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
         let ix = Instruction {
@@ -20938,33 +20934,28 @@ fn e2e_capital_outweighs_hold_time_no_early_squatter_capture() {
         .map(|_| ())
         .map_err(|e| format!("{:?}", e))
     };
-    // The early-squatter proposal lacks a weighted majority -> cannot seal.
+    // The early-squatter proposal lacks a principal majority -> cannot seal.
     assert!(
         trigger(&mut svm, &gv_early, &prop_early).is_err(),
-        "an early small-capital voter must NOT out-weigh a later large-capital voter"
+        "an early small-capital voter must not out-vote a later large-capital voter"
     );
-    // The later large-capital proposal IS the weighted-majority winner -> seals.
+    // The later large-capital proposal has the strict principal majority -> seals.
     trigger(&mut svm, &gv_late, &prop_late)
         .expect("the larger-capital proposal wins despite less hold time");
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(
         Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
         prop_late,
-        "capital dominates the soft log-time weight"
+        "the strict principal-majority proposal seals"
     );
 }
 
-// ATTACK PROBE (stale vote weight via dust-squat + late top-up): weight = floor(log2(age)) * principal with a
-// LAST-WRITE start_slot. The cheap attack is to deposit 1 dust atom EARLY (parking an early start_slot), let a
-// large age accrue, then top up to whale principal right before voting — claiming floor(log2(huge_age)) *
-// whale_principal for capital that was only just committed. The defense is that subledger::process_deposit
-// resets start_slot = now on EVERY deposit (lib.rs:643), so a top-up forfeits the squatted age. Pinned with two
-// voters at IDENTICAL final principal so the start_slot reset is the SOLE decider: bob deposits his full stake
-// early and holds; alice dust-squats early then tops up to the same stake late. With the reset alice's age is
-// smaller -> bob strictly out-weighs her and his proposal seals while alice's cannot. (Without the reset their
-// ages tie at equal principal -> neither reaches a strict majority -> bob's seal would fail: mutation-sharp.)
+// GENESIS REQUIREMENT (dust squatting is irrelevant): one live principal unit is one vote, regardless
+// of deposit age or top-up history. Bob deposits his full stake early; Alice deposits one atom early
+// and tops up much later. At identical final principal their competing proposals have identical support,
+// so neither can obtain the strict majority needed to seal.
 #[test]
-fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
+fn e2e_dust_squat_and_late_topup_do_not_change_per_unit_vote_weight() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -21065,21 +21056,25 @@ fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
     let alice_holding = Pubkey::new_unique();
     set_token(&mut svm, &alice_holding, &env.collateral_mint, &env.pool, 0);
 
-    // Both start EARLY (same slot 1000): bob commits his full 1_000_000; alice squats with 1 dust atom.
+    // Both start at slot 1000: Bob commits 1_000_000; Alice starts with one dust atom.
     deposit(&mut svm, &bob, &bob_holding, 1_000_000);
-    deposit(&mut svm, &alice, &alice_holding, 1); // alice's position: principal 1, start_slot 1000
-                                                  // Age accrues, then alice tops up to the SAME 1_000_000 total (999_999 more) — which RESETS her start_slot
-                                                  // to the top-up slot (1064), forfeiting the squatted age. (Both deposits route through insurance_deposit,
-                                                  // the genesis POLICY_WITH_SURPLUS pool path; the last-write reset lives at subledger lib.rs:1100.)
+    deposit(&mut svm, &alice, &alice_holding, 1);
+    // Alice reaches the same final principal much later. Subledger reward tenure still resets,
+    // but Genesis does not read that timestamp.
     warp(&mut svm, 64);
     deposit(&mut svm, &alice, &alice_holding, 999_999);
-    // More age, then both back their own proposals at the same slot. bob age = 128 (log2 7); alice age = 64
-    // (log2 6) because her top-up reset the clock — despite her dust having sat since the very start.
     warp(&mut svm, 64);
     vote(&mut svm, &bob, &gv_bob);
     vote(&mut svm, &alice, &gv_alice);
-    // bob weight = floor(log2(128)) * 1_000_000 = 7_000_000; alice = floor(log2(64)) * 1_000_000 =
-    // 6_000_000 (her reset clock). Without the reset both would be 7_000_000 -> a tie that seals neither.
+    let support = |proposal: &Pubkey| {
+        u128::from_le_bytes(
+            svm.get_account(proposal).unwrap().data[72..88]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(support(&gv_bob), 1_000_000, "Bob gets one vote per principal unit");
+    assert_eq!(support(&gv_alice), 1_000_000, "dust age and top-up timing add no votes");
 
     let trigger = |svm: &mut LiteSVM, gv_prop: &Pubkey, dist_prop: &Pubkey| -> Result<(), String> {
         let ix = Instruction {
@@ -21107,20 +21102,19 @@ fn e2e_dust_squat_then_late_topup_cannot_buy_early_join_weight() {
         .map(|_| ())
         .map_err(|e| format!("{:?}", e))
     };
-    // alice's squat-then-top-up bought her NO early-join weight: at equal principal her reset clock leaves her
-    // below a strict majority, so she cannot seal; bob (genuinely early, same capital) out-weighs her and seals.
     assert!(
         trigger(&mut svm, &gv_alice, &prop_alice).is_err(),
-        "a dust-squatter who tops up late cannot out-weigh an equal-capital early holder"
+        "Alice has exactly half the cast principal and cannot seal"
     );
-    trigger(&mut svm, &gv_bob, &prop_bob).expect(
-        "the genuinely-early equal-capital voter wins — the top-up reset alice's vote clock",
+    assert!(
+        trigger(&mut svm, &gv_bob, &prop_bob).is_err(),
+        "Bob has exactly half the cast principal and cannot seal"
     );
     let dist_cfg = svm.get_account(&env.dist_config).unwrap();
     assert_eq!(
         Pubkey::new_from_array(dist_cfg.data[120..152].try_into().unwrap()),
-        prop_bob,
-        "bob's proposal sealed; the late top-up forfeited the squatted age"
+        Pubkey::default(),
+        "an equal-principal tie leaves the distribution unsealed"
     );
 }
 
@@ -21193,10 +21187,6 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
         bh,
     ))
     .expect("deposit");
-    let mut c = svm.get_sysvar::<Clock>();
-    c.slot += 16;
-    svm.set_sysvar::<Clock>(&c); // fix the age so weight is constant
-
     let ballot = Pubkey::find_program_address(
         &[
             b"gv_ballot",
@@ -21249,7 +21239,7 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
     // First back establishes the single contribution W.
     vote(&mut svm, 1);
     let w = support(&svm);
-    assert!(w > 0, "backing records a positive weight");
+    assert_eq!(w, amount as u128, "backing records exactly the live principal");
     assert_eq!(
         cast(&svm),
         w,
@@ -21330,10 +21320,8 @@ fn e2e_completed_squads_execute_cannot_be_replayed() {
 }
 
 // ATTACK PROBE (voting with NO capital at all): a voter must have a real subledger position
-// (capital at risk) to vote. The fresh-position probe covers a deposited-but-too-recent
-// position (weight 0); this covers the extreme — an account that NEVER deposited has no position
-// account, so the gv `vote` cannot read/own-check it and rejects. So governance power requires
-// actually putting capital at risk; you cannot vote for free.
+// (capital at risk) to vote. An account that never deposited has no position account, so the gv
+// `vote` cannot read or owner-check it and rejects. Governance power requires live principal.
 #[test]
 fn e2e_cannot_vote_without_a_position() {
     let mut svm =
@@ -21401,12 +21389,9 @@ fn e2e_cannot_vote_without_a_position() {
     );
 }
 
-// ATTACK PROBE (Sybil split — the core resistance property): vote weight = floor(log2(age)) *
-// principal is LINEAR in principal, so splitting capital across many positions/identities must
-// give NO weight advantage over depositing it all at once. Here an attacker splits 1,000,000
-// into 4 identities of 250,000, all deposited at the same slot and voting the same proposal at
-// the same age: the total support_weight equals exactly what a SINGLE 1,000,000 position would
-// produce (floor(log2(age)) * 1,000,000). So you cannot multiply governance power by Sybiling.
+// ATTACK PROBE (Sybil split): one vote per principal unit is additive across identities. An
+// attacker splitting 1,000,000 units into four same-slot positions must record the same total
+// support as one 1,000,000-unit position, with no identity multiplier.
 #[test]
 fn e2e_sybil_splitting_gives_no_vote_advantage() {
     let mut svm =
@@ -21468,10 +21453,7 @@ fn e2e_sybil_splitting_gives_no_vote_advantage() {
         .expect("deposit");
         voters.push((who, position));
     }
-    // All positions share the same start_slot; warp once so every vote is at age 16 (log2 = 4).
-    let mut c = svm.get_sysvar::<Clock>();
-    c.slot += 16;
-    svm.set_sysvar::<Clock>(&c);
+    // All positions vote immediately after deposit; age is not part of Genesis weight.
     for (who, position) in &voters {
         let ballot = Pubkey::find_program_address(
             &[b"gv_ballot", env.gv_config.as_ref(), who.pubkey().as_ref()],
@@ -21508,8 +21490,7 @@ fn e2e_sybil_splitting_gives_no_vote_advantage() {
             .try_into()
             .unwrap(),
     ); // u128 (GG)
-       // A single 1,000,000 position at age 16 would weigh floor(log2(16)) * 1,000,000 = 4,000,000.
-    let single_position_weight = 4u128 * (split * n) as u128;
+    let single_position_weight = (split * n) as u128;
     assert_eq!(
         support, single_position_weight,
         "splitting capital across {} identities gives no weight advantage",
@@ -26573,7 +26554,7 @@ fn e2e_full_genesis_to_buy_burn() {
     ))
     .expect("create+append+register");
 
-    // --- Vote + trigger (warp slot so the position has vote weight) ---
+    // --- Vote + trigger (remain inside the configured backing phase) ---
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot = 1124;
     svm.set_sysvar::<Clock>(&clock);

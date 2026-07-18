@@ -4,16 +4,16 @@
 //! the `subledger` program: capital is forwarded into the Percolator market-0
 //! insurance vault and a subledger *position* records attribution — owner,
 //! principal, deposit slot. The funds live in Percolator, not in either program.
-//! This program reads the subledger position (principal + start_slot) and the
-//! subledger pool (outstanding_principal) at vote time; it never custodies funds.
+//! This program reads the subledger position principal and the subledger pool
+//! outstanding principal at vote time; it never custodies funds.
 //!
-//! Vote: one voter, one proposal. Weight = `floor(log2(hold)) * principal`,
-//! resolved at vote time (last-write-time start slot). Backing a different
-//! proposal requires retracting first. Quorum = `total_voted_principal*2 >
-//! outstanding`; winner = `support_weight*2 > total_cast_weight`. Exits (in the
-//! subledger) shrink `outstanding`, so quorum recomputes — "those who stay decide".
+//! Vote: one voter, one proposal. Each live principal base unit contributes one
+//! vote. Backing a different proposal requires retracting first. Quorum =
+//! `total_voted_principal*2 > outstanding`; winner = `support_principal*2 >
+//! total_voted_principal`. Exits (in the subledger) shrink `outstanding`, so
+//! quorum recomputes — "those who stay decide".
 //!
-//! Trigger (permissionless): the first proposal to clear quorum + a weighted
+//! Trigger (permissionless): the first proposal to clear quorum + a principal
 //! majority is sealed by CPI into the distribution program (this program's config
 //! PDA is that program's seal `authority`). No mint here — the fixed COIN supply
 //! is distributed by the distribution program's claim/burn. An unsealed outcome
@@ -68,7 +68,6 @@ const SUB_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 pub const SUB_POS_POOL_OFF: usize = 8;
 pub const SUB_POS_OWNER_OFF: usize = 40;
 pub const SUB_POS_PRINCIPAL_OFF: usize = 72;
-pub const SUB_POS_START_SLOT_OFF: usize = 89;
 pub const SUB_POOL_OUTSTANDING_OFF: usize = 80;
 pub const SUB_POOL_DEPOSIT_DEADLINE_OFF: usize = 240;
 pub const SUB_POOL_DEPOSIT_WINDOW_OFF: usize = 248;
@@ -147,15 +146,9 @@ fn proposal_seeds<'a>(config: &'a Pubkey, dist_proposal: &'a Pubkey) -> [&'a [u8
     [b"gv_proposal", config.as_ref(), dist_proposal.as_ref()]
 }
 
-/// Time-weighted vote power: `floor(log2(age)) * principal`. Age < 2 (or empty)
-/// has no weight, so there is monotonic pressure to deposit earlier.
-fn vote_weight(principal: u64, age: u64) -> u128 {
-    if principal == 0 || age < 2 {
-        return 0;
-    }
-    // u128: age.ilog2() <= 63 and principal <= u64::MAX, so the product < u128::MAX — never saturates.
-    // (GG fix: a u64 weight saturated to u64::MAX, then the u64 tally overflowed on the next vote -> DOS.)
-    (age.ilog2() as u128) * (principal as u128)
+/// Genesis vote power is exactly one vote per live principal base unit.
+fn vote_weight(principal: u64) -> u128 {
+    principal as u128
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +167,7 @@ struct Config {
     /// Reserved (kept for layout stability with the seal test's init accounts).
     _reserved: Pubkey,
     total_voted_principal: u64,
-    total_cast_weight: u128, // GG fix: widened so summed log-weights cannot overflow
+    total_cast_weight: u128, // Kept u128 for serialized layout stability.
     outstanding_principal: u64,
     bump: u8,
     bootstrap_end_slot: u64,
@@ -253,7 +246,7 @@ fn read_bootstrap_schedule(data: &[u8]) -> Result<(u64, u64), ProgramError> {
 }
 
 /// Per-voter ballot, owned by this program. Holds only the vote state — the
-/// principal/start_slot live in the subledger position (read at vote time), so
+/// principal lives in the subledger position (read at vote time), so
 /// this program never duplicates the deposit ledger.
 struct Ballot {
     owner: Pubkey,
@@ -287,14 +280,13 @@ impl Ballot {
     }
 }
 
-/// Read `(principal, start_slot)` from a subledger position account. The subledger
-/// position layout is: disc[8], pool[32], owner[32], principal(u64), withdrawn(u64),
-/// withdrawn_flag(u8), start_slot(u64@89).
+/// Read principal from a subledger position account. The mirrored prefix is:
+/// disc[8], pool[32], owner[32], principal(u64).
 fn read_sub_position(
     data: &[u8],
     expected_pool: &Pubkey,
     expected_owner: &Pubkey,
-) -> Result<(u64, u64), ProgramError> {
+) -> Result<u64, ProgramError> {
     if data.len() < 97 || data[..8] != SUB_POSITION_DISC {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -303,9 +295,11 @@ fn read_sub_position(
     if pool != *expected_pool || owner != *expected_owner {
         return Err(ProgramError::InvalidAccountData);
     }
-    let principal = u64::from_le_bytes(data[SUB_POS_PRINCIPAL_OFF..SUB_POS_PRINCIPAL_OFF + 8].try_into().unwrap());
-    let start_slot = u64::from_le_bytes(data[SUB_POS_START_SLOT_OFF..SUB_POS_START_SLOT_OFF + 8].try_into().unwrap());
-    Ok((principal, start_slot))
+    Ok(u64::from_le_bytes(
+        data[SUB_POS_PRINCIPAL_OFF..SUB_POS_PRINCIPAL_OFF + 8]
+            .try_into()
+            .unwrap(),
+    ))
 }
 
 /// Read `outstanding_principal` from a subledger pool account. The subledger pool
@@ -365,7 +359,7 @@ fn terminal_refund_start_slot(data: &[u8], config: &Config) -> Result<u64, Progr
 struct ProposalVote {
     config: Pubkey,
     distribution_proposal: Pubkey,
-    support_weight: u128, // GG fix: widened so summed log-weights cannot overflow
+    support_weight: u128, // Kept u128 for serialized layout stability.
     support_principal: u64,
     executed: bool,
     /// Snapshot of the distribution proposal's (entry_count, total_amount) at
@@ -1047,7 +1041,7 @@ fn retract_legacy_vote<'a>(
 // position's vote-lock: a live ballot locks the principal (no insurance-withdraw
 // until retracted), so a vote can never outlive the capital backing it.
 //
-// Reads the voter's principal + start_slot from the subledger position and the
+// Reads the voter's principal from the subledger position and the
 // pool's outstanding_principal from the subledger pool (validated by program owner
 // + PDA derivation). The quorum denominator is synced from the pool each vote, so
 // subledger exits that shrink outstanding are reflected here.
@@ -1112,15 +1106,11 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     // old ballot or retract and switch proposals before a cranker lands trigger.
     // Retraction remains open indefinitely because it is the owner's escape from
     // the Subledger vote lock and cannot add support to any proposal.
-    let back_slot = if action == VOTE_BACK {
-        let slot = Clock::get()?.slot;
-        if slot >= config.bootstrap_end_slot {
+    if action == VOTE_BACK {
+        if Clock::get()?.slot >= config.bootstrap_end_slot {
             return Err(ProgramError::InvalidInstructionData);
         }
-        Some(slot)
-    } else {
-        None
-    };
+    }
 
     // The subledger position + pool must be owned by the configured subledger
     // program and be the canonical PDAs for (pool, voter) / (pool).
@@ -1137,8 +1127,7 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if *sub_position.key != expected_sub_pos {
         return Err(ProgramError::InvalidSeeds);
     }
-    let (principal, start_slot) =
-        read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
+    let principal = read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
     // Snapshot the live pool outstanding into the config for off-chain visibility. NOTE: this is NOT
     // the quorum denominator — `trigger` deliberately RE-READS the live pool outstanding at seal time
     // (see read_sub_pool_outstanding there), never this stored field, so a late deposit/exit between the
@@ -1197,16 +1186,9 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         ballot.voted_weight = 0;
         ballot.voted_principal = 0;
     } else {
-        // Slot zero is a valid configured bootstrap start and deposit timestamp. Principal zero
-        // and age below two already produce zero weight, so no timestamp sentinel is needed.
-        let weight = vote_weight(
-            principal,
-            back_slot
-                .ok_or(ProgramError::InvalidInstructionData)?
-                .saturating_sub(start_slot),
-        );
+        let weight = vote_weight(principal);
         if weight == 0 {
-            msg!("position has no vote weight (unfunded or too recent)");
+            msg!("unfunded position has no vote weight");
             return Err(ProgramError::InvalidAccountData);
         }
         pv.support_weight = pv.support_weight.checked_add(weight).ok_or(ProgramError::ArithmeticOverflow)?;
@@ -1337,9 +1319,10 @@ fn trigger<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]
         msg!("vote lacks a principal quorum");
         return Err(ProgramError::InvalidInstructionData);
     }
-    // Winner: this proposal holds a strict majority of cast log-weight.
-    if (pv.support_weight as u128) * 2 <= config.total_cast_weight as u128 {
-        msg!("proposal lacks a weighted majority");
+    // Winner: this proposal holds a strict majority of cast principal. Use the
+    // principal tallies directly so legacy weight mirrors cannot affect selection.
+    if (pv.support_principal as u128) * 2 <= config.total_voted_principal as u128 {
+        msg!("proposal lacks a principal majority");
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -1378,12 +1361,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn weight_is_log_time_times_principal() {
-        assert_eq!(vote_weight(10, 0), 0);
-        assert_eq!(vote_weight(10, 1), 0); // age < 2 -> no weight
-        assert_eq!(vote_weight(10, 4), 20); // floor(log2(4))=2 * 10
-        assert_eq!(vote_weight(10, 1024), 100); // floor(log2(1024))=10 * 10
-        assert_eq!(vote_weight(0, 1024), 0);
+    fn weight_is_one_per_principal_unit() {
+        assert_eq!(vote_weight(0), 0);
+        assert_eq!(vote_weight(1), 1);
+        assert_eq!(vote_weight(10), 10);
+        assert_eq!(vote_weight(u64::MAX), u64::MAX as u128);
     }
 
     #[test]
