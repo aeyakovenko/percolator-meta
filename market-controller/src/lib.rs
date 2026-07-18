@@ -80,6 +80,7 @@ const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
+const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
@@ -88,6 +89,7 @@ const ASSET_ACTION_ACTIVATE: u8 = 0;
 const ASSET_ACTION_DRAIN_ONLY: u8 = 1;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
+const UPDATE_TRADE_FEE_POLICY_LEN: usize = 9;
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
 const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
 const ACTIVATE_INSURANCE_OPERATOR_OFFSET: usize = 52;
@@ -500,6 +502,26 @@ fn validate_admin_instruction_data(data: &[u8], controller: &Pubkey) -> ProgramR
     Ok(())
 }
 
+fn validate_trade_fee_update(data: &[u8], current_trade_fee_base_bps: u64) -> ProgramResult {
+    if data.first().copied() != Some(PERC_IX_UPDATE_TRADE_FEE_POLICY) {
+        return Ok(());
+    }
+    if data.len() != UPDATE_TRADE_FEE_POLICY_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let requested = u64::from_le_bytes(
+        data[1..UPDATE_TRADE_FEE_POLICY_LEN]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    // Percolator's trade wire carries a caller fee floor, not a user maximum.
+    // Allowing a post-init increase would let governance front-run a signed trade.
+    if requested > current_trade_fee_base_bps {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(())
+}
+
 fn restart_asset_index(data: &[u8]) -> Result<Option<usize>, ProgramError> {
     if data.first().copied() != Some(PERC_IX_RESTART_ASSET_ORACLE) {
         return Ok(None);
@@ -579,6 +601,13 @@ fn process_proxy_admin<'a>(
         market,
         percolator_program,
     )?;
+    if perc_tag == PERC_IX_UPDATE_TRADE_FEE_POLICY {
+        let market_data = market.try_borrow_data()?;
+        let current_trade_fee_base_bps =
+            percolator_accounting::read_trade_fee_base_bps(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        validate_trade_fee_update(data, current_trade_fee_base_bps)?;
+    }
     if let Some(asset_index) = restart_asset_index(data)? {
         let market_data = market.try_borrow_data()?;
         let controller_key = controller.key.to_bytes();
@@ -2695,6 +2724,29 @@ mod tests {
             validate_admin_instruction_data(&malformed, &controller),
             Err(ProgramError::InvalidInstructionData)
         );
+    }
+
+    #[test]
+    fn trade_fee_policy_is_monotonic_nonincreasing() {
+        let policy = |trade_fee_base_bps: u64| {
+            let mut data = vec![PERC_IX_UPDATE_TRADE_FEE_POLICY];
+            data.extend_from_slice(&trade_fee_base_bps.to_le_bytes());
+            data
+        };
+
+        assert_eq!(validate_trade_fee_update(&policy(50), 50), Ok(()));
+        assert_eq!(validate_trade_fee_update(&policy(49), 50), Ok(()));
+        assert_eq!(
+            validate_trade_fee_update(&policy(51), 50),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        let mut malformed = policy(50);
+        malformed.pop();
+        assert_eq!(
+            validate_trade_fee_update(&malformed, 50),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        assert_eq!(validate_trade_fee_update(&[19], 50), Ok(()));
     }
 
     #[test]

@@ -19,6 +19,10 @@ pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
 pub const MAINTENANCE_FEE_PER_SLOT_OFFSET: usize = HEADER_LEN + 96;
 // Pinned `WrapperConfigV16::permissionless_market_init_fee` relative to the account.
 pub const PERMISSIONLESS_MARKET_INIT_FEE_OFFSET: usize = HEADER_LEN + 112;
+// Pinned `WrapperConfigV16::trade_fee_base_bps` follows the permissionless
+// market-init fee.
+pub const TRADE_FEE_BASE_BPS_OFFSET: usize =
+    PERMISSIONLESS_MARKET_INIT_FEE_OFFSET + size_of::<u128>();
 // Pinned `WrapperConfigV16` global stale-resolution fields relative to the account.
 pub const PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET: usize = HEADER_LEN + 136;
 pub const LAST_GOOD_ORACLE_SLOT_OFFSET: usize = HEADER_LEN + 152;
@@ -420,6 +424,12 @@ pub fn read_maintenance_fee_per_slot(data: &[u8]) -> Result<u128, ReadError> {
 pub fn read_permissionless_market_init_fee(data: &[u8]) -> Result<u128, ReadError> {
     validate_market(data)?;
     read_u128(data, PERMISSIONLESS_MARKET_INIT_FEE_OFFSET)
+}
+
+/// Returns the live base trade fee from the pinned wrapper config.
+pub fn read_trade_fee_base_bps(data: &[u8]) -> Result<u64, ReadError> {
+    validate_market(data)?;
+    read_u64(data, TRADE_FEE_BASE_BPS_OFFSET)
 }
 
 /// Returns whether Percolator's whole-market stale resolution is permissionless now.
@@ -825,6 +835,20 @@ mod tests {
         market[10] = KIND_PORTFOLIO;
         assert_eq!(
             read_maintenance_fee_per_slot(&market),
+            Err(ReadError::InvalidHeader)
+        );
+    }
+
+    #[test]
+    fn trade_fee_uses_the_pinned_wrapper_offset() {
+        let mut market = market_with_stale_slots(0, 0, 0);
+        market[TRADE_FEE_BASE_BPS_OFFSET..TRADE_FEE_BASE_BPS_OFFSET + 8]
+            .copy_from_slice(&321u64.to_le_bytes());
+        assert_eq!(read_trade_fee_base_bps(&market), Ok(321));
+
+        market[10] = KIND_PORTFOLIO;
+        assert_eq!(
+            read_trade_fee_base_bps(&market),
             Err(ReadError::InvalidHeader)
         );
     }
