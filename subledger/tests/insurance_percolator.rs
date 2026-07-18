@@ -4949,6 +4949,132 @@ fn presigned_back_cannot_count_a_later_top_up_at_the_bootstrap_deadline() {
     assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
 }
 
+// STALE FULL-EXIT REPLAY: the amountless owner-signed exit must not cross a later
+// top-up. Otherwise a relayer can hold a one-unit exit authorization, let the
+// owner add capital in the final deposit slot, and land the old transaction after
+// deposits close. The owner receives the tokens but permanently loses the Genesis
+// vote and reward opportunity because a retired position cannot be re-created.
+#[test]
+fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
+    let start = 100u64;
+    let deposit_window = 10u64;
+    let bootstrap_delay = 100u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        deposit_window,
+        start,
+        bootstrap_delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(deposit_window),
+        Some(start),
+    );
+    let ve = setup_vote(&mut env);
+    let (_, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 5);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1)
+        .expect("alice deposits the principal covered by the first exit signature");
+
+    env.warp_slot(start + deposit_window - 1);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let full_exit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![13u8], // IX_INSURANCE_WITHDRAW_FULL, signed for one live unit
+    };
+    let withheld_full_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            full_exit,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    let mut top_up_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    let top_up = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: top_up_data,
+    };
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+                top_up,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice's final-slot top-up lands");
+    assert_eq!(env.read_position(&alice.pubkey()), (5, 109, false));
+    assert_eq!(env.token_amount(&alice_ata), 0);
+
+    env.warp_slot(start + deposit_window);
+    let stale_result = env.svm.send_transaction(withheld_full_exit);
+    if stale_result.is_ok() {
+        assert_eq!(
+            env.read_position(&alice.pubkey()),
+            (0, 109, true),
+            "the vulnerable wire retires all five units",
+        );
+        assert_eq!(
+            env.token_amount(&alice_ata),
+            5,
+            "the stale exit returns funds but forfeits Genesis participation",
+        );
+        assert!(
+            gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+            "a retired position cannot cast the lost post-cutoff vote",
+        );
+        panic!(
+            "an exit signed before the top-up retired the larger position after deposits closed"
+        );
+    }
+    assert_eq!(
+        env.read_position(&alice.pubkey()),
+        (5, 109, false),
+        "the stale authorization leaves all five vote units live",
+    );
+    assert_eq!(env.token_amount(&alice_ata), 0);
+
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("the owner retains the post-cutoff Genesis vote opportunity");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
