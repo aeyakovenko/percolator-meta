@@ -26176,6 +26176,8 @@ fn e2e_dao_shutdown_cannot_confiscate_winners_parked_settlement_usd() {
 // 50/50 reward/burn rounds, a dynamic reward claim, and principal recovery.
 #[test]
 fn e2e_full_genesis_to_buy_burn() {
+    use percolator_prog::ix::Instruction as PIx;
+
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -26587,6 +26589,12 @@ fn e2e_full_genesis_to_buy_burn() {
         bh,
     ))
     .expect("vote");
+    let ballot = svm.get_account(&gv_ballot).expect("live Genesis ballot");
+    assert_eq!(
+        u128::from_le_bytes(ballot.data[72..88].try_into().unwrap()),
+        principal as u128,
+        "one deposited base unit contributes exactly one vote"
+    );
     let trigger = Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
@@ -26642,9 +26650,8 @@ fn e2e_full_genesis_to_buy_burn() {
     );
 
     // The fixed Genesis winner supplies the post-launch auction. Bought COIN is
-    // routed into a dynamic reward epoch whose only cohort is the original
-    // insurance depositor, so this test joins the real Genesis and continuous
-    // halves without replacing either program with a synthetic mint.
+    // routed into a dynamic 10/10/80 capital/funding epoch, so this test joins
+    // the real Genesis and continuous halves without a synthetic reward mint.
     const SLOTS_PER_DAY: u64 = 216_000;
     let reward_start = svm.get_sysvar::<Clock>().slot;
     let round_length = 15 * SLOTS_PER_DAY;
@@ -26661,6 +26668,173 @@ fn e2e_full_genesis_to_buy_burn() {
         0,
     );
     svm.airdrop(&squads_vault, 1_000_000_000).unwrap();
+
+    // The current backing cohort is deliberately a segregated owner-bound vault,
+    // not a Percolator backing bucket. Keeping that distinction visible prevents
+    // this composition test from claiming market-risk backing that is not wired yet.
+    let no_market = Pubkey::default();
+    let backing_pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &no_market,
+        &no_market,
+        &Pubkey::default(),
+        POLICY_WITH_SURPLUS,
+        DOMAIN_BACKING,
+    );
+    let backing_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_vault,
+        &collateral_mint,
+        &backing_pool,
+        0,
+    );
+    let mut backing_init_data = vec![0u8];
+    backing_init_data.extend_from_slice(&0u64.to_le_bytes());
+    backing_init_data.push(POLICY_WITH_SURPLUS);
+    backing_init_data.push(DOMAIN_BACKING);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(backing_pool, false),
+                AccountMeta::new_readonly(backing_vault, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: backing_init_data,
+        },
+    )
+    .expect("initialize segregated collateral pool");
+    let bob = Keypair::new();
+    svm.airdrop(&bob.pubkey(), 1_000_000_000).unwrap();
+    let bob_collateral = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &bob_collateral,
+        &collateral_mint,
+        &bob.pubkey(),
+        principal,
+    );
+    let backing_position = sub_position_pda(&backing_pool, &bob.pubkey());
+    let mut backing_deposit_data = vec![1u8];
+    backing_deposit_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&bob],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(bob.pubkey(), true),
+                AccountMeta::new(backing_pool, false),
+                AccountMeta::new(backing_position, false),
+                AccountMeta::new(bob_collateral, false),
+                AccountMeta::new(backing_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: backing_deposit_data,
+        },
+    )
+    .expect("deposit segregated collateral");
+
+    // A separate live Percolator market supplies real cumulative paid-funding
+    // counters during the post-launch epoch. Both sides pay in turn.
+    let initial_price = 1_000_000u64;
+    let epoch_market = Pubkey::new_unique();
+    svm.set_account(
+        epoch_market,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_live_funding_market(
+                &epoch_market,
+                &collateral_mint,
+                &squads_vault,
+                reward_start,
+            ),
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let epoch_vault_authority = perc_vault_authority(&epoch_market, &perc_id());
+    let epoch_perc_vault = canonical_insurance_vault(&epoch_vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &epoch_perc_vault,
+        &collateral_mint,
+        &epoch_vault_authority,
+        0,
+    );
+    let long_payer = Keypair::new();
+    let short_payer = Keypair::new();
+    for owner in [&long_payer, &short_payer] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let epoch_long_pf = Pubkey::new_unique();
+    let epoch_short_pf = Pubkey::new_unique();
+    for (owner, portfolio) in [
+        (&long_payer, &epoch_long_pf),
+        (&short_payer, &epoch_short_pf),
+    ] {
+        svm.set_account(
+            *portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(epoch_market, false),
+                    AccountMeta::new(*portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize post-launch funding portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            principal,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(epoch_market, false),
+                    AccountMeta::new(*portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(epoch_perc_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: principal as u128,
+                },
+            ),
+        )
+        .expect("fund post-launch funding portfolio");
+    }
 
     // --- Handoff: DAO configures the TWAP auction share, then hands it custody. ---
     // twap config for this market.
@@ -26783,6 +26957,32 @@ fn e2e_full_genesis_to_buy_burn() {
     )
     .expect("futarchy configures externally cranked EWMA marks");
 
+    let epoch_oracle_config = build_configure_ewma_mark_message(
+        &squads_vault,
+        &epoch_market,
+        &perc_id(),
+        reward_start,
+        initial_price,
+        1,
+        0,
+    );
+    let epoch_oracle_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(epoch_market, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &epoch_oracle_config,
+        &epoch_oracle_remaining,
+    )
+    .expect("futarchy configures the eligible funding market");
+
     let reward_init = build_rd_epoch_init_message(
         &squads_vault,
         &coin_mint,
@@ -26794,13 +26994,16 @@ fn e2e_full_genesis_to_buy_burn() {
         reward_start,
         reward_end,
         0,
-        10_000,
+        1_000,
+        1_000,
         0,
-        0,
-        0,
+        8_000,
         reward_finalize_window,
         0,
-        &[(slab, pool, Pubkey::default())],
+        &[
+            (slab, pool, backing_pool),
+            (epoch_market, Pubkey::default(), Pubkey::default()),
+        ],
     );
     let reward_init_remaining = vec![
         AccountMeta::new(squads_vault, false),
@@ -26818,7 +27021,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        7,
+        8,
         &reward_init,
         &reward_init_remaining,
     )
@@ -26837,6 +27040,48 @@ fn e2e_full_genesis_to_buy_burn() {
         ),
     )
     .expect("genesis depositor registers for continuous insurance rewards");
+    send(
+        &mut svm,
+        &[&payer, &bob],
+        rd_register_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &bob.pubkey(),
+            &bob.pubkey(),
+            &slab,
+            &backing_position,
+            1,
+        ),
+    )
+    .expect("segregated collateral depositor registers for rewards");
+    send(
+        &mut svm,
+        &[&payer, &long_payer],
+        rd_register_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &long_payer.pubkey(),
+            &long_payer.pubkey(),
+            &epoch_market,
+            &epoch_long_pf,
+            4,
+        ),
+    )
+    .expect("long funding payer registers for rewards");
+    send(
+        &mut svm,
+        &[&payer, &short_payer],
+        rd_register_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &short_payer.pubkey(),
+            &short_payer.pubkey(),
+            &epoch_market,
+            &epoch_short_pf,
+            4,
+        ),
+    )
+    .expect("short funding payer registers for rewards");
 
     // --- The TWAP runs three 15-day rounds. The Genesis winner sells real distributed COIN;
     //     each round routes half to rewards and burns half. ---
@@ -26862,7 +27107,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        8,
+        9,
         &economics,
         &economics_remaining,
     )
@@ -26899,8 +27144,171 @@ fn e2e_full_genesis_to_buy_burn() {
         AccountMeta::new_readonly(reward_vault, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 9, &ib, &ib_rem)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 10, &ib, &ib_rem)
         .expect("init auction book");
+
+    let epoch_long_start = read_portfolio_funding_long_paid(&svm, &epoch_long_pf);
+    let epoch_short_start = read_portfolio_funding_short_paid(&svm, &epoch_short_pf);
+    let position_size = (percolator::POS_SCALE / 10) as i128;
+    send(
+        &mut svm,
+        &[&payer, &long_payer, &short_payer],
+        pix(
+            vec![
+                AccountMeta::new(long_payer.pubkey(), true),
+                AccountMeta::new(short_payer.pubkey(), true),
+                AccountMeta::new(epoch_market, false),
+                AccountMeta::new(epoch_long_pf, false),
+                AccountMeta::new(epoch_short_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: position_size,
+                exec_price: initial_price,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("open post-launch funding pair");
+
+    let epoch_crank_refresh = |svm: &mut LiteSVM, portfolio: &Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(epoch_market, false),
+                    AccountMeta::new(*portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+
+    let premium_slot = reward_start + 1;
+    warp_to(&mut svm, premium_slot);
+    let premium = build_push_ewma_mark_message(
+        &squads_vault,
+        &epoch_market,
+        &perc_id(),
+        premium_slot,
+        initial_price * 2,
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        11,
+        &premium,
+        &epoch_oracle_remaining,
+    )
+    .expect("futarchy pushes the long-pays-short premium");
+    epoch_crank_refresh(&mut svm, &epoch_long_pf, premium_slot)
+        .expect("refresh long at premium");
+    epoch_crank_refresh(&mut svm, &epoch_short_pf, premium_slot)
+        .expect("refresh short at premium");
+    let long_funding_slot = reward_start + 2;
+    warp_to(&mut svm, long_funding_slot);
+    epoch_crank_refresh(&mut svm, &epoch_long_pf, long_funding_slot)
+        .expect("accrue long-paid funding");
+    epoch_crank_refresh(&mut svm, &epoch_short_pf, long_funding_slot)
+        .expect("accrue short-received funding");
+    let long_record_slot = reward_start + 3;
+    warp_to(&mut svm, long_record_slot);
+    epoch_crank_refresh(&mut svm, &epoch_long_pf, long_record_slot)
+        .expect("record long-paid funding");
+    epoch_crank_refresh(&mut svm, &epoch_short_pf, long_record_slot)
+        .expect("record short-received funding");
+
+    let discount_slot = reward_start + 4;
+    warp_to(&mut svm, discount_slot);
+    let discount = build_push_ewma_mark_message(
+        &squads_vault,
+        &epoch_market,
+        &perc_id(),
+        discount_slot,
+        initial_price / 2,
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        12,
+        &discount,
+        &epoch_oracle_remaining,
+    )
+    .expect("futarchy pushes the short-pays-long discount");
+    epoch_crank_refresh(&mut svm, &epoch_short_pf, discount_slot)
+        .expect("refresh short at discount");
+    epoch_crank_refresh(&mut svm, &epoch_long_pf, discount_slot)
+        .expect("refresh long at discount");
+    let short_funding_slot = reward_start + 5;
+    warp_to(&mut svm, short_funding_slot);
+    epoch_crank_refresh(&mut svm, &epoch_short_pf, short_funding_slot)
+        .expect("accrue short-paid funding");
+    epoch_crank_refresh(&mut svm, &epoch_long_pf, short_funding_slot)
+        .expect("accrue long-received funding");
+    let short_record_slot = reward_start + 6;
+    warp_to(&mut svm, short_record_slot);
+    epoch_crank_refresh(&mut svm, &epoch_short_pf, short_record_slot)
+        .expect("record short-paid funding");
+    epoch_crank_refresh(&mut svm, &epoch_long_pf, short_record_slot)
+        .expect("record long-received funding");
+
+    let epoch_long_points =
+        read_portfolio_funding_long_paid(&svm, &epoch_long_pf) - epoch_long_start;
+    let epoch_short_points =
+        read_portfolio_funding_short_paid(&svm, &epoch_short_pf) - epoch_short_start;
+    assert!(epoch_long_points > 0, "the long paid real funding");
+    assert!(epoch_short_points > 0, "the short paid real funding");
+    assert_eq!(
+        read_portfolio_funding_short_paid(&svm, &epoch_long_pf),
+        0,
+        "the long receiver counter cannot enter payer points"
+    );
+    assert_eq!(
+        read_portfolio_funding_long_paid(&svm, &epoch_short_pf),
+        0,
+        "the short receiver counter cannot enter payer points"
+    );
+
+    let close_price = read_asset0_effective_price(&svm, &epoch_market);
+    send(
+        &mut svm,
+        &[&payer, &long_payer, &short_payer],
+        pix(
+            vec![
+                AccountMeta::new(long_payer.pubkey(), true),
+                AccountMeta::new(short_payer.pubkey(), true),
+                AccountMeta::new(epoch_market, false),
+                AccountMeta::new(epoch_long_pf, false),
+                AccountMeta::new(epoch_short_pf, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -position_size,
+                exec_price: close_price,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("close post-launch funding pair");
+    assert_eq!(read_asset0_oi(&svm, &epoch_market), (0, 0));
+    let epoch_long_points =
+        read_portfolio_funding_long_paid(&svm, &epoch_long_pf) - epoch_long_start;
+    let epoch_short_points =
+        read_portfolio_funding_short_paid(&svm, &epoch_short_pf) - epoch_short_start;
 
     svm.airdrop(&recipient.pubkey(), 1_000_000_000).unwrap();
     let r_usd = coin_ata_of(&recipient.pubkey(), &collateral_mint);
@@ -26946,7 +27354,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &multisig,
             &dao,
             &payer,
-            10 + round,
+            13 + round,
             &oracle_push,
             &oracle_remaining,
         )
@@ -27034,6 +27442,49 @@ fn e2e_full_genesis_to_buy_burn() {
         ),
     )
     .expect("Genesis depositor crystallizes continuous insurance points");
+    send(
+        &mut svm,
+        &[&bob],
+        rd_crystallize_ix(
+            &bob.pubkey(),
+            &reward_config,
+            &bob.pubkey(),
+            &slab,
+            &backing_position,
+            1,
+        ),
+    )
+    .expect("segregated collateral depositor crystallizes points");
+    send(
+        &mut svm,
+        &[&payer],
+        rd_crystallize_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &long_payer.pubkey(),
+            &epoch_market,
+            &epoch_long_pf,
+            4,
+        ),
+    )
+    .expect("crystallize long-paid funding points");
+    send(
+        &mut svm,
+        &[&payer],
+        rd_crystallize_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &short_payer.pubkey(),
+            &epoch_market,
+            &epoch_short_pf,
+            4,
+        ),
+    )
+    .expect("crystallize short-paid funding points");
+    let insurance_before_rewards = read_asset0_insurance(&svm, &slab);
+    let backing_before_rewards = token_amount(&svm, &backing_vault);
+    let insurance_position_before_rewards = svm.get_account(&position).unwrap().data;
+    let backing_position_before_rewards = svm.get_account(&backing_position).unwrap().data;
     assert!(
         send(
             &mut svm,
@@ -27061,7 +27512,25 @@ fn e2e_full_genesis_to_buy_burn() {
     )
     .expect("permissionless freeze snapshots the three-round reward vault");
     let alice_coin = Pubkey::new_unique();
+    let bob_coin = Pubkey::new_unique();
+    let long_coin = Pubkey::new_unique();
+    let short_coin = Pubkey::new_unique();
     set_token(&mut svm, &alice_coin, &coin_mint, &alice.pubkey(), 0);
+    set_token(&mut svm, &bob_coin, &coin_mint, &bob.pubkey(), 0);
+    set_token(
+        &mut svm,
+        &long_coin,
+        &coin_mint,
+        &long_payer.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &short_coin,
+        &coin_mint,
+        &short_payer.pubkey(),
+        0,
+    );
     send(
         &mut svm,
         &[&alice],
@@ -27076,12 +27545,89 @@ fn e2e_full_genesis_to_buy_burn() {
             &alice_coin,
         ),
     )
-    .expect("Genesis depositor claims the full insurance reward cohort");
-    assert_eq!(token_amount(&svm, &alice_coin), 30);
-    assert_eq!(token_amount(&svm, &reward_vault), 0);
+    .expect("Genesis depositor claims the insurance reward cohort");
+    send(
+        &mut svm,
+        &[&bob],
+        rd_claim_ix(
+            &bob.pubkey(),
+            &reward_config,
+            &bob.pubkey(),
+            &slab,
+            &backing_position,
+            1,
+            &reward_vault,
+            &bob_coin,
+        ),
+    )
+    .expect("segregated collateral depositor claims its cohort");
+    send(
+        &mut svm,
+        &[&payer],
+        rd_claim_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &long_payer.pubkey(),
+            &epoch_market,
+            &epoch_long_pf,
+            4,
+            &reward_vault,
+            &long_coin,
+        ),
+    )
+    .expect("long funding payer claims");
+    send(
+        &mut svm,
+        &[&payer],
+        rd_claim_ix(
+            &payer.pubkey(),
+            &reward_config,
+            &short_payer.pubkey(),
+            &epoch_market,
+            &epoch_short_pf,
+            4,
+            &reward_vault,
+            &short_coin,
+        ),
+    )
+    .expect("short funding payer claims");
+
+    let bought_for_rewards = 30u64;
+    let insurance_reward = bought_for_rewards * 1_000 / 10_000;
+    let collateral_reward = bought_for_rewards * 1_000 / 10_000;
+    let funding_reward = bought_for_rewards * 8_000 / 10_000;
+    let funding_points = epoch_long_points + epoch_short_points;
+    let expected_long =
+        (funding_reward as u128 * epoch_long_points / funding_points) as u64;
+    let expected_short =
+        (funding_reward as u128 * epoch_short_points / funding_points) as u64;
+    assert_eq!(token_amount(&svm, &alice_coin), insurance_reward);
+    assert_eq!(token_amount(&svm, &bob_coin), collateral_reward);
+    assert_eq!(token_amount(&svm, &long_coin), expected_long);
+    assert_eq!(token_amount(&svm, &short_coin), expected_short);
+    assert!(
+        token_amount(&svm, &reward_vault) <= 1,
+        "only pro-rata floor dust may remain"
+    );
+    assert_eq!(read_asset0_insurance(&svm, &slab), insurance_before_rewards);
+    assert_eq!(token_amount(&svm, &backing_vault), backing_before_rewards);
+    assert_eq!(
+        svm.get_account(&position).unwrap().data,
+        insurance_position_before_rewards,
+        "reward finalization cannot mutate insurance attribution"
+    );
+    assert_eq!(
+        svm.get_account(&backing_position).unwrap().data,
+        backing_position_before_rewards,
+        "reward finalization cannot mutate collateral attribution"
+    );
     assert_eq!(
         token_amount(&svm, &recipient_ata)
             + token_amount(&svm, &alice_coin)
+            + token_amount(&svm, &bob_coin)
+            + token_amount(&svm, &long_coin)
+            + token_amount(&svm, &short_coin)
+            + token_amount(&svm, &reward_vault)
             + (supply_before - mint_supply(&svm, &coin_mint)),
         total_supply,
         "Genesis COIN is conserved across seller balance, rewards, and burns"
@@ -27114,7 +27660,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        13,
+        16,
         &return_message,
         &return_remaining,
     )
@@ -27173,6 +27719,26 @@ fn e2e_full_genesis_to_buy_burn() {
         surplus - 400_000,
         "the retained protocol insurance remains after principal recovery"
     );
+    send(
+        &mut svm,
+        &[&bob],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(bob.pubkey(), true),
+                AccountMeta::new(backing_pool, false),
+                AccountMeta::new(backing_position, false),
+                AccountMeta::new(bob_collateral, false),
+                AccountMeta::new(backing_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: vec![2u8],
+        },
+    )
+    .expect("segregated collateral depositor recovers principal");
+    assert_eq!(token_amount(&svm, &bob_collateral), principal);
+    assert_eq!(token_amount(&svm, &backing_vault), 0);
+    assert_eq!(token_amount(&svm, &bob_coin), collateral_reward);
 }
 
 // ANTI-SPAM: a DAO-set flat per-bid fee (default 0.002 COIN) is BURNED on every place_bid, even
