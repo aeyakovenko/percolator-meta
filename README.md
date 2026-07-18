@@ -181,6 +181,8 @@ top of this exact security line.
 The auction's flat bid fee follows the same rule: book initialization selects its maximum and later
 Squads actions may keep or lower it. The bid wire commits to amounts but has no maximum-fee field, so
 allowing an increase could burn unrelated COIN from an already-signed bidder transaction.
+Current cancellation wires commit to the reusable slot's placement clocks and both bid legs. The old
+slot-only wire remains valid only for predecessor books that are exit-only under the upgraded binary.
 
 ## Genesis
 

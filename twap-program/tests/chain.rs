@@ -26431,7 +26431,22 @@ fn new_bidder(
     (bidder, coin_src, usd_dest)
 }
 
-fn send(svm: &mut LiteSVM, signers: &[&Keypair], ix: Instruction) -> Result<(), String> {
+trait TestInstruction {
+    fn build(self, svm: &LiteSVM) -> Instruction;
+}
+
+impl TestInstruction for Instruction {
+    fn build(self, _svm: &LiteSVM) -> Instruction {
+        self
+    }
+}
+
+fn send(
+    svm: &mut LiteSVM,
+    signers: &[&Keypair],
+    ix: impl TestInstruction,
+) -> Result<(), String> {
+    let ix = ix.build(svm);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -30979,7 +30994,7 @@ fn e2e_squads_cannot_front_run_a_presigned_bid_with_a_fee_increase() {
     );
 }
 
-fn cancel_ix(
+fn legacy_cancel_ix(
     bidder: &Pubkey,
     config: &Pubkey,
     book: &Pubkey,
@@ -31003,9 +31018,89 @@ fn cancel_ix(
     }
 }
 
-// CANCEL: an unsettled bid is reclaimable by its owner only AFTER the cooldown (an execute clears
-// the book, or 2*round_length slots pass) — so there is no last-second cancel that could
-// manipulate a pending execute. The escrowed COIN is returned but the anti-spam fee stays burned.
+struct CancelRequest {
+    bidder: Pubkey,
+    config: Pubkey,
+    book: Pubkey,
+    book_escrow: Pubkey,
+    coin_escrow: Pubkey,
+    coin_ata: Pubkey,
+    slot_index: u8,
+}
+
+impl TestInstruction for CancelRequest {
+    fn build(self, svm: &LiteSVM) -> Instruction {
+        const CURRENT_HEADER: usize = 300;
+        const PRE_CUTOFF_HEADER: usize = 292;
+        const BID_FEE_HEADER: usize = 292;
+        const HOLDING_HEADER: usize = 284;
+        const INITIAL_HEADER: usize = 252;
+        const CURRENT_SLOT: usize = 178;
+        const LEGACY_SLOT: usize = 162;
+        const MAX_BIDS: usize = 32;
+
+        let account = svm.get_account(&self.book).expect("auction book exists");
+        let (header, slot_size) = match account.data.len() {
+            len if len == CURRENT_HEADER + MAX_BIDS * CURRENT_SLOT => {
+                (CURRENT_HEADER, CURRENT_SLOT)
+            }
+            len if len == PRE_CUTOFF_HEADER + MAX_BIDS * CURRENT_SLOT => {
+                (PRE_CUTOFF_HEADER, CURRENT_SLOT)
+            }
+            len if len == BID_FEE_HEADER + MAX_BIDS * LEGACY_SLOT => {
+                (BID_FEE_HEADER, LEGACY_SLOT)
+            }
+            len if len == HOLDING_HEADER + MAX_BIDS * LEGACY_SLOT => {
+                (HOLDING_HEADER, LEGACY_SLOT)
+            }
+            len if len == INITIAL_HEADER + MAX_BIDS * LEGACY_SLOT => {
+                (INITIAL_HEADER, LEGACY_SLOT)
+            }
+            len => panic!("unsupported test auction-book layout: {len}"),
+        };
+        let mut ix = legacy_cancel_ix(
+            &self.bidder,
+            &self.config,
+            &self.book,
+            &self.book_escrow,
+            &self.coin_escrow,
+            &self.coin_ata,
+            self.slot_index,
+        );
+        if slot_size == CURRENT_SLOT && usize::from(self.slot_index) < MAX_BIDS {
+            let offset = header + usize::from(self.slot_index) * slot_size;
+            ix.data
+                .extend_from_slice(&account.data[offset + 162..offset + 178]);
+            ix.data
+                .extend_from_slice(&account.data[offset + 98..offset + 130]);
+        }
+        ix
+    }
+}
+
+fn cancel_ix(
+    bidder: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    book_escrow: &Pubkey,
+    coin_escrow: &Pubkey,
+    coin_ata: &Pubkey,
+    slot_index: u8,
+) -> CancelRequest {
+    CancelRequest {
+        bidder: *bidder,
+        config: *config,
+        book: *book,
+        book_escrow: *book_escrow,
+        coin_escrow: *coin_escrow,
+        coin_ata: *coin_ata,
+        slot_index,
+    }
+}
+
+// CANCEL: an unsettled bid is reclaimable by its owner only after 2*round_length slots pass, so
+// there is no last-second cancel that could manipulate a pending execute. The escrowed COIN is
+// returned but the anti-spam fee stays burned.
 #[test]
 fn e2e_bid_cancellable_after_cooldown_keeps_fee() {
     let mut svm =
@@ -31583,6 +31678,194 @@ fn e2e_cancel_cannot_be_replayed_to_drain_the_shared_escrow() {
         0,
         "shared escrow cleanly drained by the two legitimate cancels only"
     );
+}
+
+// PRESIGNED CANCEL REPLAY: a cancellation can outlive the bid it was signed for. A relayer can
+// withhold that transaction, let the owner recover the old bid by a different path, then submit it
+// after the same owner enters the reused slot again. Both predecessor one-byte wires and current
+// wires committed to the old bid must reject against the replacement incarnation.
+#[test]
+fn e2e_presigned_cancel_cannot_cancel_a_reused_bid_slot() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let round_length = 10u64;
+    let fee = 2_000u64;
+    let bid_coin = 10_000u64;
+    let bid_usd = 5_000u128;
+    let bk = setup_auction(&mut svm, &payer, &env, round_length, 0, None, fee);
+
+    let (alice, alice_coin, alice_usd) =
+        new_bidder(&mut svm, &payer, &env, 2 * (bid_coin + fee));
+    send(
+        &mut svm,
+        &[&alice],
+        place_bid_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            &alice_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            bid_coin as u128,
+            bid_usd,
+            None,
+        ),
+    )
+    .expect("alice places the original bid in slot zero");
+
+    // Sign but do not land this cancellation. Use one fresh blockhash for every subsequent
+    // transaction so the exact old signature stays valid while the public state moves on.
+    svm.expire_blockhash();
+    let held_blockhash = svm.latest_blockhash();
+    let withheld_exact_cancel = Transaction::new_signed_with_payer(
+        &[cancel_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            0,
+        )
+        .build(&svm)],
+        Some(&alice.pubkey()),
+        &[&alice],
+        held_blockhash,
+    );
+    let withheld_legacy_cancel = Transaction::new_signed_with_payer(
+        &[legacy_cancel_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            0,
+        )],
+        Some(&alice.pubkey()),
+        &[&alice],
+        held_blockhash,
+    );
+
+    // Alice later cancels the original bid to a different clean account. This transaction has a
+    // distinct signature, leaving the withheld canonical-destination transaction unused.
+    let fallback = Pubkey::new_unique();
+    set_token(&mut svm, &fallback, &env.coin_mint, &alice.pubkey(), 0);
+    warp_to(&mut svm, 100 + 2 * round_length + 1);
+    let original_cancel = cancel_ix(
+        &alice.pubkey(),
+        &env.twap_cfg,
+        &bk.book,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        &fallback,
+        0,
+    )
+    .build(&svm);
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[original_cancel],
+        Some(&alice.pubkey()),
+        &[&alice],
+        held_blockhash,
+    ))
+    .expect("alice recovers the original bid through a distinct cancellation");
+    assert_eq!(token_amount(&svm, &fallback), bid_coin);
+
+    // The empty expired book is permissionlessly advanced, then Alice reuses slot zero with the
+    // same bid terms and pays the flat fee again.
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        held_blockhash,
+    ))
+    .expect("permissionless crank reopens the empty book");
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[place_bid_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            &alice_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            bid_coin as u128,
+            bid_usd,
+            None,
+        )],
+        Some(&alice.pubkey()),
+        &[&alice],
+        held_blockhash,
+    ))
+    .expect("alice places a replacement bid in the reused slot");
+    assert_eq!(token_amount(&svm, &alice_coin), 0);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), bid_coin);
+
+    // The replacement has now aged enough to cancel, but both held signatures predate it. Replaying
+    // either stale authorization must not remove the new bid or waste its separately paid fee.
+    warp_to(&mut svm, 100 + 4 * round_length + 2);
+    assert!(
+        svm.send_transaction(withheld_exact_cancel).is_err(),
+        "a current cancellation must be bound to one exact bid incarnation"
+    );
+    assert!(
+        svm.send_transaction(withheld_legacy_cancel).is_err(),
+        "a current reusable book must reject predecessor slot-only cancellations"
+    );
+    assert_eq!(
+        token_amount(&svm, &alice_coin),
+        0,
+        "the stale cancellation cannot refund the replacement bid"
+    );
+    assert_eq!(
+        token_amount(&svm, &bk.coin_escrow),
+        bid_coin,
+        "the replacement bid remains committed"
+    );
+
+    let replacement_cancel = cancel_ix(
+        &alice.pubkey(),
+        &env.twap_cfg,
+        &bk.book,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        &alice_coin,
+        0,
+    )
+    .build(&svm);
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[replacement_cancel],
+        Some(&alice.pubkey()),
+        &[&alice],
+        held_blockhash,
+    ))
+    .expect("the exact replacement-bid commitment remains cancellable");
+    assert_eq!(token_amount(&svm, &alice_coin), bid_coin);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
 }
 
 // FINDING AC (oversized-leg → ranking overflow + phantom escrow): place_bid's ranking comparator

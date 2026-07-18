@@ -14220,3 +14220,22 @@ monotonic generation from the pinned slab and rejects a zero or mismatched ID be
 CPI. The regression proves a correctly bound generation-A restart remains live, a separately authorized action
 shuts down generation B, and the untouched A proposal then rejects with byte-identical B recovery accounting.
 The check adds no account, state, signer, authority, recipient, amount, token path, or value-moving CPI.
+
+## Tick - stale signed cancel crossed reusable bid incarnations (surface D, REAL DOS)
+
+The current auction reused a zeroed slot but its cancellation wire named only the slot index. A bidder could
+sign a cancellation for bid A, give it to a relayer, recover A through a distinct owner-signed cancellation,
+and later place bid B in the same slot. Once B aged through the cooldown, the withheld signature cancelled B
+even though it predated B. The refund remained bound to the bidder, so the path could not steal principal, but
+it removed a live bid after the bidder paid a second nonrefundable fee and denied that auction opportunity.
+
+Retained clean-room test commit `51f54ab` reproduces the complete public path with the real TWAP and pinned
+Percolator SBF binaries and one still-valid blockhash. Against parent `f10020d`, the old one-byte transaction
+succeeds against B. The fixed test also withholds a current exact-bid transaction for A; mutation-disabling
+only the exact comparison makes that transaction cancel B at the intended assertion.
+
+FIX: cancellation of a reusable current-format slot commits to both placement clocks and both immutable bid
+legs, and the program compares that tuple with the live slot before refunding or clearing it. Current books
+reject predecessor slot-only wires. Those wires remain accepted only for old layouts that the upgraded binary
+already treats as exit-only, preserving their owner recovery path. A freshly signed cancellation for B still
+works. The change adds no state, account, signer, authority, recipient, CPI, or custody surface.
