@@ -1059,9 +1059,9 @@ fn retract_legacy_vote<'a>(
 
 // vote accounts: [voter(s,w), config(w), ballot(w,pda), proposal_vote(w),
 //   sub_position(w), sub_pool(ro), system_program, subledger_program]
-// data: back action(u8); exact retract action(u8) || vote_nonce(u64)
-// Predecessor action-only retracts remain valid only for a nonce-zero current ballot or an exit-only
-// legacy config generation.
+// data (current): action(u8) || vote_nonce(u64)
+// Predecessor action-only votes remain valid only for a nonce-zero current ballot. Exit-only legacy
+// config generations retain their action-only retract.
 //
 // After updating the ballot, the config PDA CPIs the subledger to set/clear the
 // position's vote-lock: a live ballot locks the principal (no insurance-withdraw
@@ -1090,9 +1090,6 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         return Err(ProgramError::InvalidInstructionData);
     }
     let expected_vote_nonce = if data.len() == 9 {
-        if action != VOTE_RETRACT {
-            return Err(ProgramError::InvalidInstructionData);
-        }
         Some(u64::from_le_bytes(data[1..9].try_into().unwrap()))
     } else {
         None
@@ -1103,15 +1100,13 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if config_account.owner != program_id || proposal_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    if action == VOTE_RETRACT
-        && matches!(
-            config_account.data_len(),
-            LEGACY_CONFIG_SIZE_U64
-                | LEGACY_CONFIG_SIZE_U128
-                | LEGACY_CONFIG_SIZE_BOOTSTRAP_END
-        )
-    {
-        if expected_vote_nonce.is_some() {
+    if matches!(
+        config_account.data_len(),
+        LEGACY_CONFIG_SIZE_U64
+            | LEGACY_CONFIG_SIZE_U128
+            | LEGACY_CONFIG_SIZE_BOOTSTRAP_END
+    ) {
+        if action != VOTE_RETRACT || expected_vote_nonce.is_some() {
             return Err(ProgramError::InvalidInstructionData);
         }
         return retract_legacy_vote(
@@ -1208,11 +1203,10 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         msg!("retract your existing vote before backing another proposal");
         return Err(ProgramError::InvalidInstructionData);
     }
-    if action == VOTE_RETRACT
-        && !matches!(
-            expected_vote_nonce,
-            Some(nonce) if nonce == ballot.vote_nonce
-        )
+    if !matches!(
+        expected_vote_nonce,
+        Some(nonce) if nonce == ballot.vote_nonce
+    )
         && !(expected_vote_nonce.is_none() && ballot.vote_nonce == 0)
     {
         return Err(ProgramError::InvalidInstructionData);

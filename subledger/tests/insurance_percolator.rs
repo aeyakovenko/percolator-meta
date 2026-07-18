@@ -1690,17 +1690,19 @@ fn gv_vote_ix(
     action: u8,
 ) -> Instruction {
     let mut ix = legacy_gv_vote_ix(env, ve, voter, gv_proposal, action);
-    if action == 2 && env.svm.get_account(&ve.gv_config).unwrap().data.len() == 264 {
+    if env.svm.get_account(&ve.gv_config).unwrap().data.len() == 264 {
         let ballot = Pubkey::find_program_address(
             &[b"gv_ballot", ve.gv_config.as_ref(), voter.as_ref()],
             &gv_id(),
         )
         .0;
-        if let Some(account) = env.svm.get_account(&ballot) {
-            if account.data.len() >= 120 {
-                ix.data.extend_from_slice(&account.data[96..104]);
-            }
-        }
+        let vote_nonce = env
+            .svm
+            .get_account(&ballot)
+            .filter(|account| account.data.len() >= 120)
+            .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
+            .unwrap_or(0);
+        ix.data.extend_from_slice(&vote_nonce.to_le_bytes());
     }
     ix
 }
@@ -4790,16 +4792,25 @@ fn presigned_back_cannot_restore_a_retracted_vote_at_the_bootstrap_deadline() {
     env.svm.expire_blockhash();
     let held_blockhash = env.svm.latest_blockhash();
     let payer = clone_kp(&env.payer);
-    let back = legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
-    let withheld_back = Transaction::new_signed_with_payer(
-        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), back.clone()],
+    let exact_back = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    let withheld_exact_back = Transaction::new_signed_with_payer(
+        &[ComputeBudgetInstruction::set_compute_unit_limit(1_400_000), exact_back.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_legacy_back = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1),
+        ],
         Some(&payer.pubkey()),
         &[&payer, &alice],
         held_blockhash,
     );
     env.svm
         .send_transaction(Transaction::new_signed_with_payer(
-            &[ComputeBudgetInstruction::set_compute_unit_limit(1_399_999), back],
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_399_999), exact_back],
             Some(&payer.pubkey()),
             &[&payer, &alice],
             held_blockhash,
@@ -4820,20 +4831,34 @@ fn presigned_back_cannot_restore_a_retracted_vote_at_the_bootstrap_deadline() {
 
     env.warp_slot(bootstrap_end - 1);
     assert!(
-        env.svm.send_transaction(withheld_back).is_err(),
-        "a back signature must be bound to the ballot incarnation it observed"
+        env.svm.send_transaction(withheld_exact_back).is_err(),
+        "an exact back signature must be bound to the ballot incarnation it observed"
+    );
+    assert!(
+        env.svm.send_transaction(withheld_legacy_back).is_err(),
+        "a nonce-bearing ballot must reject a predecessor action-only back"
     );
     assert_eq!(
         gv_proposal_support(&env, &gv_proposal),
         (0, 0),
-        "the withdrawn vote stays withdrawn through the deadline"
+        "neither stale authorization restores withdrawn support"
     );
 
+    let fresh_back = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(1_399_997), fresh_back],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("a back signed for the current ballot incarnation remains live");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal).1, amount);
+
     env.warp_slot(bootstrap_end);
-    assert!(
-        gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal).is_err(),
-        "a proposal with no current support must remain unsealable"
-    );
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("only the freshly authorized support seals the proposal");
+    assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
 }
 
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):

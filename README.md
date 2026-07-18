@@ -196,10 +196,11 @@ slot-only wire remains valid only for predecessor books that are exit-only under
 3. **Bootstrap vote.** The default bootstrap delay is six 30-day months and is configurable in the
    pool/config PDA. A voter can vote immediately after depositing, and must retract before changing
    proposals or withdrawing. Quorum and the winning strict majority are computed from live,
-   unwithdrawn principal. Current retracts commit to the ballot's monotonic vote nonce, so an old
-   signature cannot remove a later vote. The action-only predecessor wire remains usable for a
-   nonce-zero predecessor or first ballot and for exit-only legacy configurations. A proposal is not
-   votable until its declared entry capacity is full, so no creator action remains after voting.
+   unwithdrawn principal. Current backs and retracts commit to the ballot's monotonic vote nonce, so
+   an old signature cannot restore a withdrawn vote or remove a later one. The action-only predecessor
+   wire remains usable for a nonce-zero predecessor or first ballot and for exit-only legacy
+   configurations. A proposal is not votable until its declared entry capacity is full, so no creator
+   action remains after voting.
    New backing closes at the bootstrap deadline; retraction remains available so the lock cannot
    trap principal while the permissionless trigger is pending or after it executes. Before an
    unsealed election can be unwound permissionlessly, every qualifying proposal has one configured

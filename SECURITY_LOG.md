@@ -14261,3 +14261,24 @@ Current exact retracts commit to that nonce. The predecessor action-only wire re
 zero, preserving every existing live ballot and first-incarnation exit, while old config generations keep
 their exit-only retract path. The change adds no account, allocation, signer, authority, recipient, CPI, token
 path, or custody surface.
+
+## Tick - stale signed back restored withdrawn Genesis support (surface B, REAL DOS)
+
+The retract-incarnation fix initially bound only retracts. A previously signed back still named no ballot
+incarnation. A relayer could withhold that transaction, let the voter land a distinct back and exact retract,
+then replay the old back in the final admissible slot. The vulnerable binary restored support the voter had
+withdrawn and relocked the position. A cranker could then seal that proposal at the deadline before the voter
+could retract again, changing the immutable 100%-supply result without a current vote.
+
+Retained clean-room test commit `f44a4f4` reproduces the public path against parent `405bdab` with the real
+Genesis Vote, Subledger, Distribution, and pinned Percolator SBF binaries. One valid blockhash spans both
+distinct backs, the exact retract, the final-slot replay, and the deadline. The fixed probe withholds both an
+exact old-nonce back and the predecessor action-only back, requires each to reject without restoring support,
+then proves a fresh current-nonce back in that same final slot remains sealable. Mutation-disabling only the
+shared nonce comparison makes the stale exact back restore the vote at the intended assertion.
+
+FIX: the existing ballot nonce now binds both current back and retract wires. Action-only compatibility is
+accepted only while a current ballot nonce is zero; every historical live ballot can therefore still vote or
+exit once under its old client, while any replacement incarnation requires the exact wire. Exit-only legacy
+config generations retain only their historical retract. The change adds no state, account, allocation,
+signer, authority, recipient, CPI, token path, or custody surface.
