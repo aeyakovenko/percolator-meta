@@ -2604,6 +2604,104 @@ fn pre_portfolio_id_stake_cannot_resume_counter_accrual_after_upgrade() {
     );
 }
 
+fn exercise_frozen_pre_portfolio_id_trader_claim(predecessor_size: usize) {
+    assert!(matches!(predecessor_size, 211 | 212));
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let supply = 1_000_000u64;
+    let env = setup_custom_split_with_fee_and_extras(
+        &mut svm,
+        &payer,
+        supply,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &[],
+    );
+
+    let owner = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+    set_slot(&mut svm, 100);
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_TRADER,
+    )
+    .expect("register the predecessor trader stake");
+
+    set_slot(&mut svm, 1_124);
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        20_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+        .expect("predecessor crystallizes its live trader loss");
+
+    let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_TRADER);
+    let mut predecessor = svm.get_account(&stake).unwrap();
+    assert_eq!(predecessor.data.len(), 220);
+    predecessor.data.truncate(predecessor_size);
+    svm.set_account(stake, predecessor).unwrap();
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window + 1);
+    freeze(&mut svm, &payer, &env).expect("freeze the predecessor trader denominator");
+
+    // Claim still applies the live cap. Half of the crystallized loss was spent after the
+    // predecessor froze, so exactly half of its fixed cohort allocation remains payable.
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        20_000,
+        10_000,
+    );
+    let recipient = create_token_account(&mut svm, &payer, &env.coin_mint, &owner.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &recipient,
+        Some(&portfolio),
+    )
+    .expect("frozen pre-ID trader claim remains live after upgrade");
+    assert_eq!(token_amount(&svm, &recipient), supply / 2);
+    assert_eq!(token_amount(&svm, &env.vault), supply / 2);
+}
+
+#[test]
+fn frozen_pre_portfolio_id_trader_stake_preserves_its_live_capped_claim() {
+    exercise_frozen_pre_portfolio_id_trader_claim(211);
+    exercise_frozen_pre_portfolio_id_trader_claim(212);
+}
+
 #[test]
 fn pre_market_index_extra_market_stake_claims_after_pre_archive_portfolio_close() {
     let mut svm = LiteSVM::new();

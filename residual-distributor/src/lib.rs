@@ -2759,11 +2759,19 @@ fn claim(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
                 // lets an owner close the portfolio to erase that cap and claim stale points.
                 return Err(ProgramError::InvalidAccountData);
             } else {
+                // The two published predecessor layouts have no portfolio ID. They cannot resume
+                // accrual, but an already-frozen trader must still be able to apply its live cap
+                // and claim. Current stakes remain bound to their exact nonzero incarnation.
+                let expected_portfolio_id = match stake_data_len {
+                    LEGACY_STAKE_SIZE | INDEXED_STAKE_SIZE => None,
+                    len if len >= STAKE_SIZE => Some(stake.portfolio_id),
+                    _ => return Err(ProgramError::InvalidAccountData),
+                };
                 let totals = portfolio_totals(
                     program_id,
                     &config,
                     &stake.owner,
-                    Some(stake.portfolio_id),
+                    expected_portfolio_id,
                     portfolio,
                     portfolio_archive,
                     Some(&portfolio_market),
