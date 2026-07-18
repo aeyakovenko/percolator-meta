@@ -20951,19 +20951,27 @@ fn e2e_voter_cannot_back_two_proposals_without_retracting() {
         &gv_id_e2e(),
     )
     .0;
-    let vote = |gv_proposal: &Pubkey, action: u8| Instruction {
-        program_id: gv_id_e2e(),
-        accounts: vec![
-            AccountMeta::new(alice.pubkey(), true),
-            AccountMeta::new(env.gv_config, false),
-            AccountMeta::new(gv_ballot, false),
-            AccountMeta::new(*gv_proposal, false),
-            AccountMeta::new(position, false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, action],
+    let vote = |svm: &LiteSVM, gv_proposal: &Pubkey, action: u8| {
+        let vote_nonce = svm
+            .get_account(&gv_ballot)
+            .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
+            .unwrap_or(0);
+        let mut data = vec![3u8, action];
+        data.extend_from_slice(&vote_nonce.to_le_bytes());
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(alice.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(gv_ballot, false),
+                AccountMeta::new(*gv_proposal, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data,
+        }
     };
     let send = |svm: &mut LiteSVM, ix: Instruction| {
         svm.expire_blockhash();
@@ -20977,7 +20985,8 @@ fn e2e_voter_cannot_back_two_proposals_without_retracting() {
     };
 
     // Back A.
-    send(&mut svm, vote(&gv_a, 1)).expect("back A");
+    let back_a = vote(&svm, &gv_a, 1);
+    send(&mut svm, back_a).expect("back A");
     // COVERAGE (mutation-sharpness for the one-vote-one-proposal guard, lib.rs:612): give B real
     // support (support_weight@72, support_principal@80) — as if another voter had backed it — so vote()'s
     // back-out subtraction does NOT underflow. Without this, B is empty and backing-B-while-live-on-A is
@@ -20995,8 +21004,9 @@ fn e2e_voter_cannot_back_two_proposals_without_retracting() {
         svm.set_account(gv_b, b).unwrap();
     }
     // Backing B while the ballot is live on A is rejected — by guard 612, now that no underflow can mask it.
+    let invalid_back_b = vote(&svm, &gv_b, 1);
     assert!(
-        send(&mut svm, vote(&gv_b, 1)).is_err(),
+        send(&mut svm, invalid_back_b).is_err(),
         "cannot back a second proposal without retracting the first"
     );
     // alice's weight is still wholly on A (no phantom leak to/from B): A unchanged, B's injected support intact.
@@ -21010,8 +21020,10 @@ fn e2e_voter_cannot_back_two_proposals_without_retracting() {
         "alice's weight stays on A — the rejected back-of-B left no phantom split"
     );
     // Retract A, then B can be backed.
-    send(&mut svm, vote(&gv_a, 2)).expect("retract A");
-    send(&mut svm, vote(&gv_b, 1)).expect("after retract, back B");
+    let retract_a = vote(&svm, &gv_a, 2);
+    send(&mut svm, retract_a).expect("retract A");
+    let back_b = vote(&svm, &gv_b, 1);
+    send(&mut svm, back_b).expect("after retract, back B");
 }
 
 // FEATURE (veto-exit): the genesis insurance pool is now share-based (POLICY_WITH_SURPLUS), so a
@@ -23636,9 +23648,11 @@ fn e2e_retract_reback_cannot_inflate_vote_weight() {
     .0;
     let vote = |svm: &mut LiteSVM, action: u8| {
         let mut data = vec![3u8, action];
-        if action == 2 {
-            data.extend_from_slice(&svm.get_account(&ballot).unwrap().data[96..104]);
-        }
+        let vote_nonce = svm
+            .get_account(&ballot)
+            .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
+            .unwrap_or(0);
+        data.extend_from_slice(&vote_nonce.to_le_bytes());
         let ix = Instruction {
             program_id: gv_id_e2e(),
             accounts: vec![
@@ -49182,27 +49196,37 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         ],
         data: interleaved_withdraw_data,
     };
-    let vote_after_return = |action: u8| Instruction {
-        program_id: gv_id_e2e(),
-        accounts: vec![
-            AccountMeta::new(depositor.pubkey(), true),
-            AccountMeta::new(env.gv_config, false),
-            AccountMeta::new(depositor_ballot, false),
-            AccountMeta::new(depositor_proposal, false),
-            AccountMeta::new(position, false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, action],
+    let vote_after_return = |action: u8, vote_nonce: u64| {
+        let mut data = vec![3u8, action];
+        data.extend_from_slice(&vote_nonce.to_le_bytes());
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(depositor_ballot, false),
+                AccountMeta::new(depositor_proposal, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data,
+        }
     };
+    let vote_nonce = u64::from_le_bytes(
+        svm.get_account(&depositor_ballot).unwrap().data[96..104]
+            .try_into()
+            .unwrap(),
+    );
+    let next_vote_nonce = vote_nonce.checked_add(1).unwrap();
     svm.expire_blockhash();
     let blockhash = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[
-            vote_after_return(2),
+            vote_after_return(2, vote_nonce),
             interleaved_withdraw,
-            vote_after_return(1),
+            vote_after_return(1, next_vote_nonce),
         ],
         Some(&payer.pubkey()),
         &[&payer, &depositor],
