@@ -32336,14 +32336,12 @@ fn e2e_init_book_rejects_degenerate_params() {
     );
 }
 
-// INIT_BOOK OVER A PRE-FUNDED ESCROW (stranded-COIN anti-strand): init_book binds the coin_escrow + settlement_usd
-// to a FRESH book that records 0 bids. If either already holds a balance (a donated/leftover amount, or a re-init
-// attempt after bids exist), binding it would STRAND that balance — no bidder slot owns it, and only claim/cancel
-// (which walk the book slots) ever move it from the book_escrow PDA = a permanent fund-freeze. The guards are
-// `ce.amount == 0` (lib.rs:1028) and `su.amount == 0` (1032). The existing init_book tests all use empty escrows;
-// this pins the amount==0 anti-strand on both legs.
+// PUBLIC INIT DOS: the approved Squads transaction reveals both pre-created escrow addresses for
+// the full one-week timelock. SPL Token transfers need no destination signature, so one atom sent
+// to either account must not veto init_book and force governance to restart that delay. Unsolicited
+// balances have no bidder slot and remain segregated while recorded obligations settle normally.
 #[test]
-fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
+fn e2e_public_escrow_dust_cannot_veto_book_init_or_inflate_claims() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -32362,13 +32360,8 @@ fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
     let coin_escrow = Pubkey::new_unique();
     let settlement_usd = Pubkey::new_unique();
     let holding = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &settlement_usd,
-        &env.collateral_mint,
-        &book_escrow,
-        0,
-    );
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(&mut svm, &settlement_usd, &env.collateral_mint, &book_escrow, 0);
     set_token(
         &mut svm,
         &holding,
@@ -32391,8 +32384,6 @@ fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
         AccountMeta::new_readonly(twap_id(), false),
     ];
 
-    // (a) PRE-FUNDED coin_escrow -> rejected (binding it would strand the 50k COIN).
-    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 50_000);
     let msg = build_init_book_message(
         &env.squads_vault,
         &book,
@@ -32410,56 +32401,188 @@ fn e2e_init_book_rejects_a_prefunded_escrow_no_stranded_balance() {
         0,
         None,
     );
-    assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &msg, &rem).is_err(),
-        "init_book must reject a pre-funded coin_escrow (would strand the COIN — no bidder slot owns it)");
-    assert!(
-        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
-        "book never created over a funded coin_escrow"
-    );
-
-    // (b) PRE-FUNDED settlement_usd (coin_escrow now empty) -> rejected (would strand the 50k USD).
-    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
-    set_token(
+    let idx = 5u64;
+    let transaction = transaction_pda(&env.squads, &env.multisig, idx);
+    let proposal = proposal_pda(&env.squads, &env.multisig, idx);
+    let send_sq = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &env.dao],
+            bh,
+        ))
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+    };
+    send_sq(
         &mut svm,
-        &settlement_usd,
-        &env.collateral_mint,
-        &book_escrow,
-        50_000,
-    );
-    let msg2 = build_init_book_message(
-        &env.squads_vault,
-        &book,
-        &env.twap_cfg,
-        &book_escrow,
-        &coin_escrow,
-        &settlement_usd,
-        &holding,
-        &env.coin_mint,
-        &env.collateral_mint,
-        0,
-        1,
-        10,
-        0,
-        0,
-        None,
-    );
-    assert!(
-        squads_execute(
-            &mut svm,
+        vault_transaction_create_ix(
             &env.squads,
             &env.multisig,
-            &env.dao,
-            &payer,
-            6,
-            &msg2,
-            &rem
-        )
-        .is_err(),
-        "init_book must reject a pre-funded settlement_usd (would strand the USD)"
+            &transaction,
+            &env.dao.pubkey(),
+            &msg,
+        ),
+    )
+    .expect("publish init_book transaction");
+    send_sq(
+        &mut svm,
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &proposal,
+            &env.dao.pubkey(),
+            idx,
+        ),
+    )
+    .expect("create init_book proposal");
+    send_sq(
+        &mut svm,
+        proposal_approve_ix(&env.squads, &env.multisig, &proposal, &env.dao.pubkey()),
+    )
+    .expect("approve init_book proposal");
+
+    // ATTACK: after the immutable transaction exposes the accounts, an unrelated signer dusts
+    // both destinations through the public SPL Token interface during the mandatory delay.
+    let attacker = Keypair::new();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let attacker_coin = Pubkey::new_unique();
+    let attacker_usd = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_coin,
+        &env.coin_mint,
+        &attacker.pubkey(),
+        0,
     );
-    assert!(
-        svm.get_account(&book).map_or(true, |a| a.data.is_empty()),
-        "book never created over a funded settlement_usd"
+    mint_coin(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.coin_mint_authority,
+        &attacker_coin,
+        1,
+    );
+    set_token(
+        &mut svm,
+        &attacker_usd,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&attacker],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &attacker_coin,
+            &coin_escrow,
+            &attacker.pubkey(),
+            &[],
+            1,
+        )
+        .unwrap(),
+    )
+    .expect("public COIN dust during timelock");
+    send(
+        &mut svm,
+        &[&attacker],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &attacker_usd,
+            &settlement_usd,
+            &attacker.pubkey(),
+            &[],
+            1,
+        )
+        .unwrap(),
+    )
+    .expect("public collateral dust during timelock");
+    assert_eq!(token_amount(&svm, &coin_escrow), 1);
+    assert_eq!(token_amount(&svm, &settlement_usd), 1);
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar::<Clock>(&clock);
+    send_sq(
+        &mut svm,
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &proposal,
+            &transaction,
+            &env.dao.pubkey(),
+            &rem,
+        ),
+    )
+    .expect("dust cannot veto the approved book initialization");
+
+    let (bidder, coin_ata, usd_ata) = new_bidder(&mut svm, &payer, &env, 100_000);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book,
+            &book_escrow,
+            &coin_escrow,
+            &coin_ata,
+            &usd_ata,
+            &env.coin_mint,
+            &env.collateral_mint,
+            100_000,
+            100_000,
+            None,
+        ),
+    )
+    .expect("ordinary bid enters the dusted book");
+    let round_end = {
+        let book_account = svm.get_account(&book).unwrap();
+        u64::from_le_bytes(book_account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &book,
+            &holding,
+            &settlement_usd,
+            &book_escrow,
+            &coin_escrow,
+            None,
+        ),
+    )
+    .expect("dusted book settles");
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &book,
+            &book_escrow,
+            &settlement_usd,
+            &coin_escrow,
+            &usd_ata,
+            &coin_ata,
+            0,
+        ),
+    )
+    .expect("recorded bidder claim drains and reopens the book");
+    assert_eq!(token_amount(&svm, &usd_ata), 100_000);
+    assert_eq!(token_amount(&svm, &coin_ata), 0);
+    assert_eq!(token_amount(&svm, &coin_escrow), 1);
+    assert_eq!(token_amount(&svm, &settlement_usd), 1);
+    assert_eq!(
+        svm.get_account(&book).unwrap().data[248],
+        0,
+        "unowned dust neither inflates the claim nor blocks the singleton book from reopening",
     );
 }
 
