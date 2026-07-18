@@ -2239,9 +2239,12 @@ fn process_close_market_and_reclaim<'a>(
 }
 
 // init_market accounts:
-// [payer(s), governance, controller_pda, market(w), collateral_mint, percolator_program]
+// [payer(s), governance, controller_pda, market(w), collateral_mint, percolator_program,
+//  retired_market_marker]
 // data: exact raw Percolator InitMarket bytes. Governance need not sign, so market
 // creation is permissionless while future controller actions remain governance-gated.
+// A retired slab key cannot re-enter this stateless controller: approved governance
+// actions bind account keys and could otherwise act on a later market generation.
 fn process_init_market<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -2257,6 +2260,7 @@ fn process_init_market<'a>(
     let market = next_account_info(iter)?;
     let collateral_mint = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    let retired_market = next_account_info(iter)?;
     if !payer.is_signer || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -2267,6 +2271,16 @@ fn process_init_market<'a>(
         market,
         percolator_program,
     )?;
+    let (market_retired, _) = retired_market_marker_state(
+        program_id,
+        retired_market,
+        percolator_program.key,
+        market.key,
+        &solana_program::system_program::ID,
+    )?;
+    if market_retired {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let bump_seed = [bump];
     let seeds = signer_seeds(
         governance.key,
@@ -2395,6 +2409,7 @@ fn process_grant_genesis_pool<'a>(
 
 // accept_market_authority accounts:
 // [governance, current_authority(signer), controller_pda, market(w), percolator_program,
+//  retired_market_marker,
 //  custody_state(optional when a canonical Subledger/TWAP PDA already owns asset_admin)]
 // A permissionless creator can hand a market to the governance-bound controller;
 // governance does not need to participate in or approve the donation. Percolator's
@@ -2423,6 +2438,7 @@ fn process_accept_market_authority<'a>(
     let controller = next_account_info(iter)?;
     let market = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    let retired_market = next_account_info(iter)?;
     let custody_state = iter.next();
     if !current.is_signer || iter.next().is_some() {
         return Err(ProgramError::MissingRequiredSignature);
@@ -2434,6 +2450,16 @@ fn process_accept_market_authority<'a>(
         market,
         percolator_program,
     )?;
+    let (market_retired, _) = retired_market_marker_state(
+        program_id,
+        retired_market,
+        percolator_program.key,
+        market.key,
+        &solana_program::system_program::ID,
+    )?;
+    if market_retired {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let restore_outgoing_backing = {
         let market_data = market.try_borrow_data()?;
         if !percolator_accounting::all_secondary_assets_retired(&market_data)
