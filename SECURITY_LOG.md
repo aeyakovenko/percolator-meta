@@ -2,6 +2,31 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - live insurance could exit before stale portfolios realized loss (surface B/C)
+
+Pinned Percolator allowed an asset-local live insurance withdrawal once the market-level mark had
+caught up and the aggregate stress flags were clear. Another portfolio could advance that mark while
+a losing portfolio still carried its pre-mark certificate. The constrained operator could then remove
+insurance before a permissionless crank crystallized the loss. This was reachable through both a
+signing depositor's public TWAP-to-Subledger full exit and an ordinary permissionless TWAP surplus
+round; neither route required governance or a forged account.
+
+The real-SBF LiteSVM exploit first removed a `500`-atom reserve through the public owner return, then
+settled and liquidated the stale short. The loser recorded the crystallized deficit with
+`insurance_spent = 0`, and the asset entered `ResetPending` with a nonzero epoch-start social-loss
+accumulator. A separate exact red/green probe opened balanced OI against the standard `1,500,000`-
+atom handoff fixture. The pre-fix permissionless round advanced but pulled `400,048` fresh insurance
+atoms into its auction holding while both positions remained live.
+
+FIX: `percolator-accounting` exposes the pinned engine's complete asset-local position/loss-state
+predicate, including OI, stored and stale position counts, active and epoch-start loss accumulators,
+loss weights, social-loss remainder/dust, explicit unallocated loss, side modes, and pending domain
+barriers. Positive live Subledger payouts now reject before any CPI or accounting mutation. TWAP
+rounds still settle and advance under exposure but pull no fresh insurance and do not ratchet the
+floor. Live secondary shutdown return uses the same predicate; resolved cleanup is unchanged.
+Fully impaired zero-payout positions can still retire. No instruction, signer, authority, recipient,
+admin role, caller-selected amount, or value destination was added.
+
 ## Tick - zero-capital backing keys cannot collect trade fees (surface A/C; coverage only)
 
 Market donation intentionally preserves a distinct asset-0 backing provider while it rejects an

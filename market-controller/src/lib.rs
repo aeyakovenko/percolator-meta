@@ -1223,6 +1223,14 @@ fn process_return_shutdown_insurance<'a>(
             usize::from(asset_index),
         )
         .map_err(|_| ProgramError::InvalidAccountData)?;
+        if percolator_accounting::asset_has_position_or_loss_state(
+            &market_data,
+            usize::from(asset_index),
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let controller_owned =
             authority == controller.key.to_bytes() && operator == controller.key.to_bytes();
         if authority == [0u8; 32]
