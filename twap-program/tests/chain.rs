@@ -28686,6 +28686,191 @@ fn e2e_bid_fee_is_charged_and_burned() {
     let _ = (alice, poor);
 }
 
+// PUBLIC LOF: a bidder signs the amount offered, but the flat fee is read from mutable book state
+// when the transaction lands. A ready Squads action must not be able to raise that fee, land first
+// under the same blockhash, and burn unrelated COIN from the bidder's canonical account.
+#[test]
+fn e2e_squads_cannot_front_run_a_presigned_bid_with_a_fee_increase() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let observed_fee = 2_000u64;
+    let hostile_fee = 50_000u64;
+    let coin_atoms = 10_000u64;
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, observed_fee);
+    let (alice, alice_coin, alice_usd) =
+        new_bidder(&mut svm, &payer, &env, coin_atoms + hostile_fee);
+
+    // Prepare and approve the fee action before the user signs, then wait out the real Squads
+    // timelock. Only its final public execute remains, so it can race the user's transaction.
+    let transaction_index = 6u64;
+    let transaction = transaction_pda(&env.squads, &env.multisig, transaction_index);
+    let proposal = proposal_pda(&env.squads, &env.multisig, transaction_index);
+    let message = build_set_bid_fee_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        hostile_fee,
+    );
+    for instruction in [
+        vault_transaction_create_ix(
+            &env.squads,
+            &env.multisig,
+            &transaction,
+            &env.dao.pubkey(),
+            &message,
+        ),
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &proposal,
+            &env.dao.pubkey(),
+            transaction_index,
+        ),
+        proposal_approve_ix(
+            &env.squads,
+            &env.multisig,
+            &proposal,
+            &env.dao.pubkey(),
+        ),
+    ] {
+        svm.expire_blockhash();
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&env.dao.pubkey()),
+            &[&env.dao],
+            svm.latest_blockhash(),
+        );
+        svm.send_transaction(transaction)
+            .expect("prepare timelocked bid-fee action");
+    }
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar::<Clock>(&clock);
+
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let presigned_bid = Transaction::new_signed_with_payer(
+        &[place_bid_ix(
+            &alice.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &alice_coin,
+            &alice_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            coin_atoms as u128,
+            5_000,
+            None,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        shared_blockhash,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let fee_front_run = Transaction::new_signed_with_payer(
+        &[vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &proposal,
+            &transaction,
+            &env.dao.pubkey(),
+            &remaining,
+        )],
+        Some(&env.dao.pubkey()),
+        &[&env.dao],
+        shared_blockhash,
+    );
+
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let fee_update = svm.send_transaction(fee_front_run);
+    let bid_result = svm.send_transaction(presigned_bid);
+    bid_result.expect("the already-signed bid remains executable at the fee the user observed");
+    let burned = supply_before - mint_supply(&svm, &env.coin_mint);
+    assert!(
+        fee_update.is_err(),
+        "a post-init fee increase landed and burned {burned} COIN from a bid that authorized only the observed {observed_fee} fee"
+    );
+    assert_eq!(burned, observed_fee);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), coin_atoms);
+    assert_eq!(
+        token_amount(&svm, &alice_coin),
+        hostile_fee - observed_fee,
+        "unrelated COIN remains in the bidder's account"
+    );
+
+    let lowered_fee = 1_000u64;
+    let lower_message = build_set_bid_fee_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        lowered_fee,
+    );
+    let lower_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &lower_message,
+        &lower_remaining,
+    )
+    .expect("governance can lower the initialized bid fee");
+    let (bob, bob_coin, bob_usd) = new_bidder(
+        &mut svm,
+        &payer,
+        &env,
+        coin_atoms + lowered_fee,
+    );
+    let supply_before_lowered_bid = mint_supply(&svm, &env.coin_mint);
+    send(
+        &mut svm,
+        &[&bob],
+        place_bid_ix(
+            &bob.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &bob_coin,
+            &bob_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            coin_atoms as u128,
+            4_000,
+            None,
+        ),
+    )
+    .expect("a later bid pays the lowered fee");
+    assert_eq!(
+        supply_before_lowered_bid - mint_supply(&svm, &env.coin_mint),
+        lowered_fee
+    );
+}
+
 fn cancel_ix(
     bidder: &Pubkey,
     config: &Pubkey,

@@ -14126,3 +14126,24 @@ use the authenticated live/archive cap, while current 220-byte stakes still requ
 This does not reopen registration or crystallization and cannot increase a frozen numerator or denominator,
 change a recipient, or move collateral, insurance, backing, or Subledger principal. The compatibility bound
 is reward COIN only.
+
+## Tick - post-signature bid-fee increase could burn unrelated bidder COIN (surface A/D, REAL LOF)
+
+The auction bid wire commits to the offered COIN and requested collateral but not to a maximum flat fee.
+`place_bid` read the mutable fee from the book when the transaction landed and burned it from the bidder's
+canonical COIN account. A compromised DAO could therefore prepare and approve a timelocked fee increase,
+wait for a user to sign under the current fee, execute the ready Squads action first, and consume unrelated
+COIN held in that account. The signature authorized the token program burn CPI but did not commit to its
+amount.
+
+The retained clean-room LiteSVM regression uses the real Squads and TWAP SBF binaries. Against vulnerable
+parent `f64b95549187d60574029b4b6d34521dbea3ae95`, it approves a fee increase from `2,000` to `50,000`, signs
+both the final Squads execute and the public bid with one blockhash, lands the update first, and observes the
+bid burn all `50,000` COIN while still escrowing the requested `10,000`. The fixed binary rejects only the
+increase, executes the already-signed bid at `2,000`, preserves the other `48,000`, and then proves a later
+timelocked decrease to `1,000` remains usable.
+
+FIX: book initialization now selects the maximum bid fee and `set_bid_fee` may only keep or lower it. This is
+the same by-construction rule used for Percolator trade fees whose public wire also lacks a user maximum. The
+change adds no instruction, account, signer, authority, recipient, CPI, or custody surface; a future increase
+requires an explicit maximum-fee field in a new user wire.

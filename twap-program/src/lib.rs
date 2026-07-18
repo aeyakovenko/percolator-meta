@@ -3129,7 +3129,8 @@ fn process_set_coin_sink(
 }
 
 // set_bid_fee accounts: [squads_vault(signer), config, book(w)]
-// data: bid_fee (u64) — the flat COIN amount burned on every place_bid (anti-spam). Squads-gated.
+// data: bid_fee (u64) — the flat COIN amount burned on every place_bid (anti-spam). Squads-gated
+// and monotonic nonincreasing after book initialization.
 fn process_set_bid_fee(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3152,6 +3153,11 @@ fn process_set_bid_fee(
     let book = load_book_header(&book_account.try_borrow_data()?)?;
     if book.config != *config_account.key {
         return Err(ProgramError::InvalidAccountData);
+    }
+    // The bid wire has no user-supplied maximum fee. An increase could land ahead of an
+    // already-signed bid and burn unrelated COIN from the bidder's canonical account.
+    if bid_fee > book.bid_fee {
+        return Err(ProgramError::InvalidInstructionData);
     }
     book_account.try_borrow_mut_data()?[BK_BID_FEE..BK_BID_FEE + 8]
         .copy_from_slice(&bid_fee.to_le_bytes());
