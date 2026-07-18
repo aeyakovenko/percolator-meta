@@ -2073,9 +2073,9 @@ const SL_USDC: usize = 114; // usdc_atoms wanted (the limit: rate = coin_atoms /
 const SL_USD_OWED: usize = 130; // set at execute: USD this bid won
 const SL_COIN_REFUND: usize = 146; // set at execute: COIN to return (unsold + over-escrow)
 const SL_PLACE_SLOT: usize = 162; // u64: slot the bid was placed (cancel after 2*round_length)
-const SL_PLACE_ROUND_END: usize = 170; // u64: book.round_end at placement. Recorded for layout/diagnostics;
-                                       // NO LONGER gates cancel (issue #28: a no-op roll moved round_end and
-                                       // unlocked cancel early — cancel now gates on the aged window alone).
+const SL_PLACE_ROUND_END: usize = 170; // u64: book.round_end at placement. Bound into the exact cancel
+                                       // commitment but NOT a cooldown gate (issue #28: a no-op roll moved
+                                       // round_end; cancellation now gates on the aged window alone).
 const SLOT_SIZE: usize = 178;
 const BOOK_SIZE: usize = BOOK_HEADER + MAX_BIDS * SLOT_SIZE;
 
@@ -3386,9 +3386,8 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     book_wr_u128(&mut d, o + SL_USDC, usdc_atoms);
     book_wr_u128(&mut d, o + SL_USD_OWED, 0);
     book_wr_u128(&mut d, o + SL_COIN_REFUND, 0);
-    // Record when the bid was placed + the round it joined, so cancel is only allowed AFTER an
-    // execute has cleared the book once (round_end moved) or 2*round_length slots pass — there is
-    // no last-second cancel that could manipulate a pending execute.
+    // Record when the bid was placed and the round it joined. Both identify the bid incarnation;
+    // place_slot also keeps cancellation closed until 2*round_length slots pass.
     let now = solana_program::clock::Clock::get()?.slot;
     d[o + SL_PLACE_SLOT..o + SL_PLACE_SLOT + 8].copy_from_slice(&now.to_le_bytes());
     d[o + SL_PLACE_ROUND_END..o + SL_PLACE_ROUND_END + 8]
@@ -4258,12 +4257,13 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> 
 
 // cancel_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
 //   coin_ata(w), token_program]
-// data: slot_index (u8)
+// data (current books): slot_index (u8) || place_slot (u64) || place_round_end (u64)
+//   || coin_atoms (u128) || usdc_atoms (u128)
+// data (exit-only legacy books without a cancel clock): slot_index (u8)
 //
-// Reclaim an UNSETTLED bid's escrowed COIN. Bidder-signed and gated on a cooldown: allowed only
-// once an `execute` has cleared the book at least once since placement (book.round_end moved) OR
-// 2*round_length slots have elapsed. That cooldown is what prevents a last-second cancel from
-// manipulating a pending execute (no race). A settled bid is resolved through `claim` instead.
+// Reclaim an UNSETTLED bid's escrowed COIN. Bidder-signed and gated until 2*round_length slots
+// have elapsed. That cooldown prevents a last-second cancel from manipulating a pending execute.
+// A settled bid is resolved through `claim` instead.
 // Only the escrowed `coin_atoms` is returned — the flat anti-spam fee was burned up front at
 // placement and is never refunded, so cancelling still costs the bidder the fee.
 fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -4276,10 +4276,19 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
     let coin_ata = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
 
-    if data.len() != 1 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let slot_index = data[0] as usize;
+    let (slot_index, expected_bid) = match data.len() {
+        1 => (data[0] as usize, None),
+        49 => (
+            data[0] as usize,
+            Some((
+                u64::from_le_bytes(data[1..9].try_into().unwrap()),
+                u64::from_le_bytes(data[9..17].try_into().unwrap()),
+                u128::from_le_bytes(data[17..33].try_into().unwrap()),
+                u128::from_le_bytes(data[33..49].try_into().unwrap()),
+            )),
+        ),
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
     if slot_index >= MAX_BIDS {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -4294,6 +4303,12 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
     }
     validate_exit_config(&config_account.try_borrow_data()?)?;
     let (book, book_layout) = load_exit_book_header(&book_account.try_borrow_data()?)?;
+    // Current slots are reusable. Require the owner signature to commit to every immutable field
+    // that identifies the intended bid, so a withheld cancellation cannot act on a later slot
+    // incarnation. Pre-clock books are exit-only and retain their historical one-byte wire.
+    if book_layout.has_cancel_clock() != expected_bid.is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if book.config != *config_account.key || *coin_escrow.key != book.coin_escrow {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -4315,6 +4330,16 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
             return Err(ProgramError::IllegalOwner); // only the bidder may cancel their own bid
         }
         if book_layout.has_cancel_clock() {
+            let expected_bid = expected_bid.ok_or(ProgramError::InvalidInstructionData)?;
+            let live_bid = (
+                book_rd_u64(&d, o + SL_PLACE_SLOT),
+                book_rd_u64(&d, o + SL_PLACE_ROUND_END),
+                book_rd_u128(&d, o + SL_COIN),
+                book_rd_u128(&d, o + SL_USDC),
+            );
+            if live_bid != expected_bid {
+                return Err(ProgramError::InvalidAccountData);
+            }
             // Anti-spoof commitment (issue #28): a current-format bid is committed until it is
             // settled or the full 2*round_length aging window elapses. Pre-cancel generations have
             // no clock, but are exit-only under the upgraded binary, so cancelling them cannot
