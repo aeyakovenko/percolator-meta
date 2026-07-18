@@ -2365,7 +2365,7 @@ fn process_close_market_and_reclaim<'a>(
 }
 
 // init_market accounts:
-// [payer(s), governance, controller_pda, market(w), collateral_mint, percolator_program,
+// [payer(s), governance, controller_pda, market(s,w), collateral_mint, percolator_program,
 //  retired_market_marker]
 // data: exact raw Percolator InitMarket bytes. Governance need not sign, so market
 // creation is permissionless while future controller actions remain governance-gated.
@@ -2389,6 +2389,9 @@ fn process_init_market<'a>(
     let retired_market = next_account_info(iter)?;
     if !payer.is_signer || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
+    }
+    if !market.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
     }
     let bump = controller_bump(
         program_id,
@@ -2419,7 +2422,7 @@ fn process_init_market<'a>(
             program_id: *percolator_program.key,
             accounts: vec![
                 AccountMeta::new_readonly(*controller.key, true),
-                AccountMeta::new(*market.key, false),
+                AccountMeta::new(*market.key, true),
                 AccountMeta::new_readonly(*collateral_mint.key, false),
             ],
             data: data.to_vec(),

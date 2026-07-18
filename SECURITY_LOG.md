@@ -14305,3 +14305,20 @@ with the live ballot and canonical Subledger position before changing any tally.
 their exit-only retract. Atomic retract/withdraw/re-back transactions explicitly commit to the post-withdraw
 principal. The change adds no state, account, allocation, signer, authority, recipient, CPI, token path, or
 custody surface, and obsolete clients cannot trap funds because every recovery wire remains accepted.
+
+## Tick - unsigned controller initialization consumed another user's blank slab (surface A, REAL DOS)
+
+The controller made market creation permissionless by requiring only the transaction payer. It accepted
+any writable blank Percolator-owned account of the expected size and de-escalated that account to a
+non-signer in its InitMarket CPI. An unrelated caller could therefore initialize another user's already
+rent-funded slab under an attacker-selected governance seed. The victim lost the intended account, and its
+rent entered the controller's terminal lifecycle, without the slab key ever authorizing construction.
+
+The retained clean-room LiteSVM regression creates a real rent-funded Percolator slab with a victim
+keypair, then submits the controller InitMarket transaction with only an unrelated payer. The vulnerable
+controller and pinned Percolator binaries consume the slab. The fixed probe requires that transaction to
+reject byte-atomically, then proves the same permissionless payer succeeds when the slab key signs.
+
+FIX: controller InitMarket requires the fresh market account to be a transaction signer and forwards that
+signer privilege to the Percolator CPI. Governance still does not sign, so market creation remains
+permissionless; possession of an already initialized market or any user deposit grants no new authority.
