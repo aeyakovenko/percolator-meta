@@ -684,20 +684,9 @@ fn gv_vote_cannot_borrow_another_voters_position_to_steal_weight() {
     // ATTACK: mallory signs, but substitutes the WHALE's position account (index 4) to cast the whale's weight.
     let mallory_ballot =
         Pubkey::find_program_address(&[b"gv_ballot", ve.gv_config.as_ref(), mallory.pubkey().as_ref()], &gv_id()).0;
-    let steal = Instruction {
-        program_id: gv_id(),
-        accounts: vec![
-            AccountMeta::new(mallory.pubkey(), true),
-            AccountMeta::new(ve.gv_config, false),
-            AccountMeta::new(mallory_ballot, false),
-            AccountMeta::new(gv_proposal, false),
-            AccountMeta::new(env.position_pda(&whale.pubkey()), false), // <-- the whale's position, not mallory's
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, 1u8],
-    };
+    let mut steal = gv_vote_ix(&env, &ve, &mallory.pubkey(), &gv_proposal, 1);
+    assert_eq!(steal.accounts[2].pubkey, mallory_ballot);
+    steal.accounts[4] = AccountMeta::new(env.position_pda(&whale.pubkey()), false);
     assert!(
         env.send(&[steal], &[&mallory]).is_err(),
         "voting with another depositor's position must be rejected (the PDA bind ties the position to the signer)"
@@ -1703,6 +1692,15 @@ fn gv_vote_ix(
             .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
             .unwrap_or(0);
         ix.data.extend_from_slice(&vote_nonce.to_le_bytes());
+        if action == 1 {
+            let principal = env
+                .svm
+                .get_account(&env.position_pda(voter))
+                .filter(|account| account.data.len() >= 80)
+                .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
+                .unwrap_or(0);
+            ix.data.extend_from_slice(&principal.to_le_bytes());
+        }
     }
     ix
 }
@@ -4407,20 +4405,9 @@ fn a_forged_subledger_position_cannot_fabricate_vote_weight_to_steal_the_supply(
         env.svm.set_account(wrong_key, forged).unwrap(); // owner stays = subledger program
         let gv_ballot = Pubkey::find_program_address(
             &[b"gv_ballot", ve.gv_config.as_ref(), alice.pubkey().as_ref()], &gv_id()).0;
-        let ix = Instruction {
-            program_id: gv_id(),
-            accounts: vec![
-                AccountMeta::new(alice.pubkey(), true),
-                AccountMeta::new(ve.gv_config, false),
-                AccountMeta::new(gv_ballot, false),
-                AccountMeta::new(gv_proposal, false),
-                AccountMeta::new(wrong_key, false), // <- substituted position at a non-canonical key
-                AccountMeta::new_readonly(env.pool, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-                AccountMeta::new_readonly(sub_id(), false),
-            ],
-            data: vec![3u8, 1u8],
-        };
+        let mut ix = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+        assert_eq!(ix.accounts[2].pubkey, gv_ballot);
+        ix.accounts[4] = AccountMeta::new(wrong_key, false);
         assert!(env.send(&[ix], &[&alice]).is_err(),
             "a position at a non-canonical address must be refused (PDA key bind, :569)");
         let (w, p) = gv_proposal_support(&env, &gv_proposal);
@@ -4563,20 +4550,8 @@ fn a_voter_cannot_double_vote_with_a_second_non_canonical_ballot() {
 
     // ATTACK: vote AGAIN but pass a DIFFERENT (non-canonical, fresh) ballot account to bank a second tally.
     let rogue_ballot = Pubkey::new_unique();
-    let rogue_vote = Instruction {
-        program_id: gv_id(),
-        accounts: vec![
-            AccountMeta::new(alice.pubkey(), true),
-            AccountMeta::new(ve.gv_config, false),
-            AccountMeta::new(rogue_ballot, false), // NOT PDA(["gv_ballot", config, alice])
-            AccountMeta::new(gv_proposal, false),
-            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![3u8, 1u8], // vote, action=back
-    };
+    let mut rogue_vote = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    rogue_vote.accounts[2] = AccountMeta::new(rogue_ballot, false);
     assert!(env.send(&[rogue_vote], &[&alice]).is_err(),
         "a second vote with a non-canonical ballot must be rejected — one ballot per voter");
     // The proposal's weight is UNCHANGED: alice still has exactly one ballot's worth, no double-count.
