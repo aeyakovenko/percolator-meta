@@ -25,6 +25,8 @@ pub const TRADE_FEE_BASE_BPS_OFFSET: usize =
     PERMISSIONLESS_MARKET_INIT_FEE_OFFSET + size_of::<u128>();
 // Pinned `WrapperConfigV16` global stale-resolution fields relative to the account.
 pub const PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET: usize = HEADER_LEN + 136;
+pub const FORCE_CLOSE_DELAY_SLOTS_OFFSET: usize =
+    PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET + size_of::<u64>();
 pub const LAST_GOOD_ORACLE_SLOT_OFFSET: usize = HEADER_LEN + 152;
 // Pinned `WrapperConfigV16::free_market_slot_count` relative to the account.
 // The wrapper config starts after the 16-byte account header; this field follows
@@ -432,6 +434,15 @@ pub fn read_trade_fee_base_bps(data: &[u8]) -> Result<u64, ReadError> {
     read_u64(data, TRADE_FEE_BASE_BPS_OFFSET)
 }
 
+/// Returns the hard-stale and force-close deadlines from the pinned wrapper config.
+pub fn read_permissionless_resolve_policy(data: &[u8]) -> Result<(u64, u64), ReadError> {
+    validate_market(data)?;
+    Ok((
+        read_u64(data, PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET)?,
+        read_u64(data, FORCE_CLOSE_DELAY_SLOTS_OFFSET)?,
+    ))
+}
+
 /// Returns whether Percolator's whole-market stale resolution is permissionless now.
 ///
 /// Percolator authenticates instruction-supplied slots against both the Clock sysvar
@@ -814,6 +825,27 @@ mod tests {
 
     #[test]
     fn stale_resolution_uses_the_authenticated_slot_and_exact_boundary() {
+        assert_eq!(
+            PERMISSIONLESS_RESOLVE_STALE_SLOTS_OFFSET,
+            HEADER_LEN
+                + offset_of!(
+                    percolator_prog::state::WrapperConfigV16,
+                    permissionless_resolve_stale_slots
+                )
+        );
+        assert_eq!(
+            FORCE_CLOSE_DELAY_SLOTS_OFFSET,
+            HEADER_LEN
+                + offset_of!(
+                    percolator_prog::state::WrapperConfigV16,
+                    force_close_delay_slots
+                )
+        );
+        let mut policy = market_with_stale_slots(50, 100, 149);
+        policy[FORCE_CLOSE_DELAY_SLOTS_OFFSET..FORCE_CLOSE_DELAY_SLOTS_OFFSET + 8]
+            .copy_from_slice(&20u64.to_le_bytes());
+        assert_eq!(read_permissionless_resolve_policy(&policy), Ok((50, 20)));
+
         let disabled = market_with_stale_slots(0, 100, 1_000);
         assert!(!permissionless_resolution_matured(&disabled, 1_000).unwrap());
 
