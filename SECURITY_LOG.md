@@ -13674,27 +13674,33 @@ fix is not a descendant of this repo's Percolator security pin, so advancing the
 later liquidation, oracle, OI, and collected-fee fixes. This compatibility guard adds no signer,
 account, authority, recipient, amount, token CPI, or user-value surface.
 
-## Tick - zero-payout Subledger exits bypassed TWAP custody accounting (surface A/C)
+## Tick - PARTIAL DOS: zero-payout Subledger exits bypassed TWAP custody accounting (surface A/C)
 
 Subledger relied on a successful Percolator withdrawal CPI to prove that its bound pool still held
 the asset-0 insurance-operator role. A fully impaired or floor-rounded withdrawal computes a zero
 payout and intentionally skips that CPI, but previously still retired owner principal and pool shares.
 After the pool-to-TWAP handoff, an owner could therefore call the ordinary public withdrawal directly,
 mutate Subledger accounting behind TWAP's back, and leave TWAP's protected principal floor overstated.
-This could suppress later fee-surplus auctions until another custody round-trip; it could not redirect
-or withdraw another user's funds.
+This suppresses later fee-surplus auctions; it cannot redirect or withdraw another user's funds.
 
-The retained real-binary LiteSVM regression hands a funded principal pool to TWAP through a timelocked
-Squads execution, applies the fully impaired loss boundary, and calls the owner-signed ordinary exit.
-The old Subledger binary accepts it and desynchronizes the floor. The fixed binary rejects byte-atomically,
-then proves the same owner can permissionlessly use TWAP's fixed return/full-exit path and any cranker can
-re-handoff custody with a zero live-principal floor. The existing pinned-Percolator liquidation regression
-independently produces the same fully impaired state through public trade, oracle, and crank instructions.
+The clean-room LiteSVM proof uses no injected program state. It initializes a real one-asset Percolator
+market and canonical principal pool, deposits one atom, grants and hands custody to TWAP through real
+timelocked Squads transactions, opens a balanced public trade, publishes a lower authenticated mark
+through Squads, and permissionlessly cranks liquidation until the one insurance atom is consumed. The
+vulnerable Subledger SBF (`e7aa438d6123fe7d967482d23807200ff6876e389787d185dfcee6b149815ced`)
+accepts the ordinary owner-signed zero-payout exit, leaving pool principal at zero and the TWAP floor at
+one. A public donor then adds one atom, governance resolves through the constrained controller, public
+resolved payouts and owner closes empty every portfolio, and terminal TWAP execution settles zero instead
+of one and burns no COIN because the stale floor consumes the entire apparent surplus.
 
 FIX: every insurance exit now verifies that the canonical pool PDA is the live asset-0 insurance
-operator before changing principal, including when no token CPI is needed. Positive and zero-payout exits
-therefore share the same custody precondition. The change adds no signer, authority, destination, amount,
-token CPI, or admin surface and cannot move insurance, backing, collateral, or reward coins.
+operator before changing principal, including when no token CPI is needed. The fixed SBF
+(`94b9a56f2f06a607a5ca0a9e644ee138a46cb7441852322a11c69406bcb0efd8`) rejects the same direct exit
+byte-atomically. The owner can instead use TWAP's fixed atomic return/full-exit path, any cranker re-hands
+custody with a zero live-principal floor, and the otherwise identical terminal sequence buys and burns one
+COIN and pays the bidder. Positive and zero-payout exits therefore share the same custody precondition.
+The change adds no signer, authority, destination, amount, token CPI, or admin surface and cannot move
+insurance, backing, collateral, or reward coins.
 
 ## Tick - raw market donation could preserve the pinned global batch gate (surface A/C)
 

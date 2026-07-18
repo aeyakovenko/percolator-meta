@@ -2409,6 +2409,18 @@ fn process_insurance_withdraw_impl(
     if *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key) {
         return Err(ProgramError::InvalidSeeds);
     }
+    // Positive payouts prove custody when Percolator accepts the pool-signed
+    // withdrawal below. Zero-payout exits skip that CPI, so enforce the same
+    // operator precondition before either path mutates pool accounting.
+    if percolator_accounting::read_asset_insurance_operator(
+        &market_slab.try_borrow_data()?,
+        0,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?
+        != pool_account.key.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // The holding account must be a token account for `mint` owned by the pool PDA
     // (the real percolator handler requires the withdraw dest to be the operator).
     let holding_state = spl_token::state::Account::unpack(&holding.try_borrow_data()?)?;
