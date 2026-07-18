@@ -335,6 +335,30 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     .expect("pool hands funded custody to TWAP");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
 
+    let owner_exit_ix = || {
+        let mut exit = twap_return_to_subledger_ix(
+            &squads_vault,
+            &pool,
+            &market,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        );
+        exit.accounts[1] = AccountMeta::new(twap_cfg, false);
+        exit.accounts[3] = AccountMeta::new(pool, false);
+        exit.accounts
+            .push(AccountMeta::new_readonly(depositor.pubkey(), true));
+        exit.accounts.push(AccountMeta::new(position, false));
+        exit.accounts.push(AccountMeta::new(depositor_token, false));
+        exit.accounts.push(AccountMeta::new(pool_holding, false));
+        exit.accounts.push(AccountMeta::new(vault, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(vault_authority, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(spl_token::ID, false));
+        exit
+    };
+
     let policy = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 10_000);
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -522,6 +546,40 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         .expect("advance bounded mark");
     }
     assert_eq!(read_asset0_effective_price(&svm, &market), 399);
+
+    // PUBLIC LOF: another portfolio has fully advanced the market-level mark, but the exposed
+    // loser still carries its pre-mark certificate. The pinned Percolator withdrawal gate does
+    // not see that stale account, so returning TWAP custody would let this owner remove the one
+    // insurance atom immediately before public liquidation needs it.
+    let market_before_exposed_exit = svm.get_account(&market).unwrap();
+    let pool_before_exposed_exit = svm.get_account(&pool).unwrap();
+    let position_before_exposed_exit = svm.get_account(&position).unwrap();
+    let config_before_exposed_exit = svm.get_account(&twap_cfg).unwrap();
+    let vault_before_exposed_exit = svm.get_account(&vault).unwrap();
+    let owner_balance_before_exposed_exit = token_amount(&svm, &depositor_token);
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            owner_exit_ix(),
+        )
+        .is_err(),
+        "live insurance must remain locked while a stale exposed portfolio can realize a loss"
+    );
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_exposed_exit);
+    assert_eq!(svm.get_account(&pool).unwrap(), pool_before_exposed_exit);
+    assert_eq!(
+        svm.get_account(&position).unwrap(),
+        position_before_exposed_exit
+    );
+    assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_exposed_exit);
+    assert_eq!(svm.get_account(&vault).unwrap(), vault_before_exposed_exit);
+    assert_eq!(
+        token_amount(&svm, &depositor_token),
+        owner_balance_before_exposed_exit
+    );
+    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+
     for _ in 0..5 {
         send(
             &mut svm,
@@ -575,36 +633,11 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before);
     assert_eq!(svm.get_account(&market).unwrap(), market_before);
 
-    let mut atomic_exit = twap_return_to_subledger_ix(
-        &squads_vault,
-        &pool,
-        &market,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-    );
-    atomic_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
-    atomic_exit.accounts[3] = AccountMeta::new(pool, false);
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new_readonly(depositor.pubkey(), true));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new(position, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new(depositor_token, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new(pool_holding, false));
-    atomic_exit.accounts.push(AccountMeta::new(vault, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new_readonly(vault_authority, false));
-    atomic_exit
-        .accounts
-        .push(AccountMeta::new_readonly(spl_token::ID, false));
-    send(&mut svm, &[&payer, &depositor], atomic_exit)
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        owner_exit_ix(),
+    )
         .expect("TWAP atomically returns custody and retires the fully impaired owner");
     assert_eq!(
         u64::from_le_bytes(
