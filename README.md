@@ -237,7 +237,7 @@ reserve must be distinct
 from the auction holding; an aliased configuration fails atomically before either surplus pull, so
 savings cannot enlarge the buy budget.
 
-The full chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
+The full-chain test runs three 15-day rounds. Each round sends 50% of bought COIN to the reward
 vault and burns 50%. At day 45 the accumulated reward vault distributes:
 
 - 10% to selected insurance principal points;
@@ -253,8 +253,10 @@ before or after cleanup within the finalize window; ordinary owner exits still f
 Permissionless portfolio-flow claims pay only
 to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
 cannot force rewards into an account it can spend. The same full-chain test then returns TWAP
-custody and proves both the insurance and segregated backing depositors can redeem without losing
-their claimed COIN.
+custody and proves both the insurance depositor and the owner-bound collateral cohort used for
+backing points can redeem without losing claimed COIN. That cohort is a standalone Subledger vault,
+not a many-depositor adapter for Percolator backing buckets; the engine's external backing-provider
+return lifecycle is covered separately.
 
 Ordinary point growth closes at the reward epoch's inclusive end slot. During the finalize window,
 capital owners may crystallize live or terminal insurance/backing at that fixed cutoff; every top-up
@@ -432,7 +434,7 @@ cargo test --workspace
 # Full real-binary genesis, long/short funding, handoff, three TWAP rounds,
 # 50/50 buyback burn/reward routing, and cumulative 10/10/80 claims.
 RUST_MIN_STACK=8388608 cargo test --manifest-path twap-program/Cargo.toml \
-  --test chain e2e_market_genesis_traders_residual_decider_then_handoff_twap \
+  --test chain e2e_full_genesis_to_buy_burn \
   -- --exact --nocapture
 ```
 
