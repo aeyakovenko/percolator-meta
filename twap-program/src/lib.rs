@@ -1954,7 +1954,7 @@ fn process_set_market_fees(
 
 // restart_asset0 accounts:
 // [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program]
-// data: now_slot(u64) || initial_price(u64)
+// data: now_slot(u64) || initial_price(u64) || expected_market_id(u64)
 //
 // Once custody is handed off, Percolator recognizes only the TWAP PDA as asset_admin.
 // This fixed wrapper keeps restart reachable without exposing a generic admin proxy or any
@@ -1965,11 +1965,12 @@ fn process_restart_asset0(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 16 {
+    if data.len() != 24 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let now_slot = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let initial_price = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let expected_market_id = u64::from_le_bytes(data[16..24].try_into().unwrap());
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -1989,6 +1990,12 @@ fn process_restart_asset0(
         || *percolator_program.key != config.percolator_program
         || !percolator_program.executable
     {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let current_market_id =
+        percolator_accounting::read_asset_market_id(&market_slab.try_borrow_data()?, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+    if expected_market_id == 0 || current_market_id != expected_market_id {
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
