@@ -1179,6 +1179,8 @@ fn process_accept_custody<'a>(
 //   subledger_program, owner(signer, optional), position(w, optional),
 //   owner_destination(w, optional), pool_holding(w, optional),
 //   percolator_vault(w, optional), vault_authority(optional), token_program(optional)]
+// data: owner exit = expected_principal(u64) | expected_start_slot(u64);
+//       no-owner governance/resolved return = empty
 //
 // This is the only recovery key transition exposed by the TWAP. It cannot select an
 // arbitrary replacement: the fixed subledger program re-derives the market-bound pool
@@ -1192,9 +1194,6 @@ fn process_return_to_subledger(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -1243,6 +1242,17 @@ fn process_return_to_subledger(
         _ => return Err(ProgramError::InvalidInstructionData),
     };
     let owner_exit_requested = owner_exit.is_some();
+    let owner_exit_witness = if owner_exit_requested {
+        if data.len() != 16 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some(data)
+    } else {
+        if !data.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        None
+    };
 
     if *subledger_program.key != SUBLEDGER_PROGRAM_ID || !subledger_program.executable {
         return Err(ProgramError::IncorrectProgramId);
@@ -1373,6 +1383,10 @@ fn process_return_to_subledger(
         token_program,
     )) = owner_exit
     {
+        let mut withdraw_data = vec![SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL];
+        withdraw_data.extend_from_slice(
+            owner_exit_witness.ok_or(ProgramError::InvalidInstructionData)?,
+        );
         invoke(
             &Instruction {
                 program_id: *subledger_program.key,
@@ -1388,7 +1402,7 @@ fn process_return_to_subledger(
                     AccountMeta::new_readonly(*percolator_program.key, false),
                     AccountMeta::new_readonly(*token_program.key, false),
                 ],
-                data: vec![SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL],
+                data: withdraw_data,
             },
             &[
                 owner.clone(),

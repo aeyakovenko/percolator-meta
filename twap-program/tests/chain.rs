@@ -336,6 +336,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     .expect("pool hands funded custody to TWAP");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
 
+    let owner_exit_witness = twap_owner_exit_witness(&svm, &position);
     let owner_exit_ix = || {
         let mut exit = twap_return_to_subledger_ix(
             &squads_vault,
@@ -357,6 +358,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
             .push(AccountMeta::new_readonly(vault_authority, false));
         exit.accounts
             .push(AccountMeta::new_readonly(spl_token::ID, false));
+        exit.data.extend_from_slice(&owner_exit_witness);
         exit
     };
 
@@ -8446,6 +8448,25 @@ fn twap_return_to_subledger_ix(
         ],
         data: vec![16u8], // IX_RETURN_TO_SUBLEDGER
     }
+}
+
+fn bind_twap_owner_exit_witness(
+    svm: &LiteSVM,
+    instruction: &mut Instruction,
+    position: &Pubkey,
+) {
+    instruction
+        .data
+        .extend_from_slice(&twap_owner_exit_witness(svm, position));
+}
+
+fn twap_owner_exit_witness(svm: &LiteSVM, position: &Pubkey) -> [u8; 16] {
+    let position = svm.get_account(position).expect("owner-exit position");
+    assert!(position.data.len() >= 97, "current owner-exit position layout");
+    let mut witness = [0u8; 16];
+    witness[..8].copy_from_slice(&position.data[72..80]); // principal
+    witness[8..].copy_from_slice(&position.data[89..97]); // last deposit slot
+    witness
 }
 
 // Run a full Squads vault-transaction lifecycle (create, propose, approve, warp past the
@@ -21506,6 +21527,7 @@ fn e2e_genesis_voter_retracts_and_exits_after_twap_handoff_atomically() {
     owner_exit
         .accounts
         .push(AccountMeta::new_readonly(spl_token::ID, false));
+    bind_twap_owner_exit_witness(&svm, &mut owner_exit, &position);
 
     let market_before = svm.get_account(&env.slab).unwrap();
     let config_before = svm.get_account(&twap_config).unwrap();
@@ -49254,6 +49276,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     attacker_return
         .accounts
         .push(AccountMeta::new_readonly(spl_token::ID, false));
+    bind_twap_owner_exit_witness(&svm, &mut attacker_return, &exiting_position);
     assert!(
         send(&mut svm, &[&payer, &attacker], attacker_return).is_err(),
         "an attacker cannot release custody with another owner's position"
@@ -49286,6 +49309,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     owner_return
         .accounts
         .push(AccountMeta::new_readonly(spl_token::ID, false));
+    bind_twap_owner_exit_witness(&svm, &mut owner_return, &exiting_position);
     let mut redirected_owner_return = owner_return.clone();
     redirected_owner_return.accounts[9] = AccountMeta::new(attacker_destination, false);
     assert!(

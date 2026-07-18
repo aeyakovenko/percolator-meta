@@ -199,9 +199,8 @@ const IX_ASSERT_PRINCIPAL: u8 = 11;
 // retires the complete position and can pay only a clean token account owned by
 // that depositor.
 const IX_RETURN_FINALIZED_POSITION: u8 = 12;
-// Owner-signed, amountless full exit. TWAP uses this after returning established
-// custody so a live owner recovery cannot commit without consuming the complete
-// position that authorized it.
+// Owner-signed full exit, committed to the position's principal and last deposit
+// slot. TWAP forwards the same signed witness after returning established custody.
 const IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 
 // Percolator CPI tags (verified against the pinned v16 program, percolator-prog 7eea209).
@@ -2298,23 +2297,29 @@ fn process_insurance_withdraw(
     process_insurance_withdraw_impl(program_id, accounts, data, false)
 }
 
-// insurance_withdraw_full has the same accounts as insurance_withdraw and no
-// instruction data. It removes the position's complete remaining principal;
-// all owner, destination, pool, market, and payout checks stay centralized in
-// the ordinary withdrawal implementation.
+// insurance_withdraw_full has the same accounts as insurance_withdraw. Data is
+// expected_principal(u64) | expected_start_slot(u64), binding the owner signature
+// to the exact deposit incarnation it removes. All owner, destination, pool,
+// market, and payout checks stay centralized in the ordinary withdrawal implementation.
 fn process_insurance_withdraw_full(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    if !data.is_empty() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
     let position_account = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
     if position_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let principal = Position::deserialize(&position_account.try_borrow_data()?)?.principal;
+    let position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    let expected_principal = read_u64(data)?;
+    let expected_start_slot = read_u64(data)?;
+    if !data.is_empty()
+        || expected_principal != position.principal
+        || expected_start_slot != position.start_slot
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let principal = position.principal;
     let amount_bytes = principal.to_le_bytes();
     let mut amount_data: &[u8] = &amount_bytes;
     process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)

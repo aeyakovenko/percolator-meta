@@ -1876,8 +1876,43 @@ fn pre_share_insurance_pool_attests_live_principal_and_preserves_owner_exit() {
     .expect("historical outstanding principal is a live owner claim");
 
     let legacy_holding = create_holding(&mut env, &legacy_pool);
-    env.insurance_withdraw(&alice, &alice_ata, &legacy_holding, &alice, amount)
-        .expect("the attested historical owner recovers real Percolator principal");
+    let historical_snapshot = env.read_position(&alice.pubkey());
+    let mut full_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    full_exit_data.extend_from_slice(&historical_snapshot.0.to_le_bytes());
+    full_exit_data.extend_from_slice(&historical_snapshot.1.to_le_bytes());
+    let exit_accounts = vec![
+        AccountMeta::new(alice.pubkey(), true),
+        AccountMeta::new(legacy_pool, false),
+        AccountMeta::new(legacy_position, false),
+        AccountMeta::new(alice_ata, false),
+        AccountMeta::new(legacy_holding, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    assert!(
+        env.send(
+            &[Instruction {
+                program_id: sub_id(),
+                accounts: exit_accounts.clone(),
+                data: vec![13u8],
+            }],
+            &[&alice],
+        )
+        .is_err(),
+        "predecessor positions reject the replayable amountless wire",
+    );
+    env.send(
+        &[Instruction {
+            program_id: sub_id(),
+            accounts: exit_accounts,
+            data: full_exit_data,
+        }],
+        &[&alice],
+    )
+    .expect("the snapshot-bound wire recovers predecessor Percolator principal");
     assert_eq!(env.token_amount(&alice_ata), amount);
     assert_eq!(env.token_amount(&env.perc_vault), 0);
     assert_eq!(env.pool_outstanding(), 0);
@@ -4947,6 +4982,256 @@ fn presigned_back_cannot_count_a_later_top_up_at_the_bootstrap_deadline() {
     gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
         .expect("only the freshly authorized quorum seals the distribution");
     assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
+}
+
+// STALE FULL-EXIT REPLAY: neither the legacy amountless wire nor a current
+// snapshot-bound owner signature may cross a later deposit incarnation. Otherwise a
+// relayer can hold an exit authorization, wait for a final-slot top-up, and land it
+// after deposits close. The owner receives the tokens but permanently loses the
+// Genesis vote and reward opportunity because a retired position cannot be re-created.
+#[test]
+fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
+    let start = 100u64;
+    let deposit_window = 10u64;
+    let bootstrap_delay = 100u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        deposit_window,
+        start,
+        bootstrap_delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(deposit_window),
+        Some(start),
+    );
+    let ve = setup_vote(&mut env);
+    let (_, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 5);
+    let (bob, bob_ata) = new_depositor(&mut env, 5);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1)
+        .expect("alice deposits the principal covered by the first exit signature");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, 5)
+        .expect("bob deposits the principal covered by the incarnation signature");
+    let alice_snapshot = env.read_position(&alice.pubkey());
+    let bob_snapshot = env.read_position(&bob.pubkey());
+    assert_eq!(alice_snapshot, (1, start, false));
+    assert_eq!(bob_snapshot, (5, start, false));
+
+    env.warp_slot(start + deposit_window - 1);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let alice_full_exit_accounts = vec![
+        AccountMeta::new(alice.pubkey(), true),
+        AccountMeta::new(env.pool, false),
+        AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+        AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    let legacy_full_exit = Instruction {
+        program_id: sub_id(),
+        accounts: alice_full_exit_accounts.clone(),
+        data: vec![13u8], // IX_INSURANCE_WITHDRAW_FULL, signed for one live unit
+    };
+    let withheld_legacy_full_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            legacy_full_exit,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let mut alice_exact_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    alice_exact_exit_data.extend_from_slice(&alice_snapshot.0.to_le_bytes());
+    alice_exact_exit_data.extend_from_slice(&alice_snapshot.1.to_le_bytes());
+    let withheld_alice_exact_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
+            Instruction {
+                program_id: sub_id(),
+                accounts: alice_full_exit_accounts,
+                data: alice_exact_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    let mut bob_exact_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    bob_exact_exit_data.extend_from_slice(&bob_snapshot.0.to_le_bytes());
+    bob_exact_exit_data.extend_from_slice(&bob_snapshot.1.to_le_bytes());
+    let withheld_bob_exact_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_997),
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(bob.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(env.position_pda(&bob.pubkey()), false),
+                    AccountMeta::new(bob_ata, false),
+                    AccountMeta::new(bob_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: bob_exact_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &bob],
+        held_blockhash,
+    );
+
+    let mut top_up_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    let top_up = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: top_up_data,
+    };
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+                top_up,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice's final-slot top-up lands");
+
+    let mut bob_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    bob_withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    let bob_withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&bob.pubkey()), false),
+            AccountMeta::new(bob_ata, false),
+            AccountMeta::new(bob_holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: bob_withdraw_data,
+    };
+    let mut bob_redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    bob_redeposit_data.extend_from_slice(&1u64.to_le_bytes());
+    let bob_redeposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(bob.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&bob.pubkey()), false),
+            AccountMeta::new(bob_ata, false),
+            AccountMeta::new(bob_holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: bob_redeposit_data,
+    };
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_996),
+                bob_withdraw,
+                bob_redeposit,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &bob],
+            held_blockhash,
+        ))
+        .expect("bob replaces one unit in the final slot without changing principal");
+    assert_eq!(env.read_position(&alice.pubkey()), (5, 109, false));
+    assert_eq!(env.read_position(&bob.pubkey()), (5, 109, false));
+    assert_eq!(env.token_amount(&alice_ata), 0);
+    assert_eq!(env.token_amount(&bob_ata), 0);
+
+    env.warp_slot(start + deposit_window);
+    let stale_result = env.svm.send_transaction(withheld_legacy_full_exit);
+    if stale_result.is_ok() {
+        assert_eq!(
+            env.read_position(&alice.pubkey()),
+            (0, 109, true),
+            "the vulnerable wire retires all five units",
+        );
+        assert_eq!(
+            env.token_amount(&alice_ata),
+            5,
+            "the stale exit returns funds but forfeits Genesis participation",
+        );
+        assert!(
+            gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+            "a retired position cannot cast the lost post-cutoff vote",
+        );
+        panic!(
+            "an exit signed before the top-up retired the larger position after deposits closed"
+        );
+    }
+    assert!(
+        env.svm
+            .send_transaction(withheld_alice_exact_exit)
+            .is_err(),
+        "the current wire rejects a stale principal and deposit-slot snapshot",
+    );
+    assert!(
+        env.svm
+            .send_transaction(withheld_bob_exact_exit)
+            .is_err(),
+        "the current wire rejects a stale deposit slot even when principal is unchanged",
+    );
+    assert_eq!(
+        env.read_position(&alice.pubkey()),
+        (5, 109, false),
+        "the stale authorization leaves all five vote units live",
+    );
+    assert_eq!(
+        env.read_position(&bob.pubkey()),
+        (5, 109, false),
+        "the stale incarnation authorization leaves bob's vote units live",
+    );
+    assert_eq!(env.token_amount(&alice_ata), 0);
+    assert_eq!(env.token_amount(&bob_ata), 0);
+
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("the owner retains the post-cutoff Genesis vote opportunity");
+    gv_vote(&mut env, &ve, &bob, &gv_proposal, 1)
+        .expect("the same-principal redepositor retains the Genesis vote opportunity");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
 }
 
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
