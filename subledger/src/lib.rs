@@ -812,46 +812,43 @@ fn wide_mul_div_ceil(a: u128, b: u128, denom: u128) -> Option<u128> {
     quotient.checked_add(u128::from(remainder != 0))
 }
 
-fn balanced_principal_domains(total: u64) -> [u128; 2] {
-    percolator_accounting::balanced_insurance_domains(u128::from(total))
+fn insurance_domain_balances(balance: percolator_accounting::InsuranceAssetBalance) -> [u128; 2] {
+    [
+        balance.domains[0].remaining_atoms,
+        balance.domains[1].remaining_atoms,
+    ]
 }
 
-fn insurance_deposit_domain_delta(
-    principal_before: u64,
-    amount: u64,
-) -> Result<[u128; 2], ProgramError> {
-    let principal_after = principal_before
-        .checked_add(amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    let before = balanced_principal_domains(principal_before);
-    let after = balanced_principal_domains(principal_after);
-    Ok([
-        after[0]
-            .checked_sub(before[0])
-            .ok_or(ProgramError::InvalidAccountData)?,
-        after[1]
-            .checked_sub(before[1])
-            .ok_or(ProgramError::InvalidAccountData)?,
-    ])
+/// Credit `amount` toward the lower live domain balance, then split any
+/// remainder evenly. Zero-value claim exits do not move these Percolator
+/// balances, while market losses are repaired before new capital is split.
+fn insurance_deposit_domain_delta(balances: [u128; 2], amount: u64) -> [u128; 2] {
+    let amount = u128::from(amount);
+    if balances[0] <= balances[1] {
+        let gap = core::cmp::min(balances[1] - balances[0], amount);
+        let remainder = amount - gap;
+        [gap + remainder / 2, remainder - remainder / 2]
+    } else {
+        let gap = core::cmp::min(balances[0] - balances[1], amount);
+        let remainder = amount - gap;
+        [remainder / 2, gap + remainder - remainder / 2]
+    }
 }
 
-fn insurance_withdraw_domain_delta(
-    principal_before: u64,
-    amount: u64,
-) -> Result<[u128; 2], ProgramError> {
-    let principal_after = principal_before
-        .checked_sub(amount)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    let before = balanced_principal_domains(principal_before);
-    let after = balanced_principal_domains(principal_after);
-    Ok([
-        before[0]
-            .checked_sub(after[0])
-            .ok_or(ProgramError::InvalidAccountData)?,
-        before[1]
-            .checked_sub(after[1])
-            .ok_or(ProgramError::InvalidAccountData)?,
-    ])
+/// Debit `amount` from the higher live domain balance, then split any
+/// remainder evenly. On an equal balance the odd atom comes from long, exactly
+/// reversing the deposit tie-break that credits it to short.
+fn insurance_withdraw_domain_delta(balances: [u128; 2], amount: u64) -> [u128; 2] {
+    let amount = u128::from(amount);
+    if balances[0] >= balances[1] {
+        let gap = core::cmp::min(balances[0] - balances[1], amount);
+        let remainder = amount - gap;
+        [gap + remainder - remainder / 2, remainder / 2]
+    } else {
+        let gap = core::cmp::min(balances[1] - balances[0], amount);
+        let remainder = amount - gap;
+        [remainder - remainder / 2, gap + remainder / 2]
+    }
 }
 
 /// Percolator's asset-wide withdrawal consumes the long domain before the short
@@ -2051,7 +2048,7 @@ fn process_init_insurance_pool(
 // data: amount (u64)
 //
 // User -> holding (user-signed). Then the pool PDA (asset-0 insurance authority)
-// tops up the two Percolator domains against the pool-wide 50/50 principal target.
+// tops up the two Percolator domains against the pool-wide 50/50 live protection target.
 // Records the position (principal += amount, start_slot = now) and bumps outstanding.
 fn process_insurance_deposit(
     program_id: &Pubkey,
@@ -2121,7 +2118,14 @@ fn process_insurance_deposit(
     // Price shares before the top-up. WITH_SURPLUS uses the complete live balance so
     // pre-existing yield stays with earlier capital. PRINCIPAL excludes protocol surplus
     // and prices only the loss-bearing portion of the pool.
-    let insurance_before = read_asset0_insurance(&market_slab.try_borrow_data()?)?;
+    let insurance_balance_before =
+        percolator_accounting::read_asset_insurance_balance(
+            &market_slab.try_borrow_data()?,
+            0,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let insurance_before =
+        u64::try_from(insurance_balance_before.remaining_atoms).unwrap_or(u64::MAX);
     let priced_balance_before = if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(insurance_before, pool.outstanding_principal)
     } else {
@@ -2140,7 +2144,10 @@ fn process_insurance_deposit(
         priced_balance_before,
         virtual_shares,
     )?;
-    let deposit_domains = insurance_deposit_domain_delta(pool.outstanding_principal, amount)?;
+    let deposit_domains = insurance_deposit_domain_delta(
+        insurance_domain_balances(insurance_balance_before),
+        amount,
+    );
     let outstanding_after = pool
         .outstanding_principal
         .checked_add(amount)
@@ -2579,7 +2586,17 @@ fn process_insurance_withdraw_impl(
         .outstanding_principal
         .checked_sub(amount)
         .ok_or(ProgramError::InvalidAccountData)?;
-    let principal_debit = insurance_withdraw_domain_delta(pool.outstanding_principal, amount)?;
+    // Only principal actually returned leaves the gross domain budgets. A
+    // haircut retires the unpaid nominal claim without moving Percolator state.
+    let paid_principal = core::cmp::min(owed, amount);
+    let principal_debit = live_insurance_balance
+        .map(|balance| {
+            insurance_withdraw_domain_delta(
+                insurance_domain_balances(balance),
+                paid_principal,
+            )
+        })
+        .unwrap_or([0, 0]);
     let insurance_after = insurance
         .checked_sub(owed)
         .ok_or(ProgramError::InvalidAccountData)?;
@@ -3240,12 +3257,14 @@ mod tests {
     fn pool_wide_odd_atom_splits_reverse_for_every_small_round_trip() {
         for principal_before in 0..32u64 {
             for amount in 1..32u64 {
-                let deposit = insurance_deposit_domain_delta(principal_before, amount).unwrap();
-                let withdraw = insurance_withdraw_domain_delta(
-                    principal_before.checked_add(amount).unwrap(),
-                    amount,
-                )
-                .unwrap();
+                let balances =
+                    percolator_accounting::balanced_insurance_domains(principal_before.into());
+                let deposit = insurance_deposit_domain_delta(balances, amount);
+                let after_deposit = [
+                    balances[0] + deposit[0],
+                    balances[1] + deposit[1],
+                ];
+                let withdraw = insurance_withdraw_domain_delta(after_deposit, amount);
                 assert_eq!(deposit, withdraw);
                 assert_eq!(deposit[0] + deposit[1], u128::from(amount));
             }
@@ -3253,13 +3272,64 @@ mod tests {
     }
 
     #[test]
+    fn live_domain_routing_cannot_amplify_a_preexisting_skew() {
+        for long in 0..32u128 {
+            for short in 0..32u128 {
+                let before_gap = long.abs_diff(short);
+                for amount in 0..32u64 {
+                    let deposit = insurance_deposit_domain_delta([long, short], amount);
+                    assert_eq!(deposit[0] + deposit[1], u128::from(amount));
+                    let after_deposit = [long + deposit[0], short + deposit[1]];
+                    assert!(
+                        after_deposit[0].abs_diff(after_deposit[1])
+                            <= before_gap.saturating_sub(u128::from(amount)).max(1),
+                    );
+
+                    if u128::from(amount) <= long + short {
+                        let debit = insurance_withdraw_domain_delta([long, short], amount);
+                        assert_eq!(debit[0] + debit[1], u128::from(amount));
+                        assert!(debit[0] <= long && debit[1] <= short);
+                        let after_withdraw = [long - debit[0], short - debit[1]];
+                        assert!(
+                            after_withdraw[0].abs_diff(after_withdraw[1])
+                                <= before_gap.saturating_sub(u128::from(amount)).max(1),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn impaired_odd_exit_reverses_only_principal_actually_paid() {
+        for balances in [[100, 100], [100, 101]] {
+            let fresh_deposit = insurance_deposit_domain_delta(balances, 1);
+            let after_deposit = [
+                balances[0] + fresh_deposit[0],
+                balances[1] + fresh_deposit[1],
+            ];
+
+            // A stale odd claim retires three nominal atoms but receives only one.
+            // Its net domain debit must reverse the fresh atom, not use the nominal
+            // claim to choose a different side.
+            let stale_exit = insurance_withdraw_domain_delta(after_deposit, 1);
+            assert_eq!(stale_exit, fresh_deposit);
+
+            // A fully impaired retirement moves no principal or live domain balance.
+            assert_eq!(insurance_withdraw_domain_delta(after_deposit, 0), [0, 0]);
+        }
+    }
+
+    #[test]
     fn impaired_payout_cannot_debit_beyond_its_nominal_domain_tranche() {
         for principal_before in 1..32u64 {
             for requested in 1..=principal_before {
-                let principal_debit =
-                    insurance_withdraw_domain_delta(principal_before, requested).unwrap();
                 for payout in 1..=requested {
                     let balance = insurance_balance(1_000, 1_000, 1_000, 1_000, 2_000);
+                    let principal_debit = insurance_withdraw_domain_delta(
+                        insurance_domain_balances(balance),
+                        payout,
+                    );
                     let plan = insurance_withdrawal_plan(
                         balance,
                         u128::from(payout),
