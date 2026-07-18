@@ -14322,3 +14322,24 @@ reject byte-atomically, then proves the same permissionless payer succeeds when 
 FIX: controller InitMarket requires the fresh market account to be a transaction signer and forwards that
 signer privilege to the Percolator CPI. Governance still does not sign, so market creation remains
 permissionless; possession of an already initialized market or any user deposit grants no new authority.
+
+## Tick - stale signed full exit retired a later Genesis top-up (surface B/C, REAL DOS)
+
+Subledger's owner-signed full-exit wire carried no position snapshot. A relayer could withhold an exit signed
+for one unit, let the owner add four units in the final deposit slot, and land the old transaction after the
+deposit window closed. The program read all five live units at execution and retired the position. Tokens
+returned to the owner, but the terminal `withdrawn` flag and closed admission window made the lost Genesis
+vote and reward opportunity irrecoverable.
+
+The retained clean-room LiteSVM regression uses the real Subledger, Genesis Vote, Distribution, and pinned
+Percolator SBF binaries with one still-valid blockhash. Against parent `d65e5b0`, the withheld one-unit exit
+returns all five units, marks the position withdrawn, and makes a post-cutoff five-unit vote fail. The fixed
+path additionally replays an exact stale principal snapshot and a same-principal snapshot made stale only by
+a final-slot withdraw/redeposit. Every stale transaction rejects byte-atomically and both owners cast all ten
+votes.
+
+FIX: every supported full-exit wire commits to the position's exact principal and last-deposit slot. Subledger
+checks that snapshot before deriving the complete withdrawal, and TWAP requires and forwards the same bytes so
+its outer owner signature cannot authorize a newly read amount. Predecessor position layouts remain recoverable
+through the same exact wire. No state, account, signer, authority, recipient, token path, or admin surface was
+added.
