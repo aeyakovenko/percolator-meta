@@ -14384,6 +14384,27 @@ assets, and manual-price assets remain immediately resolvable. The change adds n
 signer, authority, recipient, CPI, token path, custody path, or admin surface.
 
 A separate real-SBF LiteSVM liveness regression resolves the maximum current 5,834-asset, 10 MiB
-market shape through the controller in about 770,000 CU and enforces a 1,200,000-CU ceiling. The
+market shape through the controller in 378,681 CU and enforces a 1,200,000-CU ceiling. The
 preflight therefore does not trade the funding-loss fix for a terminal lifecycle DoS at the supported
 account cap.
+
+## Tick - controller asset shutdown discarded committed funding (surface A/C, REAL LOF)
+
+Pinned Percolator's `UpdateAssetLifecycle(SHUTDOWN)` freezes an asset at its current effective price,
+enters recovery, and overwrites its authenticated oracle profile without first advancing committed
+price and funding accrual. The Meta controller exposed this transition to bounded governance. In the
+retained real-SBF LiteSVM regression, an independent oracle publishes a 99 mark against a 100 effective
+price and independent users hold balanced long and short exposure. Immediate controller shutdown,
+permissionless force-close, market resolution, and owner exits record zero funding and pay both users
+100,000,000 atoms. One public crank before shutdown records `+1,000,000,000,000,000` and
+`-1,000,000,000,000,000` funding numerators and pays 100,100,000 and 99,900,000 atoms. Governance
+could therefore erase the honest receiver's 100,000-atom claim without controlling the oracle or
+either portfolio.
+
+FIX: before proxying shutdown action `3`, the controller parses the existing asset index and applies
+the shared pinned-layout accrual predicate to that one generation. Unlike global resolution, shutdown
+also rejects a value-bearing pending authenticated mark because Percolator overwrites the profile.
+Unexposed, settled, manual-price, already-caught-up, and already-recovering assets remain live; public
+crankers can commit bounded segments before governance retries. The preflight is O(1) in market size
+and adds no state, account, signer, authority, recipient, CPI, token path, custody path, or admin
+surface.

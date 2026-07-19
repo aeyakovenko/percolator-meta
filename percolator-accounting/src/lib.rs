@@ -515,6 +515,109 @@ pub fn market_is_live(data: &[u8]) -> Result<bool, ReadError> {
     Ok(mode == 0)
 }
 
+#[derive(Clone, Copy)]
+struct CommittedAccrualConfig {
+    max_accrual_dt_slots: u64,
+    max_abs_funding_e9_per_slot: u64,
+    max_price_move_bps_per_slot: u64,
+}
+
+fn committed_accrual_config(data: &[u8]) -> Result<CommittedAccrualConfig, ReadError> {
+    let field = |base: usize, offset: usize| base.checked_add(offset).ok_or(ReadError::Truncated);
+    let config = field(
+        MARKET_GROUP_OFFSET,
+        offset_of!(MarketGroupV16HeaderAccount, config),
+    )?;
+    Ok(CommittedAccrualConfig {
+        max_accrual_dt_slots: read_u64(
+            data,
+            field(config, offset_of!(V16ConfigAccount, max_accrual_dt_slots))?,
+        )?,
+        max_abs_funding_e9_per_slot: read_u64(
+            data,
+            field(
+                config,
+                offset_of!(V16ConfigAccount, max_abs_funding_e9_per_slot),
+            )?,
+        )?,
+        max_price_move_bps_per_slot: read_u64(
+            data,
+            field(
+                config,
+                offset_of!(V16ConfigAccount, max_price_move_bps_per_slot),
+            )?,
+        )?,
+    })
+}
+
+#[inline(always)]
+fn configured_asset_would_skip_committed_accrual(
+    data: &[u8],
+    asset_index: usize,
+    action_slot: u64,
+    include_pending_mark: bool,
+    config: CommittedAccrualConfig,
+) -> Result<bool, ReadError> {
+    let field = |base: usize, offset: usize| base.checked_add(offset).ok_or(ReadError::Truncated);
+    let asset = asset_engine_offset(asset_index)?
+        .checked_add(offset_of!(EngineAssetSlotV16Account, asset))
+        .ok_or(ReadError::Truncated)?;
+    let oi_long = read_u128(
+        data,
+        field(asset, offset_of!(AssetStateV16Account, oi_eff_long_q))?,
+    )?;
+    let oi_short = read_u128(
+        data,
+        field(asset, offset_of!(AssetStateV16Account, oi_eff_short_q))?,
+    )?;
+    if oi_long == 0 && oi_short == 0 {
+        return Ok(false);
+    }
+
+    let slot_last = read_u64(
+        data,
+        field(asset, offset_of!(AssetStateV16Account, slot_last))?,
+    )?;
+    if slot_last >= action_slot {
+        return Ok(false);
+    }
+    let profile = percolator_prog::state::read_asset_oracle_profile(data, asset_index)
+        .map_err(|_| ReadError::InvalidAccounting)?;
+    if !percolator_prog::oracle_v16::profile_is_price_managed(&profile)
+        || (!include_pending_mark && profile.mark_ewma_last_slot > slot_last)
+    {
+        return Ok(false);
+    }
+    let current = read_u64(
+        data,
+        field(asset, offset_of!(AssetStateV16Account, effective_price))?,
+    )?;
+    if profile.mark_ewma_e6 == current {
+        return Ok(false);
+    }
+    let dt = core::cmp::min(
+        action_slot
+            .checked_sub(slot_last)
+            .ok_or(ReadError::InvalidAccounting)?,
+        config.max_accrual_dt_slots,
+    );
+    let next = percolator_prog::oracle_v16::effective_price_from_target(
+        current,
+        profile.mark_ewma_e6,
+        config.max_price_move_bps_per_slot,
+        dt,
+        true,
+    );
+    let funding_rate = percolator_prog::policy_v16::premium_funding_rate_e9(
+        profile.mark_ewma_e6,
+        next,
+        config.max_abs_funding_e9_per_slot,
+    )
+    .ok_or(ReadError::InvalidAccounting)?;
+    let balanced = oi_long != 0 && oi_short != 0;
+    Ok(next != current || (balanced && funding_rate != 0))
+}
+
 /// Returns true when resolving at `resolve_slot` would discard a deterministic
 /// price or funding segment from an already-active authenticated mark.
 ///
@@ -528,97 +631,41 @@ pub fn resolve_would_skip_committed_accrual(
 ) -> Result<bool, ReadError> {
     validate_market(data)?;
     let (configured, _) = market_slot_counts(data)?;
-    let field = |base: usize, offset: usize| {
-        base.checked_add(offset).ok_or(ReadError::Truncated)
-    };
-    let config = field(
-        MARKET_GROUP_OFFSET,
-        offset_of!(MarketGroupV16HeaderAccount, config),
-    )?;
-    let max_accrual_dt_slots = read_u64(
-        data,
-        field(
-            config,
-            offset_of!(V16ConfigAccount, max_accrual_dt_slots),
-        )?,
-    )?;
-    let max_abs_funding_e9_per_slot = read_u64(
-        data,
-        field(
-            config,
-            offset_of!(V16ConfigAccount, max_abs_funding_e9_per_slot),
-        )?,
-    )?;
-    let max_price_move_bps_per_slot = read_u64(
-        data,
-        field(
-            config,
-            offset_of!(V16ConfigAccount, max_price_move_bps_per_slot),
-        )?,
-    )?;
+    let config = committed_accrual_config(data)?;
 
     for asset_index in 0..configured {
-        let asset = asset_engine_offset(asset_index)?
-            .checked_add(offset_of!(EngineAssetSlotV16Account, asset))
-            .ok_or(ReadError::Truncated)?;
-        let oi_long = read_u128(
+        if configured_asset_would_skip_committed_accrual(
             data,
-            field(asset, offset_of!(AssetStateV16Account, oi_eff_long_q))?,
-        )?;
-        let oi_short = read_u128(
-            data,
-            field(asset, offset_of!(AssetStateV16Account, oi_eff_short_q))?,
-        )?;
-        if oi_long == 0 && oi_short == 0 {
-            continue;
-        }
-
-        let slot_last = read_u64(
-            data,
-            field(asset, offset_of!(AssetStateV16Account, slot_last))?,
-        )?;
-        if slot_last >= resolve_slot {
-            continue;
-        }
-        let profile = percolator_prog::state::read_asset_oracle_profile(data, asset_index)
-            .map_err(|_| ReadError::InvalidAccounting)?;
-        if !percolator_prog::oracle_v16::profile_is_price_managed(&profile)
-            || profile.mark_ewma_last_slot > slot_last
-        {
-            continue;
-        }
-        let current = read_u64(
-            data,
-            field(asset, offset_of!(AssetStateV16Account, effective_price))?,
-        )?;
-        if profile.mark_ewma_e6 == current {
-            continue;
-        }
-        let dt = core::cmp::min(
-            resolve_slot
-                .checked_sub(slot_last)
-                .ok_or(ReadError::InvalidAccounting)?,
-            max_accrual_dt_slots,
-        );
-        let next = percolator_prog::oracle_v16::effective_price_from_target(
-            current,
-            profile.mark_ewma_e6,
-            max_price_move_bps_per_slot,
-            dt,
-            true,
-        );
-        let funding_rate = percolator_prog::policy_v16::premium_funding_rate_e9(
-            profile.mark_ewma_e6,
-            next,
-            max_abs_funding_e9_per_slot,
-        )
-        .ok_or(ReadError::InvalidAccounting)?;
-        let balanced = oi_long != 0 && oi_short != 0;
-        if next != current || (balanced && funding_rate != 0) {
+            asset_index,
+            resolve_slot,
+            false,
+            config,
+        )? {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Returns true when shutting down one asset at `shutdown_slot` would discard a
+/// deterministic price or funding segment.
+///
+/// Shutdown freezes the current effective price and overwrites the oracle profile,
+/// so a value-bearing pending authenticated mark must also be cranked first.
+pub fn shutdown_would_skip_committed_accrual(
+    data: &[u8],
+    asset_index: usize,
+    shutdown_slot: u64,
+) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    configured_asset_would_skip_committed_accrual(
+        data,
+        asset_index,
+        shutdown_slot,
+        true,
+        committed_accrual_config(data)?,
+    )
 }
 
 /// Returns whether one pinned-v16 asset still has open position accounting or
@@ -1127,9 +1174,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_preflight_distinguishes_committed_from_pending_marks() {
+    fn terminal_preflights_distinguish_committed_from_pending_marks() {
         let mut market = market_with_committed_funding_segment();
         assert_eq!(resolve_would_skip_committed_accrual(&market, 3), Ok(true));
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 0, 3),
+            Ok(true)
+        );
 
         let asset = asset_engine_offset(0).unwrap()
             + offset_of!(EngineAssetSlotV16Account, asset);
@@ -1141,6 +1192,11 @@ mod tests {
             resolve_would_skip_committed_accrual(&market, 3),
             Ok(false),
             "an unexposed asset cannot lose position value during resolution"
+        );
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 0, 3),
+            Ok(false),
+            "an unexposed asset cannot lose position value during shutdown"
         );
         write_u128_at(&mut market, long_offset, 1);
         write_u128_at(&mut market, short_offset, 1);
@@ -1154,6 +1210,11 @@ mod tests {
             Ok(false),
             "a settled target cannot create a skipped price or funding segment"
         );
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 0, 3),
+            Ok(false),
+            "a settled target cannot create a skipped shutdown segment"
+        );
 
         profile.mark_ewma_e6 = 99;
         profile.oracle_target_price_e6 = 99;
@@ -1164,6 +1225,11 @@ mod tests {
             Ok(false),
             "manual-price assets have no authenticated mark to commit"
         );
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 0, 3),
+            Ok(false),
+            "manual-price assets have no authenticated mark to preserve"
+        );
 
         profile.oracle_mode = percolator_prog::constants::ORACLE_MODE_AUTH_MARK;
         profile.mark_ewma_last_slot = 3;
@@ -1172,6 +1238,11 @@ mod tests {
             resolve_would_skip_committed_accrual(&market, 3),
             Ok(false),
             "an authenticated mark not yet activated by a crank is not committed"
+        );
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 0, 3),
+            Ok(true),
+            "shutdown would overwrite a pending value-bearing mark"
         );
 
         profile.mark_ewma_last_slot = 2;
@@ -1184,6 +1255,14 @@ mod tests {
             3,
         );
         assert_eq!(resolve_would_skip_committed_accrual(&market, 3), Ok(false));
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 0, 3),
+            Ok(false)
+        );
+        assert_eq!(
+            shutdown_would_skip_committed_accrual(&market, 1, 3),
+            Err(ReadError::InvalidAsset)
+        );
     }
 
     #[test]
