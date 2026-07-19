@@ -3845,13 +3845,21 @@ fn register(
         accounts.push(AccountMeta::new_readonly(legacy_owner_stake, false));
         accounts.push(AccountMeta::new_readonly(legacy_linked_stake, false));
     }
+    let mut instruction_data = vec![1u8, cohort];
+    if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+        let portfolio_id = svm
+            .get_account(linked)
+            .and_then(|account| percolator_prog::state::read_portfolio_id(&account.data).ok())
+            .unwrap_or(0);
+        instruction_data.extend_from_slice(&portfolio_id.to_le_bytes());
+    }
     let result = send(
         svm,
         payer,
         &[Instruction {
             program_id: rd_id(),
             accounts,
-            data: vec![1u8, cohort],
+            data: instruction_data,
         }],
         &[owner],
     );
@@ -12128,6 +12136,7 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
         .0;
         let account = svm.get_account(pf).unwrap();
         let market = Pubkey::new_from_array(account.data[16..48].try_into().unwrap());
+        let portfolio_id = percolator_prog::state::read_portfolio_id(&account.data).unwrap();
         let archive = Pubkey::find_program_address(
             &[
                 b"rd_portfolio_archive",
@@ -12157,7 +12166,11 @@ fn lp_cohort_accepts_any_allowlisted_market_and_rejects_others() {
                     AccountMeta::new_readonly(market, false),
                     AccountMeta::new_readonly(retired_market_pda(&stub_perc, &market), false),
                 ],
-                data: vec![1u8, COHORT_LP],
+                data: {
+                    let mut data = vec![1u8, COHORT_LP];
+                    data.extend_from_slice(&portfolio_id.to_le_bytes());
+                    data
+                },
             }],
             &[owner],
         )

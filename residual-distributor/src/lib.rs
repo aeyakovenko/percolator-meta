@@ -1946,12 +1946,28 @@ fn init_reward_epoch(
 //   portfolio cohorts: linked = Percolator portfolio, archive = its canonical cumulative telemetry PDA,
 //   and portfolio_market = its immutable-fee Percolator market account;
 //   capital cohorts: linked = subledger position.
-// data: cohort(u8)
+// data: cohort(u8), expected_portfolio_id(u64, portfolio cohorts only)
 fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let cohort = *data.first().ok_or(ProgramError::InvalidInstructionData)?;
     if cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidInstructionData);
     }
+    let portfolio_cohort = matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER);
+    let expected_portfolio_id = if portfolio_cohort {
+        if data.len() != 9 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let portfolio_id = u64::from_le_bytes(data[1..9].try_into().unwrap());
+        if portfolio_id == 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some(portfolio_id)
+    } else {
+        if data.len() != 1 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        None
+    };
     let iter = &mut accounts.iter();
     let payer = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -1960,7 +1976,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
     let linked = next_account_info(iter)?;
     let stake_account = next_account_info(iter)?;
     let system = next_account_info(iter)?;
-    let portfolio_context = if matches!(cohort, COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER) {
+    let portfolio_context = if portfolio_cohort {
         Some((
             next_account_info(iter)?,
             next_account_info(iter)?,
@@ -2083,7 +2099,7 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
                 program_id,
                 &config,
                 owner.key,
-                None,
+                expected_portfolio_id,
                 linked,
                 portfolio_context
                     .map(|(archive, _, _)| archive)
