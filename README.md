@@ -343,6 +343,11 @@ its predecessor wire without a witness, and only while that generation remains c
 secondary and replacement generation is strict. Governance must rebuild a queued asset action after
 its target slot changes generation.
 
+Market-wide `ResolveMarket` calls append a separate read-only witness derived from
+`("market-generation", market, next_market_id)`. Percolator advances `next_market_id` whenever any
+asset is created or restarted, so an approved global resolution cannot survive into a replacement
+asset generation. The controller removes this witness before CPI and stores no generation state.
+
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
 cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
 fixed portfolio cleanup. It signs only pinned Percolator `ClosePortfolio`; Percolator rejects live or

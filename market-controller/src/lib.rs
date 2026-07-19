@@ -35,6 +35,7 @@ declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 
 const CONTROLLER_SEED: &[u8] = b"market-controller";
 const ASSET_GENERATION_SEED: &[u8] = b"asset-generation";
+const MARKET_GENERATION_SEED: &[u8] = b"market-generation";
 const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
@@ -77,6 +78,7 @@ const PERC_IX_CLOSE_PORTFOLIO: u8 = 8;
 const RESIDUAL_IX_ARCHIVE_PORTFOLIO: u8 = 7;
 const PERC_IX_TOP_UP_INSURANCE: u8 = 9;
 const PERC_IX_CLOSE_SLAB: u8 = 13;
+const PERC_IX_RESOLVE_MARKET: u8 = 19;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_CONFIGURE_HYBRID_ORACLE: u8 = 34;
 const PERC_IX_CONFIGURE_EWMA_MARK: u8 = 35;
@@ -140,6 +142,22 @@ pub fn asset_generation_witness_address(
             market.as_ref(),
             &asset_index.to_le_bytes(),
             &market_id.to_le_bytes(),
+        ],
+        &id(),
+    )
+}
+
+/// Stateless read-only account key that commits a market-wide admin action to
+/// Percolator's monotonic asset-generation cursor.
+pub fn market_generation_witness_address(
+    market: &Pubkey,
+    next_market_id: u64,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            MARKET_GENERATION_SEED,
+            market.as_ref(),
+            &next_market_id.to_le_bytes(),
         ],
         &id(),
     )
@@ -744,6 +762,24 @@ fn process_proxy_admin<'a>(
         )?;
     }
     let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
+    if perc_tag == PERC_IX_RESOLVE_MARKET {
+        let next_market_id = {
+            let market_data = market.try_borrow_data()?;
+            percolator_accounting::read_next_market_id(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+        };
+        if tail.len() != 1 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let witness = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if witness.is_signer
+            || witness.is_writable
+            || *witness.key
+                != market_generation_witness_address(market.key, next_market_id).0
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+    }
     if let Some((asset_index, native_tail_len, permits_unconfigured)) =
         generation_bound_asset(data)?
     {
@@ -3098,5 +3134,16 @@ mod tests {
         );
         assert_ne!(witness, asset_generation_witness_address(&market, 2, 2).0);
         assert_ne!(witness, asset_generation_witness_address(&market, 1, 3).0);
+    }
+
+    #[test]
+    fn market_generation_witness_binds_market_and_next_market_id() {
+        let market = Pubkey::new_unique();
+        let witness = market_generation_witness_address(&market, 2).0;
+        assert_ne!(
+            witness,
+            market_generation_witness_address(&Pubkey::new_unique(), 2).0
+        );
+        assert_ne!(witness, market_generation_witness_address(&market, 3).0);
     }
 }
