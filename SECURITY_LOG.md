@@ -14405,3 +14405,28 @@ from the canonical Subledger position using a cross-pinned offset. Retract and e
 are unchanged, so an obsolete client cannot trap funds; it must upgrade only before adding support. The change
 adds no state, account, allocation, signer, authority, recipient, CPI, token path, custody path, or admin
 surface and depends on Subledger's monotonic marker from the preceding finding.
+
+## Tick - controller resolution discarded committed funding (surface A/C, REAL LOF)
+
+Pinned Percolator's privileged `ResolveMarket` path resolved exposed assets without first advancing
+an already-active authenticated mark to the current slot. A bounded Meta governor could therefore
+resolve before a public crank and discard deterministic price and funding accrual that honest traders
+had already committed to by keeping positions open after mark activation. In the retained real-SBF
+LiteSVM regression, an independent oracle activates a 99 mark against a 100 effective price, balanced
+users hold equal long and short exposure, and the creator donates only lifecycle authority to the
+controller. Immediate controller resolution pays both users 100,000,000 atoms; the control path's one
+public crank records equal-and-opposite funding and pays 100,100,000 and 99,900,000. Governance thus
+erased a 100,000-atom claim from the honest funding receiver without controlling the oracle or either
+portfolio.
+
+FIX: before proxying privileged global resolution, the controller uses the pinned read-only accounting
+layout and Percolator's exact price/funding helpers to detect value-bearing accrual from active marks.
+It rejects until public crankers commit each deterministic segment, after which the same
+generation-bound resolution remains live. Pending never-activated marks, settled targets, unexposed
+assets, and manual-price assets remain immediately resolvable. The change adds no state, account,
+signer, authority, recipient, CPI, token path, custody path, or admin surface.
+
+A separate real-SBF LiteSVM liveness regression resolves the maximum current 5,834-asset, 10 MiB
+market shape through the controller in about 770,000 CU and enforces a 1,200,000-CU ceiling. The
+preflight therefore does not trade the funding-loss fix for a terminal lifecycle DoS at the supported
+account cap.

@@ -768,6 +768,20 @@ fn process_proxy_admin<'a>(
             current_force_close_delay_slots,
         )?;
     }
+    if perc_tag == PERC_IX_RESOLVE_MARKET {
+        let resolve_slot = Clock::get()?.slot;
+        let market_data = market.try_borrow_data()?;
+        if percolator_accounting::resolve_would_skip_committed_accrual(
+            &market_data,
+            resolve_slot,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            // A public crank can commit the deterministic segment, after which
+            // the same generation-bound resolution remains executable.
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
     let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
     if generation_bound_market(data) {
         let next_market_id = {
