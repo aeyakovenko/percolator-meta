@@ -14371,13 +14371,15 @@ transaction, and redeposit that unit. Both signed fields returned to their origi
 then land the withheld exit after deposits closed, returning all tokens to the owner but permanently retiring
 the one-per-owner position and destroying its Genesis vote and reward opportunity.
 
-Retained clean-room LiteSVM test commit `efa074a` reproduces the public path against parent `d1a147c` with the
-real Subledger, Genesis Vote, Distribution, and pinned Percolator SBF binaries. The vulnerable binary accepts
-the restored snapshot after cutoff. The fixed path advances the marker from 100 to 101, rejects the withheld
-transaction, and proves all five principal units remain voteable.
+Retained clean-room LiteSVM tests reproduce both complete-exit encodings with the real Subledger, Genesis
+Vote, Distribution, and pinned Percolator SBF binaries. Test commit `efa074a` covers the snapshot wire against
+parent `d1a147c`; `88b658c` proves that the amount-only wire still bypassed the first fix. The vulnerable paths
+accept the restored positions after cutoff. The fixed path advances each marker from 100 to 101, rejects both
+withheld transactions, and proves all ten principal units remain voteable.
 
 FIX: a new position records the real deposit slot, while every top-up records
 `max(current_slot, previous_marker + 1)`. Thus the existing signed field is a monotonic deposit-incarnation
-marker as well as a conservative reward-tenure clock. Checked overflow rejects only another top-up before any
-CPI; the existing owner withdrawal remains live. No account data, wire, signer, authority, recipient, CPI,
-token path, custody path, or admin surface was added.
+marker as well as a conservative reward-tenure clock. The amount-only insurance instruction is partial-only;
+all complete owner exits use the snapshot-bound wire. Checked overflow rejects only another top-up before any
+CPI, and every owner withdrawal remains live through the exact wire. No account data, signer, authority,
+recipient, CPI, token path, custody path, or admin surface was added.

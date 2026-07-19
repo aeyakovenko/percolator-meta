@@ -420,8 +420,17 @@ impl Env {
         signer: &Keypair,
         amount: u64,
     ) -> Result<(), String> {
-        let mut data = vec![5u8]; // IX_INSURANCE_WITHDRAW
-        data.extend_from_slice(&amount.to_le_bytes());
+        let (principal, start_slot, withdrawn) = self.read_position(&owner.pubkey());
+        let data = if !withdrawn && amount == principal {
+            let mut full = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+            full.extend_from_slice(&principal.to_le_bytes());
+            full.extend_from_slice(&start_slot.to_le_bytes());
+            full
+        } else {
+            let mut partial = vec![5u8]; // IX_INSURANCE_WITHDRAW
+            partial.extend_from_slice(&amount.to_le_bytes());
+            partial
+        };
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -5788,7 +5797,7 @@ fn every_legacy_genesis_ballot_generation_can_retract_and_recover_real_percolato
     }
 }
 
-// CROSS-TAG FORFEITURE BYPASS: a voter whose insurance principal is vote-locked is refused the
+// CROSS-TAG FORFEITURE BYPASS: a voter whose insurance principal is vote-locked is refused a partial
 // insurance exit (tag 5, which checks vote_locked). The escape an attacker would reach for is the OTHER
 // withdraw — the own-vault `process_withdraw` (tag 2), which has NO vote_locked check at all (locking is
 // an insurance-only concept). If tag 2 could operate on an insurance pool it would skip the lock AND try
@@ -5813,11 +5822,11 @@ fn vote_locked_insurance_position_cannot_be_drained_via_own_vault_withdraw() {
     let dest = Pubkey::new_unique();
     let (_dist_proposal, gv_proposal) = create_and_register_proposal(&mut env, &ve, 1, &dest);
 
-    // Vote → the position is now vote-locked; the insurance exit (tag 5) is refused.
+    // Vote → the position is now vote-locked; a partial insurance exit (tag 5) is refused.
     env.warp_slot(1124);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("vote backs proposal");
     assert_eq!(env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap().data[97], 1, "vote-locked");
-    assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount).is_err(), "tag-5 exit blocked by the lock");
+    assert!(env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, amount / 2).is_err(), "tag-5 partial exit blocked by the lock");
 
     // ATTACK: route the exit through tag 2 (own-vault withdraw) to dodge the vote_locked check.
     let (snapshot_principal, snapshot_start, _) = env.read_position(&alice.pubkey());
@@ -6147,7 +6156,7 @@ fn winning_voter_can_retract_and_exit_after_finalize() {
 
 // VETO-EXIT in ONE ATOMIC TRANSACTION (surface B): a depositor vetoes the genesis by RETRACTING their vote
 // and WITHDRAWING their principal in a SINGLE tx [retract_ix, withdraw_ix]. The retract (gv vote action 2)
-// CPIs the subledger SetVoteLock(0) to clear position.vote_locked; the withdraw (subledger tag 5) then checks
+// CPIs the subledger SetVoteLock(0) to clear position.vote_locked; the snapshot-bound complete exit then checks
 // position.vote_locked == false. For the one-tx veto to work, the lock-clear written by instruction 1 MUST be
 // visible to instruction 2 within the same transaction (intra-tx account-state propagation), AND the gv tally
 // must drop so quorum recomputes as the voter leaves. This pins that the veto is atomic — there is no two-step
@@ -6177,7 +6186,10 @@ fn veto_exit_retract_and_withdraw_in_one_atomic_tx() {
 
     // THE VETO-EXIT: retract + withdraw in ONE transaction.
     let retract_ix = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2);
-    let mut wdata = vec![5u8]; wdata.extend_from_slice(&amount.to_le_bytes());
+    let (snapshot_principal, snapshot_start, _) = env.read_position(&alice.pubkey());
+    let mut wdata = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    wdata.extend_from_slice(&snapshot_principal.to_le_bytes());
+    wdata.extend_from_slice(&snapshot_start.to_le_bytes());
     let withdraw_ix = Instruction {
         program_id: sub_id(),
         accounts: vec![

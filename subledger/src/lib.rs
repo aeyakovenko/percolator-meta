@@ -2297,7 +2297,9 @@ fn process_insurance_deposit(
 //   vault_authority, percolator_program, token_program]
 // data: amount (u64)
 //
-// Owner-bound, principal-only exit: `amount <= position.principal`. The pool PDA
+// Owner-bound, principal-only partial exit: `amount < position.principal`.
+// Complete exits use IX_INSURANCE_WITHDRAW_FULL so the owner signature commits
+// to the exact position incarnation. The pool PDA
 // (asset-0 insurance operator) signs WithdrawInsuranceAsset (tag 57). NOTE: the
 // real percolator handler requires the withdraw destination to be owned by the
 // *operator* (the pool PDA), not an arbitrary user, so we withdraw into a
@@ -2308,7 +2310,7 @@ fn process_insurance_withdraw(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    process_insurance_withdraw_impl(program_id, accounts, data, false)
+    process_insurance_withdraw_impl(program_id, accounts, data, false, true)
 }
 
 // insurance_withdraw_full has the same accounts as insurance_withdraw. Data is
@@ -2329,7 +2331,7 @@ fn process_insurance_withdraw_full(
     let principal = position.principal;
     let amount_bytes = principal.to_le_bytes();
     let mut amount_data: &[u8] = &amount_bytes;
-    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false, false)
 }
 
 fn require_full_exit_snapshot(data: &mut &[u8], position: &Position) -> ProgramResult {
@@ -2362,7 +2364,7 @@ fn process_return_finalized_position(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    process_insurance_withdraw_impl(program_id, accounts, data, true)
+    process_insurance_withdraw_impl(program_id, accounts, data, true, false)
 }
 
 fn process_insurance_withdraw_impl(
@@ -2370,6 +2372,7 @@ fn process_insurance_withdraw_impl(
     accounts: &[AccountInfo],
     data: &mut &[u8],
     terminal: bool,
+    partial_only: bool,
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
     let owner = next_account_info(iter)?;
@@ -2533,6 +2536,12 @@ fn process_insurance_withdraw_impl(
     // Principal-only: never exceeds the owner's own recorded principal.
     if amount > position.principal || amount > pool.outstanding_principal {
         return Err(ProgramError::InsufficientFunds);
+    }
+    // The amount-bearing wire carries no position-incarnation witness. Keep it
+    // partial so it can never permanently retire a later incarnation; complete
+    // owner exits must use IX_INSURANCE_WITHDRAW_FULL's exact snapshot.
+    if partial_only && amount == position.principal {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
     // Read live asset-0 insurance from the slab. Current positions use shares priced
