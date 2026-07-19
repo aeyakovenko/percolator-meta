@@ -9845,7 +9845,7 @@ fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
 }
 
 #[test]
-fn probe_public_stale_resolve_preflight_stays_bounded_at_dense_10m_market_shape() {
+fn probe_public_zero_delta_stale_resolve_stays_bounded_at_dense_10m_market_shape() {
     use percolator_prog::ix::Instruction as PIx;
 
     const ASSET_COUNT: usize = 5_834;
@@ -9876,16 +9876,20 @@ fn probe_public_stale_resolve_preflight_stays_bounded_at_dense_10m_market_shape(
     wrapper.marketauth = payer.pubkey().to_bytes();
     wrapper.collateral_mint = collateral_mint.to_bytes();
     wrapper.last_good_oracle_slot = 1;
-    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
-    wrapper.mark_ewma_e6 = PRICE;
+    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_AUTH_MARK;
+    wrapper.mark_ewma_e6 = PRICE - 1;
     wrapper.mark_ewma_last_slot = 1;
-    wrapper.oracle_target_price_e6 = PRICE;
-    let config = percolator_prog::risk::V16Config::public_user_fund_with_market_slots(
+    wrapper.mark_ewma_halflife_slots = 0;
+    wrapper.oracle_target_price_e6 = PRICE - 1;
+    wrapper.oracle_target_publish_time = 1;
+    let mut config = percolator_prog::risk::V16Config::public_user_fund_with_market_slots(
         percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
         ASSET_COUNT as u32,
         0,
         10,
     );
+    config.max_price_move_bps_per_slot = 1;
+    config.max_abs_funding_e9_per_slot = 0;
     let mut market_data = vec![
         0u8;
         percolator_prog::state::market_account_len_for_capacity(ASSET_COUNT).unwrap()
@@ -9909,6 +9913,7 @@ fn probe_public_stale_resolve_preflight_stays_bounded_at_dense_10m_market_shape(
             slot.engine.asset.loss_weight_sum_long = percolator::V16PodU128::new(1);
             slot.engine.asset.loss_weight_sum_short = percolator::V16PodU128::new(1);
         }
+        group.validate_shape().unwrap();
     }
     let market_rent = svm.minimum_balance_for_rent_exemption(market_data.len());
     svm.set_account(
