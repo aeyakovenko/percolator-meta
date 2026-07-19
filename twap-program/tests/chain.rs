@@ -19786,6 +19786,50 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         send(&mut svm, &[&env.dao], ix).expect("approve a generation-A market resolution");
     }
 
+    // Approve a shorter permissionless-resolution deadline in generation A, but leave it queued.
+    // If this global control is not generation-bound, an executor can arm it only after generation
+    // B starts and then use Percolator's public stale-resolution path to terminate the replacement.
+    let stale_policy = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 1,
+            force_close_delay_slots: 1,
+        }
+        .encode(),
+    );
+    let stale_policy_index = 10u64;
+    let stale_policy_transaction =
+        transaction_pda(&env.squads, &env.multisig, stale_policy_index);
+    let stale_policy_proposal = proposal_pda(&env.squads, &env.multisig, stale_policy_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_transaction,
+            &env.dao.pubkey(),
+            &stale_policy,
+        ),
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_proposal,
+            &env.dao.pubkey(),
+            stale_policy_index,
+        ),
+        proposal_approve_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_proposal,
+            &env.dao.pubkey(),
+        ),
+    ] {
+        send(&mut svm, &[&env.dao], ix)
+            .expect("approve a generation-A stale-resolution policy");
+    }
+
     let initial_price = 1_000_001;
     let restart = build_twap_restart_asset0_message(
         &env.squads_vault,
@@ -19803,7 +19847,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.multisig,
         &env.dao,
         &payer,
-        10,
+        11,
         &restart,
         &twap_remaining,
     )
@@ -19874,6 +19918,45 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         "the probe must reach a live replacement market"
     );
 
+    let before_stale_policy = svm.get_account(&env.slab).unwrap();
+    let stale_policy_result = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_proposal,
+            &stale_policy_transaction,
+            &env.dao.pubkey(),
+            &controller_remaining,
+        ),
+    );
+    if stale_policy_result.is_ok() {
+        warp_to(&mut svm, restart_slot + 1);
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![AccountMeta::new(env.slab, false)],
+                data: percolator_prog::ix::Instruction::ResolveStalePermissionless {
+                    now_slot: restart_slot + 1,
+                }
+                .encode(),
+            },
+        )
+        .expect("the replayed one-slot policy makes generation B publicly resolvable");
+    }
+    assert!(
+        stale_policy_result.is_err(),
+        "a generation-A stale-resolution policy remained executable against live generation B"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        before_stale_policy,
+        "stale policy rejection must preserve every generation-B account byte"
+    );
+
     let generation_b = restarted_group.assets[0].market_id;
     let generation_witness =
         market_controller_program::asset_generation_witness_address(&env.slab, 0, generation_b).0;
@@ -19910,7 +19993,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.multisig,
         &env.dao,
         &payer,
-        11,
+        12,
         &shutdown_b,
         &generation_b_remaining,
     )
@@ -19970,7 +20053,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.multisig,
         &env.dao,
         &payer,
-        12,
+        13,
         &fresh_resolve,
         &fresh_resolve_remaining,
     )
