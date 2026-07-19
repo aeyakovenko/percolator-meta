@@ -167,16 +167,17 @@ capital's own tenure.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`da64be639168b496833dd4c701607a94fcb06b6c` and its engine layout dependency to
-`143e68c4917ed0400a27b952f036a5677047cd84`.
+`cf69b40e095bf4ee6b750af56c68f1c3c05b9c0a` and its engine layout dependency to
+`c1a058f3f6057838e78a6ada51509af336fd4ed6`.
 
-That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
-active. Both governance wrappers therefore reject nonzero backing policies but preserve exact-zero
-updates to clear predecessor state. The ordinary trade fee is selected when the market is initialized
-and can only stay constant or decrease afterward: the pinned trade wire has a caller fee floor but no
-user maximum, so an increase could reprice an already-signed trade. Safe increases require an upstream
-max-fee field and a new pin. Backing fees can be re-enabled only after batch-safe accounting is merged on
-top of this exact security line.
+That Percolator revision reserves sparse source-domain capacity before admitting exposure, so every
+accepted leg retains room for its first favorable settlement. It also rejects every atomic batch while
+any backing utilization-fee policy is active. Both governance wrappers therefore reject nonzero backing
+policies but preserve exact-zero updates to clear predecessor state. The ordinary trade fee is selected
+when the market is initialized and can only stay constant or decrease afterward: the pinned trade wire
+has a caller fee floor but no user maximum, so an increase could reprice an already-signed trade. Safe
+increases require an upstream max-fee field and a new pin. Backing fees can be re-enabled only after
+batch-safe accounting is merged on top of this exact security line.
 
 The auction's flat bid fee follows the same rule: book initialization selects its maximum and later
 Squads actions may keep or lower it. The bid wire commits to amounts but has no maximum-fee field, so
