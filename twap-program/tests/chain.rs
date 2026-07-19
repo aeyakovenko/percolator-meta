@@ -19536,7 +19536,7 @@ fn e2e_squads_cannot_terminally_drain_insurance_after_resolve() {
 // marketauth restart it. The constrained TWAP surface must therefore expose the fixed, value-neutral
 // asset-0 restart or a temporary oracle shutdown permanently strands an otherwise reusable market.
 #[test]
-fn e2e_post_genesis_twap_custody_can_restart_asset0() {
+fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -19718,6 +19718,45 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         send(&mut svm, &[&env.dao], ix).expect("approve a generation-A TWAP restart");
     }
 
+    // Approve a market-wide resolution while generation A is still current, but leave it
+    // executable in Squads. A restart changes the economic market incarnation without changing
+    // the slab or controller keys, so this authorization must not survive into generation B.
+    let stale_resolve = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    let stale_resolve_index = 9u64;
+    let stale_resolve_transaction =
+        transaction_pda(&env.squads, &env.multisig, stale_resolve_index);
+    let stale_resolve_proposal = proposal_pda(&env.squads, &env.multisig, stale_resolve_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_transaction,
+            &env.dao.pubkey(),
+            &stale_resolve,
+        ),
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_proposal,
+            &env.dao.pubkey(),
+            stale_resolve_index,
+        ),
+        proposal_approve_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_proposal,
+            &env.dao.pubkey(),
+        ),
+    ] {
+        send(&mut svm, &[&env.dao], ix).expect("approve a generation-A market resolution");
+    }
+
     let initial_price = 1_000_001;
     let restart = build_twap_restart_asset0_message(
         &env.squads_vault,
@@ -19735,7 +19774,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &env.multisig,
         &env.dao,
         &payer,
-        9,
+        10,
         &restart,
         &twap_remaining,
     )
@@ -19779,6 +19818,33 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
     );
     assert_eq!(token_amount(&svm, &env.perc_vault), token_insurance_before);
 
+    let before_stale_resolve = svm.get_account(&env.slab).unwrap();
+    let stale_resolve_result = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_proposal,
+            &stale_resolve_transaction,
+            &env.dao.pubkey(),
+            &controller_remaining,
+        ),
+    );
+    assert!(
+        stale_resolve_result.is_err(),
+        "a generation-A global resolution remained executable against live generation B"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        before_stale_resolve,
+        "stale resolution rejection must preserve every generation-B account byte"
+    );
+    assert!(
+        percolator_accounting::market_is_live(&before_stale_resolve.data).unwrap(),
+        "the probe must reach a live replacement market"
+    );
+
     let generation_b = restarted_group.assets[0].market_id;
     let generation_witness =
         market_controller_program::asset_generation_witness_address(&env.slab, 0, generation_b).0;
@@ -19815,7 +19881,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &env.multisig,
         &env.dao,
         &payer,
-        10,
+        11,
         &shutdown_b,
         &generation_b_remaining,
     )
