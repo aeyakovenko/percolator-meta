@@ -14385,3 +14385,23 @@ principal, and that marker; complete owner exits use the snapshot-bound wire. Pr
 recovery remains available only for layouts that cannot accept another deposit. Checked overflow rejects only
 another top-up before any CPI, and every owner withdrawal remains live through an exact wire. No account data,
 signer, authority, recipient, CPI, token path, custody path, or admin surface was added.
+
+## Tick - stale signed back crossed a same-principal deposit incarnation (surface B, REAL DOS)
+
+Genesis Vote bound each current back to the ballot nonce and exact live principal, but not to Subledger's
+last-deposit marker. A voter could sign a five-unit back, partially withdraw one unit, and redeposit it in the
+same slot. Principal returned to five while the monotonic marker advanced from 100 to 101. A relayer could
+then land the old principal-only back in the final voting slot and immediately seal the complete fixed-supply
+distribution with replacement capital that the signature did not observe.
+
+Retained clean-room LiteSVM test commit `32a9412` reproduces the public path against parent `dee83ad` with the
+real Genesis Vote, Subledger, Distribution, and pinned Percolator SBF binaries. The marker-shaped stale back
+is submitted first so omitting only the new comparison fails at the intended assertion; the vulnerable binary
+then accepts the predecessor principal-only wire. The fixed binary rejects both byte-atomically, accepts a
+fresh marker-101 back in the same final slot, and seals only that current support.
+
+FIX: a current back now commits to `ballot_nonce || principal || last_deposit_marker`. Genesis reads the marker
+from the canonical Subledger position using a cross-pinned offset. Retract and every principal-recovery path
+are unchanged, so an obsolete client cannot trap funds; it must upgrade only before adding support. The change
+adds no state, account, allocation, signer, authority, recipient, CPI, token path, custody path, or admin
+surface and depends on Subledger's monotonic marker from the preceding finding.

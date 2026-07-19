@@ -1704,13 +1704,19 @@ fn gv_vote_ix(
             .unwrap_or(0);
         ix.data.extend_from_slice(&vote_nonce.to_le_bytes());
         if action == 1 {
-            let principal = env
+            let position = env
                 .svm
                 .get_account(&env.position_pda(voter))
-                .filter(|account| account.data.len() >= 80)
+                .filter(|account| account.data.len() >= 97);
+            let principal = position
+                .as_ref()
                 .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
                 .unwrap_or(0);
+            let start_slot = position
+                .map(|account| u64::from_le_bytes(account.data[89..97].try_into().unwrap()))
+                .unwrap_or(0);
             ix.data.extend_from_slice(&principal.to_le_bytes());
+            ix.data.extend_from_slice(&start_slot.to_le_bytes());
         }
     }
     ix

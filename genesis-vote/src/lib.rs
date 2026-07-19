@@ -68,6 +68,7 @@ const SUB_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 pub const SUB_POS_POOL_OFF: usize = 8;
 pub const SUB_POS_OWNER_OFF: usize = 40;
 pub const SUB_POS_PRINCIPAL_OFF: usize = 72;
+pub const SUB_POS_START_SLOT_OFF: usize = 89;
 pub const SUB_POOL_OUTSTANDING_OFF: usize = 80;
 pub const SUB_POOL_DEPOSIT_DEADLINE_OFF: usize = 240;
 pub const SUB_POOL_DEPOSIT_WINDOW_OFF: usize = 248;
@@ -285,13 +286,12 @@ impl Ballot {
     }
 }
 
-/// Read principal from a subledger position account. The mirrored prefix is:
-/// disc[8], pool[32], owner[32], principal(u64).
+/// Read principal and the last-deposit marker from a subledger position account.
 fn read_sub_position(
     data: &[u8],
     expected_pool: &Pubkey,
     expected_owner: &Pubkey,
-) -> Result<u64, ProgramError> {
+) -> Result<(u64, u64), ProgramError> {
     if data.len() < 97 || data[..8] != SUB_POSITION_DISC {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -300,10 +300,17 @@ fn read_sub_position(
     if pool != *expected_pool || owner != *expected_owner {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(u64::from_le_bytes(
-        data[SUB_POS_PRINCIPAL_OFF..SUB_POS_PRINCIPAL_OFF + 8]
-            .try_into()
-            .unwrap(),
+    Ok((
+        u64::from_le_bytes(
+            data[SUB_POS_PRINCIPAL_OFF..SUB_POS_PRINCIPAL_OFF + 8]
+                .try_into()
+                .unwrap(),
+        ),
+        u64::from_le_bytes(
+            data[SUB_POS_START_SLOT_OFF..SUB_POS_START_SLOT_OFF + 8]
+                .try_into()
+                .unwrap(),
+        ),
     ))
 }
 
@@ -1060,7 +1067,8 @@ fn retract_legacy_vote<'a>(
 // vote accounts: [voter(s,w), config(w), ballot(w,pda), proposal_vote(w),
 //   sub_position(w), sub_pool(ro), system_program, subledger_program]
 // data (current):
-//   back:    action(u8) || vote_nonce(u64) || expected_principal(u64)
+//   back:    action(u8) || vote_nonce(u64) || expected_principal(u64) ||
+//            expected_start_slot(u64)
 //   retract: action(u8) || vote_nonce(u64)
 // A nonce-zero current ballot may use the predecessor action-only encoding only to
 // retract. Exit-only legacy config generations retain their action-only retract.
@@ -1088,18 +1096,21 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
         return Err(ProgramError::InvalidInstructionData);
     }
     let action = data[0];
-    let (expected_vote_nonce, expected_principal) = match (action, data.len()) {
-        (VOTE_BACK, 17) => (
-            Some(u64::from_le_bytes(data[1..9].try_into().unwrap())),
-            Some(u64::from_le_bytes(data[9..17].try_into().unwrap())),
-        ),
-        (VOTE_RETRACT, 9) => (
-            Some(u64::from_le_bytes(data[1..9].try_into().unwrap())),
-            None,
-        ),
-        (VOTE_RETRACT, 1) => (None, None),
-        _ => return Err(ProgramError::InvalidInstructionData),
-    };
+    let (expected_vote_nonce, expected_principal, expected_start_slot) =
+        match (action, data.len()) {
+            (VOTE_BACK, 25) => (
+                Some(u64::from_le_bytes(data[1..9].try_into().unwrap())),
+                Some(u64::from_le_bytes(data[9..17].try_into().unwrap())),
+                Some(u64::from_le_bytes(data[17..25].try_into().unwrap())),
+            ),
+            (VOTE_RETRACT, 9) => (
+                Some(u64::from_le_bytes(data[1..9].try_into().unwrap())),
+                None,
+                None,
+            ),
+            (VOTE_RETRACT, 1) => (None, None, None),
+            _ => return Err(ProgramError::InvalidInstructionData),
+        };
     if !voter.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -1165,9 +1176,12 @@ fn vote<'a>(program_id: &Pubkey, accounts: &'a [AccountInfo<'a>], data: &[u8]) -
     if *sub_position.key != expected_sub_pos {
         return Err(ProgramError::InvalidSeeds);
     }
-    let principal = read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
-    if action == VOTE_BACK && expected_principal != Some(principal) {
-        msg!("back authorization does not match live principal");
+    let (principal, start_slot) =
+        read_sub_position(&sub_position.try_borrow_data()?, sub_pool.key, voter.key)?;
+    if action == VOTE_BACK
+        && (expected_principal != Some(principal) || expected_start_slot != Some(start_slot))
+    {
+        msg!("back authorization does not match live position incarnation");
         return Err(ProgramError::InvalidInstructionData);
     }
     // Snapshot the live pool outstanding into the config for off-chain visibility. NOTE: this is NOT
