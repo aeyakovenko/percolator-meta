@@ -3877,6 +3877,309 @@ fn depositor_round_trip_cannot_reassign_another_owners_insurance_domain() {
     );
 }
 
+// SEGREGATION/LIVENESS BOUNDARY: a public bankruptcy may consume one insurance
+// domain while leaving a winner in ResetPending. A non-cooperating winner can
+// temporarily keep the surviving domain reserved, but cannot lock an independent
+// Subledger depositor: after governance resolves and the configured delay matures,
+// CloseResolved is permissionless and pays only to a clean winner-owned account.
+#[test]
+fn permissionless_resolved_close_unblocks_owner_exit_after_public_insurance_loss() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    env.svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_insurance_pool();
+
+    let (depositor, depositor_ata) = new_depositor(&mut env, 4);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&depositor, &depositor_ata, &holding, 4)
+        .expect("fund both insurance domains");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
+    let short_portfolio = create_percolator_portfolio(&mut env, &short, 200);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (2 * percolator::POS_SCALE) as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open a public pair");
+
+    env.warp_slot(101);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 1_000,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("move the mark against the short");
+    public_percolator_crank(&mut env, long_portfolio, 101, true)
+        .expect("settle the winner");
+    env.warp_slot(102);
+    public_percolator_crank(&mut env, long_portfolio, 102, true)
+        .expect("refresh the winner");
+    env.warp_slot(103);
+    for _ in 0..2 {
+        public_percolator_crank(&mut env, short_portfolio, 103, true)
+            .expect("liquidate the short");
+    }
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let (_, group) = percolator_prog::state::read_market(&market.data).unwrap();
+    let long_state = percolator_prog::state::read_portfolio(
+        &env.svm.get_account(&long_portfolio).unwrap().data,
+    )
+    .unwrap();
+    let short_state = percolator_prog::state::read_portfolio(
+        &env.svm.get_account(&short_portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(group.insurance, 2, "one two-atom insurance domain was consumed");
+    assert_eq!(asset_insurance_remaining(&env, 0), 2);
+    assert!(
+        percolator_accounting::asset_has_position_or_loss_state(&market.data, 0).unwrap(),
+        "the winner's reset leg keeps a positive live exit guarded",
+    );
+    assert_eq!(group.vault - group.c_tot - group.insurance, 202);
+    assert_eq!(long_state.capital.get(), 1_000_000);
+    assert_eq!(long_state.pnl.get(), 600);
+    assert!(!percolator::active_bitmap_is_empty(
+        long_state.active_bitmap.map(percolator::V16PodU64::get),
+    ));
+    assert_eq!(short_state.capital.get(), 0);
+    assert_eq!(short_state.pnl.get(), 0);
+    assert!(percolator::active_bitmap_is_empty(
+        short_state.active_bitmap.map(percolator::V16PodU64::get),
+    ));
+    let market_before_exit = env.svm.get_account(&env.slab).unwrap();
+    let vault_before_exit = env.token_amount(&env.perc_vault);
+    let exit = env.insurance_withdraw(&depositor, &depositor_ata, &holding, &depositor, 4);
+    assert!(exit.is_err(), "a positive live exit cannot outrun stale loss settlement");
+    assert_eq!(env.svm.get_account(&env.slab).unwrap().data, market_before_exit.data);
+    assert_eq!(env.token_amount(&env.perc_vault), vault_before_exit);
+    assert_eq!(env.pool_outstanding(), 4);
+    assert_eq!(env.token_amount(&depositor_ata), 0);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("governance resolves without the stale winner's signature");
+    let resolved_market_before_exit = env.svm.get_account(&env.slab).unwrap();
+    let resolved_vault_before_exit = env.token_amount(&env.perc_vault);
+    let resolved_exit =
+        env.insurance_withdraw(&depositor, &depositor_ata, &holding, &depositor, 4);
+    assert!(
+        resolved_exit.is_err(),
+        "the remaining insurance stays reserved until the winner is wound down",
+    );
+    assert_eq!(
+        env.svm.get_account(&env.slab).unwrap().data,
+        resolved_market_before_exit.data,
+    );
+    assert_eq!(env.token_amount(&env.perc_vault), resolved_vault_before_exit);
+    assert_eq!(env.pool_outstanding(), 4);
+
+    let (cfg, resolved_group) = percolator_prog::state::read_market(
+        &env.svm.get_account(&env.slab).unwrap().data,
+    )
+    .unwrap();
+    assert!(cfg.force_close_delay_slots > 0);
+    env.warp_slot(
+        resolved_group
+            .resolved_slot
+            .checked_add(cfg.force_close_delay_slots)
+            .unwrap(),
+    );
+    let payer = clone_kp(&env.payer);
+    let long_destination =
+        create_token_account(&mut env.svm, &payer, &env.mint, &long.pubkey());
+    let mut resolved_steps = 0usize;
+    for _ in 0..512 {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(long.pubkey(), false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(long_portfolio, false),
+                    AccountMeta::new(long_destination, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                }
+                .encode(),
+            }],
+            &[],
+        )
+        .expect("each permissionless resolved-close step makes bounded progress");
+        resolved_steps += 1;
+        if env.token_amount(&long_destination) == 1_000_200 {
+            break;
+        }
+    }
+    assert_eq!(
+        env.token_amount(&long_destination),
+        1_000_200,
+        "resolved payout is the winner's principal plus the loser's crystallized capital",
+    );
+    assert!(resolved_steps < 512, "the absent winner has a bounded public close path");
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(long.pubkey(), false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(long_destination, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: PIx::ClaimResolvedPayoutTopup.encode(),
+        }],
+        &[],
+    )
+    .expect("the destination-bound topup path is also permissionless");
+    assert_eq!(
+        env.token_amount(&long_destination),
+        1_000_200,
+        "consumed insurance is protocol residual, not a second trader payout",
+    );
+    let payer = clone_kp(&env.payer);
+    let short_destination =
+        create_token_account(&mut env.svm, &payer, &env.mint, &short.pubkey());
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(short.pubkey(), false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(short_portfolio, false),
+                AccountMeta::new(short_destination, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: PIx::CloseResolved {
+                fee_rate_per_slot: 0,
+            }
+            .encode(),
+        }],
+        &[],
+    )
+    .expect("a cranker settles the absent bankrupt portfolio");
+    assert_eq!(env.token_amount(&short_destination), 0);
+    for portfolio in [long_portfolio, short_portfolio] {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                data: PIx::ClosePortfolio.encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("resolved market authority deregisters an empty absent portfolio");
+    }
+    for side in [0, 1] {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![AccountMeta::new(env.slab, false)],
+                data: PIx::FinalizeResetSide {
+                    asset_index: 0,
+                    side,
+                }
+                .encode(),
+            }],
+            &[],
+        )
+        .expect("a cranker finalizes the resolved asset reset barrier");
+    }
+    env.insurance_withdraw(&depositor, &depositor_ata, &holding, &depositor, 4)
+        .expect("the impaired owner exits after bounded permissionless winner close");
+    assert_eq!(env.token_amount(&depositor_ata), 2);
+    assert_eq!(env.pool_outstanding(), 0);
+    let (_, final_group) = percolator_prog::state::read_market(
+        &env.svm.get_account(&env.slab).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(final_group.c_tot, 0);
+    assert_eq!(final_group.insurance, 0);
+    assert_eq!(env.token_amount(&env.perc_vault), 2);
+    assert_eq!(
+        env.token_amount(&long_destination)
+            + env.token_amount(&depositor_ata)
+            + env.token_amount(&env.perc_vault),
+        1_000_000 + 200 + 4,
+        "trader principal, surviving insurance, and consumed-loss residual conserve exactly",
+    );
+}
+
 // PUBLIC LOF: spent domain budget is historical, not live protection. After a
 // one-sided loss, fresh insurance must rebuild the configured 50/50 live allocation
 // instead of balancing gross budgets around atoms that the market already consumed.
