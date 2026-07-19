@@ -9249,13 +9249,14 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
 }
 
 #[test]
-fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
+fn probe_terminal_actions_cannot_skip_committed_value() {
     use percolator_prog::ix::Instruction as PIx;
 
     #[derive(Clone, Copy, Debug)]
     enum TerminalAction {
         Resolve,
         Shutdown,
+        StaleResolve,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -9281,8 +9282,14 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
         const DEPOSIT: u128 = 100_000_000;
-        let (price, mark, max_price_move_bps_per_slot, size_q, activate_mark, resolve_slot) =
-            match segment {
+        let (
+            price,
+            mut mark,
+            max_price_move_bps_per_slot,
+            size_q,
+            activate_mark,
+            resolve_slot,
+        ): (u64, u64, u64, i128, bool, u64) = match segment {
                 Segment::ActiveFunding => (
                     100,
                     99,
@@ -9300,6 +9307,11 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                     PRIME_SLOT,
                 ),
             };
+        if matches!(terminal, TerminalAction::StaleResolve) {
+            mark = price
+                .checked_add(price * max_price_move_bps_per_slot / 10_000)
+                .unwrap();
+        }
 
         let mut svm = LiteSVM::new().with_compute_budget(
             solana_program_runtime::compute_budget::ComputeBudget {
@@ -9397,12 +9409,16 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                     AccountMeta::new(market, false),
                 ],
                 PIx::ConfigurePermissionlessResolve {
-                    stale_slots: 1_000,
+                    stale_slots: if matches!(terminal, TerminalAction::StaleResolve) {
+                        1
+                    } else {
+                        1_000
+                    },
                     force_close_delay_slots: 1,
                 },
             ),
         )
-        .expect("configure the bounded public force-close delay");
+        .expect("configure the bounded public terminal delays");
         send(
             &mut svm,
             &[&payer, &creator, &oracle],
@@ -9580,11 +9596,17 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         )
         .expect("donate bounded lifecycle authority to the controller");
 
-        clock.slot = resolve_slot;
-        clock.unix_timestamp = resolve_slot as i64;
+        let initial_terminal_slot = if matches!(terminal, TerminalAction::StaleResolve) {
+            resolve_slot + 1
+        } else {
+            resolve_slot
+        };
+        clock.slot = initial_terminal_slot;
+        clock.unix_timestamp = initial_terminal_slot as i64;
         svm.set_sysvar(&clock);
         if crank_before_terminal {
-            crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
+            crank(&mut svm, initial_terminal_slot)
+                .expect("commit the deterministic market segment");
         }
         let terminal_slot = if oracle_race_atomic {
             let terminal_slot = resolve_slot + 1;
@@ -9614,7 +9636,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
             .expect("independent oracle republishes immediately before governance");
             terminal_slot
         } else {
-            resolve_slot
+            initial_terminal_slot
         };
         let resolve = |svm: &LiteSVM| {
             let witness = controller_market_generation_witness(svm, &market);
@@ -9654,7 +9676,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 } else if crank_before_terminal {
                     first_resolve.expect("settled controller resolve remains live");
                 } else if first_resolve.is_err() {
-                    crank(&mut svm, resolve_slot)
+                    crank(&mut svm, terminal_slot)
                         .expect("public crank catches up committed value");
                     let retry_resolve_ix = resolve(&svm);
                     send(&mut svm, &[&payer, &governance], retry_resolve_ix)
@@ -9724,9 +9746,9 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 } else if crank_before_terminal {
                     first_shutdown.expect("settled controller shutdown remains live");
                 } else if first_shutdown.is_err() {
-                    crank(&mut svm, resolve_slot)
+                    crank(&mut svm, terminal_slot)
                         .expect("public crank catches up committed value");
-                    let retry_shutdown_ix = shutdown(&svm, resolve_slot);
+                    let retry_shutdown_ix = shutdown(&svm, terminal_slot);
                     send(&mut svm, &[&payer, &governance], retry_shutdown_ix)
                         .expect("controller shutdown succeeds after bounded catch-up");
                 }
@@ -9765,6 +9787,31 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 send(&mut svm, &[&payer, &governance], final_resolve_ix)
                     .expect("controller resolves after public Recovery cleanup");
                 funding
+            }
+            TerminalAction::StaleResolve => {
+                let stale_resolve = || {
+                    pix(
+                        vec![AccountMeta::new(market, false)],
+                        PIx::ResolveStalePermissionless {
+                            now_slot: terminal_slot,
+                        },
+                    )
+                };
+                let first_resolve = send(&mut svm, &[&payer], stale_resolve());
+                if crank_before_terminal {
+                    first_resolve.expect("settled public stale resolution remains live");
+                } else if first_resolve.is_err() {
+                    crank(&mut svm, terminal_slot)
+                        .expect("public stale-boundary crank catches up committed value");
+                    send(&mut svm, &[&payer], stale_resolve())
+                        .expect("public stale resolution succeeds after bounded catch-up");
+                }
+                let state = percolator_prog::state::read_market(
+                    &svm.get_account(&market).unwrap().data,
+                )
+                .unwrap()
+                .1;
+                (state.assets[0].f_long_num, state.assets[0].f_short_num)
             }
         };
 
@@ -9869,6 +9916,31 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
     assert_eq!(
         attack.short_payout, control.short_payout,
         "{attack:?} != {control:?}"
+    );
+
+    let control = run(
+        Segment::PendingPrice,
+        true,
+        TerminalAction::StaleResolve,
+        false,
+    );
+    let attack = run(
+        Segment::PendingPrice,
+        false,
+        TerminalAction::StaleResolve,
+        false,
+    );
+    assert_eq!(control.f_long_num, 0);
+    assert_eq!(control.f_short_num, 0);
+    assert!(control.long_payout > 100_000_000, "{control:?}");
+    assert!(control.short_payout < 100_000_000, "{control:?}");
+    assert_eq!(
+        attack.long_payout, control.long_payout,
+        "public stale resolution discarded an authenticated mark: {attack:?} != {control:?}"
+    );
+    assert_eq!(
+        attack.short_payout, control.short_payout,
+        "public stale resolution discarded an authenticated mark: {attack:?} != {control:?}"
     );
 
     for terminal in [TerminalAction::Resolve, TerminalAction::Shutdown] {

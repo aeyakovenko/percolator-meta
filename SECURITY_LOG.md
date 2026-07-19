@@ -14478,3 +14478,20 @@ cannot interleave within one transaction. The retained real-SBF LiteSVM probe pu
 the next slot, proves standalone shutdown and resolution both reject, then executes each as
 `[PermissionlessCrank, controller terminal action]`. Both atomic paths commit, preserve the expected
 long/short settlement, and complete the normal owner recovery lifecycle. No code change was required.
+
+## Tick - public stale resolution discarded a pending authenticated price (surface A/C, REAL LOF)
+
+Percolator's signerless `ResolveStalePermissionless` path could resolve directly from stored engine
+state while an independent oracle's newer authenticated mark was waiting for its first public crank.
+An unaffiliated caller could therefore win the stale-boundary race and terminally discard the bounded
+price move. In the retained real-SBF LiteSVM regression, independent users hold balanced exposure at
+10,000, the oracle publishes the maximum one-crank move, and both control and attack reach the same
+terminal slot. Crank-first resolution pays 100,100,000 / 99,900,000 atoms; the prior public stale path
+paid 100,000,000 to each side, erasing the long's 100,000-atom claim.
+
+FIX: the workspace pins Percolator commit `eab3c4f66e45381860541a04701e7f0438a0ffe3`,
+which rejects both privileged and signerless resolution whenever a public crank can still commit
+value. The public crank performs the bounded catch-up and the same stale resolver then succeeds. A
+mutation check against the prior `da64be639168b496833dd4c701607a94fcb06b6c` SBF binary fails on the
+exact payout delta; the fixed binary passes. Meta adds no state, signer, authority, recipient, CPI,
+token, custody, or admin surface.
