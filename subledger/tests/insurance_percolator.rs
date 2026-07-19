@@ -5234,6 +5234,131 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
 }
 
+// SAME-SLOT POSITION ABA: principal plus the raw Clock slot is not an
+// incarnation witness. A partial exit and equal redeposit can restore both
+// values before the slot advances, allowing an older full-exit signature to
+// retire replacement capital after Genesis admission closes.
+#[test]
+fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_aba() {
+    let start = 100u64;
+    let deposit_window = 10u64;
+    let bootstrap_delay = 100u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        deposit_window,
+        start,
+        bootstrap_delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(deposit_window),
+        Some(start),
+    );
+    let ve = setup_vote(&mut env);
+    let (_, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 6);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 4)
+        .expect("alice deposits initial Genesis principal");
+
+    env.warp_slot(start + deposit_window - 1);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1)
+        .expect("alice reaches five units in the final deposit slot");
+    let signed_snapshot = env.read_position(&alice.pubkey());
+    assert_eq!(signed_snapshot, (5, start + deposit_window - 1, false));
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let exit_accounts = vec![
+        AccountMeta::new(alice.pubkey(), true),
+        AccountMeta::new(env.pool, false),
+        AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+        AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    let mut full_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    full_exit_data.extend_from_slice(&signed_snapshot.0.to_le_bytes());
+    full_exit_data.extend_from_slice(&signed_snapshot.1.to_le_bytes());
+    let withheld_full_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            Instruction {
+                program_id: sub_id(),
+                accounts: exit_accounts.clone(),
+                data: full_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    let mut partial_exit_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    partial_exit_data.extend_from_slice(&1u64.to_le_bytes());
+    let mut redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    redeposit_data.extend_from_slice(&1u64.to_le_bytes());
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
+                Instruction {
+                    program_id: sub_id(),
+                    accounts: exit_accounts,
+                    data: partial_exit_data,
+                },
+                Instruction {
+                    program_id: sub_id(),
+                    accounts: vec![
+                        AccountMeta::new(alice.pubkey(), true),
+                        AccountMeta::new(env.pool, false),
+                        AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+                        AccountMeta::new(alice_ata, false),
+                        AccountMeta::new(holding, false),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(perc_id(), false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                    ],
+                    data: redeposit_data,
+                },
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice replaces one unit without advancing the Solana slot");
+    assert_eq!(env.read_position(&alice.pubkey()).0, 5);
+    assert_eq!(env.token_amount(&alice_ata), 1);
+
+    env.warp_slot(start + deposit_window);
+    if env.svm.send_transaction(withheld_full_exit).is_ok() {
+        assert_eq!(env.read_position(&alice.pubkey()).0, 0);
+        assert_eq!(env.token_amount(&alice_ata), 6);
+        assert!(gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err());
+        panic!("a same-slot ABA let an old signature retire replacement Genesis capital");
+    }
+
+    assert_eq!(
+        env.read_position(&alice.pubkey()),
+        (5, start + deposit_window, false),
+        "the replacement deposit advances the position witness even within one slot",
+    );
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("all five replacement units retain their Genesis vote");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
