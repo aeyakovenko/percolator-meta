@@ -5268,17 +5268,23 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
 
     let (alice, alice_ata) = new_depositor(&mut env, 6);
     let (bob, bob_ata) = new_depositor(&mut env, 6);
+    let (charlie, charlie_ata) = new_depositor(&mut env, 6);
     let pool = env.pool;
     let holding = create_holding(&mut env, &pool);
     let bob_holding = create_holding(&mut env, &pool);
+    let charlie_holding = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &holding, 5)
         .expect("alice creates the position covered by the held exit");
     env.insurance_deposit(&bob, &bob_ata, &bob_holding, 5)
         .expect("bob creates the position covered by the amount-bearing exit");
+    env.insurance_deposit(&charlie, &charlie_ata, &charlie_holding, 5)
+        .expect("charlie creates the position covered by the partial exits");
     let original = env.read_position(&alice.pubkey());
     let bob_original = env.read_position(&bob.pubkey());
+    let charlie_original = env.read_position(&charlie.pubkey());
     assert_eq!(original, (5, start, false));
     assert_eq!(bob_original, original);
+    assert_eq!(charlie_original, original);
     let original_position = env
         .svm
         .get_account(&env.position_pda(&alice.pubkey()))
@@ -5344,6 +5350,60 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
         &[&payer, &bob],
         held_blockhash,
     );
+    let mut exact_partial_exit_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    exact_partial_exit_data.extend_from_slice(&1u64.to_le_bytes());
+    exact_partial_exit_data.extend_from_slice(&charlie_original.0.to_le_bytes());
+    exact_partial_exit_data.extend_from_slice(&charlie_original.1.to_le_bytes());
+    let withheld_exact_partial_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_997),
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(charlie.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(env.position_pda(&charlie.pubkey()), false),
+                    AccountMeta::new(charlie_ata, false),
+                    AccountMeta::new(charlie_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: exact_partial_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &charlie],
+        held_blockhash,
+    );
+    let mut amount_partial_exit_data = vec![5u8]; // predecessor amount-only encoding
+    amount_partial_exit_data.extend_from_slice(&1u64.to_le_bytes());
+    let withheld_amount_partial_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_996),
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(charlie.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(env.position_pda(&charlie.pubkey()), false),
+                    AccountMeta::new(charlie_ata, false),
+                    AccountMeta::new(charlie_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: amount_partial_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &charlie],
+        held_blockhash,
+    );
 
     env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 1)
         .expect("alice partially withdraws in the deposit slot");
@@ -5353,14 +5413,20 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
         .expect("bob partially withdraws in the deposit slot");
     env.insurance_deposit(&bob, &bob_ata, &bob_holding, 1)
         .expect("bob restores the principal in the same slot");
+    env.insurance_withdraw(&charlie, &charlie_ata, &charlie_holding, &charlie, 1)
+        .expect("charlie partially withdraws in the deposit slot");
+    env.insurance_deposit(&charlie, &charlie_ata, &charlie_holding, 1)
+        .expect("charlie restores the principal in the same slot");
     let restored = env.read_position(&alice.pubkey());
     let bob_restored = env.read_position(&bob.pubkey());
+    let charlie_restored = env.read_position(&charlie.pubkey());
     assert_eq!(
         restored,
         (original.0, original.1 + 1, false),
         "the same-slot redeposit advances the signed incarnation marker",
     );
     assert_eq!(bob_restored, restored);
+    assert_eq!(charlie_restored, restored);
     let restored_position = env
         .svm
         .get_account(&env.position_pda(&alice.pubkey()))
@@ -5380,15 +5446,35 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
         env.svm.send_transaction(withheld_amount_exit).is_err(),
         "the ordinary amount wire cannot bypass the complete-exit witness",
     );
+    assert!(
+        env.svm
+            .send_transaction(withheld_exact_partial_exit)
+            .is_err(),
+        "an exact partial exit cannot cross a position incarnation",
+    );
+    assert!(
+        env.svm
+            .send_transaction(withheld_amount_partial_exit)
+            .is_err(),
+        "a current position cannot retain the replayable amount-only partial wire",
+    );
     assert_eq!(env.read_position(&alice.pubkey()), restored);
     assert_eq!(env.read_position(&bob.pubkey()), bob_restored);
+    assert_eq!(
+        env.read_position(&charlie.pubkey()),
+        charlie_restored,
+        "the withheld partial exits cannot reduce post-cutoff vote principal",
+    );
     assert_eq!(env.token_amount(&alice_ata), 1);
     assert_eq!(env.token_amount(&bob_ata), 1);
+    assert_eq!(env.token_amount(&charlie_ata), 1);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
         .expect("alice retains the post-cutoff Genesis vote opportunity");
     gv_vote(&mut env, &ve, &bob, &gv_proposal, 1)
         .expect("bob retains the post-cutoff Genesis vote opportunity");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
+    gv_vote(&mut env, &ve, &charlie, &gv_proposal, 1)
+        .expect("charlie retains the post-cutoff Genesis vote opportunity");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (15, 15));
 }
 
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
