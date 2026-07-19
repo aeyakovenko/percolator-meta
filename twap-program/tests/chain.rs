@@ -9844,6 +9844,121 @@ fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
     );
 }
 
+#[test]
+fn probe_public_stale_resolve_preflight_stays_bounded_at_10m_market_shape() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const ASSET_COUNT: usize = 5_834;
+    const PRICE: u64 = 100;
+    const STALE_SLOT: u64 = 2;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: STALE_SLOT,
+        unix_timestamp: STALE_SLOT as i64,
+        ..Clock::default()
+    });
+
+    // Public activation can construct this shape. Install the otherwise ordinary initialized slab
+    // directly so this probe spends its transaction budget on the terminal public instruction.
+    let market = Pubkey::new_unique();
+    let collateral_mint = Pubkey::new_unique();
+    let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
+    wrapper.marketauth = payer.pubkey().to_bytes();
+    wrapper.collateral_mint = collateral_mint.to_bytes();
+    wrapper.last_good_oracle_slot = 1;
+    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
+    wrapper.mark_ewma_e6 = PRICE;
+    wrapper.mark_ewma_last_slot = 1;
+    wrapper.oracle_target_price_e6 = PRICE;
+    let config = percolator_prog::risk::V16Config::public_user_fund_with_market_slots(
+        percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
+        ASSET_COUNT as u32,
+        0,
+        10,
+    );
+    let mut market_data = vec![
+        0u8;
+        percolator_prog::state::market_account_len_for_capacity(ASSET_COUNT).unwrap()
+    ];
+    percolator_prog::state::init_market_account_zero_copy(
+        &mut market_data,
+        &wrapper,
+        config,
+        market.to_bytes(),
+        PRICE,
+        1,
+    )
+    .expect("construct the maximum current market shape");
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_data.len());
+    svm.set_account(
+        market,
+        Account {
+            lamports: market_rent,
+            data: market_data,
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure signerless stale resolution through the public API");
+
+    svm.expire_blockhash();
+    let metadata = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![AccountMeta::new(market, false)],
+                PIx::ResolveStalePermissionless {
+                    now_slot: STALE_SLOT,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .expect("maximum-shape signerless stale resolution stays within the transaction CU limit");
+    eprintln!(
+        "10 MiB public stale resolution used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        metadata.compute_units_consumed < 1_200_000,
+        "maximum-shape public stale resolution used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        percolator_accounting::market_is_resolved_and_empty(
+            &svm.get_account(&market).unwrap().data
+        )
+        .unwrap()
+    );
+}
+
 // A TWAP bid is a standing COIN/collateral order rather than a
 // Percolator-position instruction. Exercise it across an asset-0 market generation change and
 // verify that neither side receives terms outside the signed bid or the protected insurance floor.

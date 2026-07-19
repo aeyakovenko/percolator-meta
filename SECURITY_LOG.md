@@ -14422,3 +14422,12 @@ value. The public crank performs the bounded catch-up and the same stale resolve
 mutation check against the prior `da64be639168b496833dd4c701607a94fcb06b6c` SBF binary fails on the
 exact payout delta; the fixed binary passes. Meta adds no state, signer, authority, recipient, CPI,
 token, custody, or admin surface.
+
+## Tick - stale-resolution accrual scan cannot exhaust terminal compute (surface A/C, BLOCKED)
+
+The fixed signerless resolver scans every configured asset before entering terminal mode, so a dense
+maximum-size market could have converted the LoF fix into a public lifecycle DoS. A retained real-SBF
+LiteSVM probe constructs the supported 5,834-asset, 10 MiB slab, configures stale resolution through
+the real public API, and invokes `ResolveStalePermissionless` at the exact boundary. The transaction
+resolves successfully using 78,219 CU, below the test's 1,200,000-CU ceiling. No code change was
+required.
