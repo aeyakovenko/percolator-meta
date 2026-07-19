@@ -147,8 +147,8 @@ pub fn asset_generation_witness_address(
     )
 }
 
-/// Stateless read-only account key that commits a market-wide admin action to
-/// Percolator's monotonic asset-generation cursor.
+/// Stateless read-only account key that commits a market-wide terminal action or
+/// terminal-resolution policy to Percolator's monotonic asset-generation cursor.
 pub fn market_generation_witness_address(
     market: &Pubkey,
     next_market_id: u64,
@@ -614,6 +614,13 @@ fn restart_asset_index(data: &[u8]) -> Result<Option<usize>, ProgramError> {
     ]))))
 }
 
+fn generation_bound_market(data: &[u8]) -> bool {
+    matches!(
+        data.first().copied(),
+        Some(PERC_IX_RESOLVE_MARKET) | Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE)
+    )
+}
+
 /// Returns the target asset and the number of accounts Percolator itself expects after the slab.
 /// The controller requires one additional final account that commits governance to the current
 /// engine-assigned market ID, then removes it before CPI.
@@ -762,7 +769,7 @@ fn process_proxy_admin<'a>(
         )?;
     }
     let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
-    if perc_tag == PERC_IX_RESOLVE_MARKET {
+    if generation_bound_market(data) {
         let next_market_id = {
             let market_data = market.try_borrow_data()?;
             percolator_accounting::read_next_market_id(&market_data)
@@ -3134,6 +3141,17 @@ mod tests {
         );
         assert_ne!(witness, asset_generation_witness_address(&market, 2, 2).0);
         assert_ne!(witness, asset_generation_witness_address(&market, 1, 3).0);
+    }
+
+    #[test]
+    fn market_generation_binding_covers_both_terminal_resolution_controls() {
+        assert!(generation_bound_market(&[PERC_IX_RESOLVE_MARKET]));
+        assert!(generation_bound_market(&[
+            PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE
+        ]));
+        assert!(!generation_bound_market(&[
+            PERC_IX_UPDATE_TRADE_FEE_POLICY
+        ]));
     }
 
     #[test]
