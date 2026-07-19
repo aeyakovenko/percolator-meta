@@ -9235,7 +9235,7 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
 }
 
 #[test]
-fn probe_controller_resolve_cannot_skip_committed_funding() {
+fn probe_terminal_resolution_cannot_skip_committed_value() {
     use percolator_prog::ix::Instruction as PIx;
 
     #[derive(Clone, Copy)]
@@ -9252,12 +9252,23 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         short_payout: u64,
     }
 
-    fn run(segment: Segment, crank_before_resolve: bool) -> Outcome {
+    fn run(
+        segment: Segment,
+        crank_before_resolve: bool,
+        public_stale: bool,
+        stale_boundary_probe: bool,
+    ) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
         const DEPOSIT: u128 = 100_000_000;
-        let (price, mark, max_price_move_bps_per_slot, size_q, activate_mark, resolve_slot) =
-            match segment {
+        let (
+            price,
+            mut mark,
+            max_price_move_bps_per_slot,
+            size_q,
+            activate_mark,
+            resolve_slot,
+        ): (u64, u64, u64, i128, bool, u64) = match segment {
                 Segment::ActiveFunding => (
                     100,
                     99,
@@ -9275,6 +9286,11 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                     PRIME_SLOT,
                 ),
             };
+        if stale_boundary_probe {
+            mark = price
+                .checked_add(price * max_price_move_bps_per_slot / 10_000)
+                .unwrap();
+        }
 
         let mut svm = LiteSVM::new().with_compute_budget(
             solana_program_runtime::compute_budget::ComputeBudget {
@@ -9363,6 +9379,23 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             ),
         )
         .expect("initialize the public funding market");
+        if public_stale {
+            send(
+                &mut svm,
+                &[&payer, &creator],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(creator.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::ConfigurePermissionlessResolve {
+                        stale_slots: 1,
+                        force_close_delay_slots: 1,
+                    },
+                ),
+            )
+            .expect("configure the public stale-resolution boundary");
+        }
         send(
             &mut svm,
             &[&payer, &creator, &oracle],
@@ -9543,11 +9576,16 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         )
         .expect("donate bounded lifecycle authority to the controller");
 
-        clock.slot = resolve_slot;
-        clock.unix_timestamp = resolve_slot as i64;
+        let terminal_slot = if stale_boundary_probe {
+            resolve_slot + 1
+        } else {
+            resolve_slot
+        };
+        clock.slot = terminal_slot;
+        clock.unix_timestamp = terminal_slot as i64;
         svm.set_sysvar(&clock);
         if crank_before_resolve {
-            crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
+            crank(&mut svm, terminal_slot).expect("commit the deterministic market segment");
         }
         let resolve = |svm: &LiteSVM| {
             let witness = controller_market_generation_witness(svm, &market);
@@ -9565,20 +9603,41 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 data,
             }
         };
-        let first_resolve_ix = resolve(&svm);
-        let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
-        if crank_before_resolve {
-            first_resolve.expect("settled controller resolve remains live");
-        } else if first_resolve.is_err() {
-            crank(&mut svm, resolve_slot).expect("public crank catches up committed value");
-            let retry_resolve_ix = resolve(&svm);
-            send(&mut svm, &[&payer, &governance], retry_resolve_ix)
-                .expect("controller resolve succeeds after bounded catch-up");
+        if public_stale {
+            let stale_resolve = || {
+                pix(
+                    vec![AccountMeta::new(market, false)],
+                    PIx::ResolveStalePermissionless {
+                        now_slot: terminal_slot,
+                    },
+                )
+            };
+            let first_resolve = send(&mut svm, &[&payer], stale_resolve());
+            if first_resolve.is_err() {
+                crank(&mut svm, terminal_slot)
+                    .expect("public stale-boundary crank catches up committed value");
+                send(&mut svm, &[&payer], stale_resolve())
+                    .expect("public stale resolution succeeds after bounded catch-up");
+            }
+        } else {
+            let first_resolve_ix = resolve(&svm);
+            let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
+            if crank_before_resolve {
+                first_resolve.expect("settled controller resolve remains live");
+            } else if first_resolve.is_err() {
+                crank(&mut svm, terminal_slot).expect("public crank catches up committed value");
+                let retry_resolve_ix = resolve(&svm);
+                send(&mut svm, &[&payer, &governance], retry_resolve_ix)
+                    .expect("controller resolve succeeds after bounded catch-up");
+            }
         }
 
         let resolved = percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
             .unwrap()
             .1;
+        clock.slot = terminal_slot + 1;
+        clock.unix_timestamp = (terminal_slot + 1) as i64;
+        svm.set_sysvar(&clock);
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
                 vec![
@@ -9639,22 +9698,37 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         }
     }
 
-    let control = run(Segment::ActiveFunding, true);
-    let attack = run(Segment::ActiveFunding, false);
+    let control = run(Segment::ActiveFunding, true, false, false);
+    let attack = run(Segment::ActiveFunding, false, false, false);
     assert!(control.f_long_num > 0 && control.f_short_num < 0);
     assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
     assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
     assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
 
-    let control = run(Segment::PendingPrice, true);
-    let attack = run(Segment::PendingPrice, false);
+    let control = run(Segment::PendingPrice, true, false, false);
+    let attack = run(Segment::PendingPrice, false, false, false);
     assert_eq!(control.f_long_num, 0);
     assert_eq!(control.f_short_num, 0);
     assert!(control.long_payout > 100_000_000, "{control:?}");
     assert!(control.short_payout < 100_000_000, "{control:?}");
     assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+
+    let control = run(Segment::PendingPrice, true, false, true);
+    let attack = run(Segment::PendingPrice, false, true, true);
+    assert_eq!(control.f_long_num, 0);
+    assert_eq!(control.f_short_num, 0);
+    assert!(control.long_payout > 100_000_000, "{control:?}");
+    assert!(control.short_payout < 100_000_000, "{control:?}");
+    assert_eq!(
+        attack.long_payout, control.long_payout,
+        "public stale resolution discarded an authenticated mark: {attack:?} != {control:?}"
+    );
+    assert_eq!(
+        attack.short_payout, control.short_payout,
+        "public stale resolution discarded an authenticated mark: {attack:?} != {control:?}"
+    );
 }
 
 #[test]
