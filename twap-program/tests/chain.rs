@@ -9238,18 +9238,22 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
 // a position whose first favorable settlement needs a missing 33rd domain. Admission must reserve
 // that capacity up front; otherwise an honest mark move leaves no bounded owner or keeper action
 // able to settle, convert, close, or reduce the live portfolio.
-#[test]
-fn e2e_source_capacity_is_reserved_before_new_exposure() {
+fn run_source_capacity_probe(
+    source_count: usize,
+    market_capacity: usize,
+    probe_conversion: bool,
+) {
     use percolator_prog::ix::Instruction as PIx;
 
     const ACTIVE_CAP: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
-    const HISTORICAL_ASSETS: u16 = 16;
-    const NEW_ASSET: u16 = HISTORICAL_ASSETS;
-    const MARKET_CAPACITY: usize = 70;
+    const FIXTURE_ASSETS: u16 = 16;
+    const NEW_ASSET: u16 = FIXTURE_ASSETS;
     const PRICE_LOW: u64 = 100;
     const PRICE_HIGH: u64 = 101;
     const DEPOSIT: u128 = 1_000_000;
     const SIZE_Q: i128 = percolator::POS_SCALE as i128;
+
+    assert!(source_count > 0 && source_count <= percolator::PORTFOLIO_SOURCE_DOMAIN_CAP);
 
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -9277,7 +9281,7 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
     let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
     let market = Keypair::new();
     let market_len =
-        percolator_prog::state::market_account_len_for_capacity(MARKET_CAPACITY).unwrap();
+        percolator_prog::state::market_account_len_for_capacity(market_capacity).unwrap();
     let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
     send(
         &mut svm,
@@ -9290,7 +9294,7 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
             &perc_id(),
         ),
     )
-    .expect("public creator allocates a capacity-70 market");
+    .expect("public creator allocates the requested market shape");
     let market = market.pubkey();
     send(
         &mut svm,
@@ -9521,7 +9525,8 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
         )
     };
 
-    for asset_index in 0..HISTORICAL_ASSETS {
+    let historical_assets = u16::try_from(source_count.div_ceil(2)).unwrap();
+    for asset_index in 0..historical_assets {
         trade(&mut svm, asset_index, SIZE_Q, PRICE_LOW)
             .expect("owner opens one long source domain");
         slot += 1;
@@ -9539,6 +9544,9 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
         trade(&mut svm, asset_index, -SIZE_Q, PRICE_HIGH)
             .expect("owner closes the long exposure");
 
+        if usize::from(asset_index) * 2 + 1 >= source_count {
+            continue;
+        }
         trade(&mut svm, asset_index, -SIZE_Q, PRICE_HIGH)
             .expect("owner opens one short source domain");
         slot += 1;
@@ -9567,13 +9575,189 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
             .iter()
             .filter(|source| source.is_occupied())
             .count(),
-        percolator::PORTFOLIO_SOURCE_DOMAIN_CAP,
-        "ordinary settlements fill all 32 sparse source slots"
+        source_count,
+        "ordinary settlements create every requested sparse source claim"
     );
-    assert_eq!(filled.pnl.get(), i128::from(2 * HISTORICAL_ASSETS));
+    assert_eq!(filled.pnl.get(), i128::try_from(source_count).unwrap());
     assert!(percolator::active_bitmap_is_empty(
         filled.active_bitmap.map(percolator::V16PodU64::get)
     ));
+
+    if probe_conversion {
+        let market_before_conversion = svm.get_account(&market).unwrap();
+        let portfolio_before_conversion = svm.get_account(&portfolio.pubkey()).unwrap();
+        let conversion_ix = pix(
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio.pubkey(), false),
+            ],
+            PIx::ConvertReleasedPnl { amount: u128::MAX },
+        );
+        svm.expire_blockhash();
+        let conversion = svm.send_transaction(Transaction::new_signed_with_payer(
+            &[conversion_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &owner],
+            svm.latest_blockhash(),
+        ));
+        if let Ok(ref metadata) = conversion {
+            eprintln!(
+                "converted {source_count} public source claims in {} CU",
+                metadata.compute_units_consumed
+            );
+            let converted = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio.pubkey()).unwrap().data,
+            )
+            .unwrap();
+            assert_eq!(converted.capital.get(), DEPOSIT + source_count as u128);
+            assert_eq!(converted.pnl.get(), 0);
+            assert_eq!(
+                converted
+                    .source_domains
+                    .iter()
+                    .filter(|source| source.is_occupied())
+                    .count(),
+                0
+            );
+
+            let destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &destination,
+                &collateral_mint,
+                &owner.pubkey(),
+                0,
+            );
+            send(
+                &mut svm,
+                &[&payer, &owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Withdraw {
+                        amount: DEPOSIT + source_count as u128,
+                    },
+                ),
+            )
+            .expect("owner withdraws principal and every converted source claim");
+            assert_eq!(
+                token_amount(&svm, &destination) as u128,
+                DEPOSIT + source_count as u128
+            );
+            return;
+        }
+
+        let failed_conversion = conversion.unwrap_err();
+        let conversion_error = format!("{:?}", failed_conversion.err);
+        let conversion_cu = failed_conversion.meta.compute_units_consumed;
+        let conversion_logs = failed_conversion.meta.logs.join(" | ");
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_conversion);
+        assert_eq!(
+            svm.get_account(&portfolio.pubkey()).unwrap(),
+            portfolio_before_conversion
+        );
+
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        let earned_withdrawal = send(
+            &mut svm,
+            &[&payer, &owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw {
+                    amount: DEPOSIT + 1,
+                },
+            ),
+        );
+        assert!(
+            earned_withdrawal.is_err(),
+            "Withdraw must not bypass source-backed PnL conversion"
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_conversion);
+        assert_eq!(
+            svm.get_account(&portfolio.pubkey()).unwrap(),
+            portfolio_before_conversion
+        );
+
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount: DEPOSIT },
+            ),
+        )
+        .expect("the conversion failure must not trap original principal");
+        assert_eq!(token_amount(&svm, &destination) as u128, DEPOSIT);
+
+        let claim_only = percolator_prog::state::read_portfolio(
+            &svm.get_account(&portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(claim_only.capital.get(), 0);
+        assert_eq!(claim_only.pnl.get(), i128::try_from(source_count).unwrap());
+        let claim_only_market = svm.get_account(&market).unwrap();
+        let claim_only_portfolio = svm.get_account(&portfolio.pubkey()).unwrap();
+        let close = send(
+            &mut svm,
+            &[&payer, &owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::ClosePortfolio,
+            ),
+        );
+        assert!(close.is_err(), "a live positive claim is not an empty portfolio");
+        assert_eq!(svm.get_account(&market).unwrap(), claim_only_market);
+        assert_eq!(
+            svm.get_account(&portfolio.pubkey()).unwrap(),
+            claim_only_portfolio
+        );
+        panic!(
+            "{source_count} public source claims cannot convert within the transaction budget; \
+             principal exits but earned value remains locked: {conversion_error}; \
+             consumed {conversion_cu} CU; logs: {conversion_logs}"
+        );
+    }
+
+    assert_eq!(
+        source_count,
+        percolator::PORTFOLIO_SOURCE_DOMAIN_CAP,
+        "the exposure-admission probe requires a full source table"
+    );
 
     trade(&mut svm, 0, SIZE_Q, PRICE_LOW)
         .expect("owner keeps one historical claim-bearing exposure active");
@@ -9700,7 +9884,7 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
     )
     .unwrap();
     assert_eq!(withdrawn.capital.get(), 0);
-    assert_eq!(withdrawn.pnl.get(), i128::from(2 * HISTORICAL_ASSETS));
+    assert_eq!(withdrawn.pnl.get(), i128::try_from(source_count).unwrap());
     assert_eq!(
         withdrawn
             .source_domains
@@ -9710,6 +9894,20 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
         percolator::PORTFOLIO_SOURCE_DOMAIN_CAP,
         "the separate positive-claim conversion path is outside this admission fix"
     );
+}
+
+#[test]
+fn e2e_source_capacity_is_reserved_before_new_exposure() {
+    run_source_capacity_probe(percolator::PORTFOLIO_SOURCE_DOMAIN_CAP, 70, false);
+}
+
+// PUBLIC LOF: every source claim is created through ordinary trading and honest settlement. A
+// successful conversion must remain below the chain transaction limit even at the supported sparse
+// cap; otherwise the owner can recover principal but cannot withdraw earned, fully-backed value.
+#[test]
+fn probe_max_source_claims_remain_convertible() {
+    run_source_capacity_probe(percolator::PORTFOLIO_SOURCE_DOMAIN_CAP / 2, 70, true);
+    run_source_capacity_probe(percolator::PORTFOLIO_SOURCE_DOMAIN_CAP, 17, true);
 }
 
 #[test]
