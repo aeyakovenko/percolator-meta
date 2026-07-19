@@ -99,6 +99,15 @@ fn read_u128_at(svm: &LiteSVM, pf: &Pubkey, off: usize) -> u128 {
 fn read_crystallized(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 196) } // HEADER_LEN(16)+180
 fn read_spent(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 212) }        // HEADER_LEN(16)+196
 fn read_received(svm: &LiteSVM, pf: &Pubkey) -> u128 { read_u128_at(svm, pf, 228) }     // HEADER_LEN(16)+212
+fn rd_portfolio_registration_data(svm: &LiteSVM, portfolio: &Pubkey, cohort: u8) -> Vec<u8> {
+    let portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(portfolio).expect("portfolio").data,
+    )
+    .expect("portfolio ID");
+    let mut data = vec![1u8, cohort];
+    data.extend_from_slice(&portfolio_id.to_le_bytes());
+    data
+}
 fn perc_vault_authority(slab: &Pubkey) -> Pubkey { Pubkey::find_program_address(&[b"vault", slab.as_ref()], &perc_id()).0 }
 fn canonical_insurance_vault(va: &Pubkey, mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[va.as_ref(), spl_token::ID.as_ref(), mint.as_ref()], &ATA_PROGRAM_ID).0
@@ -234,6 +243,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
         // register BEFORE the loss (snapshot = 0): long -> TRADER, short -> LP.
         for (o, cohort, pf) in [(&long, 3u8, long_pf), (&short, 2u8, short_pf)] {
             let stake = rd_stake_pda(&rd_config, &o.pubkey(), &pf, cohort);
+            let register_data = rd_portfolio_registration_data(&svm, &pf, cohort);
             send(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(o.pubkey(), true),
                 AccountMeta::new_readonly(o.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
@@ -241,7 +251,7 @@ fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_market
                 AccountMeta::new_readonly(rd_portfolio_archive_pda(market, &o.pubkey(), &pf), false),
                 AccountMeta::new_readonly(*market, false),
                 AccountMeta::new_readonly(retired_market_pda(market), false),
-            ], data: vec![1u8, cohort] }], &[o]).expect("register");
+            ], data: register_data }], &[o]).expect("register");
             let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &o.pubkey(), 0);
             stakes.push((o.insecure_clone(), cohort, pf, ata, *market));
         }
@@ -701,6 +711,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         }
         total_notional += (posq.unsigned_abs()) * initial_price as u128 / percolator::POS_SCALE;
         let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
+        let register_data = rd_portfolio_registration_data(&svm, &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
@@ -708,7 +719,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
             AccountMeta::new_readonly(market, false),
             AccountMeta::new_readonly(retired_market_pda(&market), false),
-        ], data: vec![1u8, 3u8] }], &[&owner]).expect("register trader");
+        ], data: register_data }], &[&owner]).expect("register trader");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         rational.push((owner, pf, ata, mi, is_long));
     }
@@ -731,6 +742,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
         }
         total_notional += (posq.unsigned_abs()) * initial_price as u128 / percolator::POS_SCALE;
         let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
+        let register_data = rd_portfolio_registration_data(&svm, &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
@@ -738,7 +750,7 @@ fn full_economy_100_traders_10_assets_distribution_report() {
             AccountMeta::new_readonly(rd_portfolio_archive_pda(&fm, &owner.pubkey(), &pf), false),
             AccountMeta::new_readonly(fm, false),
             AccountMeta::new_readonly(retired_market_pda(&fm), false),
-        ], data: vec![1u8, 3u8] }], &[&owner]).expect("register farmer leg");
+        ], data: register_data }], &[&owner]).expect("register farmer leg");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         farmer.push((owner, pf, ata));
     }
@@ -1011,6 +1023,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             legs.push((a, is_long));
         }
         let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
+        let register_data = rd_portfolio_registration_data(&svm, &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
@@ -1018,7 +1031,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
             AccountMeta::new_readonly(market, false),
             AccountMeta::new_readonly(retired_market_pda(&market), false),
-        ], data: vec![1u8, 3u8] }], &[&owner]).expect("register trader");
+        ], data: register_data }], &[&owner]).expect("register trader");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         rational.push((owner, pf, ata, legs));
     }
@@ -1045,6 +1058,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             assets.push(a);
         }
         let stake = rd_stake_pda(&rd_config, &owner.pubkey(), &pf, 3);
+        let register_data = rd_portfolio_registration_data(&svm, &pf, 3);
         tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
             AccountMeta::new(payer.pubkey(), true), AccountMeta::new_readonly(rd_config, false), AccountMeta::new_readonly(owner.pubkey(), true),
             AccountMeta::new_readonly(owner.pubkey(), false), AccountMeta::new_readonly(pf, false), AccountMeta::new(stake, false),
@@ -1052,7 +1066,7 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
             AccountMeta::new_readonly(rd_portfolio_archive_pda(&market, &owner.pubkey(), &pf), false),
             AccountMeta::new_readonly(market, false),
             AccountMeta::new_readonly(retired_market_pda(&market), false),
-        ], data: vec![1u8, 3u8] }], &[&owner]).expect("register farmer leg");
+        ], data: register_data }], &[&owner]).expect("register farmer leg");
         let ata = Pubkey::new_unique(); set_token(&mut svm, &ata, &coin_mint, &owner.pubkey(), 0);
         farmer.push((owner, pf, ata, assets));
     }
