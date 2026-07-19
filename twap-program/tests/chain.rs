@@ -49481,6 +49481,416 @@ fn e2e_ewma_mark_move_is_bounded_by_collected_trade_fees() {
     }
 }
 
+// A public trader that controls the EWMA print must not recover more collateral through a
+// liquidation reward than the trade paid to move that mark. This follows the complete public
+// route through SPL deposits, liquidation, position closure, PnL conversion, and SPL withdrawals.
+#[test]
+fn e2e_trade_driven_mark_cannot_profit_from_an_independent_liquidation() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const MARK: u64 = 1_000_000;
+    const VICTIM_DEPOSIT: u64 = 50_000;
+    const ATTACK_DEPOSIT: u64 = 1_000;
+    const CRANKER_DEPOSIT: u64 = 1;
+    const TINY_POSITION: i128 = (percolator::POS_SCALE / 10_000) as i128;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    for signer in [&payer, &admin] {
+        svm.airdrop(&signer.pubkey(), 1_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 0,
+        unix_timestamp: 0,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0;
+                percolator_prog::state::market_account_len_for_capacity(1).unwrap()
+            ],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 6_480_000,
+                initial_price: MARK,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 500,
+                initial_margin_bps: 500,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 5,
+                liquidation_fee_cap: percolator::MAX_PROTOCOL_FEE_ABS,
+                min_liquidation_abs: 500,
+                max_price_move_bps_per_slot: 24,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 1_000,
+                min_funding_lifetime_slots: 10_000_000,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize a live production-risk market");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateLiquidationFeePolicy {
+                cranker_share_bps: 10_000,
+            },
+        ),
+    )
+    .expect("configure the supported public liquidation reward");
+    warp_to(&mut svm, 1);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: MARK,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("configure the trade-driven EWMA mark");
+
+    let victim_owner = Keypair::new();
+    let honest_owner = Keypair::new();
+    let attack_long_owner = Keypair::new();
+    let attack_short_owner = Keypair::new();
+    let cranker_owner = Keypair::new();
+    let victim = Pubkey::new_unique();
+    let honest = Pubkey::new_unique();
+    let attack_long = Pubkey::new_unique();
+    let attack_short = Pubkey::new_unique();
+    let cranker = Pubkey::new_unique();
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    for (owner, portfolio) in [
+        (&victim_owner, victim),
+        (&honest_owner, honest),
+        (&attack_long_owner, attack_long),
+        (&attack_short_owner, attack_short),
+        (&cranker_owner, cranker),
+    ] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a public portfolio");
+    }
+
+    for (owner, portfolio, amount) in [
+        (&victim_owner, victim, VICTIM_DEPOSIT),
+        (&honest_owner, honest, 2_000_000),
+        (&attack_long_owner, attack_long, ATTACK_DEPOSIT),
+        (&attack_short_owner, attack_short, ATTACK_DEPOSIT),
+        (&cranker_owner, cranker, CRANKER_DEPOSIT),
+    ] {
+        let source = Pubkey::new_unique();
+        set_token(&mut svm, &source, &collateral, &owner.pubkey(), amount);
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(amount),
+                },
+            ),
+        )
+        .expect("deposit real SPL collateral");
+    }
+
+    let trade = |svm: &mut LiteSVM,
+                 owner_a: &Keypair,
+                 owner_b: &Keypair,
+                 portfolio_a: Pubkey,
+                 portfolio_b: Pubkey,
+                 size_q: i128,
+                 exec_price: u64| {
+        send(
+            svm,
+            &[&payer, owner_a, owner_b],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner_a.pubkey(), true),
+                    AccountMeta::new_readonly(owner_b.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio_a, false),
+                    AccountMeta::new(portfolio_b, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q,
+                    exec_price,
+                    fee_bps: 0,
+                },
+            ),
+        )
+    };
+    trade(
+        &mut svm,
+        &victim_owner,
+        &honest_owner,
+        victim,
+        honest,
+        percolator::POS_SCALE as i128,
+        MARK,
+    )
+    .expect("open the independent victim position");
+
+    let attacker_deposits = u128::from(ATTACK_DEPOSIT) * 2 + u128::from(CRANKER_DEPOSIT);
+    let insurance_before_move = read_asset0_insurance(&svm, &market);
+    warp_to(&mut svm, 2);
+    trade(
+        &mut svm,
+        &attack_long_owner,
+        &attack_short_owner,
+        attack_long,
+        attack_short,
+        TINY_POSITION,
+        999_800,
+    )
+    .expect("public wash trade moves the EWMA by one basis point");
+    let (cfg_after_move, group_after_move) = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    let move_fee = group_after_move.insurance - insurance_before_move;
+    assert_eq!(cfg_after_move.mark_ewma_e6, 999_900);
+    assert_eq!(move_fee, 200, "the mark mover pays a real two-sided fee");
+
+    let capital = |svm: &LiteSVM, portfolio: Pubkey| {
+        percolator_prog::state::read_portfolio(&svm.get_account(&portfolio).unwrap().data)
+            .unwrap()
+            .capital
+            .get()
+    };
+    let cranker_before = capital(&svm, cranker);
+    let victim_before = capital(&svm, victim);
+    let mut liquidated = false;
+    for attempt in 0..8 {
+        let observations = if attempt == 0 {
+            vec![percolator_prog::ix::CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 0,
+            }]
+        } else {
+            Vec::new()
+        };
+        send(
+            &mut svm,
+            &[&payer, &cranker_owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(cranker_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(victim, false),
+                    AccountMeta::new(cranker, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: 2,
+                    observations,
+                },
+            ),
+        )
+        .expect("public cranker advances the independent victim");
+        let victim_position = percolator_prog::state::read_portfolio(
+            &svm.get_account(&victim).unwrap().data,
+        )
+        .unwrap()
+        .legs[0]
+            .basis_pos_q
+            .get();
+        if victim_position != percolator::POS_SCALE as i128 {
+            liquidated = true;
+            break;
+        }
+    }
+    assert!(liquidated, "the public mark move must liquidate the victim");
+    assert!(
+        capital(&svm, victim) < victim_before,
+        "the liquidation must charge real collateral to the independent victim"
+    );
+    let liquidation_reward = capital(&svm, cranker) - cranker_before;
+
+    for portfolio in [attack_long, attack_short] {
+        for _ in 0..4 {
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: 2,
+                        observations: Vec::new(),
+                    },
+                ),
+            )
+            .expect("public crank settles an attacker-controlled wash leg");
+        }
+    }
+    trade(
+        &mut svm,
+        &attack_long_owner,
+        &attack_short_owner,
+        attack_long,
+        attack_short,
+        -TINY_POSITION,
+        cfg_after_move.mark_ewma_e6,
+    )
+    .expect("attackers close both wash-trade legs");
+
+    for (owner, portfolio) in [
+        (&attack_long_owner, attack_long),
+        (&attack_short_owner, attack_short),
+    ] {
+        let pnl = percolator_prog::state::read_portfolio(
+            &svm.get_account(&portfolio).unwrap().data,
+        )
+        .unwrap()
+        .pnl
+        .get();
+        if pnl > 0 {
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::ConvertReleasedPnl {
+                        amount: pnl as u128,
+                    },
+                ),
+            )
+            .expect("convert the wash leg's released PnL");
+        }
+    }
+
+    let mut extracted = 0u128;
+    for (owner, portfolio) in [
+        (&attack_long_owner, attack_long),
+        (&attack_short_owner, attack_short),
+        (&cranker_owner, cranker),
+    ] {
+        let amount = capital(&svm, portfolio);
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral,
+            &owner.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount },
+            ),
+        )
+        .expect("withdraw all attacker-controlled collateral");
+        extracted += u128::from(token_amount(&svm, &destination));
+    }
+    assert!(
+        extracted <= attacker_deposits,
+        "trade-driven cranker extracted {extracted} after depositing {attacker_deposits}; liquidation reward {liquidation_reward} exceeded mark-move fee {move_fee}"
+    );
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OrganicRewardCleanup {
     None,
