@@ -16796,12 +16796,18 @@ fn gv_vote_data_e2e(
     let mut data = vec![3u8, action];
     data.extend_from_slice(&vote_nonce.to_le_bytes());
     if action == 1 {
-        let principal = svm
+        let position = svm
             .get_account(position)
-            .filter(|account| account.data.len() >= 80)
+            .filter(|account| account.data.len() >= 97);
+        let principal = position
+            .as_ref()
             .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
             .unwrap_or(0);
+        let start_slot = position
+            .map(|account| u64::from_le_bytes(account.data[89..97].try_into().unwrap()))
+            .unwrap_or(0);
         data.extend_from_slice(&principal.to_le_bytes());
+        data.extend_from_slice(&start_slot.to_le_bytes());
     }
     data
 }
@@ -49353,6 +49359,11 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         ],
         data: interleaved_withdraw_data,
     };
+    let position_marker = u64::from_le_bytes(
+        svm.get_account(&position).unwrap().data[89..97]
+            .try_into()
+            .unwrap(),
+    );
     let vote_after_return = |action: u8, vote_nonce: u64, expected_principal: Option<u64>| {
         let mut data = vec![3u8, action];
         data.extend_from_slice(&vote_nonce.to_le_bytes());
@@ -49362,6 +49373,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                     .expect("a back must commit to its post-transaction principal")
                     .to_le_bytes(),
             );
+            data.extend_from_slice(&position_marker.to_le_bytes());
         }
         Instruction {
             program_id: gv_id_e2e(),

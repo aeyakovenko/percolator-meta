@@ -1704,13 +1704,19 @@ fn gv_vote_ix(
             .unwrap_or(0);
         ix.data.extend_from_slice(&vote_nonce.to_le_bytes());
         if action == 1 {
-            let principal = env
+            let position = env
                 .svm
                 .get_account(&env.position_pda(voter))
-                .filter(|account| account.data.len() >= 80)
+                .filter(|account| account.data.len() >= 97);
+            let principal = position
+                .as_ref()
                 .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
                 .unwrap_or(0);
+            let start_slot = position
+                .map(|account| u64::from_le_bytes(account.data[89..97].try_into().unwrap()))
+                .unwrap_or(0);
             ix.data.extend_from_slice(&principal.to_le_bytes());
+            ix.data.extend_from_slice(&start_slot.to_le_bytes());
         }
     }
     ix
@@ -5023,6 +5029,113 @@ fn presigned_back_cannot_count_a_later_top_up_at_the_bootstrap_deadline() {
     env.warp_slot(start + delay);
     gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
         .expect("only the freshly authorized quorum seals the distribution");
+    assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
+}
+
+// POSITION-INCARNATION BACK REPLAY: principal alone does not identify the capital a
+// voter authorized. A same-slot partial exit and equal redeposit restores principal
+// but advances the Subledger deposit marker. A relayer must not be able to land the
+// old back in the final voting slot and seal a distribution with replacement capital.
+#[test]
+fn presigned_back_cannot_cross_same_principal_position_incarnations() {
+    let start = 100u64;
+    let delay = 10u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        delay,
+        start,
+        delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(delay), Some(start));
+    let ve = setup_vote(&mut env);
+    let (dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 5);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 5)
+        .expect("alice creates the position covered by the held backs");
+    let original = env.read_position(&alice.pubkey());
+    assert_eq!(original, (5, start, false));
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let mut principal_only_back =
+        legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    principal_only_back.data.extend_from_slice(&0u64.to_le_bytes()); // vote nonce
+    principal_only_back
+        .data
+        .extend_from_slice(&original.0.to_le_bytes());
+    let mut exact_old_back = principal_only_back.clone();
+    exact_old_back
+        .data
+        .extend_from_slice(&original.1.to_le_bytes());
+    let withheld_exact_old_back = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            exact_old_back,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_principal_only_back = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            principal_only_back,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 1)
+        .expect("alice partially exits the original position incarnation");
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1)
+        .expect("alice restores principal in the same slot");
+    let replacement = env.read_position(&alice.pubkey());
+    assert_eq!(
+        replacement,
+        (original.0, original.1 + 1, false),
+        "the replacement capital has a distinct monotonic deposit marker",
+    );
+
+    env.warp_slot(start + delay - 1);
+    assert!(
+        env.svm.send_transaction(withheld_exact_old_back).is_err(),
+        "a marker-bearing back cannot cross a position incarnation",
+    );
+    assert!(
+        env.svm
+            .send_transaction(withheld_principal_only_back)
+            .is_err(),
+        "a current position cannot retain the principal-only back wire",
+    );
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        (0, 0),
+        "replacement capital remains uncommitted after both stale backs",
+    );
+
+    let fresh_back = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
+                fresh_back,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("a fresh back for the replacement incarnation remains live");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+
+    env.warp_slot(start + delay);
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("only current-incarnation support seals the distribution");
     assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
 }
 
