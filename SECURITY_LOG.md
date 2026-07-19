@@ -14405,3 +14405,27 @@ pinned program does not accrue funding on the activation crank; after activation
 price-or-funding predicate applies. A public cranker commits the bounded step and governance retries
 the same generation-bound resolution. No state, account, signer, authority, recipient, CPI, token,
 custody, or admin surface is added.
+
+## Tick - admitted exposure exhausted sparse source capacity (surface C, REAL DOS)
+
+Pinned Percolator admitted a new position after an ordinary portfolio had accumulated positive claims
+in all 32 sparse source domains. The active-leg limit did not reserve a domain for that new position's
+first favorable settlement. After an honest authenticated mark moved from 100 to 101, the missing 33rd
+domain made permissionless crank, one-atom claim conversion, closing either live leg, and
+`RebalanceReduce` all fail and roll back. The accepted portfolio therefore had no bounded owner or
+keeper continuation; only privileged shutdown and forfeiture could recover it.
+
+The retained clean-room LiteSVM regression constructs all 32 domains through 64 signed trades and 32
+honest mark settlements across 16 assets. Against program
+`da64be639168b496833dd4c701607a94fcb06b6c` and engine
+`143e68c4917ed0400a27b952f036a5677047cd84`, it reaches the no-continuation assertion with SBF checksum
+`637f4fa15acc405c4351ea2c5e154d5324d62aae0cfa9505d96ca97e21b186d1`.
+
+FIX: program `cf69b40e095bf4ee6b750af56c68f1c3c05b9c0a` and engine
+`c1a058f3f6057838e78a6ada51509af336fd4ed6` reserve sparse source capacity before admitting new
+exposure. The same transaction now rejects atomically, the historical exposure remains closeable, and
+the owner withdraws all 1,000,000 units of original principal. The 32 positive claims deliberately
+remain unconverted so their separate maximum-source compute path is not conflated with admission
+liveness. The fixed SBF checksum is
+`15e43cb3939f365fdc7f5f3e3b4c9a6c0046db4306a48aa226af78da847b396d`. The pin adds no Meta account,
+signer, authority, recipient, CPI, custody, or collateral-moving surface.
