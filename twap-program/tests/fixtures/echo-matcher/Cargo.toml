@@ -1,0 +1,15 @@
+[package]
+name = "meta-echo-matcher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "meta_echo_matcher"
+
+[dependencies]
+blake3 = "=1.8.2"
+solana-program = "=1.18.26"
+
+[workspace]
