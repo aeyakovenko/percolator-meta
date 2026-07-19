@@ -346,7 +346,11 @@ its target slot changes generation.
 Market-wide `ResolveMarket` calls append a separate read-only witness derived from
 `("market-generation", market, next_market_id)`. Percolator advances `next_market_id` whenever any
 asset is created or restarted, so an approved global resolution cannot survive into a replacement
-asset generation. The controller removes this witness before CPI and stores no generation state.
+asset generation. The controller also rejects resolution while an exposed asset has deterministic
+price or funding accrual under an already-active authenticated mark; any public cranker can commit
+the segment and the same generation-bound resolution can then retry. The controller removes the
+witness before CPI and stores no generation state. This preflight is read-only and adds no signer,
+authority, recipient, token, or collateral path.
 
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
 cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
