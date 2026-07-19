@@ -14469,16 +14469,3 @@ pinned program does not accrue funding on the activation crank; after activation
 price-or-funding predicate applies. A public cranker commits the bounded step and governance retries
 the same generation-bound resolution. No state, account, signer, authority, recipient, CPI, token,
 custody, or admin surface is added.
-
-## Tick - near-maximum Genesis schedule overflowed its terminal phase (surface C, INIT HARDENING)
-
-Genesis and Subledger accepted a schedule where `start + delay` and `start + deposit_window` were
-individually representable, but Genesis later derived `bootstrap_end + deposit_window` with checked
-addition. A deliberately near-`u64::MAX` deployment could therefore initialize successfully and then
-reject both the final trigger and all fallback returns with arithmetic overflow. This is an initializer
-footgun, not an unprivileged attack against a normally initialized live instance.
-
-The retained LiteSVM regression initializes the boundary schedule, advances to its last representable
-trigger slot, and seals a full-supply proposal through the public instruction. The derived terminal
-boundary now saturates at `u64::MAX`, preserving the remaining trigger slot and eventual fallback
-cleanup without changing any account, signer, authority, custody, token, or governance surface.

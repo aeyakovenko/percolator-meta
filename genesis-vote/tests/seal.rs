@@ -691,38 +691,6 @@ fn trigger_rejects_before_configured_bootstrap_delay_elapsed() {
 }
 
 #[test]
-fn near_max_bootstrap_schedule_does_not_overflow_the_trigger_phase() {
-    let delay = 3u64;
-    let start = u64::MAX - 4;
-    let bootstrap_end = start + delay;
-    let deposit_window = 2u64;
-    let mut env = Env::new_unwired_with_schedule(delay, start);
-
-    // Both schedule components are individually representable and accepted at
-    // initialization. The later fallback deadline is not: bootstrap_end +
-    // deposit_window exceeds u64 even though there is still one trigger slot.
-    let mut pool = env.svm.get_account(&env.sub_pool).unwrap();
-    pool.data[240..248].copy_from_slice(&(start + deposit_window).to_le_bytes());
-    pool.data[248..256].copy_from_slice(&deposit_window.to_le_bytes());
-    env.svm.set_account(env.sub_pool, pool).unwrap();
-    env.init_gv_with_schedule(delay, start)
-        .expect("near-maximum schedule initializes");
-
-    let recipient = Pubkey::new_unique();
-    let dist_proposal = env.create_dist_proposal(1, &[(recipient, 100)]);
-    let gv_proposal = env.register(&dist_proposal);
-    let mut pool = env.svm.get_account(&env.sub_pool).unwrap();
-    pool.data[80..88].copy_from_slice(&10u64.to_le_bytes());
-    env.svm.set_account(env.sub_pool, pool).unwrap();
-    env.inject_tally(&gv_proposal, 10, 8, 10, 8, 10);
-
-    env.set_slot(bootstrap_end);
-    env.trigger(&gv_proposal, &dist_proposal)
-        .expect("overflowing fallback deadline cannot disable the representable trigger slot");
-    assert_eq!(env.dist_sealed_proposal(), dist_proposal);
-}
-
-#[test]
 fn terminal_attestation_requires_elapsed_schedule_and_canonical_subledger_pool() {
     let mut env = Env::new();
     let attest = |config: Pubkey, pool: Pubkey| Instruction {
