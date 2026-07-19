@@ -347,11 +347,12 @@ its target slot changes generation.
 Market-wide `ResolveMarket` calls append a separate read-only witness derived from
 `("market-generation", market, next_market_id)`. Percolator advances `next_market_id` whenever any
 asset is created or restarted, so an approved global resolution cannot survive into a replacement
-asset generation. The controller also rejects resolution while an exposed asset has deterministic
-price or funding accrual under an already-active authenticated mark; any public cranker can commit
-the segment and the same generation-bound resolution can then retry. The controller removes the
-witness before CPI and stores no generation state. This preflight is read-only and adds no signer,
-authority, recipient, token, or collateral path.
+asset generation. The controller also rejects resolution while an exposed asset has an executable
+price step from a newly authenticated mark or deterministic price/funding accrual from an active
+mark; any public cranker can commit the segment and the same generation-bound resolution can then
+retry. The controller removes the witness before CPI and stores no generation state. This preflight
+is read-only and adds no signer, authority, recipient, token, or collateral path.
+
 Asset shutdown applies the same read-only check to its exact generation and also preserves a pending
 authenticated mark, because shutdown would otherwise overwrite that mark while freezing the old
 effective price. Public crankers can commit each bounded segment before governance retries shutdown.

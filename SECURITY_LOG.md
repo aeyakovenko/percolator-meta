@@ -14451,3 +14451,21 @@ Unexposed, settled, manual-price, already-caught-up, and already-recovering asse
 crankers can commit bounded segments before governance retries. The preflight is O(1) in market size
 and adds no state, account, signer, authority, recipient, CPI, token path, custody path, or admin
 surface.
+
+## Tick - controller resolution discarded a pending authenticated price (surface A/C, REAL LOF)
+
+The first resolution guard intentionally ignored a mark whose publication slot was newer than the
+engine accrual cursor. Pinned Percolator's first public crank suppresses funding for that mark, but it
+can still advance the circuit-breaker-bounded effective price. A bounded Meta governor could resolve
+before that crank and terminally choose the older price even though an independent oracle had already
+authenticated the transition. In the retained real-SBF LiteSVM regression, independent users hold
+balanced exposure at 10,000 and an independent oracle publishes 20,000. Crank-first resolution moves
+the bounded price to 10,100 and pays 100,100,000 / 99,900,000 atoms; immediate controller resolution
+paid 100,000,000 to each side, erasing the long's 100,000-atom claim.
+
+FIX: the read-only resolve preflight now includes a pending authenticated mark exactly when its first
+ordinary crank can move the effective price. It still excludes pending zero-move funding because the
+pinned program does not accrue funding on the activation crank; after activation, the existing
+price-or-funding predicate applies. A public cranker commits the bounded step and governance retries
+the same generation-bound resolution. No state, account, signer, authority, recipient, CPI, token,
+custody, or admin surface is added.

@@ -9258,6 +9258,12 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         Shutdown,
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum Segment {
+        ActiveFunding,
+        PendingPrice,
+    }
+
     #[derive(Debug)]
     struct Outcome {
         f_long_num: i128,
@@ -9266,14 +9272,33 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         short_payout: u64,
     }
 
-    fn run(crank_before_terminal: bool, terminal: TerminalAction) -> Outcome {
-        const PRICE: u64 = 100;
-        const MARK: u64 = 99;
+    fn run(
+        segment: Segment,
+        crank_before_terminal: bool,
+        terminal: TerminalAction,
+    ) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
-        const RESOLVE_SLOT: u64 = 3;
         const DEPOSIT: u128 = 100_000_000;
-        const SIZE_Q: i128 = 100_000 * percolator::POS_SCALE as i128;
+        let (price, mark, max_price_move_bps_per_slot, size_q, activate_mark, resolve_slot) =
+            match segment {
+                Segment::ActiveFunding => (
+                    100,
+                    99,
+                    1,
+                    100_000 * percolator::POS_SCALE as i128,
+                    true,
+                    3,
+                ),
+                Segment::PendingPrice => (
+                    10_000,
+                    20_000,
+                    100,
+                    1_000 * percolator::POS_SCALE as i128,
+                    false,
+                    PRIME_SLOT,
+                ),
+            };
 
         let mut svm = LiteSVM::new().with_compute_budget(
             solana_program_runtime::compute_budget::ComputeBudget {
@@ -9339,7 +9364,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                     max_portfolio_assets: 1,
                     h_min: 0,
                     h_max: 10,
-                    initial_price: PRICE,
+                    initial_price: price,
                     min_nonzero_mm_req: 1,
                     min_nonzero_im_req: 2,
                     maintenance_margin_bps: 10_000,
@@ -9349,7 +9374,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                     liquidation_fee_bps: 0,
                     liquidation_fee_cap: 0,
                     min_liquidation_abs: 0,
-                    max_price_move_bps_per_slot: 1,
+                    max_price_move_bps_per_slot,
                     max_accrual_dt_slots: 1,
                     max_abs_funding_e9_per_slot: 10_000,
                     min_funding_lifetime_slots: 1,
@@ -9405,7 +9430,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 PIx::ConfigureAuthMark {
                     asset_index: 0,
                     now_slot: OPEN_SLOT,
-                    initial_mark_e6: PRICE,
+                    initial_mark_e6: price,
                 },
             ),
         )
@@ -9486,8 +9511,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 ],
                 PIx::TradeNoCpi {
                     asset_index: 0,
-                    size_q: SIZE_Q,
-                    exec_price: PRICE,
+                    size_q,
+                    exec_price: price,
                     fee_bps: 0,
                 },
             ),
@@ -9509,7 +9534,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 PIx::PushAuthMark {
                     asset_index: 0,
                     now_slot: PRIME_SLOT,
-                    mark_e6: MARK,
+                    mark_e6: mark,
                 },
             ),
         )
@@ -9534,7 +9559,9 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 ),
             )
         };
-        crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
+        if activate_mark {
+            crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
+        }
 
         let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
         send(
@@ -9555,11 +9582,11 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         )
         .expect("donate bounded lifecycle authority to the controller");
 
-        clock.slot = RESOLVE_SLOT;
-        clock.unix_timestamp = RESOLVE_SLOT as i64;
+        clock.slot = resolve_slot;
+        clock.unix_timestamp = resolve_slot as i64;
         svm.set_sysvar(&clock);
         if crank_before_terminal {
-            crank(&mut svm, RESOLVE_SLOT).expect("commit the deterministic funding segment");
+            crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
         }
         let resolve = |svm: &LiteSVM| {
             let witness = controller_market_generation_witness(svm, &market);
@@ -9584,8 +9611,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 if crank_before_terminal {
                     first_resolve.expect("settled controller resolve remains live");
                 } else if first_resolve.is_err() {
-                    crank(&mut svm, RESOLVE_SLOT)
-                        .expect("public crank catches up committed funding");
+                    crank(&mut svm, resolve_slot)
+                        .expect("public crank catches up committed value");
                     let retry_resolve_ix = resolve(&svm);
                     send(&mut svm, &[&payer, &governance], retry_resolve_ix)
                         .expect("controller resolve succeeds after bounded catch-up");
@@ -9613,7 +9640,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                         &PIx::UpdateAssetLifecycle {
                             action: 3, // ASSET_ACTION_SHUTDOWN
                             asset_index: 0,
-                            now_slot: RESOLVE_SLOT,
+                            now_slot: resolve_slot,
                             initial_price: 0,
                             insurance_authority: [0u8; 32],
                             insurance_operator: [0u8; 32],
@@ -9639,8 +9666,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 if crank_before_terminal {
                     first_shutdown.expect("settled controller shutdown remains live");
                 } else if first_shutdown.is_err() {
-                    crank(&mut svm, RESOLVE_SLOT)
-                        .expect("public crank catches up committed funding");
+                    crank(&mut svm, resolve_slot)
+                        .expect("public crank catches up committed value");
                     let retry_shutdown_ix = shutdown(&svm);
                     send(&mut svm, &[&payer, &governance], retry_shutdown_ix)
                         .expect("controller shutdown succeeds after bounded catch-up");
@@ -9655,8 +9682,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                     shutdown_state.assets[0].f_short_num,
                 );
 
-                clock.slot = RESOLVE_SLOT + 1;
-                clock.unix_timestamp = (RESOLVE_SLOT + 1) as i64;
+                clock.slot = resolve_slot + 1;
+                clock.unix_timestamp = (resolve_slot + 1) as i64;
                 svm.set_sysvar(&clock);
                 send(
                     &mut svm,
@@ -9670,8 +9697,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                         ],
                         PIx::ForceCloseAbandonedAsset {
                             asset_index: 0,
-                            now_slot: RESOLVE_SLOT + 1,
-                            close_q: SIZE_Q as u128,
+                            now_slot: resolve_slot + 1,
+                            close_q: size_q as u128,
                         },
                     ),
                 )
@@ -9683,8 +9710,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
             }
         };
 
-        clock.slot = RESOLVE_SLOT + 2;
-        clock.unix_timestamp = (RESOLVE_SLOT + 2) as i64;
+        clock.slot = resolve_slot + 2;
+        clock.unix_timestamp = (resolve_slot + 2) as i64;
         svm.set_sysvar(&clock);
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
@@ -9747,8 +9774,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
     }
 
     for terminal in [TerminalAction::Resolve, TerminalAction::Shutdown] {
-        let control = run(true, terminal);
-        let attack = run(false, terminal);
+        let control = run(Segment::ActiveFunding, true, terminal);
+        let attack = run(Segment::ActiveFunding, false, terminal);
         assert!(
             control.f_long_num > 0 && control.f_short_num < 0,
             "{terminal:?} control did not accrue funding: {control:?}"
@@ -9770,6 +9797,21 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
             "{terminal:?}: {attack:?} != {control:?}"
         );
     }
+
+    let control = run(Segment::PendingPrice, true, TerminalAction::Resolve);
+    let attack = run(Segment::PendingPrice, false, TerminalAction::Resolve);
+    assert_eq!(control.f_long_num, 0);
+    assert_eq!(control.f_short_num, 0);
+    assert!(control.long_payout > 100_000_000, "{control:?}");
+    assert!(control.short_payout < 100_000_000, "{control:?}");
+    assert_eq!(
+        attack.long_payout, control.long_payout,
+        "{attack:?} != {control:?}"
+    );
+    assert_eq!(
+        attack.short_payout, control.short_payout,
+        "{attack:?} != {control:?}"
+    );
 }
 
 #[test]
