@@ -1408,6 +1408,182 @@ fn trader_live_cap_is_exact_when_its_intermediate_exceeds_u128() {
 }
 
 #[test]
+fn maximum_six_market_reward_epoch_keeps_last_market_claims_live() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    let mint_auth = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+    let epoch_id = 40u64;
+    let rd_config = reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id);
+    let vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    let supply = 1_000_000u64;
+    mint_to(&mut svm, &payer, &coin_mint, &mint_auth, &vault, supply);
+
+    let stub_sub = Pubkey::new_unique();
+    let stub_perc = Pubkey::new_unique();
+    let scopes = (0..6)
+        .map(|_| RewardEpochMarket {
+            market: Pubkey::new_unique(),
+            insurance_pool: Pubkey::new_unique(),
+            backing_pool: Pubkey::default(),
+        })
+        .collect::<Vec<_>>();
+    let emission_start = 100u64;
+    let emission_end = 200u64;
+    let finalize_window = 10u64;
+    set_slot(&mut svm, 50);
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                stub_perc,
+                stub_sub,
+                rd_config,
+                vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                emission_start,
+                emission_end,
+                supply,
+                5_000,
+                0,
+                0,
+                5_000,
+                finalize_window,
+                0,
+                &scopes,
+            ),
+        }],
+        &[&dao],
+    )
+    .expect("initialize the maximum six-market reward epoch");
+    revoke_mint(&mut svm, &payer, &coin_mint, &mint_auth);
+
+    let env = Env {
+        rd_config,
+        coin_mint,
+        vault,
+        mint_auth: Keypair::new(),
+        stub_sub,
+        stub_perc,
+        ins_pool: scopes[5].insurance_pool,
+        back_pool: Pubkey::default(),
+        market: scopes[0].market,
+        supply,
+        emission_end,
+        finalize_window,
+    };
+    let insurance_owner = Keypair::new();
+    let funding_owner = Keypair::new();
+    let insurance_position = Pubkey::new_unique();
+    let funding_portfolio = Pubkey::new_unique();
+    set_position(
+        &mut svm,
+        &insurance_position,
+        &stub_sub,
+        &scopes[5].insurance_pool,
+        &insurance_owner.pubkey(),
+        10,
+        false,
+    );
+    set_portfolio_funding(
+        &mut svm,
+        &funding_portfolio,
+        &stub_perc,
+        &scopes[5].market,
+        &funding_owner.pubkey(),
+        0,
+        0,
+        0,
+        0,
+    );
+    let insurance_recipient =
+        create_token_account(&mut svm, &payer, &coin_mint, &insurance_owner.pubkey());
+    let funding_recipient =
+        create_token_account(&mut svm, &payer, &coin_mint, &funding_owner.pubkey());
+
+    set_slot(&mut svm, emission_start);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &insurance_owner,
+        &insurance_owner.pubkey(),
+        &insurance_position,
+        COHORT_INSURANCE,
+    )
+    .expect("register insurance from the sixth market scope");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &funding_owner,
+        &funding_owner.pubkey(),
+        &funding_portfolio,
+        COHORT_FUNDING_PAYER,
+    )
+    .expect("register funding payer from the sixth market scope");
+
+    set_portfolio_funding(
+        &mut svm,
+        &funding_portfolio,
+        &stub_perc,
+        &scopes[5].market,
+        &funding_owner.pubkey(),
+        40,
+        0,
+        60,
+        0,
+    );
+    set_slot(&mut svm, emission_end);
+    crystallize(
+        &mut svm,
+        &payer,
+        &env,
+        &insurance_owner,
+        &insurance_position,
+    )
+    .expect("crystallize sixth-scope insurance points");
+    crystallize(&mut svm, &payer, &env, &funding_owner, &funding_portfolio)
+        .expect("crystallize sixth-scope funding points");
+
+    set_slot(&mut svm, emission_end + finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze maximum-scope epoch");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &insurance_owner,
+        &insurance_recipient,
+        Some(&insurance_position),
+    )
+    .expect("claim sixth-scope insurance allocation");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &funding_owner,
+        &funding_recipient,
+        Some(&funding_portfolio),
+    )
+    .expect("claim sixth-scope funding allocation");
+
+    assert_eq!(token_amount(&svm, &insurance_recipient), supply / 2);
+    assert_eq!(token_amount(&svm, &funding_recipient), supply / 2);
+    assert_eq!(token_amount(&svm, &vault), 0);
+}
+
+#[test]
 fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(rd_id(), rd_so()).unwrap();
