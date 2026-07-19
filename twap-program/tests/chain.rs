@@ -4187,20 +4187,26 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     .expect("fund controller-owned insurance before shutdown");
     assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
 
-    let proxy = |percolator_instruction: percolator_prog::ix::Instruction| {
+    let proxy = |percolator_instruction: percolator_prog::ix::Instruction,
+                 generation_witness: Option<Pubkey>| {
         let mut data = vec![0u8]; // IX_PROXY_ADMIN
         data.extend_from_slice(&percolator_instruction.encode());
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if let Some(witness) = generation_witness {
+            accounts.push(AccountMeta::new_readonly(witness, false));
+        }
         Instruction {
             program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market, false),
-                AccountMeta::new_readonly(perc_id(), false),
-            ],
+            accounts,
             data,
         }
     };
+    let market_generation_witness = controller_market_generation_witness(&svm, &market);
 
     send(
         &mut svm,
@@ -4210,6 +4216,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
                 stale_slots: 1_000,
                 force_close_delay_slots: 5,
             },
+            Some(market_generation_witness),
         ),
     )
     .expect("controller configures the shutdown delay");
@@ -4231,7 +4238,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
             insurance_operator: [0; 32],
             backing_bucket_authority: [0; 32],
             oracle_authority: [0; 32],
-        }),
+        }, None),
     )
     .expect("controller shuts down asset 0");
 
@@ -4266,6 +4273,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
             backing_bucket_authority: [0; 32],
             oracle_authority: [0; 32],
         },
+        None,
     );
     assert!(
         send(
@@ -4289,6 +4297,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
             backing_bucket_authority: attacker.to_bytes(),
             oracle_authority: attacker.to_bytes(),
         },
+        None,
     );
     assert!(
         send(
@@ -4327,7 +4336,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     send(
         &mut svm,
         &[&payer, &governance],
-        proxy(restart),
+        proxy(restart, None),
     )
     .expect("controller exposes the pinned value-neutral restart lifecycle");
 
@@ -4494,6 +4503,8 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
     )
     .expect("fund controller-owned insurance before the lifecycle change");
 
+    let policy_generation_witness =
+        controller_market_generation_witness(&svm, &market.pubkey());
     let controller_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market.pubkey(), false),
@@ -4501,11 +4512,21 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
-    let configure_resolve = build_controller_proxy_message(
+    let policy_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market.pubkey(), false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(policy_generation_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let configure_resolve = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
+        &[],
+        &policy_generation_witness,
         &PIx::ConfigurePermissionlessResolve {
             stale_slots: 1_000,
             force_close_delay_slots: 5,
@@ -4520,7 +4541,7 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         &payer,
         1,
         &configure_resolve,
-        &controller_remaining,
+        &policy_remaining,
     )
     .expect("configure the governed restart path");
 
@@ -4992,20 +5013,25 @@ fn e2e_controller_cannot_strand_positions_in_drain_only() {
         "market donation preserves the independent oracle"
     );
 
-    let proxy = |raw: Vec<u8>| {
+    let proxy = |raw: Vec<u8>, generation_witness: Option<Pubkey>| {
         let mut data = vec![0u8]; // IX_PROXY_ADMIN
         data.extend_from_slice(&raw);
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if let Some(witness) = generation_witness {
+            accounts.push(AccountMeta::new_readonly(witness, false));
+        }
         Instruction {
             program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market_key, false),
-                AccountMeta::new_readonly(perc_id(), false),
-            ],
+            accounts,
             data,
         }
     };
+    let policy_generation_witness = controller_market_generation_witness(&svm, &market_key);
     send(
         &mut svm,
         &[&payer, &governance],
@@ -5015,6 +5041,7 @@ fn e2e_controller_cannot_strand_positions_in_drain_only() {
                 force_close_delay_slots: 1,
             }
             .encode(),
+            Some(policy_generation_witness),
         ),
     )
     .expect("governance configures bounded shutdown and stale-resolution delays");
@@ -5132,6 +5159,7 @@ fn e2e_controller_cannot_strand_positions_in_drain_only() {
                 oracle_authority: [0u8; 32],
             }
             .encode(),
+            None,
         ),
     );
 
@@ -5286,6 +5314,7 @@ fn e2e_controller_cannot_strand_positions_in_drain_only() {
                 oracle_authority: [0u8; 32],
             }
             .encode(),
+            None,
         ),
     )
     .expect("the controller retains the bounded shutdown lifecycle");
@@ -5663,20 +5692,25 @@ fn e2e_controller_cannot_extend_funded_resolution_deadlines() {
         },
     )
     .expect("creator donates lifecycle authority to the constrained controller");
-    let proxy = |raw: Vec<u8>| {
+    let proxy = |raw: Vec<u8>, generation_witness: Option<Pubkey>| {
         let mut data = vec![0u8]; // IX_PROXY_ADMIN
         data.extend_from_slice(&raw);
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if let Some(witness) = generation_witness {
+            accounts.push(AccountMeta::new_readonly(witness, false));
+        }
         Instruction {
             program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market, false),
-                AccountMeta::new_readonly(perc_id(), false),
-            ],
+            accounts,
             data,
         }
     };
+    let policy_generation_witness = controller_market_generation_witness(&svm, &market);
     send(
         &mut svm,
         &[&payer, &governance],
@@ -5686,6 +5720,7 @@ fn e2e_controller_cannot_extend_funded_resolution_deadlines() {
                 force_close_delay_slots: STALE_SLOTS,
             }
             .encode(),
+            Some(policy_generation_witness),
         ),
     )
     .expect("governance publishes the initial bounded-exit policy");
@@ -5810,6 +5845,7 @@ fn e2e_controller_cannot_extend_funded_resolution_deadlines() {
                 force_close_delay_slots: percolator_prog::constants::MAX_FORCE_CLOSE_DELAY_SLOTS,
             }
             .encode(),
+            Some(policy_generation_witness),
         ),
     );
     if extension.is_err() {
@@ -6303,20 +6339,25 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
     )
     .expect("legacy provider deposits insurance through the public API");
 
-    let proxy = |percolator_instruction: PIx| {
+    let proxy = |percolator_instruction: PIx, generation_witness: Option<Pubkey>| {
         let mut data = vec![0u8];
         data.extend_from_slice(&percolator_instruction.encode());
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if let Some(witness) = generation_witness {
+            accounts.push(AccountMeta::new_readonly(witness, false));
+        }
         Instruction {
             program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market, false),
-                AccountMeta::new_readonly(perc_id(), false),
-            ],
+            accounts,
             data,
         }
     };
+    let policy_generation_witness = controller_market_generation_witness(&svm, &market);
     send(
         &mut svm,
         &[&payer, &provider],
@@ -6352,7 +6393,7 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
         proxy(PIx::ConfigurePermissionlessResolve {
             stale_slots: 1_000,
             force_close_delay_slots: 5,
-        }),
+        }, Some(policy_generation_witness)),
     )
     .expect("governance configures the public shutdown lifecycle");
 
@@ -6371,7 +6412,7 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
             insurance_operator: [0u8; 32],
             backing_bucket_authority: [0u8; 32],
             oracle_authority: [0u8; 32],
-        }),
+        }, None),
     )
     .expect("governance moves the legacy asset into recovery");
 
@@ -6385,7 +6426,7 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
             asset_index: 0,
             now_slot: 111,
             initial_price: 1_000_000,
-        }),
+        }, None),
     )
     .is_ok()
     {
@@ -11886,6 +11927,7 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
     )
     .expect("permissionless controller-owned market init");
 
+    let policy_generation_witness = controller_market_generation_witness(&svm, &slab);
     let mut stale_config_data = vec![0u8]; // IX_PROXY_ADMIN
     stale_config_data.extend_from_slice(
         &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
@@ -11904,6 +11946,7 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(policy_generation_witness, false),
             ],
             data: stale_config_data,
         },
@@ -14107,6 +14150,7 @@ fn e2e_controller_freezes_shutdown_returns_when_stale_resolution_matures() {
             data: controller_data,
         }
     };
+    let policy_generation_witness = controller_market_generation_witness(&svm, &slab);
     send(
         &mut svm,
         &[&payer, &governance],
@@ -14116,7 +14160,7 @@ fn e2e_controller_freezes_shutdown_returns_when_stale_resolution_matures() {
                 force_close_delay_slots: 5,
             }
             .encode(),
-            None,
+            Some(policy_generation_witness),
         ),
     )
     .expect("governance configures the public stale-resolution boundary");
@@ -14708,17 +14752,28 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
 
     // Configure shutdown, activate asset 1 with EXTERNAL insurance/backing roles,
     // and fund it through the real Percolator program.
-    let configure_shutdown = build_controller_proxy_message(
+    let policy_generation_witness = controller_market_generation_witness(&svm, &slab);
+    let configure_shutdown = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &slab,
         &perc_id(),
+        &[],
+        &policy_generation_witness,
         &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
             stale_slots: 1_000,
             force_close_delay_slots: 10,
         }
         .encode(),
     );
+    let policy_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(policy_generation_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
     squads_execute(
         &mut svm,
         &squads,
@@ -14727,7 +14782,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &payer,
         3,
         &configure_shutdown,
-        &controller_remaining,
+        &policy_remaining,
     )
     .expect("controller configures shutdown delay");
     let backing_provider = Keypair::new();
@@ -16156,11 +16211,14 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
     assert_eq!(token_amount(&svm, &owner_token), 1);
     assert_eq!(read_asset0_insurance(&svm, &market), 0);
 
-    let configure_resolve = build_controller_proxy_message(
+    let policy_generation_witness = controller_market_generation_witness(&svm, &market);
+    let configure_resolve = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &market,
         &perc_id(),
+        &[],
+        &policy_generation_witness,
         &PIx::ConfigurePermissionlessResolve {
             stale_slots: 10,
             force_close_delay_slots: 1,
@@ -16172,6 +16230,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         AccountMeta::new(market, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(policy_generation_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -19786,6 +19845,50 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         send(&mut svm, &[&env.dao], ix).expect("approve a generation-A market resolution");
     }
 
+    // Approve a shorter permissionless-resolution deadline in generation A, but leave it queued.
+    // If this global control is not generation-bound, an executor can arm it only after generation
+    // B starts and then use Percolator's public stale-resolution path to terminate the replacement.
+    let stale_policy = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 1,
+            force_close_delay_slots: 1,
+        }
+        .encode(),
+    );
+    let stale_policy_index = 10u64;
+    let stale_policy_transaction =
+        transaction_pda(&env.squads, &env.multisig, stale_policy_index);
+    let stale_policy_proposal = proposal_pda(&env.squads, &env.multisig, stale_policy_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_transaction,
+            &env.dao.pubkey(),
+            &stale_policy,
+        ),
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_proposal,
+            &env.dao.pubkey(),
+            stale_policy_index,
+        ),
+        proposal_approve_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_proposal,
+            &env.dao.pubkey(),
+        ),
+    ] {
+        send(&mut svm, &[&env.dao], ix)
+            .expect("approve a generation-A stale-resolution policy");
+    }
+
     let initial_price = 1_000_001;
     let restart = build_twap_restart_asset0_message(
         &env.squads_vault,
@@ -19803,7 +19906,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.multisig,
         &env.dao,
         &payer,
-        10,
+        11,
         &restart,
         &twap_remaining,
     )
@@ -19874,6 +19977,45 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         "the probe must reach a live replacement market"
     );
 
+    let before_stale_policy = svm.get_account(&env.slab).unwrap();
+    let stale_policy_result = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_policy_proposal,
+            &stale_policy_transaction,
+            &env.dao.pubkey(),
+            &controller_remaining,
+        ),
+    );
+    if stale_policy_result.is_ok() {
+        warp_to(&mut svm, restart_slot + 1);
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: perc_id(),
+                accounts: vec![AccountMeta::new(env.slab, false)],
+                data: percolator_prog::ix::Instruction::ResolveStalePermissionless {
+                    now_slot: restart_slot + 1,
+                }
+                .encode(),
+            },
+        )
+        .expect("the replayed one-slot policy makes generation B publicly resolvable");
+    }
+    assert!(
+        stale_policy_result.is_err(),
+        "a generation-A stale-resolution policy remained executable against live generation B"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        before_stale_policy,
+        "stale policy rejection must preserve every generation-B account byte"
+    );
+
     let generation_b = restarted_group.assets[0].market_id;
     let generation_witness =
         market_controller_program::asset_generation_witness_address(&env.slab, 0, generation_b).0;
@@ -19910,7 +20052,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.multisig,
         &env.dao,
         &payer,
-        11,
+        12,
         &shutdown_b,
         &generation_b_remaining,
     )
@@ -19970,7 +20112,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.multisig,
         &env.dao,
         &payer,
-        12,
+        13,
         &fresh_resolve,
         &fresh_resolve_remaining,
     )
@@ -51090,17 +51232,29 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     .1
     .assets[1]
     .market_id;
+    let policy_generation_witness = controller_market_generation_witness(&svm, &market);
+    let mut configure_policy_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    configure_policy_data.extend_from_slice(
+        &PIx::ConfigurePermissionlessResolve {
+            stale_slots: 1_000,
+            force_close_delay_slots: 10,
+        }
+        .encode(),
+    );
     send(
         &mut svm,
         &[&payer, &governance],
-        proxy(
-            PIx::ConfigurePermissionlessResolve {
-                stale_slots: 1_000,
-                force_close_delay_slots: 10,
-            }
-            .encode(),
-            None,
-        ),
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(policy_generation_witness, false),
+            ],
+            data: configure_policy_data,
+        },
     )
     .expect("configure the shutdown delay");
 
