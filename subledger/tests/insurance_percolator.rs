@@ -5234,6 +5234,108 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
 }
 
+// STALE FULL-EXIT REPLAY: a partial withdrawal and equal redeposit can happen in
+// the same slot, restoring both principal and start_slot. That round trip must
+// still invalidate an earlier owner signature before deposits close; otherwise a
+// relayer can retire the restored position after the cutoff and destroy its vote.
+#[test]
+fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
+    let start = 100u64;
+    let deposit_window = 10u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        deposit_window,
+        start,
+        100,
+    );
+    env.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(deposit_window),
+        Some(start),
+    );
+    let ve = setup_vote(&mut env);
+    let (_, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 6);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 5)
+        .expect("alice creates the position covered by the held exit");
+    let original = env.read_position(&alice.pubkey());
+    assert_eq!(original, (5, start, false));
+    let original_position = env
+        .svm
+        .get_account(&env.position_pda(&alice.pubkey()))
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(original_position.data[80..88].try_into().unwrap()),
+        0,
+    );
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let mut full_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    full_exit_data.extend_from_slice(&original.0.to_le_bytes());
+    full_exit_data.extend_from_slice(&original.1.to_le_bytes());
+    let withheld_full_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(alice.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+                    AccountMeta::new(alice_ata, false),
+                    AccountMeta::new(holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: full_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 1)
+        .expect("alice partially withdraws in the deposit slot");
+    env.insurance_deposit(&alice, &alice_ata, &holding, 1)
+        .expect("alice restores the principal in the same slot");
+    let restored = env.read_position(&alice.pubkey());
+    assert_eq!(
+        restored,
+        (original.0, original.1 + 1, false),
+        "the same-slot redeposit advances the signed incarnation marker",
+    );
+    let restored_position = env
+        .svm
+        .get_account(&env.position_pda(&alice.pubkey()))
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(restored_position.data[80..88].try_into().unwrap()),
+        1,
+        "the cumulative withdrawal counter distinguishes the incarnation",
+    );
+
+    env.warp_slot(start + deposit_window);
+    assert!(
+        env.svm.send_transaction(withheld_full_exit).is_err(),
+        "an exit signed before a same-slot withdraw/redeposit must be stale",
+    );
+    assert_eq!(env.read_position(&alice.pubkey()), restored);
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("alice retains the post-cutoff Genesis vote opportunity");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
