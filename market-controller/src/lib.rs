@@ -94,6 +94,7 @@ const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_ACTION_ACTIVATE: u8 = 0;
 const ASSET_ACTION_DRAIN_ONLY: u8 = 1;
+const ASSET_ACTION_SHUTDOWN: u8 = 3;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const CONFIGURE_HYBRID_ORACLE_LEN: usize = 156;
@@ -779,6 +780,28 @@ fn process_proxy_admin<'a>(
         {
             // A public crank can commit the deterministic segment, after which
             // the same generation-bound resolution remains executable.
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    if perc_tag == PERC_IX_UPDATE_ASSET_LIFECYCLE
+        && data.get(1).copied() == Some(ASSET_ACTION_SHUTDOWN)
+    {
+        if data.len() != UPDATE_ASSET_LIFECYCLE_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let asset_index = data.get(2..4).ok_or(ProgramError::InvalidInstructionData)?;
+        let asset_index = usize::from(u16::from_le_bytes([asset_index[0], asset_index[1]]));
+        let shutdown_slot = Clock::get()?.slot;
+        let market_data = market.try_borrow_data()?;
+        if percolator_accounting::shutdown_would_skip_committed_accrual(
+            &market_data,
+            asset_index,
+            shutdown_slot,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            // Shutdown freezes the current effective price and overwrites the
+            // mark. A public crank can commit the segment before governance retries.
             return Err(ProgramError::InvalidAccountData);
         }
     }

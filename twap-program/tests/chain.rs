@@ -9249,8 +9249,14 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
 }
 
 #[test]
-fn probe_controller_resolve_cannot_skip_committed_funding() {
+fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
     use percolator_prog::ix::Instruction as PIx;
+
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalAction {
+        Resolve,
+        Shutdown,
+    }
 
     #[derive(Debug)]
     struct Outcome {
@@ -9260,7 +9266,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         short_payout: u64,
     }
 
-    fn run(crank_before_resolve: bool) -> Outcome {
+    fn run(crank_before_terminal: bool, terminal: TerminalAction) -> Outcome {
         const PRICE: u64 = 100;
         const MARK: u64 = 99;
         const OPEN_SLOT: u64 = 1;
@@ -9356,6 +9362,21 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             ),
         )
         .expect("initialize the public funding market");
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigurePermissionlessResolve {
+                    stale_slots: 1_000,
+                    force_close_delay_slots: 1,
+                },
+            ),
+        )
+        .expect("configure the bounded public force-close delay");
         send(
             &mut svm,
             &[&payer, &creator, &oracle],
@@ -9537,7 +9558,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         clock.slot = RESOLVE_SLOT;
         clock.unix_timestamp = RESOLVE_SLOT as i64;
         svm.set_sysvar(&clock);
-        if crank_before_resolve {
+        if crank_before_terminal {
             crank(&mut svm, RESOLVE_SLOT).expect("commit the deterministic funding segment");
         }
         let resolve = |svm: &LiteSVM| {
@@ -9556,20 +9577,115 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 data,
             }
         };
-        let first_resolve_ix = resolve(&svm);
-        let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
-        if crank_before_resolve {
-            first_resolve.expect("settled controller resolve remains live");
-        } else if first_resolve.is_err() {
-            crank(&mut svm, RESOLVE_SLOT).expect("public crank catches up committed funding");
-            let retry_resolve_ix = resolve(&svm);
-            send(&mut svm, &[&payer, &governance], retry_resolve_ix)
-                .expect("controller resolve succeeds after bounded catch-up");
-        }
+        let funding = match terminal {
+            TerminalAction::Resolve => {
+                let first_resolve_ix = resolve(&svm);
+                let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
+                if crank_before_terminal {
+                    first_resolve.expect("settled controller resolve remains live");
+                } else if first_resolve.is_err() {
+                    crank(&mut svm, RESOLVE_SLOT)
+                        .expect("public crank catches up committed funding");
+                    let retry_resolve_ix = resolve(&svm);
+                    send(&mut svm, &[&payer, &governance], retry_resolve_ix)
+                        .expect("controller resolve succeeds after bounded catch-up");
+                }
+                let state = percolator_prog::state::read_market(
+                    &svm.get_account(&market).unwrap().data,
+                )
+                .unwrap()
+                .1;
+                (state.assets[0].f_long_num, state.assets[0].f_short_num)
+            }
+            TerminalAction::Shutdown => {
+                let shutdown = |svm: &LiteSVM| {
+                    let market_id = percolator_accounting::read_asset_market_id(
+                        &svm.get_account(&market).unwrap().data,
+                        0,
+                    )
+                    .unwrap();
+                    let witness = market_controller_program::asset_generation_witness_address(
+                        &market, 0, market_id,
+                    )
+                    .0;
+                    let mut data = vec![0u8]; // controller IX_PROXY_ADMIN
+                    data.extend_from_slice(
+                        &PIx::UpdateAssetLifecycle {
+                            action: 3, // ASSET_ACTION_SHUTDOWN
+                            asset_index: 0,
+                            now_slot: RESOLVE_SLOT,
+                            initial_price: 0,
+                            insurance_authority: [0u8; 32],
+                            insurance_operator: [0u8; 32],
+                            backing_bucket_authority: [0u8; 32],
+                            oracle_authority: [0u8; 32],
+                        }
+                        .encode(),
+                    );
+                    Instruction {
+                        program_id: controller_id(),
+                        accounts: vec![
+                            AccountMeta::new_readonly(governance.pubkey(), true),
+                            AccountMeta::new_readonly(controller, false),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new_readonly(perc_id(), false),
+                            AccountMeta::new_readonly(witness, false),
+                        ],
+                        data,
+                    }
+                };
+                let first_shutdown_ix = shutdown(&svm);
+                let first_shutdown = send(&mut svm, &[&payer, &governance], first_shutdown_ix);
+                if crank_before_terminal {
+                    first_shutdown.expect("settled controller shutdown remains live");
+                } else if first_shutdown.is_err() {
+                    crank(&mut svm, RESOLVE_SLOT)
+                        .expect("public crank catches up committed funding");
+                    let retry_shutdown_ix = shutdown(&svm);
+                    send(&mut svm, &[&payer, &governance], retry_shutdown_ix)
+                        .expect("controller shutdown succeeds after bounded catch-up");
+                }
+                let shutdown_state = percolator_prog::state::read_market(
+                    &svm.get_account(&market).unwrap().data,
+                )
+                .unwrap()
+                .1;
+                let funding = (
+                    shutdown_state.assets[0].f_long_num,
+                    shutdown_state.assets[0].f_short_num,
+                );
 
-        let resolved = percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
-            .unwrap()
-            .1;
+                clock.slot = RESOLVE_SLOT + 1;
+                clock.unix_timestamp = (RESOLVE_SLOT + 1) as i64;
+                svm.set_sysvar(&clock);
+                send(
+                    &mut svm,
+                    &[&payer],
+                    pix(
+                        vec![
+                            AccountMeta::new(payer.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(long_portfolio.pubkey(), false),
+                            AccountMeta::new(short_portfolio.pubkey(), false),
+                        ],
+                        PIx::ForceCloseAbandonedAsset {
+                            asset_index: 0,
+                            now_slot: RESOLVE_SLOT + 1,
+                            close_q: SIZE_Q as u128,
+                        },
+                    ),
+                )
+                .expect("permissionless force-close flattens the recovering users");
+                let final_resolve_ix = resolve(&svm);
+                send(&mut svm, &[&payer, &governance], final_resolve_ix)
+                    .expect("controller resolves after public Recovery cleanup");
+                funding
+            }
+        };
+
+        clock.slot = RESOLVE_SLOT + 2;
+        clock.unix_timestamp = (RESOLVE_SLOT + 2) as i64;
+        svm.set_sysvar(&clock);
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
                 vec![
@@ -9623,20 +9739,37 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         )
         .expect("funding winner collects released value");
         Outcome {
-            f_long_num: resolved.assets[0].f_long_num,
-            f_short_num: resolved.assets[0].f_short_num,
+            f_long_num: funding.0,
+            f_short_num: funding.1,
             long_payout: token_amount(&svm, &long_destination),
             short_payout: token_amount(&svm, &short_destination),
         }
     }
 
-    let control = run(true);
-    let attack = run(false);
-    assert!(control.f_long_num > 0 && control.f_short_num < 0);
-    assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
-    assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
-    assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
-    assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+    for terminal in [TerminalAction::Resolve, TerminalAction::Shutdown] {
+        let control = run(true, terminal);
+        let attack = run(false, terminal);
+        assert!(
+            control.f_long_num > 0 && control.f_short_num < 0,
+            "{terminal:?} control did not accrue funding: {control:?}"
+        );
+        assert_eq!(
+            attack.f_long_num, control.f_long_num,
+            "{terminal:?}: {attack:?} != {control:?}"
+        );
+        assert_eq!(
+            attack.f_short_num, control.f_short_num,
+            "{terminal:?}: {attack:?} != {control:?}"
+        );
+        assert_eq!(
+            attack.long_payout, control.long_payout,
+            "{terminal:?}: {attack:?} != {control:?}"
+        );
+        assert_eq!(
+            attack.short_payout, control.short_payout,
+            "{terminal:?}: {attack:?} != {control:?}"
+        );
+    }
 }
 
 #[test]
