@@ -9276,6 +9276,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         segment: Segment,
         crank_before_terminal: bool,
         terminal: TerminalAction,
+        oracle_race_atomic: bool,
     ) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
@@ -9539,26 +9540,23 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
             ),
         )
         .expect("publish the honest funding checkpoint");
-        let crank = |svm: &mut LiteSVM, slot: u64| {
-            send(
-                svm,
-                &[&payer],
-                pix(
-                    vec![
-                        AccountMeta::new_readonly(payer.pubkey(), true),
-                        AccountMeta::new(market, false),
-                        AccountMeta::new(long_portfolio.pubkey(), false),
-                    ],
-                    PIx::PermissionlessCrank {
-                        now_slot: slot,
-                        observations: vec![percolator_prog::ix::CrankObservationHint {
-                            asset_index: 0,
-                            oracle_accounts: 0,
-                        }],
-                    },
-                ),
+        let crank_ix = |slot: u64| {
+            pix(
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(long_portfolio.pubkey(), false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
             )
         };
+        let crank = |svm: &mut LiteSVM, slot: u64| send(svm, &[&payer], crank_ix(slot));
         if activate_mark {
             crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
         }
@@ -9588,6 +9586,36 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         if crank_before_terminal {
             crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
         }
+        let terminal_slot = if oracle_race_atomic {
+            let terminal_slot = resolve_slot + 1;
+            clock.slot = terminal_slot;
+            clock.unix_timestamp = terminal_slot as i64;
+            svm.set_sysvar(&clock);
+            let raced_mark = if mark >= price {
+                mark.checked_add(price).unwrap()
+            } else {
+                mark.checked_sub(1).unwrap()
+            };
+            send(
+                &mut svm,
+                &[&payer, &oracle],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(oracle.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::PushAuthMark {
+                        asset_index: 0,
+                        now_slot: terminal_slot,
+                        mark_e6: raced_mark,
+                    },
+                ),
+            )
+            .expect("independent oracle republishes immediately before governance");
+            terminal_slot
+        } else {
+            resolve_slot
+        };
         let resolve = |svm: &LiteSVM| {
             let witness = controller_market_generation_witness(svm, &market);
             let mut data = vec![0u8];
@@ -9608,7 +9636,22 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
             TerminalAction::Resolve => {
                 let first_resolve_ix = resolve(&svm);
                 let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
-                if crank_before_terminal {
+                if oracle_race_atomic {
+                    assert!(
+                        first_resolve.is_err(),
+                        "a fresh authenticated mark must block a standalone resolve"
+                    );
+                    let resolve_ix = resolve(&svm);
+                    svm.expire_blockhash();
+                    let blockhash = svm.latest_blockhash();
+                    svm.send_transaction(Transaction::new_signed_with_payer(
+                        &[crank_ix(terminal_slot), resolve_ix],
+                        Some(&payer.pubkey()),
+                        &[&payer, &governance],
+                        blockhash,
+                    ))
+                    .expect("an atomic public crank plus resolve defeats oracle racing");
+                } else if crank_before_terminal {
                     first_resolve.expect("settled controller resolve remains live");
                 } else if first_resolve.is_err() {
                     crank(&mut svm, resolve_slot)
@@ -9625,7 +9668,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                 (state.assets[0].f_long_num, state.assets[0].f_short_num)
             }
             TerminalAction::Shutdown => {
-                let shutdown = |svm: &LiteSVM| {
+                let shutdown = |svm: &LiteSVM, action_slot: u64| {
                     let market_id = percolator_accounting::read_asset_market_id(
                         &svm.get_account(&market).unwrap().data,
                         0,
@@ -9640,7 +9683,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                         &PIx::UpdateAssetLifecycle {
                             action: 3, // ASSET_ACTION_SHUTDOWN
                             asset_index: 0,
-                            now_slot: resolve_slot,
+                            now_slot: action_slot,
                             initial_price: 0,
                             insurance_authority: [0u8; 32],
                             insurance_operator: [0u8; 32],
@@ -9661,14 +9704,29 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                         data,
                     }
                 };
-                let first_shutdown_ix = shutdown(&svm);
+                let first_shutdown_ix = shutdown(&svm, terminal_slot);
                 let first_shutdown = send(&mut svm, &[&payer, &governance], first_shutdown_ix);
-                if crank_before_terminal {
+                if oracle_race_atomic {
+                    assert!(
+                        first_shutdown.is_err(),
+                        "a fresh authenticated mark must block a standalone shutdown"
+                    );
+                    let shutdown_ix = shutdown(&svm, terminal_slot);
+                    svm.expire_blockhash();
+                    let blockhash = svm.latest_blockhash();
+                    svm.send_transaction(Transaction::new_signed_with_payer(
+                        &[crank_ix(terminal_slot), shutdown_ix],
+                        Some(&payer.pubkey()),
+                        &[&payer, &governance],
+                        blockhash,
+                    ))
+                    .expect("an atomic public crank plus shutdown defeats oracle racing");
+                } else if crank_before_terminal {
                     first_shutdown.expect("settled controller shutdown remains live");
                 } else if first_shutdown.is_err() {
                     crank(&mut svm, resolve_slot)
                         .expect("public crank catches up committed value");
-                    let retry_shutdown_ix = shutdown(&svm);
+                    let retry_shutdown_ix = shutdown(&svm, resolve_slot);
                     send(&mut svm, &[&payer, &governance], retry_shutdown_ix)
                         .expect("controller shutdown succeeds after bounded catch-up");
                 }
@@ -9682,8 +9740,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                     shutdown_state.assets[0].f_short_num,
                 );
 
-                clock.slot = resolve_slot + 1;
-                clock.unix_timestamp = (resolve_slot + 1) as i64;
+                clock.slot = terminal_slot + 1;
+                clock.unix_timestamp = (terminal_slot + 1) as i64;
                 svm.set_sysvar(&clock);
                 send(
                     &mut svm,
@@ -9697,7 +9755,7 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
                         ],
                         PIx::ForceCloseAbandonedAsset {
                             asset_index: 0,
-                            now_slot: resolve_slot + 1,
+                            now_slot: terminal_slot + 1,
                             close_q: size_q as u128,
                         },
                     ),
@@ -9710,8 +9768,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
             }
         };
 
-        clock.slot = resolve_slot + 2;
-        clock.unix_timestamp = (resolve_slot + 2) as i64;
+        clock.slot = terminal_slot + 2;
+        clock.unix_timestamp = (terminal_slot + 2) as i64;
         svm.set_sysvar(&clock);
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
@@ -9774,8 +9832,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
     }
 
     for terminal in [TerminalAction::Resolve, TerminalAction::Shutdown] {
-        let control = run(Segment::ActiveFunding, true, terminal);
-        let attack = run(Segment::ActiveFunding, false, terminal);
+        let control = run(Segment::ActiveFunding, true, terminal, false);
+        let attack = run(Segment::ActiveFunding, false, terminal, false);
         assert!(
             control.f_long_num > 0 && control.f_short_num < 0,
             "{terminal:?} control did not accrue funding: {control:?}"
@@ -9798,8 +9856,8 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         );
     }
 
-    let control = run(Segment::PendingPrice, true, TerminalAction::Resolve);
-    let attack = run(Segment::PendingPrice, false, TerminalAction::Resolve);
+    let control = run(Segment::PendingPrice, true, TerminalAction::Resolve, false);
+    let attack = run(Segment::PendingPrice, false, TerminalAction::Resolve, false);
     assert_eq!(control.f_long_num, 0);
     assert_eq!(control.f_short_num, 0);
     assert!(control.long_payout > 100_000_000, "{control:?}");
@@ -9812,6 +9870,12 @@ fn probe_controller_terminal_actions_cannot_skip_committed_funding() {
         attack.short_payout, control.short_payout,
         "{attack:?} != {control:?}"
     );
+
+    for terminal in [TerminalAction::Resolve, TerminalAction::Shutdown] {
+        let outcome = run(Segment::PendingPrice, false, terminal, true);
+        assert!(outcome.long_payout > 100_000_000, "{terminal:?}: {outcome:?}");
+        assert!(outcome.short_payout < 100_000_000, "{terminal:?}: {outcome:?}");
+    }
 }
 
 #[test]

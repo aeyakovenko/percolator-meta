@@ -14469,3 +14469,12 @@ pinned program does not accrue funding on the activation crank; after activation
 price-or-funding predicate applies. A public cranker commits the bounded step and governance retries
 the same generation-bound resolution. No state, account, signer, authority, recipient, CPI, token,
 custody, or admin surface is added.
+
+## Tick - independent oracle racing cannot stall controller terminal actions (surface A/C, BLOCKED)
+
+The accrual guards above intentionally reject shutdown or resolution while an authenticated mark has
+value available to commit. An independent oracle can republish between separate transactions, but it
+cannot interleave within one transaction. The retained real-SBF LiteSVM probe publishes a fresh mark at
+the next slot, proves standalone shutdown and resolution both reject, then executes each as
+`[PermissionlessCrank, controller terminal action]`. Both atomic paths commit, preserve the expected
+long/short settlement, and complete the normal owner recovery lifecycle. No code change was required.
