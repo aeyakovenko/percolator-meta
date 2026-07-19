@@ -9845,7 +9845,7 @@ fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
 }
 
 #[test]
-fn probe_public_stale_resolve_preflight_stays_bounded_at_10m_market_shape() {
+fn probe_public_stale_resolve_preflight_stays_bounded_at_dense_10m_market_shape() {
     use percolator_prog::ix::Instruction as PIx;
 
     const ASSET_COUNT: usize = 5_834;
@@ -9899,6 +9899,17 @@ fn probe_public_stale_resolve_preflight_stays_bounded_at_10m_market_shape() {
         1,
     )
     .expect("construct the maximum current market shape");
+    {
+        let (_, group) = percolator_prog::state::market_view_mut(&mut market_data).unwrap();
+        for slot in group.markets.iter_mut() {
+            slot.engine.asset.oi_eff_long_q = percolator::V16PodU128::new(1);
+            slot.engine.asset.oi_eff_short_q = percolator::V16PodU128::new(1);
+            slot.engine.asset.stored_pos_count_long = percolator::V16PodU64::new(1);
+            slot.engine.asset.stored_pos_count_short = percolator::V16PodU64::new(1);
+            slot.engine.asset.loss_weight_sum_long = percolator::V16PodU128::new(1);
+            slot.engine.asset.loss_weight_sum_short = percolator::V16PodU128::new(1);
+        }
+    }
     let market_rent = svm.minimum_balance_for_rent_exemption(market_data.len());
     svm.set_account(
         market,
@@ -9947,16 +9958,15 @@ fn probe_public_stale_resolve_preflight_stays_bounded_at_10m_market_shape() {
         metadata.compute_units_consumed
     );
     assert!(
-        metadata.compute_units_consumed < 1_200_000,
+        metadata.compute_units_consumed < 1_300_000,
         "maximum-shape public stale resolution used {} CU",
         metadata.compute_units_consumed
     );
-    assert!(
-        percolator_accounting::market_is_resolved_and_empty(
-            &svm.get_account(&market).unwrap().data
-        )
-        .unwrap()
-    );
+    let (_, mode, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(mode, percolator::MarketModeV16::Resolved);
 }
 
 // A TWAP bid is a standing COIN/collateral order rather than a
