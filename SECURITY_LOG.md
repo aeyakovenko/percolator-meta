@@ -14362,3 +14362,22 @@ FIX: own-vault and live-insurance complete exits now reuse one exact principal/l
 Every predecessor position layout remains withdrawable through the exact wire. The change adds no state,
 account, signer, authority, recipient, token path, custody path, or admin surface; tokens were never redirectable
 under the vulnerable path.
+
+## Tick - same-slot round trip revived a stale Genesis full exit (surface B/C, REAL DOS)
+
+The exact full-exit witness bound principal and `start_slot`, but an insurance position supports partial exits
+and later top-ups. In one slot, an owner could sign a complete exit, withdraw one unit through a distinct
+transaction, and redeposit that unit. Both signed fields returned to their original values. A relayer could
+then land the withheld exit after deposits closed, returning all tokens to the owner but permanently retiring
+the one-per-owner position and destroying its Genesis vote and reward opportunity.
+
+Retained clean-room LiteSVM test commit `efa074a` reproduces the public path against parent `d1a147c` with the
+real Subledger, Genesis Vote, Distribution, and pinned Percolator SBF binaries. The vulnerable binary accepts
+the restored snapshot after cutoff. The fixed path advances the marker from 100 to 101, rejects the withheld
+transaction, and proves all five principal units remain voteable.
+
+FIX: a new position records the real deposit slot, while every top-up records
+`max(current_slot, previous_marker + 1)`. Thus the existing signed field is a monotonic deposit-incarnation
+marker as well as a conservative reward-tenure clock. Checked overflow rejects only another top-up before any
+CPI; the existing owner withdrawal remains live. No account data, wire, signer, authority, recipient, CPI,
+token path, custody path, or admin surface was added.
