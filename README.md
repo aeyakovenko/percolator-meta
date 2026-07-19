@@ -167,8 +167,10 @@ capital's own tenure.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`eab3c4f66e45381860541a04701e7f0438a0ffe3` and its engine layout dependency to
+`5f1789a157dd06a27ecc4c966dcfa6a97d164d6a` and its engine layout dependency to
 `143e68c4917ed0400a27b952f036a5677047cd84`.
+That pin keeps signerless stale resolution below the transaction compute ceiling at the supported
+5,834-asset shape even when every exposed authenticated mark differs but rounds to no accrual work.
 
 That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
 active. Both governance wrappers therefore reject nonzero backing policies but preserve exact-zero
