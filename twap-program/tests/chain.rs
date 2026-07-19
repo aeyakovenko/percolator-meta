@@ -12442,6 +12442,10 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
         ),
     )
     .expect("attacker materializes an empty portfolio");
+    let attacker_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
     send(
         &mut svm,
         &[&payer, &attacker],
@@ -12453,6 +12457,7 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
             &slab,
             &portfolio.pubkey(),
             4,
+            Some(attacker_portfolio_id),
         ),
     )
     .expect("attacker registers a zero-counter stake in the original market generation");
@@ -13052,6 +13057,10 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
         ),
     )
     .expect("attacker initializes replacement-market reward witness");
+    let hijack_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&hijack_portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
     assert!(
         send(
             &mut svm,
@@ -13064,6 +13073,7 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
                 &slab,
                 &hijack_portfolio.pubkey(),
                 4,
+                Some(hijack_portfolio_id),
             ),
         )
         .is_err(),
@@ -30186,6 +30196,14 @@ fn e2e_full_genesis_to_buy_burn() {
         &reward_init_remaining,
     )
     .expect("futarchy initializes the dynamic bought-COIN epoch");
+    let epoch_long_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&epoch_long_pf).unwrap().data,
+    )
+    .unwrap();
+    let epoch_short_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&epoch_short_pf).unwrap().data,
+    )
+    .unwrap();
     send(
         &mut svm,
         &[&payer, &alice],
@@ -30197,6 +30215,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &slab,
             &position,
             0,
+            None,
         ),
     )
     .expect("genesis depositor registers for continuous insurance rewards");
@@ -30211,6 +30230,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &slab,
             &backing_position,
             1,
+            None,
         ),
     )
     .expect("segregated collateral depositor registers for rewards");
@@ -30225,6 +30245,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &epoch_market,
             &epoch_long_pf,
             4,
+            Some(epoch_long_portfolio_id),
         ),
     )
     .expect("long funding payer registers for rewards");
@@ -30239,6 +30260,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &epoch_market,
             &epoch_short_pf,
             4,
+            Some(epoch_short_portfolio_id),
         ),
     )
     .expect("short funding payer registers for rewards");
@@ -42695,6 +42717,16 @@ fn build_rd_epoch_init_message(
     message
 }
 
+fn rd_register_data(cohort: u8, portfolio_id: Option<u64>) -> Vec<u8> {
+    let mut data = vec![1, cohort];
+    if matches!(cohort, 2 | 3 | 4) {
+        let portfolio_id = portfolio_id.expect("portfolio cohort requires a live portfolio ID");
+        assert_ne!(portfolio_id, 0, "portfolio ID must be nonzero");
+        data.extend_from_slice(&portfolio_id.to_le_bytes());
+    }
+    data
+}
+
 fn rd_register_ix(
     payer: &Pubkey,
     config: &Pubkey,
@@ -42703,6 +42735,7 @@ fn rd_register_ix(
     market: &Pubkey,
     linked: &Pubkey,
     cohort: u8,
+    portfolio_id: Option<u64>,
 ) -> Instruction {
     let mut accounts = vec![
         AccountMeta::new(*payer, true),
@@ -42727,7 +42760,7 @@ fn rd_register_ix(
     Instruction {
         program_id: rd_id(),
         accounts,
-        data: vec![1, cohort],
+        data: rd_register_data(cohort, portfolio_id),
     }
 }
 
@@ -43039,11 +43072,19 @@ fn e2e_stale_registration_cannot_redirect_reinitialized_portfolio_rewards() {
         data,
     };
 
-    // The victim signed the then-current one-byte registration for incarnation A. The relayer
-    // withholds it while the victim closes A and initializes B at the same account address.
+    // The victim signs both the historical one-byte wire and the ID-bound wire for incarnation A.
+    // The relayer withholds them while the victim closes A and initializes B at the same address.
     svm.expire_blockhash();
     let held_blockhash = svm.latest_blockhash();
-    let stale_registration = Transaction::new_signed_with_payer(
+    let mut first_incarnation_data = vec![1, 4];
+    first_incarnation_data.extend_from_slice(&first_portfolio_id.to_le_bytes());
+    let stale_id_registration = Transaction::new_signed_with_payer(
+        &[register_ix(attacker.pubkey(), first_incarnation_data)],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    );
+    let legacy_registration = Transaction::new_signed_with_payer(
         &[register_ix(attacker.pubkey(), vec![1, 4])],
         Some(&payer.pubkey()),
         &[&payer, &victim],
@@ -43090,7 +43131,10 @@ fn e2e_stale_registration_cannot_redirect_reinitialized_portfolio_rewards() {
     .unwrap();
     assert!(second_portfolio_id > first_portfolio_id);
 
-    let stale_registration_accepted = svm.send_transaction(stale_registration).is_ok();
+    let stale_id_accepted = svm.send_transaction(stale_id_registration).is_ok();
+    let legacy_registration_accepted =
+        !stale_id_accepted && svm.send_transaction(legacy_registration).is_ok();
+    let stale_registration_accepted = stale_id_accepted || legacy_registration_accepted;
     if !stale_registration_accepted {
         let mut current_registration_data = vec![1, 4];
         current_registration_data.extend_from_slice(&second_portfolio_id.to_le_bytes());
@@ -43911,6 +43955,10 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         ],
         data: vec![1u8, 1u8],
     }; // COHORT_BACKING
+    let live_portfolio_id = |portfolio: &Pubkey| {
+        percolator_prog::state::read_portfolio_id(&svm.get_account(portfolio).unwrap().data)
+            .unwrap()
+    };
     let long_payer_stake = rd_stake_pda(&rd_config, &long_payer.pubkey(), &long_payer_pf, 4);
     let reg_long_payer = Instruction {
         program_id: rd_id(),
@@ -43929,7 +43977,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
-        data: vec![1u8, 4u8],
+        data: rd_register_data(4, Some(live_portfolio_id(&long_payer_pf))),
     }; // COHORT_FUNDING_PAYER
     let short_receiver_stake =
         rd_stake_pda(&rd_config, &short_receiver.pubkey(), &short_receiver_pf, 4);
@@ -43954,7 +44002,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
-        data: vec![1u8, 4u8],
+        data: rd_register_data(4, Some(live_portfolio_id(&short_receiver_pf))),
     }; // receiver-only account in COHORT_FUNDING_PAYER
     let short_payer_stake = rd_stake_pda(&rd_config, &short_payer.pubkey(), &short_payer_pf, 4);
     let reg_short_payer = Instruction {
@@ -43974,7 +44022,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
-        data: vec![1u8, 4u8],
+        data: rd_register_data(4, Some(live_portfolio_id(&short_payer_pf))),
     }; // COHORT_FUNDING_PAYER
     let long_receiver_stake =
         rd_stake_pda(&rd_config, &long_receiver.pubkey(), &long_receiver_pf, 4);
@@ -43999,7 +44047,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
-        data: vec![1u8, 4u8],
+        data: rd_register_data(4, Some(live_portfolio_id(&long_receiver_pf))),
     }; // receiver-only account in COHORT_FUNDING_PAYER
     let dual_payer_stake = rd_stake_pda(&rd_config, &dual_payer.pubkey(), &dual_payer_pf, 4);
     let reg_dual_payer = Instruction {
@@ -44019,7 +44067,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
-        data: vec![1u8, 4u8],
+        data: rd_register_data(4, Some(live_portfolio_id(&dual_payer_pf))),
     };
     let dual_receiver_stake =
         rd_stake_pda(&rd_config, &dual_receiver.pubkey(), &dual_receiver_pf, 4);
@@ -44044,7 +44092,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             AccountMeta::new_readonly(slab, false),
             AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
         ],
-        data: vec![1u8, 4u8],
+        data: rd_register_data(4, Some(live_portfolio_id(&dual_receiver_pf))),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -45242,6 +45290,14 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
 
     // All reward inputs are read-only to the distributor. Register the insurance/backing shares and
     // the two real funding-paying portfolios at the beginning of the 45-day window.
+    let epoch_long_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&epoch_long_pf).unwrap().data,
+    )
+    .unwrap();
+    let epoch_short_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&epoch_short_pf).unwrap().data,
+    )
+    .unwrap();
     send(
         &mut svm,
         &[&payer, &alice],
@@ -45253,6 +45309,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &slab,
             &position,
             0,
+            None,
         ),
     )
     .expect("insurance registers in buyback epoch");
@@ -45267,6 +45324,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &slab,
             &backing_position,
             1,
+            None,
         ),
     )
     .expect("backing registers in buyback epoch");
@@ -45281,6 +45339,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &epoch_market,
             &epoch_long_pf,
             4,
+            Some(epoch_long_portfolio_id),
         ),
     )
     .expect("long payer registers in buyback epoch");
@@ -45295,6 +45354,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
             &epoch_market,
             &epoch_short_pf,
             4,
+            Some(epoch_short_portfolio_id),
         ),
     )
     .expect("short payer registers in buyback epoch");
@@ -46332,6 +46392,10 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         &long_owner.pubkey(),
         0,
     );
+    let long_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&long_portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
     send(
         &mut svm,
         &[&payer, &long_owner],
@@ -46343,6 +46407,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
             &market_key,
             &long_portfolio.pubkey(),
             4,
+            Some(long_portfolio_id),
         ),
     )
     .expect("long registers before paying funding");
@@ -47966,7 +48031,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
                 false,
             ),
         ],
-        data: vec![1u8, reward_cohort],
+        data: rd_register_data(reward_cohort, Some(registered_reward_portfolio_id)),
     };
     if let Some(decoy) = zero_fee_decoy {
         svm.expire_blockhash();
@@ -50888,6 +50953,7 @@ fn run_absent_finalized_genesis_voter_cannot_block_terminal_market_close(
             &env.slab,
             &position,
             0,
+            None,
         ),
     )
     .expect("register the genesis insurance position for rewards");

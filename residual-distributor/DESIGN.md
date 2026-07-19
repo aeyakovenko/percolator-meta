@@ -114,6 +114,11 @@ Squads transaction under Solana's packet-size limit. All scope fields are fixed 
 `register_start` for the portfolio-flow cohorts requires `portfolio.provenance.market_group ∈ allow-list`
 (`Config::market_allowed`). Pinned by allow-list e2e tests;
 the single-market form is finding IL (`register_rejects_portfolio_from_a_foreign_market`).
+Portfolio-flow registration data also carries the live nonzero monotonic `portfolio_id`; legacy
+one-byte portfolio registrations and IDs that do not match the observed live/archive incarnation are
+rejected. This prevents a withheld owner-signed registration from binding an old recipient to rewards
+earned after the same portfolio address is closed and reinitialized. Insurance/backing registration data
+remains the single cohort byte because a terminal subledger position cannot become a new deposit incarnation.
 
 **Setup flow (how the allow-listed markets are made trustworthy).** At genesis init the market-authority
 key (the asset_admin / oracle authority of the N markets) is held **locally by the creator**. The creator
