@@ -27185,6 +27185,94 @@ fn place_bid_rejects_late_bids_after_round_end() {
     );
 }
 
+// PUBLIC LOF: a bid authorization must commit to the round the bidder inspected. With a short
+// round, an untrusted submitter can hold a still-valid signed transaction, permissionlessly roll
+// the empty book, and land that old authorization in the replacement round. That burns the
+// bidder's fee and exposes their escrow under a competition window they never approved.
+#[test]
+fn place_bid_rejects_a_signed_authorization_after_the_round_changes() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+    let bid_fee = 7;
+    let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, bid_fee);
+
+    let (bidder, coin_src, usd_dest) = new_bidder(&mut svm, &payer, &env, 100 + bid_fee);
+    let first_round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+
+    // The victim signs while the first round is open. The transaction remains unsubmitted.
+    let shared_blockhash = svm.latest_blockhash();
+    let stale_bid = Transaction::new_signed_with_payer(
+        &[place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_src,
+            &usd_dest,
+            &env.coin_mint,
+            &env.collateral_mint,
+            100,
+            100,
+            None,
+        )],
+        Some(&bidder.pubkey()),
+        &[&bidder],
+        shared_blockhash,
+    );
+
+    // Anyone can roll the empty first round before submitting the victim's still-valid message.
+    warp_to(&mut svm, first_round_end);
+    let roll = Transaction::new_signed_with_payer(
+        &[execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        shared_blockhash,
+    );
+    svm.send_transaction(roll)
+        .expect("permissionless crank advances the empty book");
+    let second_round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(second_round_end > first_round_end, "the round changed");
+
+    assert!(
+        svm.send_transaction(stale_bid).is_err(),
+        "the first-round authorization must not enter the replacement round"
+    );
+    assert_eq!(
+        token_amount(&svm, &coin_src),
+        100 + bid_fee,
+        "a stale authorization must not burn the fee or escrow COIN"
+    );
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+}
+
 // HEADLINE: a full buy/burn — three bids at different rates clear at ONE marginal uniform price,
 // the bought COIN is really burned (mint supply drops), winners' USD is parked and claimed, and
 // surplus COIN is refunded. All against the real percolator + Squads + twap binaries.
