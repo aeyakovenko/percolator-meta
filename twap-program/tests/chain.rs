@@ -9238,6 +9238,12 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
 fn probe_controller_resolve_cannot_skip_committed_funding() {
     use percolator_prog::ix::Instruction as PIx;
 
+    #[derive(Clone, Copy)]
+    enum Segment {
+        ActiveFunding,
+        PendingPrice,
+    }
+
     #[derive(Debug)]
     struct Outcome {
         f_long_num: i128,
@@ -9246,14 +9252,29 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         short_payout: u64,
     }
 
-    fn run(crank_before_resolve: bool) -> Outcome {
-        const PRICE: u64 = 100;
-        const MARK: u64 = 99;
+    fn run(segment: Segment, crank_before_resolve: bool) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
-        const RESOLVE_SLOT: u64 = 3;
         const DEPOSIT: u128 = 100_000_000;
-        const SIZE_Q: i128 = 100_000 * percolator::POS_SCALE as i128;
+        let (price, mark, max_price_move_bps_per_slot, size_q, activate_mark, resolve_slot) =
+            match segment {
+                Segment::ActiveFunding => (
+                    100,
+                    99,
+                    1,
+                    100_000 * percolator::POS_SCALE as i128,
+                    true,
+                    3,
+                ),
+                Segment::PendingPrice => (
+                    10_000,
+                    20_000,
+                    100,
+                    1_000 * percolator::POS_SCALE as i128,
+                    false,
+                    PRIME_SLOT,
+                ),
+            };
 
         let mut svm = LiteSVM::new().with_compute_budget(
             solana_program_runtime::compute_budget::ComputeBudget {
@@ -9319,7 +9340,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                     max_portfolio_assets: 1,
                     h_min: 0,
                     h_max: 10,
-                    initial_price: PRICE,
+                    initial_price: price,
                     min_nonzero_mm_req: 1,
                     min_nonzero_im_req: 2,
                     maintenance_margin_bps: 10_000,
@@ -9329,7 +9350,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                     liquidation_fee_bps: 0,
                     liquidation_fee_cap: 0,
                     min_liquidation_abs: 0,
-                    max_price_move_bps_per_slot: 1,
+                    max_price_move_bps_per_slot,
                     max_accrual_dt_slots: 1,
                     max_abs_funding_e9_per_slot: 10_000,
                     min_funding_lifetime_slots: 1,
@@ -9370,7 +9391,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 PIx::ConfigureAuthMark {
                     asset_index: 0,
                     now_slot: OPEN_SLOT,
-                    initial_mark_e6: PRICE,
+                    initial_mark_e6: price,
                 },
             ),
         )
@@ -9451,8 +9472,8 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 ],
                 PIx::TradeNoCpi {
                     asset_index: 0,
-                    size_q: SIZE_Q,
-                    exec_price: PRICE,
+                    size_q,
+                    exec_price: price,
                     fee_bps: 0,
                 },
             ),
@@ -9474,7 +9495,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 PIx::PushAuthMark {
                     asset_index: 0,
                     now_slot: PRIME_SLOT,
-                    mark_e6: MARK,
+                    mark_e6: mark,
                 },
             ),
         )
@@ -9499,7 +9520,9 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 ),
             )
         };
-        crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
+        if activate_mark {
+            crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
+        }
 
         let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
         send(
@@ -9520,11 +9543,11 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         )
         .expect("donate bounded lifecycle authority to the controller");
 
-        clock.slot = RESOLVE_SLOT;
-        clock.unix_timestamp = RESOLVE_SLOT as i64;
+        clock.slot = resolve_slot;
+        clock.unix_timestamp = resolve_slot as i64;
         svm.set_sysvar(&clock);
         if crank_before_resolve {
-            crank(&mut svm, RESOLVE_SLOT).expect("commit the deterministic funding segment");
+            crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
         }
         let resolve = |svm: &LiteSVM| {
             let witness = controller_market_generation_witness(svm, &market);
@@ -9547,7 +9570,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         if crank_before_resolve {
             first_resolve.expect("settled controller resolve remains live");
         } else if first_resolve.is_err() {
-            crank(&mut svm, RESOLVE_SLOT).expect("public crank catches up committed funding");
+            crank(&mut svm, resolve_slot).expect("public crank catches up committed value");
             let retry_resolve_ix = resolve(&svm);
             send(&mut svm, &[&payer, &governance], retry_resolve_ix)
                 .expect("controller resolve succeeds after bounded catch-up");
@@ -9616,11 +9639,20 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         }
     }
 
-    let control = run(true);
-    let attack = run(false);
+    let control = run(Segment::ActiveFunding, true);
+    let attack = run(Segment::ActiveFunding, false);
     assert!(control.f_long_num > 0 && control.f_short_num < 0);
     assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
     assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
+    assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
+    assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+
+    let control = run(Segment::PendingPrice, true);
+    let attack = run(Segment::PendingPrice, false);
+    assert_eq!(control.f_long_num, 0);
+    assert_eq!(control.f_short_num, 0);
+    assert!(control.long_payout > 100_000_000, "{control:?}");
+    assert!(control.short_payout < 100_000_000, "{control:?}");
     assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
 }

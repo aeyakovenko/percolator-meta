@@ -516,12 +516,12 @@ pub fn market_is_live(data: &[u8]) -> Result<bool, ReadError> {
 }
 
 /// Returns true when resolving at `resolve_slot` would discard a deterministic
-/// price or funding segment from an already-active authenticated mark.
+/// price or funding segment from an authenticated mark.
 ///
-/// A mark published after the asset's current accrual cursor is still pending and
-/// is intentionally excluded: privileged resolution has never committed to that
-/// observation. Once a public crank reaches its publication slot, every later
-/// value-bearing segment must be accrued before the controller can resolve.
+/// A newly published mark is value-bearing when its first public crank can move
+/// the effective price. Funding remains excluded until that activation crank,
+/// matching pinned Percolator's anti-retroactivity rule. Once active, either a
+/// price move or nonzero two-sided funding must be accrued before resolution.
 pub fn resolve_would_skip_committed_accrual(
     data: &[u8],
     resolve_slot: u64,
@@ -582,11 +582,10 @@ pub fn resolve_would_skip_committed_accrual(
         }
         let profile = percolator_prog::state::read_asset_oracle_profile(data, asset_index)
             .map_err(|_| ReadError::InvalidAccounting)?;
-        if !percolator_prog::oracle_v16::profile_is_price_managed(&profile)
-            || profile.mark_ewma_last_slot > slot_last
-        {
+        if !percolator_prog::oracle_v16::profile_is_price_managed(&profile) {
             continue;
         }
+        let pending_mark = profile.mark_ewma_last_slot > slot_last;
         let current = read_u64(
             data,
             field(asset, offset_of!(AssetStateV16Account, effective_price))?,
@@ -614,7 +613,7 @@ pub fn resolve_would_skip_committed_accrual(
         )
         .ok_or(ReadError::InvalidAccounting)?;
         let balanced = oi_long != 0 && oi_short != 0;
-        if next != current || (balanced && funding_rate != 0) {
+        if next != current || (!pending_mark && balanced && funding_rate != 0) {
             return Ok(true);
         }
     }
@@ -1127,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_preflight_distinguishes_committed_from_pending_marks() {
+    fn resolve_preflight_rejects_value_bearing_authenticated_marks() {
         let mut market = market_with_committed_funding_segment();
         assert_eq!(resolve_would_skip_committed_accrual(&market, 3), Ok(true));
 
@@ -1171,13 +1170,32 @@ mod tests {
         assert_eq!(
             resolve_would_skip_committed_accrual(&market, 3),
             Ok(false),
-            "an authenticated mark not yet activated by a crank is not committed"
+            "a pending zero-move mark cannot accrue funding on its activation crank"
+        );
+
+        profile.mark_ewma_e6 = 20_000;
+        profile.oracle_target_price_e6 = 20_000;
+        percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, effective_price),
+            10_000,
+        );
+        assert_eq!(
+            resolve_would_skip_committed_accrual(&market, 3),
+            Ok(true),
+            "resolution cannot erase a pending mark with an executable bounded price step"
         );
 
         profile.mark_ewma_last_slot = 2;
+        profile.mark_ewma_e6 = 99;
+        profile.oracle_target_price_e6 = 99;
         percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
-        let asset = asset_engine_offset(0).unwrap()
-            + offset_of!(EngineAssetSlotV16Account, asset);
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, effective_price),
+            100,
+        );
         write_u64_at(
             &mut market,
             asset + offset_of!(AssetStateV16Account, slot_last),
