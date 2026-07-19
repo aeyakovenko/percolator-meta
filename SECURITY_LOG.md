@@ -14496,12 +14496,21 @@ mutation check against the prior `da64be639168b496833dd4c701607a94fcb06b6c` SBF 
 exact payout delta; the fixed binary passes. Meta adds no state, signer, authority, recipient, CPI,
 token, custody, or admin surface.
 
-## Tick - stale-resolution accrual scan cannot exhaust terminal compute (surface A/C, BLOCKED)
+## Tick - dense zero-delta stale resolution exhausted terminal compute (surface A/C, REAL DOS)
 
-The fixed signerless resolver scans every configured asset before entering terminal mode, so a dense
-maximum-size market could have converted the LoF fix into a public lifecycle DoS. A retained real-SBF
-LiteSVM probe constructs the supported 5,834-asset, 10 MiB slab with coherent nonzero long and short
-exposure in every asset, configures stale resolution through the real public API, and invokes
-`ResolveStalePermissionless` at the exact boundary. The transaction resolves successfully using
-1,210,015 CU, below the test's 1,300,000-CU guard and the 1,400,000-CU protocol ceiling. No code
-change was required.
+The `eab3c4f66e45381860541a04701e7f0438a0ffe3` signerless resolver scanned and fully
+validated every exposed asset before entering terminal mode. At the supported 5,834-asset, 10 MiB
+shape, each authenticated mark can differ from its engine price while the configured one-slot move
+rounds to zero and funding is disabled. There is then no accrual to commit: an ordinary exit rejects
+as `OracleStale`, an honest account crank rejects as `EngineNonProgress`, and the sole terminal
+resolver exhausted the transaction. The retained real-SBF LiteSVM mutation consumed 1,399,944 CU in
+Percolator and the full 1,400,000-CU transaction before failing as `ProgramFailedToComplete`.
+
+FIX: the workspace pins Percolator commit `5f1789a157dd06a27ecc4c966dcfa6a97d164d6a`.
+It computes the zero-delta ceiling once and validates only the profile fields consumed by the
+terminal scan. The Meta regression installs a shape-validated max-size fixture to isolate terminal
+compute, configures stale resolution through the public API, and verifies that the signerless
+resolver reaches `Resolved` in 1,140,254 CU, below its 1,300,000-CU guard. The pinned program's
+separate LiteSVM regression constructs all assets and exposure through public instructions and proves
+the blocked exit and no-progress crank conditions. Meta adds no state, account, signer, authority,
+recipient, CPI, token, custody, or admin surface.
