@@ -362,10 +362,11 @@ fn terminal_refund_start_slot(data: &[u8], config: &Config) -> Result<u64, Progr
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    config
-        .bootstrap_end_slot
-        .checked_add(deposit_window)
-        .ok_or(ProgramError::ArithmeticOverflow)
+    // The fallback phase is derived after both committed schedule components
+    // have been validated above. Saturate only this terminal boundary so an
+    // otherwise representable near-u64::MAX bootstrap cannot overflow-brick the
+    // final trigger slot and every later terminal return.
+    Ok(config.bootstrap_end_slot.saturating_add(deposit_window))
 }
 
 struct ProposalVote {
