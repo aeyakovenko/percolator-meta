@@ -14362,3 +14362,26 @@ FIX: own-vault and live-insurance complete exits now reuse one exact principal/l
 Every predecessor position layout remains withdrawable through the exact wire. The change adds no state,
 account, signer, authority, recipient, token path, custody path, or admin surface; tokens were never redirectable
 under the vulnerable path.
+
+## Tick - same-slot round trip revived a stale Genesis full exit (surface B/C, REAL DOS)
+
+The exact full-exit witness bound principal and `start_slot`, but an insurance position supports partial exits
+and later top-ups. In one slot, an owner could sign a complete exit, withdraw one unit through a distinct
+transaction, and redeposit that unit. Both signed fields returned to their original values. A relayer could
+then land the withheld exit after deposits closed, returning all tokens to the owner but permanently retiring
+the one-per-owner position and destroying its Genesis vote and reward opportunity.
+
+Retained clean-room LiteSVM tests reproduce all three stale encodings with the real Subledger, Genesis Vote,
+Distribution, and pinned Percolator SBF binaries. Test commit `efa074a` covers the snapshot wire against parent
+`d1a147c`; `88b658c` proves that the amount-only complete exit still bypassed the first fix; `bf2431c` proves
+that merely making that wire partial-only still let a withheld one-unit exit destroy post-cutoff vote principal.
+The vulnerable paths accept the restored positions after cutoff. The fixed path advances each marker from 100
+to 101, rejects every withheld transaction, and proves all fifteen principal units remain voteable.
+
+FIX: a new position records the real deposit slot, while every top-up records
+`max(current_slot, previous_marker + 1)`. Thus the existing signed field is a monotonic deposit-incarnation
+marker as well as a conservative reward-tenure clock. Current partial insurance exits bind amount, exact
+principal, and that marker; complete owner exits use the snapshot-bound wire. Predecessor amount-only partial
+recovery remains available only for layouts that cannot accept another deposit. Checked overflow rejects only
+another top-up before any CPI, and every owner withdrawal remains live through an exact wire. No account data,
+signer, authority, recipient, CPI, token path, custody path, or admin surface was added.

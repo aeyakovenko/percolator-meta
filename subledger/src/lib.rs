@@ -752,6 +752,17 @@ impl Position {
     }
 }
 
+fn next_position_start_slot(position: &Position, now: u64) -> Result<u64, ProgramError> {
+    if position.principal == 0 {
+        return Ok(now);
+    }
+    let next_incarnation = position
+        .start_slot
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok(core::cmp::max(now, next_incarnation))
+}
+
 fn supported_position_size(size: usize) -> bool {
     matches!(size, POSITION_SIZE_BASE | POSITION_SIZE_TENURE) || size >= POSITION_SIZE
 }
@@ -1610,6 +1621,7 @@ fn process_deposit(
         }
         p
     };
+    let next_start_slot = next_position_start_slot(&position, Clock::get()?.slot)?;
 
     // Tenure-fair shares (POLICY_WITH_SURPLUS, finding HT): price this deposit by the LIVE vault
     // balance BEFORE the pull, so a late depositor can only ever redeem surplus accrued during its own
@@ -1657,9 +1669,10 @@ fn process_deposit(
         .shares
         .checked_add(shares_minted)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    // Last-write-time: topping up resets the vote clock, so late additions don't
-    // earn early-join weight.
-    position.start_slot = Clock::get()?.slot;
+    // This is both the reward-tenure clock and the owner-signed exit incarnation.
+    // Advance it monotonically so two deposits in one slot cannot revive a stale
+    // full-exit signature after an intervening partial insurance withdrawal.
+    position.start_slot = next_start_slot;
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
@@ -2199,6 +2212,7 @@ fn process_insurance_deposit(
         p
     };
     move_position_to_current_share_generation(&mut position, &pool)?;
+    let next_start_slot = next_position_start_slot(&position, now)?;
 
     // 1) User -> holding (user-signed; the user is moving their own funds).
     invoke(
@@ -2268,8 +2282,10 @@ fn process_insurance_deposit(
         .shares
         .checked_add(shares_minted)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    // Last-write-time: topping up resets the vote clock.
-    position.start_slot = Clock::get()?.slot;
+    // This is both the reward-tenure clock and the owner-signed exit incarnation.
+    // Advance it monotonically so two deposits in one slot cannot revive a stale
+    // full-exit signature after an intervening partial insurance withdrawal.
+    position.start_slot = next_start_slot;
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
@@ -2279,9 +2295,14 @@ fn process_insurance_deposit(
 // insurance_withdraw accounts: [owner(s,w), pool(w), position(w), owner_ata(w),
 //   holding(w, pool-PDA-owned token acct), market_slab(w), percolator_vault(w),
 //   vault_authority, percolator_program, token_program]
-// data: amount (u64)
+// data (current positions): amount (u64) | expected_principal (u64) |
+//   expected_start_slot (u64)
+// data (predecessor positions): amount (u64)
 //
-// Owner-bound, principal-only exit: `amount <= position.principal`. The pool PDA
+// Owner-bound, principal-only partial exit: `amount < position.principal`. A
+// current position commits to its exact incarnation; predecessor layouts keep
+// their amount-only recovery wire because they cannot accept another deposit.
+// Complete exits use IX_INSURANCE_WITHDRAW_FULL. The pool PDA
 // (asset-0 insurance operator) signs WithdrawInsuranceAsset (tag 57). NOTE: the
 // real percolator handler requires the withdraw destination to be owned by the
 // *operator* (the pool PDA), not an arbitrary user, so we withdraw into a
@@ -2292,7 +2313,23 @@ fn process_insurance_withdraw(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    process_insurance_withdraw_impl(program_id, accounts, data, false)
+    let position_account = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if position_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    let amount = read_u64(data)?;
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if position_account.data_len() >= POSITION_SIZE {
+        require_full_exit_snapshot(data, &position)?;
+    } else if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount_bytes = amount.to_le_bytes();
+    let mut amount_data: &[u8] = &amount_bytes;
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false, true)
 }
 
 // insurance_withdraw_full has the same accounts as insurance_withdraw. Data is
@@ -2313,7 +2350,7 @@ fn process_insurance_withdraw_full(
     let principal = position.principal;
     let amount_bytes = principal.to_le_bytes();
     let mut amount_data: &[u8] = &amount_bytes;
-    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false, false)
 }
 
 fn require_full_exit_snapshot(data: &mut &[u8], position: &Position) -> ProgramResult {
@@ -2346,7 +2383,7 @@ fn process_return_finalized_position(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    process_insurance_withdraw_impl(program_id, accounts, data, true)
+    process_insurance_withdraw_impl(program_id, accounts, data, true, false)
 }
 
 fn process_insurance_withdraw_impl(
@@ -2354,6 +2391,7 @@ fn process_insurance_withdraw_impl(
     accounts: &[AccountInfo],
     data: &mut &[u8],
     terminal: bool,
+    partial_only: bool,
 ) -> ProgramResult {
     let iter = &mut accounts.iter();
     let owner = next_account_info(iter)?;
@@ -2517,6 +2555,11 @@ fn process_insurance_withdraw_impl(
     // Principal-only: never exceeds the owner's own recorded principal.
     if amount > position.principal || amount > pool.outstanding_principal {
         return Err(ProgramError::InsufficientFunds);
+    }
+    // Keep the amount-bearing wire partial; its current encoding is snapshot-bound
+    // above, while complete exits use IX_INSURANCE_WITHDRAW_FULL.
+    if partial_only && amount == position.principal {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
     // Read live asset-0 insurance from the slab. Current positions use shares priced
