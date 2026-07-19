@@ -16811,6 +16811,11 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     // If the provider disappears now, any cranker can complete shutdown without
     // acquiring custody: the controller must return all remaining backing only to
     // the provider recorded in Percolator's asset profile.
+    // ATTACK PROBE: a hostile cranker returns only part of the abandoned long-domain
+    // principal, then lets whole-market stale resolution mature. The resolved path
+    // must be able to continue from the already-initialized controller ledger and
+    // return the exact remainder without the absent provider or DAO signing.
+    let shutdown_return_amount = abandoned_amount / 2;
     let return_abandoned = controller_return_shutdown_backing_ix(
         &squads_vault,
         &controller,
@@ -16822,15 +16827,15 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &backing_ledger,
         &perc_id(),
         2,
-        abandoned_amount as u128,
+        shutdown_return_amount as u128,
         live_provider_earnings as u128,
     );
     send(&mut svm, &[&payer], return_abandoned)
         .expect("permissionless crank returns abandoned backing to the recorded provider");
     assert_eq!(
         token_amount(&svm, &provider_destination),
-        asset_insurance_amount + abandoned_amount + live_provider_earnings,
-        "recorded provider receives both earnings and remaining principal"
+        asset_insurance_amount + shutdown_return_amount + live_provider_earnings,
+        "recorded provider receives the partial principal and all requested earnings"
     );
     let controller_ledger = percolator_prog::state::read_backing_domain_ledger(
         &svm.get_account(&backing_ledger).unwrap().data,
@@ -16841,6 +16846,16 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     assert_eq!(
         controller_ledger.total_earnings_withdrawn_atoms,
         live_provider_earnings as u128
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&slab).unwrap().data,
+            1,
+        )
+        .unwrap()[0]
+            .principal_atoms,
+        (abandoned_amount - shutdown_return_amount) as u128,
+        "authoritative slab accounting must retain the exact unresolved remainder"
     );
     assert!(
         svm.get_account(&controller_transit)
@@ -17010,7 +17025,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     assert_eq!(
         token_amount(&svm, &provider_destination),
         asset_insurance_amount
-            + abandoned_amount
+            + shutdown_return_amount
             + live_provider_earnings
             + resolved_only_insurance_amount
     );
