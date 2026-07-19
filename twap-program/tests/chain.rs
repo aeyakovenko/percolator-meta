@@ -9235,7 +9235,7 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
 }
 
 #[test]
-fn probe_controller_resolve_cannot_skip_committed_funding() {
+fn probe_terminal_resolution_cannot_skip_committed_value() {
     use percolator_prog::ix::Instruction as PIx;
 
     #[derive(Clone, Copy)]
@@ -9252,12 +9252,23 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         short_payout: u64,
     }
 
-    fn run(segment: Segment, crank_before_resolve: bool) -> Outcome {
+    fn run(
+        segment: Segment,
+        crank_before_resolve: bool,
+        public_stale: bool,
+        stale_boundary_probe: bool,
+    ) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
         const DEPOSIT: u128 = 100_000_000;
-        let (price, mark, max_price_move_bps_per_slot, size_q, activate_mark, resolve_slot) =
-            match segment {
+        let (
+            price,
+            mut mark,
+            max_price_move_bps_per_slot,
+            size_q,
+            activate_mark,
+            resolve_slot,
+        ): (u64, u64, u64, i128, bool, u64) = match segment {
                 Segment::ActiveFunding => (
                     100,
                     99,
@@ -9275,6 +9286,11 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                     PRIME_SLOT,
                 ),
             };
+        if stale_boundary_probe {
+            mark = price
+                .checked_add(price * max_price_move_bps_per_slot / 10_000)
+                .unwrap();
+        }
 
         let mut svm = LiteSVM::new().with_compute_budget(
             solana_program_runtime::compute_budget::ComputeBudget {
@@ -9363,6 +9379,23 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             ),
         )
         .expect("initialize the public funding market");
+        if public_stale {
+            send(
+                &mut svm,
+                &[&payer, &creator],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(creator.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::ConfigurePermissionlessResolve {
+                        stale_slots: 1,
+                        force_close_delay_slots: 1,
+                    },
+                ),
+            )
+            .expect("configure the public stale-resolution boundary");
+        }
         send(
             &mut svm,
             &[&payer, &creator, &oracle],
@@ -9543,11 +9576,16 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         )
         .expect("donate bounded lifecycle authority to the controller");
 
-        clock.slot = resolve_slot;
-        clock.unix_timestamp = resolve_slot as i64;
+        let terminal_slot = if stale_boundary_probe {
+            resolve_slot + 1
+        } else {
+            resolve_slot
+        };
+        clock.slot = terminal_slot;
+        clock.unix_timestamp = terminal_slot as i64;
         svm.set_sysvar(&clock);
         if crank_before_resolve {
-            crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
+            crank(&mut svm, terminal_slot).expect("commit the deterministic market segment");
         }
         let resolve = |svm: &LiteSVM| {
             let witness = controller_market_generation_witness(svm, &market);
@@ -9565,20 +9603,41 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 data,
             }
         };
-        let first_resolve_ix = resolve(&svm);
-        let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
-        if crank_before_resolve {
-            first_resolve.expect("settled controller resolve remains live");
-        } else if first_resolve.is_err() {
-            crank(&mut svm, resolve_slot).expect("public crank catches up committed value");
-            let retry_resolve_ix = resolve(&svm);
-            send(&mut svm, &[&payer, &governance], retry_resolve_ix)
-                .expect("controller resolve succeeds after bounded catch-up");
+        if public_stale {
+            let stale_resolve = || {
+                pix(
+                    vec![AccountMeta::new(market, false)],
+                    PIx::ResolveStalePermissionless {
+                        now_slot: terminal_slot,
+                    },
+                )
+            };
+            let first_resolve = send(&mut svm, &[&payer], stale_resolve());
+            if first_resolve.is_err() {
+                crank(&mut svm, terminal_slot)
+                    .expect("public stale-boundary crank catches up committed value");
+                send(&mut svm, &[&payer], stale_resolve())
+                    .expect("public stale resolution succeeds after bounded catch-up");
+            }
+        } else {
+            let first_resolve_ix = resolve(&svm);
+            let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
+            if crank_before_resolve {
+                first_resolve.expect("settled controller resolve remains live");
+            } else if first_resolve.is_err() {
+                crank(&mut svm, terminal_slot).expect("public crank catches up committed value");
+                let retry_resolve_ix = resolve(&svm);
+                send(&mut svm, &[&payer, &governance], retry_resolve_ix)
+                    .expect("controller resolve succeeds after bounded catch-up");
+            }
         }
 
         let resolved = percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
             .unwrap()
             .1;
+        clock.slot = terminal_slot + 1;
+        clock.unix_timestamp = (terminal_slot + 1) as i64;
+        svm.set_sysvar(&clock);
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
                 vec![
@@ -9639,22 +9698,37 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         }
     }
 
-    let control = run(Segment::ActiveFunding, true);
-    let attack = run(Segment::ActiveFunding, false);
+    let control = run(Segment::ActiveFunding, true, false, false);
+    let attack = run(Segment::ActiveFunding, false, false, false);
     assert!(control.f_long_num > 0 && control.f_short_num < 0);
     assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
     assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
     assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
 
-    let control = run(Segment::PendingPrice, true);
-    let attack = run(Segment::PendingPrice, false);
+    let control = run(Segment::PendingPrice, true, false, false);
+    let attack = run(Segment::PendingPrice, false, false, false);
     assert_eq!(control.f_long_num, 0);
     assert_eq!(control.f_short_num, 0);
     assert!(control.long_payout > 100_000_000, "{control:?}");
     assert!(control.short_payout < 100_000_000, "{control:?}");
     assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+
+    let control = run(Segment::PendingPrice, true, false, true);
+    let attack = run(Segment::PendingPrice, false, true, true);
+    assert_eq!(control.f_long_num, 0);
+    assert_eq!(control.f_short_num, 0);
+    assert!(control.long_payout > 100_000_000, "{control:?}");
+    assert!(control.short_payout < 100_000_000, "{control:?}");
+    assert_eq!(
+        attack.long_payout, control.long_payout,
+        "public stale resolution discarded an authenticated mark: {attack:?} != {control:?}"
+    );
+    assert_eq!(
+        attack.short_payout, control.short_payout,
+        "public stale resolution discarded an authenticated mark: {attack:?} != {control:?}"
+    );
 }
 
 #[test]
@@ -9768,6 +9842,131 @@ fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
         )
         .unwrap()
     );
+}
+
+#[test]
+fn probe_public_stale_resolve_preflight_stays_bounded_at_dense_10m_market_shape() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const ASSET_COUNT: usize = 5_834;
+    const PRICE: u64 = 100;
+    const STALE_SLOT: u64 = 2;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: STALE_SLOT,
+        unix_timestamp: STALE_SLOT as i64,
+        ..Clock::default()
+    });
+
+    // Public activation can construct this shape. Install the otherwise ordinary initialized slab
+    // directly so this probe spends its transaction budget on the terminal public instruction.
+    let market = Pubkey::new_unique();
+    let collateral_mint = Pubkey::new_unique();
+    let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
+    wrapper.marketauth = payer.pubkey().to_bytes();
+    wrapper.collateral_mint = collateral_mint.to_bytes();
+    wrapper.last_good_oracle_slot = 1;
+    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
+    wrapper.mark_ewma_e6 = PRICE;
+    wrapper.mark_ewma_last_slot = 1;
+    wrapper.oracle_target_price_e6 = PRICE;
+    let config = percolator_prog::risk::V16Config::public_user_fund_with_market_slots(
+        percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
+        ASSET_COUNT as u32,
+        0,
+        10,
+    );
+    let mut market_data = vec![
+        0u8;
+        percolator_prog::state::market_account_len_for_capacity(ASSET_COUNT).unwrap()
+    ];
+    percolator_prog::state::init_market_account_zero_copy(
+        &mut market_data,
+        &wrapper,
+        config,
+        market.to_bytes(),
+        PRICE,
+        1,
+    )
+    .expect("construct the maximum current market shape");
+    {
+        let (_, group) = percolator_prog::state::market_view_mut(&mut market_data).unwrap();
+        for slot in group.markets.iter_mut() {
+            slot.engine.asset.oi_eff_long_q = percolator::V16PodU128::new(1);
+            slot.engine.asset.oi_eff_short_q = percolator::V16PodU128::new(1);
+            slot.engine.asset.stored_pos_count_long = percolator::V16PodU64::new(1);
+            slot.engine.asset.stored_pos_count_short = percolator::V16PodU64::new(1);
+            slot.engine.asset.loss_weight_sum_long = percolator::V16PodU128::new(1);
+            slot.engine.asset.loss_weight_sum_short = percolator::V16PodU128::new(1);
+        }
+    }
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_data.len());
+    svm.set_account(
+        market,
+        Account {
+            lamports: market_rent,
+            data: market_data,
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure signerless stale resolution through the public API");
+
+    svm.expire_blockhash();
+    let metadata = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![AccountMeta::new(market, false)],
+                PIx::ResolveStalePermissionless {
+                    now_slot: STALE_SLOT,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .expect("maximum-shape signerless stale resolution stays within the transaction CU limit");
+    eprintln!(
+        "10 MiB public stale resolution used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        metadata.compute_units_consumed < 1_300_000,
+        "maximum-shape public stale resolution used {} CU",
+        metadata.compute_units_consumed
+    );
+    let (_, mode, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(mode, percolator::MarketModeV16::Resolved);
 }
 
 // A TWAP bid is a standing COIN/collateral order rather than a

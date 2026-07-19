@@ -167,7 +167,7 @@ capital's own tenure.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`da64be639168b496833dd4c701607a94fcb06b6c` and its engine layout dependency to
+`eab3c4f66e45381860541a04701e7f0438a0ffe3` and its engine layout dependency to
 `143e68c4917ed0400a27b952f036a5677047cd84`.
 
 That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
@@ -392,7 +392,9 @@ redirect or fragment it, and a frozen canonical account is never required. While
 bypass Percolator's delayed secondary-asset shutdown override.
 
 Global stale resolution is permissionless, so a cranker can resolve before those shutdown returns
-run. The resolved companions require the whole market to be resolved and empty, derive every amount
+run. The pinned program rejects stale resolution while a public crank can still commit a
+value-bearing authenticated mark; after that bounded catch-up, the same signerless resolver remains
+live. The resolved companions require the whole market to be resolved and empty, derive every amount
 from the slab, and use the controller's existing secondary `asset_admin` role to rotate only the
 relevant insurance or backing role. They then return all value to a clean account owned solely by
 the outgoing recorded provider, but only up to the exact amount attributed by that cleanup. If the
