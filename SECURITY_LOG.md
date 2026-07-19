@@ -14500,7 +14500,8 @@ token, custody, or admin surface.
 
 The fixed signerless resolver scans every configured asset before entering terminal mode, so a dense
 maximum-size market could have converted the LoF fix into a public lifecycle DoS. A retained real-SBF
-LiteSVM probe constructs the supported 5,834-asset, 10 MiB slab, configures stale resolution through
-the real public API, and invokes `ResolveStalePermissionless` at the exact boundary. The transaction
-resolves successfully using 78,219 CU, below the test's 1,200,000-CU ceiling. No code change was
-required.
+LiteSVM probe constructs the supported 5,834-asset, 10 MiB slab with coherent nonzero long and short
+exposure in every asset, configures stale resolution through the real public API, and invokes
+`ResolveStalePermissionless` at the exact boundary. The transaction resolves successfully using
+1,210,015 CU, below the test's 1,300,000-CU guard and the 1,400,000-CU protocol ceiling. No code
+change was required.
