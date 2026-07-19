@@ -707,11 +707,14 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     .expect("a public donor adds one post-loss fee-surplus atom");
     assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
 
-    let resolve = build_controller_proxy_message(
+    let resolve_witness = controller_market_generation_witness(&svm, &market);
+    let resolve = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &market,
         &perc_id(),
+        &[],
+        &resolve_witness,
         &PIx::ResolveMarket.encode(),
     );
     let resolve_remaining = vec![
@@ -719,6 +722,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         AccountMeta::new(market, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(resolve_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -837,6 +841,12 @@ fn controller_id() -> Pubkey {
 
 fn controller_pda(governance: &Pubkey, market: &Pubkey, perc: &Pubkey) -> Pubkey {
     market_controller_program::controller_address(governance, market, perc).0
+}
+
+fn controller_market_generation_witness(svm: &LiteSVM, market: &Pubkey) -> Pubkey {
+    let market_data = svm.get_account(market).unwrap().data;
+    let next_market_id = percolator_accounting::read_next_market_id(&market_data).unwrap();
+    market_controller_program::market_generation_witness_address(market, next_market_id).0
 }
 
 fn retired_market_pda(market: &Pubkey, perc: &Pubkey) -> Pubkey {
@@ -12576,6 +12586,7 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
 
     let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
     resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    let resolve_witness = controller_market_generation_witness(&svm, &slab);
     send(
         &mut svm,
         &[&payer, &governance],
@@ -12586,6 +12597,7 @@ fn e2e_abandoned_portfolio_cleanup_blocks_retired_market_reward_replay() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(resolve_witness, false),
             ],
             data: resolve_data,
         },
@@ -13245,6 +13257,7 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
 
     let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
     resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    let resolve_witness = controller_market_generation_witness(&svm, &slab);
     send(
         &mut svm,
         &[&payer, &governance],
@@ -13255,6 +13268,7 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(slab, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(resolve_witness, false),
             ],
             data: resolve_data,
         },
@@ -13832,6 +13846,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
 
     let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
     resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    let resolve_witness = controller_market_generation_witness(&svm, &slab);
     let resolve = Instruction {
         program_id: controller_id(),
         accounts: vec![
@@ -13839,6 +13854,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(resolve_witness, false),
         ],
         data: resolve_data,
     };
@@ -16554,6 +16570,7 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
     assert_eq!(token_amount(&svm, &primary_vault), primary_dust);
     assert_eq!(token_amount(&svm, &secondary_vault), secondary_dust);
 
+    let resolve_witness = controller_market_generation_witness(&svm, &slab);
     let resolve = Instruction {
         program_id: controller_id(),
         accounts: vec![
@@ -16561,6 +16578,7 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(resolve_witness, false),
         ],
         data: vec![0, 19], // proxy_admin -> ResolveMarket
     };
@@ -19564,7 +19582,7 @@ fn e2e_squads_cannot_terminally_drain_insurance_after_resolve() {
 // marketauth restart it. The constrained TWAP surface must therefore expose the fixed, value-neutral
 // asset-0 restart or a temporary oracle shutdown permanently strands an otherwise reusable market.
 #[test]
-fn e2e_post_genesis_twap_custody_can_restart_asset0() {
+fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -19746,6 +19764,56 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         send(&mut svm, &[&env.dao], ix).expect("approve a generation-A TWAP restart");
     }
 
+    // Approve a market-wide resolution while generation A is still current, but leave it
+    // executable in Squads. A restart changes the economic market incarnation without changing
+    // the slab or controller keys, so this authorization must not survive into generation B.
+    let stale_resolve_witness = controller_market_generation_witness(&svm, &env.slab);
+    let stale_resolve = build_controller_generation_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &[],
+        &stale_resolve_witness,
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    let stale_resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(stale_resolve_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let stale_resolve_index = 9u64;
+    let stale_resolve_transaction =
+        transaction_pda(&env.squads, &env.multisig, stale_resolve_index);
+    let stale_resolve_proposal = proposal_pda(&env.squads, &env.multisig, stale_resolve_index);
+    for ix in [
+        vault_transaction_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_transaction,
+            &env.dao.pubkey(),
+            &stale_resolve,
+        ),
+        proposal_create_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_proposal,
+            &env.dao.pubkey(),
+            stale_resolve_index,
+        ),
+        proposal_approve_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_proposal,
+            &env.dao.pubkey(),
+        ),
+    ] {
+        send(&mut svm, &[&env.dao], ix).expect("approve a generation-A market resolution");
+    }
+
     let initial_price = 1_000_001;
     let restart = build_twap_restart_asset0_message(
         &env.squads_vault,
@@ -19763,7 +19831,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &env.multisig,
         &env.dao,
         &payer,
-        9,
+        10,
         &restart,
         &twap_remaining,
     )
@@ -19807,6 +19875,33 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
     );
     assert_eq!(token_amount(&svm, &env.perc_vault), token_insurance_before);
 
+    let before_stale_resolve = svm.get_account(&env.slab).unwrap();
+    let stale_resolve_result = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_resolve_proposal,
+            &stale_resolve_transaction,
+            &env.dao.pubkey(),
+            &stale_resolve_remaining,
+        ),
+    );
+    assert!(
+        stale_resolve_result.is_err(),
+        "a generation-A global resolution remained executable against live generation B"
+    );
+    assert_eq!(
+        svm.get_account(&env.slab).unwrap(),
+        before_stale_resolve,
+        "stale resolution rejection must preserve every generation-B account byte"
+    );
+    assert!(
+        percolator_accounting::market_is_live(&before_stale_resolve.data).unwrap(),
+        "the probe must reach a live replacement market"
+    );
+
     let generation_b = restarted_group.assets[0].market_id;
     let generation_witness =
         market_controller_program::asset_generation_witness_address(&env.slab, 0, generation_b).0;
@@ -19843,7 +19938,7 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         &env.multisig,
         &env.dao,
         &payer,
-        10,
+        11,
         &shutdown_b,
         &generation_b_remaining,
     )
@@ -19878,6 +19973,40 @@ fn e2e_post_genesis_twap_custody_can_restart_asset0() {
         "stale restart rejection must preserve generation-B recovery accounting"
     );
     assert_eq!(token_amount(&svm, &env.perc_vault), token_insurance_before);
+
+    let fresh_resolve_witness = controller_market_generation_witness(&svm, &env.slab);
+    let fresh_resolve = build_controller_generation_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &[],
+        &fresh_resolve_witness,
+        &percolator_prog::ix::Instruction::ResolveMarket.encode(),
+    );
+    let fresh_resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(fresh_resolve_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        12,
+        &fresh_resolve,
+        &fresh_resolve_remaining,
+    )
+    .expect("a fresh generation-B witness preserves the bounded resolution path");
+    assert!(
+        !percolator_accounting::market_is_live(&svm.get_account(&env.slab).unwrap().data)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -24033,11 +24162,14 @@ fn e2e_approved_old_generation_resolve_cannot_shutdown_reused_market_key() {
     send(&mut svm, &[&payer, &market], init_market())
         .expect("permissionlessly initialize the first controller-owned generation");
 
-    let resolve_message = build_controller_proxy_message(
+    let resolve_witness = controller_market_generation_witness(&svm, &market.pubkey());
+    let resolve_message = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
+        &[],
+        &resolve_witness,
         &percolator_prog::ix::Instruction::ResolveMarket.encode(),
     );
     let resolve_remaining = vec![
@@ -24045,6 +24177,7 @@ fn e2e_approved_old_generation_resolve_cannot_shutdown_reused_market_key() {
         AccountMeta::new(market.pubkey(), false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(resolve_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
 
@@ -46705,6 +46838,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     svm.set_sysvar(&clock);
     let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
     resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+    let resolve_witness = controller_market_generation_witness(&svm, &market_key);
     send(
         &mut svm,
         &[&payer, &governance],
@@ -46715,6 +46849,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new(market_key, false),
                 AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(resolve_witness, false),
             ],
             data: resolve_data,
         },
@@ -48973,6 +49108,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         .expect("creator donates the live market to the fixed controller");
         let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
         resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+        let resolve_witness = controller_market_generation_witness(&svm, &market);
         send(
             &mut svm,
             &[&governance],
@@ -48983,6 +49119,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
                     AccountMeta::new_readonly(controller, false),
                     AccountMeta::new(market, false),
                     AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(resolve_witness, false),
                 ],
                 data: resolve_data,
             },
@@ -50129,11 +50266,14 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     // Resolution can race the external re-handoff crank after these owner exits. The
     // established pending permit must remain usable in resolved mode; otherwise this ordinary
     // governance lifecycle transition would leave custody on the pool until another DAO action.
-    let resolve = build_controller_proxy_message(
+    let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
+    let resolve = build_controller_generation_proxy_message(
         &env.squads_vault,
         &controller,
         &env.slab,
         &perc_id(),
+        &[],
+        &resolve_witness,
         &percolator_prog::ix::Instruction::ResolveMarket.encode(),
     );
     let resolve_remaining = vec![
@@ -50141,6 +50281,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new(env.slab, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(resolve_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(

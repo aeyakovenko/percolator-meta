@@ -11,6 +11,8 @@ pub const HEADER_LEN: usize = 16;
 pub const WRAPPER_CONFIG_LEN: usize = 448;
 pub const ASSET_WRAPPER_LEN: usize = 512;
 pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
+pub const NEXT_MARKET_ID_OFFSET: usize =
+    MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, next_market_id);
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
@@ -656,6 +658,13 @@ pub fn read_asset_market_id(data: &[u8], asset_index: usize) -> Result<u64, Read
     )
 }
 
+/// Returns the market-wide generation cursor. Percolator advances this monotonic
+/// identifier whenever any asset slot is created or restarted.
+pub fn read_next_market_id(data: &[u8]) -> Result<u64, ReadError> {
+    validate_market(data)?;
+    read_u64(data, NEXT_MARKET_ID_OFFSET)
+}
+
 /// Returns the insurance withdrawal authority recorded in one pinned-v16 asset profile.
 pub fn read_asset_insurance_authority(
     data: &[u8],
@@ -996,6 +1005,17 @@ mod tests {
             read_asset_market_id(&market, 1),
             Err(ReadError::InvalidAsset)
         );
+    }
+
+    #[test]
+    fn next_market_id_uses_the_pinned_market_header_offset() {
+        let mut market = market_with_insurance_capacity();
+        market[NEXT_MARKET_ID_OFFSET..NEXT_MARKET_ID_OFFSET + 8]
+            .copy_from_slice(&91u64.to_le_bytes());
+        assert_eq!(read_next_market_id(&market), Ok(91));
+
+        market[10] = KIND_PORTFOLIO;
+        assert_eq!(read_next_market_id(&market), Err(ReadError::InvalidHeader));
     }
 
     #[test]
