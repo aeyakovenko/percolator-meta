@@ -3187,7 +3187,7 @@ fn process_set_bid_fee(
 
 // place_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
 //   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_dest(w)?]
-// data: coin_atoms (u128) || usdc_atoms (u128)
+// data: coin_atoms (u128) || usdc_atoms (u128) || expected_round_end (u64)
 //
 // PERMISSIONLESS. The bidder escrows `coin_atoms` COIN, offering it for `usdc_atoms` USD (limit
 // rate coin/usdc). The bid CANNOT be cancelled afterwards (anti-spoofing) — it only leaves the
@@ -3206,11 +3206,12 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let collateral_mint = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
 
-    if data.len() != 32 {
+    if data.len() != 40 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let coin_atoms = u128::from_le_bytes(data[..16].try_into().unwrap());
     let usdc_atoms = u128::from_le_bytes(data[16..32].try_into().unwrap());
+    let expected_round_end = u64::from_le_bytes(data[32..40].try_into().unwrap());
     if coin_atoms == 0 || usdc_atoms == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -3230,7 +3231,10 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     let book = load_book_header(&book_account.try_borrow_data()?)?;
-    if book.config != *config_account.key || book.state != BOOK_STATE_OPEN {
+    if book.config != *config_account.key
+        || book.state != BOOK_STATE_OPEN
+        || book.round_end != expected_round_end
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     let now = solana_program::clock::Clock::get()?.slot;
