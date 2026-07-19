@@ -26203,7 +26203,7 @@ fn place_bid_ix(
     coin_atoms: u128,
     usdc_atoms: u128,
     evict: Option<Pubkey>,
-) -> Instruction {
+) -> PlaceBidInstruction {
     let mut accounts = vec![
         AccountMeta::new(*bidder, true),
         AccountMeta::new_readonly(*config, false),
@@ -26222,11 +26222,19 @@ fn place_bid_ix(
     let mut data = vec![7u8];
     data.extend_from_slice(&coin_atoms.to_le_bytes());
     data.extend_from_slice(&usdc_atoms.to_le_bytes());
-    Instruction {
-        program_id: twap_id(),
-        accounts,
-        data,
+    PlaceBidInstruction {
+        book: *book,
+        instruction: Instruction {
+            program_id: twap_id(),
+            accounts,
+            data,
+        },
     }
+}
+
+struct PlaceBidInstruction {
+    book: Pubkey,
+    instruction: Instruction,
 }
 
 fn donate_insurance_ix(
@@ -26614,6 +26622,19 @@ trait TestInstruction {
 impl TestInstruction for Instruction {
     fn build(self, _svm: &LiteSVM) -> Instruction {
         self
+    }
+}
+
+impl TestInstruction for PlaceBidInstruction {
+    fn build(mut self, svm: &LiteSVM) -> Instruction {
+        let book = svm
+            .get_account(&self.book)
+            .expect("place_bid book must exist");
+        let round_end = u64::from_le_bytes(book.data[240..248].try_into().unwrap());
+        self.instruction
+            .data
+            .extend_from_slice(&round_end.to_le_bytes());
+        self.instruction
     }
 }
 
@@ -27229,7 +27250,8 @@ fn place_bid_rejects_a_signed_authorization_after_the_round_changes() {
             100,
             100,
             None,
-        )],
+        )
+        .build(&svm)],
         Some(&bidder.pubkey()),
         &[&bidder],
         shared_blockhash,
@@ -31164,7 +31186,8 @@ fn e2e_squads_cannot_front_run_a_presigned_bid_with_a_fee_increase() {
             coin_atoms as u128,
             5_000,
             None,
-        )],
+        )
+        .build(&svm)],
         Some(&payer.pubkey()),
         &[&payer, &alice],
         shared_blockhash,
@@ -32084,7 +32107,8 @@ fn e2e_presigned_cancel_cannot_cancel_a_reused_bid_slot() {
             bid_coin as u128,
             bid_usd,
             None,
-        )],
+        )
+        .build(&svm)],
         Some(&alice.pubkey()),
         &[&alice],
         held_blockhash,
