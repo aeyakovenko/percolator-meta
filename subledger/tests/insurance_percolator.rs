@@ -429,6 +429,8 @@ impl Env {
         } else {
             let mut partial = vec![5u8]; // IX_INSURANCE_WITHDRAW
             partial.extend_from_slice(&amount.to_le_bytes());
+            partial.extend_from_slice(&principal.to_le_bytes());
+            partial.extend_from_slice(&start_slot.to_le_bytes());
             partial
         };
         let ix = Instruction {
@@ -1885,10 +1887,6 @@ fn pre_share_insurance_pool_attests_live_principal_and_preserves_owner_exit() {
     .expect("historical outstanding principal is a live owner claim");
 
     let legacy_holding = create_holding(&mut env, &legacy_pool);
-    let historical_snapshot = env.read_position(&alice.pubkey());
-    let mut full_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
-    full_exit_data.extend_from_slice(&historical_snapshot.0.to_le_bytes());
-    full_exit_data.extend_from_slice(&historical_snapshot.1.to_le_bytes());
     let exit_accounts = vec![
         AccountMeta::new(alice.pubkey(), true),
         AccountMeta::new(legacy_pool, false),
@@ -1913,6 +1911,38 @@ fn pre_share_insurance_pool_attests_live_principal_and_preserves_owner_exit() {
         .is_err(),
         "predecessor positions reject the replayable amountless wire",
     );
+    let mut predecessor_full_amount = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    predecessor_full_amount.extend_from_slice(&amount.to_le_bytes());
+    assert!(
+        env.send(
+            &[Instruction {
+                program_id: sub_id(),
+                accounts: exit_accounts.clone(),
+                data: predecessor_full_amount,
+            }],
+            &[&alice],
+        )
+        .is_err(),
+        "the predecessor amount wire cannot retire a complete position",
+    );
+    let partial_amount = amount / 2;
+    let mut predecessor_partial = vec![5u8]; // historical amount-only partial wire
+    predecessor_partial.extend_from_slice(&partial_amount.to_le_bytes());
+    env.send(
+        &[Instruction {
+            program_id: sub_id(),
+            accounts: exit_accounts.clone(),
+            data: predecessor_partial,
+        }],
+        &[&alice],
+    )
+    .expect("a deposit-closed predecessor position retains partial recovery");
+    assert_eq!(env.token_amount(&alice_ata), partial_amount);
+
+    let historical_snapshot = env.read_position(&alice.pubkey());
+    let mut full_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    full_exit_data.extend_from_slice(&historical_snapshot.0.to_le_bytes());
+    full_exit_data.extend_from_slice(&historical_snapshot.1.to_le_bytes());
     env.send(
         &[Instruction {
             program_id: sub_id(),
@@ -4157,7 +4187,10 @@ fn foreign_market_slab_cannot_inflate_the_haircut() {
     }).unwrap();
 
     // ATTACK: withdraw with market_slab pointing at the HEALTHY foreign market to read its 2M basis.
-    let mut d = vec![5u8]; d.extend_from_slice(&amount.to_le_bytes());
+    let (principal, start_slot, _) = env.read_position(&alice.pubkey());
+    let mut d = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+    d.extend_from_slice(&principal.to_le_bytes());
+    d.extend_from_slice(&start_slot.to_le_bytes());
     let attack = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -5139,6 +5172,8 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
 
     let mut bob_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
     bob_withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    bob_withdraw_data.extend_from_slice(&bob_snapshot.0.to_le_bytes());
+    bob_withdraw_data.extend_from_slice(&bob_snapshot.1.to_le_bytes());
     let bob_withdraw = Instruction {
         program_id: sub_id(),
         accounts: vec![

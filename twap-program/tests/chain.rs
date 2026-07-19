@@ -8477,8 +8477,9 @@ fn subledger_insurance_withdraw_data(
         data.extend_from_slice(&witness);
         data
     } else {
-        let mut data = vec![5u8]; // IX_INSURANCE_WITHDRAW (partial only)
+        let mut data = vec![5u8]; // IX_INSURANCE_WITHDRAW (partial, snapshot-bound)
         data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&witness);
         data
     }
 }
@@ -17986,7 +17987,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     .expect("deposit");
 
     // Sanity: BEFORE the handoff, alice can withdraw (the pool is the operator).
-    let withdraw = |amt: u64| Instruction {
+    let withdraw = |svm: &LiteSVM, amt: u64| Instruction {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new(alice.pubkey(), true),
@@ -18000,16 +18001,13 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
-        data: {
-            let mut d = vec![5u8];
-            d.extend_from_slice(&amt.to_le_bytes());
-            d
-        },
+        data: subledger_insurance_withdraw_data(svm, &position, amt),
     };
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let withdraw_one = withdraw(&svm, 1);
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[withdraw(1)],
+        &[withdraw_one],
         Some(&payer.pubkey()),
         &[&payer, &alice],
         bh,
@@ -18169,7 +18167,8 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     // insurance operator, so percolator refuses the pool-signed WithdrawInsuranceLimited.
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
-    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[withdraw(100)], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
+    let blocked_withdraw = withdraw(&svm, 100);
+    assert!(svm.send_transaction(Transaction::new_signed_with_payer(&[blocked_withdraw], Some(&payer.pubkey()), &[&payer, &alice], bh)).is_err(),
         "post-handoff the subledger exit path is closed — depositors must exit during the timelock window");
 
     // PUBLIC CUSTODY/DOS PROBE: a second valid insurance pool can be created for the
@@ -18283,8 +18282,9 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let before = token_amount(&svm, &alice_ata);
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let withdraw_100 = withdraw(&svm, 100);
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[withdraw(100)],
+        &[withdraw_100],
         Some(&payer.pubkey()),
         &[&payer, &alice],
         bh,
@@ -18302,8 +18302,9 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let live_principal = 100_000u64;
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
+    let withdraw_to_live = withdraw(&svm, remaining_principal - live_principal);
     svm.send_transaction(Transaction::new_signed_with_payer(
-        &[withdraw(remaining_principal - live_principal)],
+        &[withdraw_to_live],
         Some(&payer.pubkey()),
         &[&payer, &alice],
         bh,
@@ -18462,9 +18463,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     .expect("return custody for final owner exit");
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
-    let mut final_withdraw = withdraw(live_principal);
-    final_withdraw.data =
-        subledger_insurance_withdraw_data(&svm, &position, live_principal);
+    let final_withdraw = withdraw(&svm, live_principal);
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[final_withdraw],
         Some(&payer.pubkey()),
@@ -21705,6 +21704,7 @@ fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot
         data: gv_vote_data_e2e(svm, &gv_ballot, &position, action),
     };
     // Withdraw builder parameterized by amount (the partial draw is the attack; the full builder above is fixed).
+    let partial_witness = subledger_full_exit_witness(&svm, &position);
     let withdraw_amt = |amt: u64| Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -21722,6 +21722,7 @@ fn e2e_vote_locked_position_cannot_partially_withdraw_to_keep_an_inflated_ballot
         data: {
             let mut d = vec![5u8];
             d.extend_from_slice(&amt.to_le_bytes());
+            d.extend_from_slice(&partial_witness);
             d
         },
     };
@@ -49334,8 +49335,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     // pool instead of subtracting only the owner consumed by the atomic return. This
     // owner retracts around the exit and re-backs the reduced principal, then disappears.
     let interleaved_exit = 4u64;
-    let mut interleaved_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
-    interleaved_withdraw_data.extend_from_slice(&interleaved_exit.to_le_bytes());
+    let interleaved_withdraw_data =
+        subledger_insurance_withdraw_data(&svm, &position, interleaved_exit);
     let interleaved_withdraw = Instruction {
         program_id: sub_id(),
         accounts: vec![

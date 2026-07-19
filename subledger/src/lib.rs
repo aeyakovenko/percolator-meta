@@ -2295,11 +2295,14 @@ fn process_insurance_deposit(
 // insurance_withdraw accounts: [owner(s,w), pool(w), position(w), owner_ata(w),
 //   holding(w, pool-PDA-owned token acct), market_slab(w), percolator_vault(w),
 //   vault_authority, percolator_program, token_program]
-// data: amount (u64)
+// data (current positions): amount (u64) | expected_principal (u64) |
+//   expected_start_slot (u64)
+// data (predecessor positions): amount (u64)
 //
-// Owner-bound, principal-only partial exit: `amount < position.principal`.
-// Complete exits use IX_INSURANCE_WITHDRAW_FULL so the owner signature commits
-// to the exact position incarnation. The pool PDA
+// Owner-bound, principal-only partial exit: `amount < position.principal`. A
+// current position commits to its exact incarnation; predecessor layouts keep
+// their amount-only recovery wire because they cannot accept another deposit.
+// Complete exits use IX_INSURANCE_WITHDRAW_FULL. The pool PDA
 // (asset-0 insurance operator) signs WithdrawInsuranceAsset (tag 57). NOTE: the
 // real percolator handler requires the withdraw destination to be owned by the
 // *operator* (the pool PDA), not an arbitrary user, so we withdraw into a
@@ -2310,7 +2313,23 @@ fn process_insurance_withdraw(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    process_insurance_withdraw_impl(program_id, accounts, data, false, true)
+    let position_account = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if position_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    let amount = read_u64(data)?;
+    if amount == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if position_account.data_len() >= POSITION_SIZE {
+        require_full_exit_snapshot(data, &position)?;
+    } else if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount_bytes = amount.to_le_bytes();
+    let mut amount_data: &[u8] = &amount_bytes;
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false, true)
 }
 
 // insurance_withdraw_full has the same accounts as insurance_withdraw. Data is
@@ -2537,9 +2556,8 @@ fn process_insurance_withdraw_impl(
     if amount > position.principal || amount > pool.outstanding_principal {
         return Err(ProgramError::InsufficientFunds);
     }
-    // The amount-bearing wire carries no position-incarnation witness. Keep it
-    // partial so it can never permanently retire a later incarnation; complete
-    // owner exits must use IX_INSURANCE_WITHDRAW_FULL's exact snapshot.
+    // Keep the amount-bearing wire partial; its current encoding is snapshot-bound
+    // above, while complete exits use IX_INSURANCE_WITHDRAW_FULL.
     if partial_only && amount == position.principal {
         return Err(ProgramError::InvalidInstructionData);
     }
