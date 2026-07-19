@@ -397,6 +397,9 @@ mark; any public cranker can commit the segment and the same generation-bound re
 retry. The controller removes the
 witness before CPI and stores no generation state. This preflight is read-only and adds no signer,
 authority, recipient, token, or collateral path.
+Asset shutdown applies the same read-only check to its exact generation and preserves a pending
+authenticated mark when its first bounded crank moves the effective price. Public crankers can
+commit each segment before governance retries shutdown.
 
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner
 cannot hold `materialized_portfolio_count` above zero forever: any cranker can invoke the controller's
