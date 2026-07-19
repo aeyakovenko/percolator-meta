@@ -9639,6 +9639,119 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
 }
 
+#[test]
+fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
+    const ASSET_COUNT: usize = 5_834;
+    const PRICE: u64 = 100;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 2,
+        unix_timestamp: 2,
+        ..Clock::default()
+    });
+
+    // Public secondary-slot activation can reach this valid configured shape. Direct fixture
+    // installation avoids thousands of irrelevant activation transactions while retaining the
+    // real controller and Percolator SBF execution under the transaction CU limit.
+    let market = Pubkey::new_unique();
+    let collateral_mint = Pubkey::new_unique();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
+    wrapper.marketauth = controller.to_bytes();
+    wrapper.collateral_mint = collateral_mint.to_bytes();
+    wrapper.last_good_oracle_slot = 1;
+    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
+    wrapper.mark_ewma_e6 = PRICE;
+    wrapper.mark_ewma_last_slot = 1;
+    wrapper.oracle_target_price_e6 = PRICE;
+    let config = percolator_prog::risk::V16Config::public_user_fund_with_market_slots(
+        percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
+        ASSET_COUNT as u32,
+        0,
+        10,
+    );
+    let mut market_data = vec![
+        0u8;
+        percolator_prog::state::market_account_len_for_capacity(ASSET_COUNT).unwrap()
+    ];
+    percolator_prog::state::init_market_account_zero_copy(
+        &mut market_data,
+        &wrapper,
+        config,
+        market.to_bytes(),
+        PRICE,
+        1,
+    )
+    .expect("construct the maximum current market shape");
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_data.len());
+    svm.set_account(
+        market,
+        Account {
+            lamports: market_rent,
+            data: market_data,
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let witness = controller_market_generation_witness(&svm, &market);
+    let mut resolve_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    let resolve = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(witness, false),
+        ],
+        data: resolve_data,
+    };
+    svm.expire_blockhash();
+    let metadata = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[resolve],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            svm.latest_blockhash(),
+        ))
+        .expect("maximum-shape controller resolution stays within the transaction CU limit");
+    eprintln!(
+        "10 MiB controller ResolveMarket preflight used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        metadata.compute_units_consumed < 1_200_000,
+        "maximum-shape controller resolution used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        percolator_accounting::market_is_resolved_and_empty(
+            &svm.get_account(&market).unwrap().data
+        )
+        .unwrap()
+    );
+}
+
 // A TWAP bid is a standing COIN/collateral order rather than a
 // Percolator-position instruction. Exercise it across an asset-0 market generation change and
 // verify that neither side receives terms outside the signed bid or the protected insurance floor.
