@@ -5258,12 +5258,18 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
         create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
 
     let (alice, alice_ata) = new_depositor(&mut env, 6);
+    let (bob, bob_ata) = new_depositor(&mut env, 6);
     let pool = env.pool;
     let holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &holding, 5)
         .expect("alice creates the position covered by the held exit");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, 5)
+        .expect("bob creates the position covered by the amount-bearing exit");
     let original = env.read_position(&alice.pubkey());
+    let bob_original = env.read_position(&bob.pubkey());
     assert_eq!(original, (5, start, false));
+    assert_eq!(bob_original, original);
     let original_position = env
         .svm
         .get_account(&env.position_pda(&alice.pubkey()))
@@ -5303,17 +5309,49 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
         &[&payer, &alice],
         held_blockhash,
     );
+    let mut amount_exit_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    amount_exit_data.extend_from_slice(&bob_original.0.to_le_bytes());
+    let withheld_amount_exit = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(bob.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(env.position_pda(&bob.pubkey()), false),
+                    AccountMeta::new(bob_ata, false),
+                    AccountMeta::new(bob_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: amount_exit_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &bob],
+        held_blockhash,
+    );
 
     env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 1)
         .expect("alice partially withdraws in the deposit slot");
     env.insurance_deposit(&alice, &alice_ata, &holding, 1)
         .expect("alice restores the principal in the same slot");
+    env.insurance_withdraw(&bob, &bob_ata, &bob_holding, &bob, 1)
+        .expect("bob partially withdraws in the deposit slot");
+    env.insurance_deposit(&bob, &bob_ata, &bob_holding, 1)
+        .expect("bob restores the principal in the same slot");
     let restored = env.read_position(&alice.pubkey());
+    let bob_restored = env.read_position(&bob.pubkey());
     assert_eq!(
         restored,
         (original.0, original.1 + 1, false),
         "the same-slot redeposit advances the signed incarnation marker",
     );
+    assert_eq!(bob_restored, restored);
     let restored_position = env
         .svm
         .get_account(&env.position_pda(&alice.pubkey()))
@@ -5329,11 +5367,19 @@ fn presigned_full_exit_cannot_cross_same_slot_withdraw_redeposit_incarnation() {
         env.svm.send_transaction(withheld_full_exit).is_err(),
         "an exit signed before a same-slot withdraw/redeposit must be stale",
     );
+    assert!(
+        env.svm.send_transaction(withheld_amount_exit).is_err(),
+        "the ordinary amount wire cannot bypass the complete-exit witness",
+    );
     assert_eq!(env.read_position(&alice.pubkey()), restored);
+    assert_eq!(env.read_position(&bob.pubkey()), bob_restored);
     assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.token_amount(&bob_ata), 1);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
         .expect("alice retains the post-cutoff Genesis vote opportunity");
-    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+    gv_vote(&mut env, &ve, &bob, &gv_proposal, 1)
+        .expect("bob retains the post-cutoff Genesis vote opportunity");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
 }
 
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
