@@ -26329,6 +26329,37 @@ fn build_set_coin_sink_send_message(
     m
 }
 
+fn build_set_coin_sink_send_with_cutoff_message(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    coin_sink: &Pubkey,
+    cutoff_slot: u64,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(1);
+    m.push(5);
+    m.extend_from_slice(squads_vault.as_ref());
+    m.extend_from_slice(book.as_ref());
+    m.extend_from_slice(config.as_ref());
+    m.extend_from_slice(coin_sink.as_ref());
+    m.extend_from_slice(twap_id().as_ref());
+    m.push(1);
+    m.push(4);
+    m.push(4);
+    for i in [0u8, 2, 1, 3] {
+        m.push(i);
+    }
+    let mut data = vec![10u8, 1u8];
+    data.extend_from_slice(&cutoff_slot.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 #[allow(clippy::too_many_arguments)]
 fn place_bid_ix(
     bidder: &Pubkey,
@@ -32858,6 +32889,157 @@ fn e2e_execute_buyback_retains_fraction_to_sink_and_burns_the_rest() {
         "spent USD parked for the winner"
     );
     let _ = (alice, a_usd);
+}
+
+// A commitment made while a reward sink is live remains settleable after that sink expires. The
+// execution slot, not the bid slot, controls routing: bought COIN burns instead of entering a closed
+// reward epoch, while the bidder's USD remains permissionlessly claimable.
+#[test]
+fn e2e_pre_cutoff_bid_executed_after_sink_cutoff_burns_and_remains_claimable() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let reward_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault,
+        &env.coin_mint,
+        &Pubkey::new_unique(),
+        0,
+    );
+    let bk = setup_auction(
+        &mut svm,
+        &payer,
+        &env,
+        10,
+        1,
+        Some(reward_vault),
+        0,
+    );
+    let round_end = {
+        let book = svm.get_account(&bk.book).unwrap();
+        u64::from_le_bytes(book.data[240..248].try_into().unwrap())
+    };
+    let sink = build_set_coin_sink_send_with_cutoff_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        &reward_vault,
+        round_end,
+    );
+    let sink_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(bk.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(reward_vault, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &sink,
+        &sink_accounts,
+    )
+    .expect("futarchy binds the reward epoch cutoff");
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &reward_vault, 0, 5_000);
+    let economics_accounts = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(reward_vault, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &economics,
+        &economics_accounts,
+    )
+    .expect("futarchy configures a 50/50 live-sink split");
+
+    let (bidder, coin_source, usd_destination) = new_bidder(&mut svm, &payer, &env, 100);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &coin_source,
+            &usd_destination,
+            &env.coin_mint,
+            &env.collateral_mint,
+            100,
+            100,
+            None,
+        ),
+    )
+    .expect("bidder commits while the reward sink is live");
+
+    warp_to(&mut svm, round_end + 1);
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            Some(reward_vault),
+        ),
+    )
+    .expect("permissionless execution crosses the reward cutoff");
+    assert_eq!(token_amount(&svm, &reward_vault), 0);
+    assert_eq!(supply_before - mint_supply(&svm, &env.coin_mint), 100);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 100);
+    assert!(
+        read_asset0_insurance(&svm, &env.slab) >= read_reserved_floor(&svm, &env.twap_cfg),
+        "the late execution preserves the insurance floor"
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.settlement_usd,
+            &bk.coin_escrow,
+            &usd_destination,
+            &coin_source,
+            0,
+        ),
+    )
+    .expect("permissionless claim drains the straddling round");
+    assert_eq!(token_amount(&svm, &usd_destination), 100);
+    assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
 }
 
 // PUBLIC LOF: applying the reward/burn fraction independently to every round lets a bidder
