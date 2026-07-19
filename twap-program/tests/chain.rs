@@ -44175,6 +44175,511 @@ fn rd_claim_ix(
     }
 }
 
+// PUBLIC REWARD LOF: registration binds an owner-selected recipient for the lifetime of a stake.
+// A signed registration for an empty portfolio incarnation must not be replayable after that same
+// account is closed and reinitialized: otherwise the stale recipient captures funding paid by the
+// replacement portfolio. This probe follows the replay through real Percolator funding and COIN payout.
+#[test]
+fn e2e_stale_registration_cannot_redirect_reinitialized_portfolio_rewards() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let victim = Keypair::new();
+    let counterparty = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &admin, &victim, &counterparty, &attacker] {
+        svm.airdrop(&signer.pubkey(), 1_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let collateral_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &collateral_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public user allocates the funding market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 1_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 10_000,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("public creator initializes the funding market");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("configure authenticated funding marks");
+
+    let victim_portfolio = Keypair::new();
+    let counterparty_portfolio = Keypair::new();
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&victim, &victim_portfolio),
+        (&counterparty, &counterparty_portfolio),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+    }
+    let first_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&victim_portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    assert_ne!(first_portfolio_id, 0);
+
+    let coin_authority = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_authority.pubkey());
+    let reward_supply = 100u64;
+    let epoch_id = 9_001u64;
+    let rd_config = rd_epoch_config_pda(&coin_authority.pubkey(), &coin_mint, epoch_id);
+    let rd_vault = Pubkey::new_unique();
+    set_token(&mut svm, &rd_vault, &coin_mint, &rd_config, 0);
+    send(
+        &mut svm,
+        &[&payer, &coin_authority],
+        spl_token::instruction::mint_to(
+            &spl_token::ID,
+            &coin_mint,
+            &rd_vault,
+            &coin_authority.pubkey(),
+            &[],
+            reward_supply,
+        )
+        .unwrap(),
+    )
+    .expect("fund the fixed reward vault");
+    send(
+        &mut svm,
+        &[&payer, &coin_authority],
+        rd_epoch_init_ix(
+            &payer.pubkey(),
+            &coin_authority.pubkey(),
+            &coin_mint,
+            &perc_id(),
+            &sub_id(),
+            &rd_config,
+            &rd_vault,
+            epoch_id,
+            100,
+            200,
+            reward_supply,
+            0,
+            0,
+            0,
+            10_000,
+            10,
+            0,
+            &[(market, Pubkey::default(), Pubkey::default())],
+        ),
+    )
+    .expect("initialize the funding-only reward epoch");
+
+    let stake = rd_stake_pda(
+        &rd_config,
+        &victim.pubkey(),
+        &victim_portfolio.pubkey(),
+        4,
+    );
+    let register_ix = |recipient: Pubkey, data: Vec<u8>| Instruction {
+        program_id: rd_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new_readonly(rd_config, false),
+            AccountMeta::new_readonly(victim.pubkey(), true),
+            AccountMeta::new_readonly(recipient, false),
+            AccountMeta::new_readonly(victim_portfolio.pubkey(), false),
+            AccountMeta::new(stake, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&market, &victim.pubkey(), &victim_portfolio.pubkey()),
+                false,
+            ),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+        ],
+        data,
+    };
+
+    // The victim signed the then-current one-byte registration for incarnation A. The relayer
+    // withholds it while the victim closes A and initializes B at the same account address.
+    svm.expire_blockhash();
+    let held_blockhash = svm.latest_blockhash();
+    let stale_registration = Transaction::new_signed_with_payer(
+        &[register_ix(attacker.pubkey(), vec![1, 4])],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    );
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[
+            pix(
+                vec![
+                    AccountMeta::new_readonly(victim.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(victim_portfolio.pubkey(), false),
+                ],
+                PIx::ClosePortfolio,
+            ),
+            solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &victim_portfolio.pubkey(),
+                1_000_000_000,
+            ),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    ))
+    .expect("victim closes incarnation A while preserving the reusable account");
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::InitPortfolio,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    ))
+    .expect("victim initializes incarnation B at the same address");
+    let second_portfolio_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&victim_portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    assert!(second_portfolio_id > first_portfolio_id);
+
+    let stale_registration_accepted = svm.send_transaction(stale_registration).is_ok();
+    if !stale_registration_accepted {
+        let mut current_registration_data = vec![1, 4];
+        current_registration_data.extend_from_slice(&second_portfolio_id.to_le_bytes());
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[register_ix(victim.pubkey(), current_registration_data)],
+            Some(&payer.pubkey()),
+            &[&payer, &victim],
+            held_blockhash,
+        ))
+        .expect("the current incarnation registers with its exact portfolio ID");
+    }
+    let stake_data = svm.get_account(&stake).unwrap().data;
+    assert_eq!(
+        u64::from_le_bytes(stake_data[212..220].try_into().unwrap()),
+        second_portfolio_id,
+        "the created stake observes incarnation B"
+    );
+    let bound_recipient = Pubkey::new_from_array(stake_data[104..136].try_into().unwrap());
+    assert_eq!(
+        bound_recipient,
+        if stale_registration_accepted {
+            attacker.pubkey()
+        } else {
+            victim.pubkey()
+        }
+    );
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral,
+        &vault_authority,
+        0,
+    );
+    for (owner, portfolio) in [
+        (&victim, &victim_portfolio),
+        (&counterparty, &counterparty_portfolio),
+    ] {
+        let source = Pubkey::new_unique();
+        set_token(&mut svm, &source, &collateral, &owner.pubkey(), 1_000_000);
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000_000 },
+            ),
+        )
+        .expect("public trader deposits collateral");
+    }
+    send(
+        &mut svm,
+        &[&payer, &victim, &counterparty],
+        pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(counterparty.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(counterparty_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (percolator::POS_SCALE / 10) as i128,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("incarnation B opens a long against the counterparty");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.slot = 101;
+    clock.unix_timestamp = 101;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushEwmaMark {
+                asset_index: 0,
+                now_slot: 101,
+                mark_e6: 2_000_000,
+            },
+        ),
+    )
+    .expect("authenticated premium makes incarnation B's long pay funding");
+    for slot in [101u64, 102, 103] {
+        clock.slot = slot;
+        clock.unix_timestamp = slot as i64;
+        svm.set_sysvar(&clock);
+        for _ in 0..8 {
+            crank(&mut svm, victim_portfolio.pubkey(), slot)
+                .expect("record incarnation B's long-paid funding");
+            crank(&mut svm, counterparty_portfolio.pubkey(), slot)
+                .expect("record the counterparty's funding receipt");
+        }
+    }
+    assert!(
+        read_portfolio_funding_long_paid(&svm, &victim_portfolio.pubkey()) > 0,
+        "the replacement portfolio paid real funding"
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        rd_crystallize_ix(
+            &payer.pubkey(),
+            &rd_config,
+            &victim.pubkey(),
+            &market,
+            &victim_portfolio.pubkey(),
+            4,
+        ),
+    )
+    .expect("permissionless crystallization records incarnation B's paid funding");
+    assert!(
+        u128::from_le_bytes(
+            svm.get_account(&stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap()
+        ) > 0,
+        "the replayed stake owns real funding points"
+    );
+    send(
+        &mut svm,
+        &[&payer, &coin_authority],
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &coin_mint,
+            None,
+            spl_token::instruction::AuthorityType::MintTokens,
+            &coin_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("revoke fixed-supply mint authority");
+    clock.slot = 211;
+    clock.unix_timestamp = 211;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&payer],
+        rd_freeze_ix(&payer.pubkey(), &rd_config, &coin_mint, &rd_vault),
+    )
+    .expect("freeze the completed reward epoch");
+
+    let victim_coin = Pubkey::new_unique();
+    let attacker_coin = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_coin,
+        &coin_mint,
+        &victim.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &attacker_coin,
+        &coin_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    let claim_destination = if stale_registration_accepted {
+        attacker_coin
+    } else {
+        victim_coin
+    };
+    send(
+        &mut svm,
+        &[&payer],
+        rd_claim_ix(
+            &payer.pubkey(),
+            &rd_config,
+            &victim.pubkey(),
+            &market,
+            &victim_portfolio.pubkey(),
+            4,
+            &rd_vault,
+            &claim_destination,
+        ),
+    )
+    .expect("claim the sole funding-payer allocation");
+    if stale_registration_accepted {
+        assert_eq!(
+            token_amount(&svm, &attacker_coin),
+            reward_supply,
+            "the stale authorization redirected incarnation B's entire allocation"
+        );
+    }
+    assert_eq!(
+        token_amount(&svm, &attacker_coin),
+        0,
+        "a stale registration cannot pay incarnation B's rewards to the old recipient"
+    );
+    assert_eq!(
+        token_amount(&svm, &victim_coin),
+        reward_supply,
+        "the current incarnation receives the funding it paid for"
+    );
+}
+
 #[test]
 fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     use percolator_prog::ix::Instruction as PIx;
