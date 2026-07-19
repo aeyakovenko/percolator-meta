@@ -1080,7 +1080,7 @@ fn validate_provider_return_token_accounts(
     Ok(())
 }
 
-fn validate_controller_insurance_return(
+fn validate_controller_protocol_return(
     controller: &AccountInfo,
     governance: &AccountInfo,
     transit: &AccountInfo,
@@ -1091,7 +1091,7 @@ fn validate_controller_insurance_return(
     }
     let transit_state = spl_token::state::Account::unpack(&transit.try_borrow_data()?)?;
     let destination_state = spl_token::state::Account::unpack(&destination.try_borrow_data()?)?;
-    // Controller-owned protocol insurance has no user claimant. Always use the one-shot
+    // Controller-owned protocol value has no user claimant. Always use the one-shot
     // governance return instead of retaining it in controller custody: TWAP has its own public
     // terminal return, and two independently selectable controller accounts cannot both be
     // forwarded by CloseSlab's single primary-mint transit.
@@ -1230,8 +1230,9 @@ fn reject_shutdown_return_after_stale_resolution_matures(market: &AccountInfo) -
 // The controller can exercise marketauth's shutdown override, but neither governance
 // nor the caller chooses the recipient: the attributed withdrawal and, when the
 // transit account is empty, its rent go to a clean account owned by the backing authority
-// recorded in the asset profile. Earnings are returned first because Percolator
-// refuses a final-principal exit while earnings remain.
+// recorded in the asset profile. Controller-owned protocol backing instead uses an empty
+// one-shot transit and a clean governance-owned destination. Earnings are returned first
+// because Percolator refuses a final-principal exit while earnings remain.
 fn process_return_shutdown_backing<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1278,7 +1279,7 @@ fn process_return_shutdown_backing<'a>(
         percolator_program,
     )?;
     reject_shutdown_return_after_stale_resolution_matures(market)?;
-    let provider = {
+    let (provider, controller_owned) = {
         let market_data = market.try_borrow_data()?;
         let authority = percolator_accounting::read_asset_backing_authority(
             &market_data,
@@ -1288,14 +1289,26 @@ fn process_return_shutdown_backing<'a>(
         if authority == [0u8; 32] {
             return Err(ProgramError::InvalidAccountData);
         }
-        Pubkey::new_from_array(authority)
+        (
+            Pubkey::new_from_array(authority),
+            authority == controller.key.to_bytes(),
+        )
     };
-    validate_provider_return_token_accounts(
-        controller,
-        &provider,
-        controller_transit,
-        provider_destination,
-    )?;
+    if controller_owned {
+        validate_controller_protocol_return(
+            controller,
+            governance,
+            controller_transit,
+            provider_destination,
+        )?;
+    } else {
+        validate_provider_return_token_accounts(
+            controller,
+            &provider,
+            controller_transit,
+            provider_destination,
+        )?;
+    }
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -1449,7 +1462,7 @@ fn process_return_shutdown_insurance<'a>(
         (Pubkey::new_from_array(authority), amount, controller_owned)
     };
     if controller_owned {
-        validate_controller_insurance_return(
+        validate_controller_protocol_return(
             controller,
             governance,
             controller_transit,
@@ -1691,7 +1704,7 @@ fn process_return_resolved_asset_insurance<'a>(
         (Pubkey::new_from_array(authority), amount, controller_owned)
     };
     if controller_owned {
-        validate_controller_insurance_return(
+        validate_controller_protocol_return(
             controller,
             governance,
             controller_transit,
@@ -1775,6 +1788,8 @@ fn process_return_resolved_asset_insurance<'a>(
 // Resolved-mode companion to the shutdown backing return. The controller can
 // rotate only the backing role it already administers, and all principal and
 // earnings are slab-derived and returned to the outgoing recorded provider.
+// Controller-owned protocol backing uses the same one-shot governance return as
+// controller-owned insurance.
 fn process_return_resolved_asset_backing<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1830,7 +1845,7 @@ fn process_return_resolved_asset_backing<'a>(
         market,
         percolator_program,
     )?;
-    let (provider, balances) = {
+    let (provider, balances, controller_owned) = {
         let market_data = market.try_borrow_data()?;
         if percolator_accounting::read_market_authority(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
@@ -1851,21 +1866,33 @@ fn process_return_resolved_asset_backing<'a>(
         )
         .map_err(|_| ProgramError::InvalidAccountData)?;
         if authority == [0u8; 32]
-            || authority == controller.key.to_bytes()
             || !balances
                 .iter()
                 .any(|balance| balance.principal_atoms != 0 || balance.earnings_atoms != 0)
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        (Pubkey::new_from_array(authority), balances)
+        (
+            Pubkey::new_from_array(authority),
+            balances,
+            authority == controller.key.to_bytes(),
+        )
     };
-    validate_provider_return_token_accounts(
-        controller,
-        &provider,
-        controller_transit,
-        provider_destination,
-    )?;
+    if controller_owned {
+        validate_controller_protocol_return(
+            controller,
+            governance,
+            controller_transit,
+            provider_destination,
+        )?;
+    } else {
+        validate_provider_return_token_accounts(
+            controller,
+            &provider,
+            controller_transit,
+            provider_destination,
+        )?;
+    }
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -1882,14 +1909,16 @@ fn process_return_resolved_asset_backing<'a>(
     })?;
     let return_amount =
         u64::try_from(return_amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
-    rotate_asset_role_to_controller(
-        controller,
-        market,
-        percolator_program,
-        &seeds,
-        asset_index,
-        ASSET_AUTH_BACKING_BUCKET,
-    )?;
+    if !controller_owned {
+        rotate_asset_role_to_controller(
+            controller,
+            market,
+            percolator_program,
+            &seeds,
+            asset_index,
+            ASSET_AUTH_BACKING_BUCKET,
+        )?;
+    }
 
     for (domain, balance, backing_ledger) in [
         (long_domain, balances[0], long_backing_ledger),
@@ -1943,7 +1972,8 @@ fn process_return_resolved_asset_backing<'a>(
 // whole market is resolved and empty, this fixed operation atomically moves only
 // the backing role to the controller, drains both asset-0 domains using balances
 // read from the pinned slab, and forwards everything to the outgoing provider.
-// No caller selects a recipient or amount, and any failed CPI rolls back the role
+// Controller-owned protocol backing uses the one-shot governance return. No caller
+// selects a recipient or amount, and any failed CPI rolls back the role
 // transition. A constrained current asset-admin program may invoke this instruction
 // as a signer; before the first custody handoff the controller signs both roles.
 fn process_return_resolved_asset0_backing<'a>(
@@ -1994,7 +2024,7 @@ fn process_return_resolved_asset0_backing<'a>(
         market,
         percolator_program,
     )?;
-    let (provider, balances) = {
+    let (provider, balances, controller_owned) = {
         let market_data = market.try_borrow_data()?;
         if percolator_accounting::read_market_authority(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
@@ -2015,14 +2045,27 @@ fn process_return_resolved_asset0_backing<'a>(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        (Pubkey::new_from_array(authority), balances)
+        (
+            Pubkey::new_from_array(authority),
+            balances,
+            authority == controller.key.to_bytes(),
+        )
     };
-    validate_provider_return_token_accounts(
-        controller,
-        &provider,
-        controller_transit,
-        provider_destination,
-    )?;
+    if controller_owned {
+        validate_controller_protocol_return(
+            controller,
+            governance,
+            controller_transit,
+            provider_destination,
+        )?;
+    } else {
+        validate_provider_return_token_accounts(
+            controller,
+            &provider,
+            controller_transit,
+            provider_destination,
+        )?;
+    }
 
     let bump_seed = [bump];
     let seeds = signer_seeds(
@@ -2039,28 +2082,30 @@ fn process_return_resolved_asset0_backing<'a>(
     })?;
     let return_amount =
         u64::try_from(return_amount).map_err(|_| ProgramError::ArithmeticOverflow)?;
-    let mut rotate_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
-    rotate_data.extend_from_slice(&0u16.to_le_bytes());
-    rotate_data.push(ASSET_AUTH_BACKING_BUCKET);
-    rotate_data.extend_from_slice(controller.key.as_ref());
-    invoke_signed(
-        &Instruction {
-            program_id: *percolator_program.key,
-            accounts: vec![
-                AccountMeta::new_readonly(*current_asset_admin.key, true),
-                AccountMeta::new_readonly(*controller.key, true),
-                AccountMeta::new(*market.key, false),
+    if !controller_owned {
+        let mut rotate_data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+        rotate_data.extend_from_slice(&0u16.to_le_bytes());
+        rotate_data.push(ASSET_AUTH_BACKING_BUCKET);
+        rotate_data.extend_from_slice(controller.key.as_ref());
+        invoke_signed(
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*current_asset_admin.key, true),
+                    AccountMeta::new_readonly(*controller.key, true),
+                    AccountMeta::new(*market.key, false),
+                ],
+                data: rotate_data,
+            },
+            &[
+                current_asset_admin.clone(),
+                controller.clone(),
+                market.clone(),
+                percolator_program.clone(),
             ],
-            data: rotate_data,
-        },
-        &[
-            current_asset_admin.clone(),
-            controller.clone(),
-            market.clone(),
-            percolator_program.clone(),
-        ],
-        &[&seeds],
-    )?;
+            &[&seeds],
+        )?;
+    }
 
     for (domain, balance, backing_ledger) in [
         (0u16, balances[0], long_backing_ledger),
