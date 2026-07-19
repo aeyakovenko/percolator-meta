@@ -624,8 +624,9 @@ struct Position {
     principal: u64,
     withdrawn_amount: u64,
     withdrawn: bool,
-    /// Last-write-time of this position (set on deposit). Topping up resets it so
-    /// late additions do not inherit earlier reward tenure.
+    /// Monotonic last-deposit witness. This is normally the deposit clock slot,
+    /// but repeated deposits in one slot advance it so stale full-exit signatures
+    /// cannot cross a withdraw/redeposit ABA.
     start_slot: u64,
     /// Set by the pool's vote_authority while a genesis vote is live on this
     /// position. Blocks insurance-withdraw until the vote is retracted.
@@ -754,6 +755,17 @@ impl Position {
 
 fn supported_position_size(size: usize) -> bool {
     matches!(size, POSITION_SIZE_BASE | POSITION_SIZE_TENURE) || size >= POSITION_SIZE
+}
+
+fn next_deposit_start_slot(position: &Position, now: u64) -> Result<u64, ProgramError> {
+    if position.principal == 0 {
+        return Ok(now);
+    }
+    let next = position
+        .start_slot
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok(core::cmp::max(now, next))
 }
 
 // ---------------------------------------------------------------------------
@@ -1610,6 +1622,7 @@ fn process_deposit(
         }
         p
     };
+    let deposit_start_slot = next_deposit_start_slot(&position, Clock::get()?.slot)?;
 
     // Tenure-fair shares (POLICY_WITH_SURPLUS, finding HT): price this deposit by the LIVE vault
     // balance BEFORE the pull, so a late depositor can only ever redeem surplus accrued during its own
@@ -1657,9 +1670,8 @@ fn process_deposit(
         .shares
         .checked_add(shares_minted)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    // Last-write-time: topping up resets the vote clock, so late additions don't
-    // earn early-join weight.
-    position.start_slot = Clock::get()?.slot;
+    // This is both the reward-tenure start and the full-exit incarnation witness.
+    position.start_slot = deposit_start_slot;
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
@@ -2046,7 +2058,7 @@ fn process_init_insurance_pool(
 //
 // User -> holding (user-signed). Then the pool PDA (asset-0 insurance authority)
 // tops up the two Percolator domains against the pool-wide 50/50 live protection target.
-// Records the position (principal += amount, start_slot = now) and bumps outstanding.
+// Records the position (principal += amount, monotonic deposit witness) and bumps outstanding.
 fn process_insurance_deposit(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2199,6 +2211,7 @@ fn process_insurance_deposit(
         p
     };
     move_position_to_current_share_generation(&mut position, &pool)?;
+    let deposit_start_slot = next_deposit_start_slot(&position, now)?;
 
     // 1) User -> holding (user-signed; the user is moving their own funds).
     invoke(
@@ -2268,8 +2281,8 @@ fn process_insurance_deposit(
         .shares
         .checked_add(shares_minted)
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    // Last-write-time: topping up resets the vote clock.
-    position.start_slot = Clock::get()?.slot;
+    // This is both the reward-tenure start and the full-exit incarnation witness.
+    position.start_slot = deposit_start_slot;
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;

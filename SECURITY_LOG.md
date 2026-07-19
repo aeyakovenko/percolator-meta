@@ -14362,3 +14362,22 @@ FIX: own-vault and live-insurance complete exits now reuse one exact principal/l
 Every predecessor position layout remains withdrawable through the exact wire. The change adds no state,
 account, signer, authority, recipient, token path, custody path, or admin surface; tokens were never redirectable
 under the vulnerable path.
+
+## Tick - same-slot position ABA bypassed the full-exit snapshot (surface B/C, REAL DOS)
+
+The exact full-exit wire committed to principal and the raw last-deposit clock slot. Multiple ordered
+transactions can mutate one position within a single Solana slot. A relayer could therefore withhold a signed
+five-unit full exit, let its owner partially withdraw and redeposit one unit in the same final admission slot,
+and submit the old signature after deposits closed. Both committed values returned to `(5, same_slot)`, so the
+old binary retired the replacement position. Funds returned only to the owner, but the one-per-owner position
+became permanently withdrawn and all five Genesis votes and reward participation were lost.
+
+The retained clean-room LiteSVM regression uses the real Subledger, Genesis Vote, Distribution, and pinned
+Percolator SBF binaries. One blockhash spans the withheld exit and the public withdraw/redeposit replacement.
+Against `d1a147c`, the stale transaction returns all five units, marks the position withdrawn, and makes its
+post-window vote fail. The fixed binary rejects that transaction and the owner casts all five votes.
+
+FIX: the existing `start_slot` is now a monotonic last-deposit witness. A first deposit stores the real clock
+slot; each top-up stores `max(clock_slot, previous + 1)`. Normal tenure behavior is unchanged, while every
+same-slot replacement advances the exact witness already carried by complete-exit and TWAP proxy wires. No
+account layout, instruction shape, signer, authority, recipient, CPI, token path, or admin surface was added.
