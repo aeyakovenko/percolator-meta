@@ -167,8 +167,10 @@ capital's own tenure.
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`da64be639168b496833dd4c701607a94fcb06b6c` and its engine layout dependency to
-`143e68c4917ed0400a27b952f036a5677047cd84`.
+`81dfda2863315348b544455c13fdcc4c08b93539` and its engine layout dependency to
+`f0e189a149e428b7647a9cc0909315cd80161376`.
+That pair retires each positive source claim in the same domain whose backing funds the conversion,
+so an unfunded claim cannot make an independent provider pay twice for another domain's claim.
 
 That Percolator revision rejects every atomic batch while any backing utilization-fee policy is
 active. Both governance wrappers therefore reject nonzero backing policies but preserve exact-zero

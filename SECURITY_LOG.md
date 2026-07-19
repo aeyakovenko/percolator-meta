@@ -14405,3 +14405,27 @@ pinned program does not accrue funding on the activation crank; after activation
 price-or-funding predicate applies. A public cranker commits the bounded step and governance retries
 the same generation-bound resolution. No state, account, signer, authority, recipient, CPI, token,
 custody, or admin surface is added.
+
+## Tick - aggregate conversion charged backing across source domains (surface A/B, REAL LOF)
+
+Account-wide `ConvertReleasedPnl` selected realizable backing by source domain but returned only an
+aggregate face amount. The subsequent PnL setter retired that face in sparse portfolio-slot order.
+A public winner could therefore leave a lower-index claim unfunded, fund only a higher source domain,
+consume the higher domain's backing while burning the lower claim, refresh its risk certificate with
+a bounded open-and-close, and consume the same provider domain again.
+
+The clean-room real-SBF LiteSVM regression initializes a two-asset market, deposits 200 atoms from an
+independent provider into domain 3, creates one 100-atom claim in domain 1 and one in domain 3 through
+ordinary trades and authenticated marks, and leaves the original loser stale. On the vulnerable
+`percolator-prog@5f1789a157dd06a27ecc4c966dcfa6a97d164d6a` /
+`percolator@143e68c4917ed0400a27b952f036a5677047cd84` pair, both conversions succeeded:
+winner capital rose from 1,000 to 1,200, both claims disappeared, and the domain-3 provider was
+charged 200 atoms for its domain's 100-atom claim.
+
+FIX: this branch pins `percolator-prog@81dfda2863315348b544455c13fdcc4c08b93539` and
+`percolator@f0e189a149e428b7647a9cc0909315cd80161376`. The first conversion now preserves
+domain 1's unfunded claim and retires domain 3's funded claim. The second conversion rejects, winner
+capital remains 1,100, and provider consumption remains exactly 100 atoms. The vulnerable SBF
+checksum was `8c1e90c9316c8e20727a49ea2284901291d85822df716e4feab06047c442f43f`; the fixed
+checksum is `0bbc20d164d679a6d594abafa8ab115aa3fee27ee4d33e350eac5e08c589a58c`.
+Meta adds no state, signer, authority, recipient, CPI, token, custody, or admin surface.

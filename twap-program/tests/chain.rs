@@ -9770,6 +9770,410 @@ fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
     );
 }
 
+#[test]
+fn e2e_public_conversion_cannot_charge_backing_across_source_domains() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INITIAL_PRICE: u64 = 100;
+    const MOVED_PRICE: u64 = 105;
+    const SIZE_Q: i128 = 20 * percolator::POS_SCALE as i128;
+    const CLAIM: u128 = 100;
+    const LOWER_DOMAIN: usize = 1;
+    const FUNDED_DOMAIN: usize = 3;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    for signer in [&payer, &admin] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0u8;
+                percolator_prog::state::market_account_len_for_capacity(2).unwrap()
+            ],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 2,
+                h_min: 0,
+                h_max: 10,
+                initial_price: INITIAL_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 1_000,
+                initial_margin_bps: 1_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 500,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize the two-asset public market");
+    for asset_index in [0u16, 1] {
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigureAuthMark {
+                    asset_index,
+                    now_slot: 1,
+                    initial_mark_e6: INITIAL_PRICE,
+                },
+            ),
+        )
+        .expect("configure each authenticated mark");
+    }
+
+    let backing_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_source,
+        &collateral,
+        &admin.pubkey(),
+        (2 * CLAIM) as u64,
+    );
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(backing_source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: FUNDED_DOMAIN as u16,
+                amount: 2 * CLAIM,
+                expiry_slot: 10,
+            },
+        ),
+    )
+    .expect("external provider funds only the higher source domain");
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let winner_owner = Keypair::new();
+    let stale_loser_owner = Keypair::new();
+    let replacement_owner = Keypair::new();
+    let mut portfolios = Vec::new();
+    for owner in [&winner_owner, &stale_loser_owner, &replacement_owner] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let portfolio = Pubkey::new_unique();
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize public portfolio");
+        let collateral_source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &collateral_source,
+            &collateral,
+            &owner.pubkey(),
+            1_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(collateral_source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 1_000 },
+            ),
+        )
+        .expect("deposit public portfolio collateral");
+        portfolios.push(portfolio);
+    }
+    let winner = portfolios[0];
+    let stale_loser = portfolios[1];
+    let replacement = portfolios[2];
+
+    for asset_index in [0u16, 1] {
+        send(
+            &mut svm,
+            &[&payer, &winner_owner, &stale_loser_owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(winner_owner.pubkey(), true),
+                    AccountMeta::new_readonly(stale_loser_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner, false),
+                    AccountMeta::new(stale_loser, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index,
+                    size_q: SIZE_Q,
+                    exec_price: INITIAL_PRICE,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("open the winner against the stale loser");
+    }
+
+    warp_to(&mut svm, 2);
+    for asset_index in [0u16, 1] {
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index,
+                    now_slot: 2,
+                    mark_e6: MOVED_PRICE,
+                },
+            ),
+        )
+        .expect("publish the favorable mark");
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: 2,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("refresh only the winner");
+    }
+
+    let winner_after_marks = percolator_prog::state::read_portfolio(
+        &svm.get_account(&winner).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(winner_after_marks.pnl.get(), (2 * CLAIM) as i128);
+    let (_, after_marks) = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(
+        after_marks.source_credit[LOWER_DOMAIN].positive_claim_bound_num,
+        CLAIM * percolator::BOUND_SCALE,
+    );
+    assert_eq!(
+        after_marks.source_credit[LOWER_DOMAIN].fresh_reserved_backing_num,
+        0,
+    );
+    assert_eq!(
+        after_marks.source_credit[FUNDED_DOMAIN].positive_claim_bound_num,
+        CLAIM * percolator::BOUND_SCALE,
+    );
+    assert_eq!(
+        after_marks.source_credit[FUNDED_DOMAIN].fresh_reserved_backing_num,
+        2 * CLAIM * percolator::BOUND_SCALE,
+    );
+
+    for asset_index in [0u16, 1] {
+        send(
+            &mut svm,
+            &[&payer, &winner_owner, &replacement_owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(winner_owner.pubkey(), true),
+                    AccountMeta::new_readonly(replacement_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner, false),
+                    AccountMeta::new(replacement, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index,
+                    size_q: -SIZE_Q,
+                    exec_price: MOVED_PRICE,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("flatten the winner without refreshing the original loser");
+    }
+
+    send(
+        &mut svm,
+        &[&payer, &winner_owner],
+        pix(
+            vec![
+                AccountMeta::new_readonly(winner_owner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(winner, false),
+            ],
+            PIx::ConvertReleasedPnl { amount: CLAIM },
+        ),
+    )
+    .expect("convert the one funded domain claim");
+    let (_, after_first) = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    let lower_after_first =
+        after_first.source_credit[LOWER_DOMAIN].positive_claim_bound_num;
+    let funded_after_first =
+        after_first.source_credit[FUNDED_DOMAIN].positive_claim_bound_num;
+
+    for size_q in [percolator::POS_SCALE as i128, -(percolator::POS_SCALE as i128)] {
+        send(
+            &mut svm,
+            &[&payer, &winner_owner, &replacement_owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(winner_owner.pubkey(), true),
+                    AccountMeta::new_readonly(replacement_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(winner, false),
+                    AccountMeta::new(replacement, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q,
+                    exec_price: MOVED_PRICE,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("refresh the flat winner after the backing risk epoch changes");
+    }
+    let before_second = percolator_prog::state::read_portfolio(
+        &svm.get_account(&winner).unwrap().data,
+    )
+    .unwrap();
+    let second = send(
+        &mut svm,
+        &[&payer, &winner_owner],
+        pix(
+            vec![
+                AccountMeta::new_readonly(winner_owner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(winner, false),
+            ],
+            PIx::ConvertReleasedPnl { amount: CLAIM },
+        ),
+    );
+    let after_second_portfolio = percolator_prog::state::read_portfolio(
+        &svm.get_account(&winner).unwrap().data,
+    )
+    .unwrap();
+    let (_, after_second) = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap();
+    let consumed = after_second.source_backing_buckets[FUNDED_DOMAIN]
+        .consumed_liened_backing_num;
+    eprintln!(
+        "cross-domain conversion: first=({lower_after_first},{funded_after_first}) second={second:?} capital={} pnl={} consumed={consumed}",
+        after_second_portfolio.capital.get(),
+        after_second_portfolio.pnl.get(),
+    );
+
+    assert_eq!(
+        lower_after_first,
+        CLAIM * percolator::BOUND_SCALE,
+        "conversion must not burn the unfunded lower-domain claim",
+    );
+    assert_eq!(
+        funded_after_first, 0,
+        "conversion must retire the claim in the domain whose backing it consumes",
+    );
+    assert!(
+        second.is_err(),
+        "the unfunded residual claim must not consume the same provider backing again",
+    );
+    assert_eq!(after_second_portfolio.capital.get(), before_second.capital.get());
+    assert_eq!(after_second_portfolio.pnl.get(), before_second.pnl.get());
+    assert_eq!(
+        consumed,
+        CLAIM * percolator::BOUND_SCALE,
+        "one source provider cannot be charged above its domain-local claim",
+    );
+}
+
 // A TWAP bid is a standing COIN/collateral order rather than a
 // Percolator-position instruction. Exercise it across an asset-0 market generation change and
 // verify that neither side receives terms outside the signed bid or the protected insurance floor.
