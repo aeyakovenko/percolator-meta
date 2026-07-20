@@ -4358,6 +4358,613 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
 }
 
+// PUBLIC LOF: an independently operated EWMA oracle can sign a report for an empty asset,
+// retain the complete transaction, and submit it after the constrained controller has shut down
+// and restarted that slot. The report must be bound to the old asset generation: otherwise it can
+// move the mark against positions opened only after restart and the beneficiary can withdraw the
+// victim's transferred collateral through ordinary public instructions.
+#[test]
+fn e2e_signed_ewma_mark_cannot_cross_controller_asset_restart() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const PRICE: u64 = 100;
+    const STALE_INPUT_PRICE: u64 = 50;
+    const REPLAYED_PRICE: u64 = 75;
+    const DEPOSIT: u128 = 1_000_000;
+    const SIZE_Q: i128 = (5_000 * percolator::POS_SCALE) as i128;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    let oracle = Keypair::new();
+    for signer in [&payer, &creator, &governance, &oracle] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public creator allocates the market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("creator initializes a normal fully collateralized market");
+    send(
+        &mut svm,
+        &[&payer, &creator, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("creator installs an independent oracle authority");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: PRICE,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("independent oracle configures generation A");
+
+    let retained_blockhash = svm.latest_blockhash();
+    let retained_report = Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                mark_e6: STALE_INPUT_PRICE,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &oracle],
+        retained_blockhash,
+    );
+    let retained_blockhash_control = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &creator.pubkey(),
+            1,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        retained_blockhash,
+    );
+
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates lifecycle control to the constrained controller");
+    let proxy = |raw: Vec<u8>, generation_witness: Pubkey| Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(generation_witness, false),
+        ],
+        data: {
+            let mut data = vec![0u8]; // IX_PROXY_ADMIN
+            data.extend_from_slice(&raw);
+            data
+        },
+    };
+    let market_generation_witness = controller_market_generation_witness(&svm, &market);
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 100,
+                force_close_delay_slots: 1,
+            }
+            .encode(),
+            market_generation_witness,
+        ),
+    )
+    .expect("governance configures the bounded restart path");
+
+    let generation_a = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap()
+    .1
+    .assets[0]
+    .market_id;
+    let generation_a_witness = market_controller_program::asset_generation_witness_address(
+        &market,
+        0,
+        generation_a,
+    )
+    .0;
+    svm.set_sysvar(&Clock {
+        slot: 101,
+        unix_timestamp: 101,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: 101,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            }
+            .encode(),
+            generation_a_witness,
+        ),
+    )
+    .expect("controller shuts down empty generation A");
+    svm.set_sysvar(&Clock {
+        slot: 102,
+        unix_timestamp: 102,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::RestartAssetOracle {
+                asset_index: 0,
+                now_slot: 102,
+                initial_price: PRICE,
+            }
+            .encode(),
+            generation_a_witness,
+        ),
+    )
+    .expect("controller restarts the slot as generation B");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 102,
+                initial_mark_e6: PRICE,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("the preserved independent oracle configures generation B");
+    let generation_b = percolator_prog::state::read_market(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap()
+    .1
+    .assets[0]
+    .market_id;
+    assert!(generation_b > generation_a);
+    assert_eq!(
+        percolator_prog::state::read_asset_oracle_profile(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .oracle_authority,
+        oracle.pubkey().to_bytes(),
+        "restart preserves the independent oracle authority"
+    );
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let victim = Keypair::new();
+    let counterparty = Keypair::new();
+    let victim_portfolio = Keypair::new();
+    let counterparty_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&victim, &victim_portfolio),
+        (&counterparty, &counterparty_portfolio),
+    ] {
+        svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            DEPOSIT as u64,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: DEPOSIT },
+            ),
+        )
+        .expect("public user deposits independent collateral");
+    }
+    send(
+        &mut svm,
+        &[&payer, &victim, &counterparty],
+        pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(counterparty.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(counterparty_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: SIZE_Q,
+                exec_price: PRICE,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("fresh generation-B users open balanced exposure");
+
+    svm.set_sysvar(&Clock {
+        slot: 103,
+        unix_timestamp: 103,
+        ..Clock::default()
+    });
+    let market_before = svm.get_account(&market).unwrap();
+    let victim_before = svm.get_account(&victim_portfolio.pubkey()).unwrap();
+    let counterparty_before = svm.get_account(&counterparty_portfolio.pubkey()).unwrap();
+    svm.send_transaction(retained_blockhash_control)
+        .expect("the retained report's blockhash is still valid at replay time");
+    let replay = svm.send_transaction(retained_report);
+    if replay.is_ok() {
+        let profile = percolator_prog::state::read_asset_oracle_profile(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            profile.oracle_target_price_e6, REPLAYED_PRICE,
+            "the generation-A report reached generation B"
+        );
+        svm.set_sysvar(&Clock {
+            slot: 104,
+            unix_timestamp: 104,
+            ..Clock::default()
+        });
+        for portfolio in [victim_portfolio.pubkey(), counterparty_portfolio.pubkey()] {
+            let mut progressed = false;
+            for _ in 0..4 {
+                progressed |= send(
+                    &mut svm,
+                    &[&payer],
+                    pix(
+                        vec![
+                            AccountMeta::new(payer.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio, false),
+                        ],
+                        PIx::PermissionlessCrank {
+                            now_slot: 104,
+                            observations: vec![percolator_prog::ix::CrankObservationHint {
+                                asset_index: 0,
+                                oracle_accounts: 0,
+                            }],
+                        },
+                    ),
+                )
+                .is_ok();
+            }
+            assert!(progressed, "bounded public crank progresses the stale mark");
+        }
+        let victim_state = percolator_prog::state::read_portfolio(
+            &svm.get_account(&victim_portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap();
+        let counterparty_state = percolator_prog::state::read_portfolio(
+            &svm.get_account(&counterparty_portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap();
+        let victim_equity = victim_state.capital.get() as i128 + victim_state.pnl.get();
+        let counterparty_equity =
+            counterparty_state.capital.get() as i128 + counterparty_state.pnl.get();
+        assert!(victim_equity < DEPOSIT as i128);
+        assert!(counterparty_equity > DEPOSIT as i128);
+
+        let exit_owner = Keypair::new();
+        let exit_portfolio = Keypair::new();
+        svm.airdrop(&exit_owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, &exit_portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &exit_portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("replacement liquidity allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, &exit_owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(exit_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(exit_portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("replacement liquidity initializes a portfolio");
+        let exit_source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &exit_source,
+            &collateral_mint,
+            &exit_owner.pubkey(),
+            DEPOSIT as u64,
+        );
+        send(
+            &mut svm,
+            &[&payer, &exit_owner],
+            pix(
+                vec![
+                    AccountMeta::new(exit_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(exit_portfolio.pubkey(), false),
+                    AccountMeta::new(exit_source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: DEPOSIT },
+            ),
+        )
+        .expect("replacement liquidity deposits collateral");
+        send(
+            &mut svm,
+            &[&payer, &counterparty, &exit_owner],
+            pix(
+                vec![
+                    AccountMeta::new(counterparty.pubkey(), true),
+                    AccountMeta::new(exit_owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(counterparty_portfolio.pubkey(), false),
+                    AccountMeta::new(exit_portfolio.pubkey(), false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: SIZE_Q,
+                    exec_price: REPLAYED_PRICE,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("beneficiary exits against fresh public liquidity");
+        let beneficiary = percolator_prog::state::read_portfolio(
+            &svm.get_account(&counterparty_portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap();
+        assert!(percolator::active_bitmap_is_empty(
+            beneficiary.active_bitmap.map(percolator::V16PodU64::get)
+        ));
+        assert!(beneficiary.pnl.get() > 0);
+        send(
+            &mut svm,
+            &[&payer, &counterparty],
+            pix(
+                vec![
+                    AccountMeta::new(counterparty.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(counterparty_portfolio.pubkey(), false),
+                ],
+                PIx::ConvertReleasedPnl {
+                    amount: beneficiary.pnl.get() as u128,
+                },
+            ),
+        )
+        .expect("beneficiary converts the transferred PnL");
+        let withdrawable = percolator_prog::state::read_portfolio(
+            &svm.get_account(&counterparty_portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap()
+        .capital
+        .get();
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &counterparty.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &counterparty],
+            pix(
+                vec![
+                    AccountMeta::new(counterparty.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(counterparty_portfolio.pubkey(), false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw {
+                    amount: withdrawable,
+                },
+            ),
+        )
+        .expect("beneficiary withdraws through the ordinary public custody path");
+        assert_eq!(token_amount(&svm, &destination) as u128, withdrawable);
+        assert!(withdrawable > DEPOSIT);
+        panic!(
+            "generation-A EWMA report reduced fresh victim equity from {DEPOSIT} to {victim_equity} and let the beneficiary withdraw {withdrawable}"
+        );
+    }
+
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before,
+        "rejected stale report leaves generation-B market bytes unchanged"
+    );
+    assert_eq!(
+        svm.get_account(&victim_portfolio.pubkey()).unwrap(),
+        victim_before,
+        "rejected stale report leaves the victim unchanged"
+    );
+    assert_eq!(
+        svm.get_account(&counterparty_portfolio.pubkey()).unwrap(),
+        counterparty_before,
+        "rejected stale report leaves the counterparty unchanged"
+    );
+}
+
 // CROSS-GENERATION ADMIN DOS: Squads approves an oracle configuration for generation A, but a
 // separate governed lifecycle shuts down and restarts the same asset slot as generation B before
 // execution. The old transaction commits only to the slab and asset index; it must not re-anchor
