@@ -282,6 +282,9 @@ base-unit principal times `floor(log2(tenure))`. Reward finalization and claims 
 underlying principal, shares, or Percolator balances. A permissionless terminal genesis return
 preserves only the remaining capital through its authenticated return slot, whether crystallized
 before or after cleanup within the finalize window; ordinary owner exits still forfeit rewards.
+Every owner-signed capital crystallize commits to the Subledger position's exact principal, start
+slot, and monotonic action nonce, so a withheld authorization cannot cross a later top-up, withdrawal,
+vote-lock transition, or terminal return and redistribute fixed COIN through the shared denominator.
 Permissionless portfolio-flow claims pay only
 to an initialized account owned by the bound recipient and reject any token delegate, so a cranker
 cannot force rewards into an account it can spend. The same full-chain test then returns TWAP

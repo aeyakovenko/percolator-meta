@@ -14485,3 +14485,28 @@ is `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. All seven
 lifecycle probes, every legacy Genesis ballot-generation recovery probe, all 28 Genesis
 unit/integration tests, and both affected full-chain lifecycle tests pass. No account, state, signer,
 authority, recipient, CPI, token path, custody path, or admin surface was added.
+
+## Tick - stale signed capital crystallize redistributed an exited backer's reward (surface D, REAL LOF)
+
+Residual capital crystallization was owner-gated but its instruction carried no position snapshot. A
+relayer could withhold a valid owner-signed crystallize while backing was live, let the owner exit through
+Subledger, then land the old transaction before reward freeze. Crystallize read the exited position as zero,
+removed the victim's points from the shared denominator, and let an equal co-staker claim the victim's fixed
+COIN allocation. Subledger still returned principal only to its owner; the vulnerable path could not redirect
+insurance or backing custody.
+
+The retained clean-room LiteSVM regression uses the real Residual and Subledger public APIs with one valid
+blockhash. Two independent owners deposit 100 backing units and crystallize 600 points each. Against Residual
+checksum `8fccaea80d570fbc7625afe2efc005f74bf76ece4bf5240b7a71e19a0453151d`, the victim's real full exit
+returns all 100 units, the held crystallize drops the denominator from 1,200 to 600, and the co-staker claims
+all 1,000,000 reward units. The backing vault retains the other owner's 100 units throughout.
+
+FIX: insurance/backing crystallize now commits to the position's exact principal, start slot, and monotonic
+action nonce. A full exit changes only the nonce, making that comparison mutation-sharp; top-ups, partial
+withdrawals, vote locks, and terminal return also invalidate predecessor authorizations. Portfolio-flow
+crystallize remains data-empty and permissionless. The fixed Residual checksum is
+`37d1ae59110e9b3bc4be54d4657d5e97b9ea40d06e40a19d759a3cc421da23ec`; pinned Subledger remains
+`ec680da6320be1ff39e8d0de150ec32f2a37fc10265c3c96c3d039d007b7cf6f`. All 110 Residual tests,
+the complete Genesis-to-buy/burn path, the market-to-45-day 50/50 buyback/burn lifecycle, and terminal-return
+capital crystallization pass. No account, state, signer, authority, recipient, CPI, token path, custody path,
+or admin surface was added.
