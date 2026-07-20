@@ -48363,6 +48363,16 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         &long_owner.pubkey(),
         &long_portfolio.pubkey(),
     );
+    send(
+        &mut svm,
+        &[&reinitializer],
+        solana_sdk::system_instruction::transfer(&reinitializer.pubkey(), &archive, 1),
+    )
+    .expect("an unaffiliated user prefunds the deterministic archive PDA");
+    let prefunded_archive = svm.get_account(&archive).unwrap();
+    assert_eq!(prefunded_archive.owner, system_program::ID);
+    assert!(prefunded_archive.data.is_empty());
+    assert_eq!(prefunded_archive.lamports, 1);
     let cleanup = Instruction {
         program_id: controller_id(),
         accounts: vec![
@@ -48402,6 +48412,10 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         "the attacker rematerialized the victim key without its signature"
     );
     assert_eq!(svm.get_account(&archive).unwrap().owner, rd_id());
+    assert!(
+        svm.get_account(&archive).unwrap().lamports > 1,
+        "terminal cleanup adopts and rent-funds the prefunded archive PDA"
+    );
     assert_eq!(
         u64::from_le_bytes(
             svm.get_account(&archive).unwrap().data[256..264]
