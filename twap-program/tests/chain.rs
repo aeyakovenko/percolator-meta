@@ -54267,6 +54267,367 @@ fn e2e_insurance_topup_cannot_replay_across_asset_generations() {
     );
 }
 
+// PUBLIC LOF: closing a slab must not reset the generation namespace used by signed collateral
+// intents. Otherwise a creator can recreate the same market address, retain the victim as the
+// contribution authority, replay an old base-insurance top-up, and withdraw it as the new operator.
+#[test]
+fn e2e_insurance_topup_cannot_replay_across_market_recreation() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const AMOUNT: u64 = 350_000;
+    const CURRENT_AMOUNT: u64 = 11;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    let payer = Keypair::new();
+    let generation_a_admin = Keypair::new();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &generation_a_admin, &victim, &attacker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_keypair = Keypair::new();
+    let market = market_keypair.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_keypair],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public payer allocates the first market generation");
+
+    let market_generation = Pubkey::find_program_address(
+        &[b"market-generation", market.as_ref()],
+        &perc_id(),
+    )
+    .0;
+    let init_market = |authority: Pubkey| {
+        pix(
+            vec![
+                AccountMeta::new(authority, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(market_generation, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 100,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        )
+    };
+    send(
+        &mut svm,
+        &[&payer, &generation_a_admin],
+        init_market(generation_a_admin.pubkey()),
+    )
+    .expect("initialize market generation A");
+
+    let read_asset0_market_id = |svm: &LiteSVM| {
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
+            .unwrap()
+            .1
+            .assets[0]
+            .market_id
+    };
+    let generation_a = read_asset0_market_id(&svm);
+    let rotate_insurance_authority =
+        |svm: &mut LiteSVM, current: &Keypair, incoming: &Keypair, market_id: u64| {
+            let accounts = vec![
+                AccountMeta::new_readonly(current.pubkey(), true),
+                AccountMeta::new_readonly(incoming.pubkey(), true),
+                AccountMeta::new(market, false),
+            ];
+            let legacy = pix(
+                accounts.clone(),
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind: 1,
+                    new_pubkey: incoming.pubkey().to_bytes(),
+                },
+            );
+            if send(svm, &[&payer, current, incoming], legacy).is_ok() {
+                return;
+            }
+            let mut data = vec![65u8];
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&market_id.to_le_bytes());
+            data.push(1);
+            data.extend_from_slice(incoming.pubkey().as_ref());
+            send(
+                svm,
+                &[&payer, current, incoming],
+                Instruction {
+                    program_id: perc_id(),
+                    accounts,
+                    data,
+                },
+            )
+            .expect("generation-bound authority rotation remains live");
+        };
+    rotate_insurance_authority(
+        &mut svm,
+        &generation_a_admin,
+        &victim,
+        generation_a,
+    );
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let victim_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_source,
+        &collateral_mint,
+        &victim.pubkey(),
+        AMOUNT + CURRENT_AMOUNT,
+    );
+    let topup_accounts = vec![
+        AccountMeta::new_readonly(victim.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(victim_source, false),
+        AccountMeta::new(vault, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    svm.expire_blockhash();
+    let retained_blockhash = svm.latest_blockhash();
+    let legacy_topup = Transaction::new_signed_with_payer(
+        &[pix(
+            topup_accounts.clone(),
+            PIx::TopUpInsurance {
+                amount: u128::from(AMOUNT),
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        retained_blockhash,
+    );
+    let mut generation_a_topup_data = vec![9u8];
+    generation_a_topup_data.extend_from_slice(&generation_a.to_le_bytes());
+    generation_a_topup_data.extend_from_slice(&u128::from(AMOUNT).to_le_bytes());
+    let generation_a_topup = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: topup_accounts.clone(),
+            data: generation_a_topup_data,
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        retained_blockhash,
+    );
+
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(generation_a_admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &generation_a_admin],
+        retained_blockhash,
+    ))
+    .expect("resolve the empty generation-A market");
+
+    let close_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &close_destination,
+        &collateral_mint,
+        &generation_a_admin.pubkey(),
+        0,
+    );
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(generation_a_admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(close_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(market_generation, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: PIx::CloseSlab.encode(),
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &generation_a_admin],
+        retained_blockhash,
+    ))
+    .expect("close market generation A through the public terminal path");
+    assert!(
+        svm.get_account(&market)
+            .map_or(true, |account| account.lamports == 0),
+        "generation-A slab is closed",
+    );
+
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[init_market(attacker.pubkey())],
+        Some(&payer.pubkey()),
+        &[&payer, &attacker],
+        retained_blockhash,
+    ))
+    .expect("recreate generation B at the same market address");
+    let generation_b = read_asset0_market_id(&svm);
+    set_token(
+        &mut svm,
+        &vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let rotation_accounts = vec![
+        AccountMeta::new_readonly(attacker.pubkey(), true),
+        AccountMeta::new_readonly(victim.pubkey(), true),
+        AccountMeta::new(market, false),
+    ];
+    let legacy_rotation = Transaction::new_signed_with_payer(
+        &[pix(
+            rotation_accounts.clone(),
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 1,
+                new_pubkey: victim.pubkey().to_bytes(),
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &attacker, &victim],
+        retained_blockhash,
+    );
+    if svm.send_transaction(legacy_rotation).is_err() {
+        let mut data = vec![65u8];
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&generation_b.to_le_bytes());
+        data.push(1);
+        data.extend_from_slice(victim.pubkey().as_ref());
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: rotation_accounts,
+                data,
+            }],
+            Some(&payer.pubkey()),
+            &[&payer, &attacker, &victim],
+            retained_blockhash,
+        ))
+        .expect("configure the generation-B contribution authority");
+    }
+
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let source_before_replay = svm.get_account(&victim_source).unwrap();
+    let vault_before_replay = svm.get_account(&vault).unwrap();
+    if svm.send_transaction(legacy_topup).is_ok() {
+        assert_eq!(token_amount(&svm, &victim_source), CURRENT_AMOUNT);
+        assert_eq!(token_amount(&svm, &vault), AMOUNT);
+        let attacker_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &attacker_destination,
+            &collateral_mint,
+            &attacker.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &attacker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(attacker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(attacker_destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::WithdrawInsuranceAsset {
+                    asset_index: 0,
+                    amount: u128::from(AMOUNT),
+                },
+            ),
+        )
+        .expect("generation-B operator withdraws the replayed collateral");
+        assert_eq!(token_amount(&svm, &attacker_destination), AMOUNT);
+        panic!(
+            "market generation reset from {generation_a} to {generation_b}; replacement operator stole {AMOUNT} victim atoms"
+        );
+    }
+
+    assert!(
+        generation_b > generation_a,
+        "full market recreation must advance the persistent generation namespace",
+    );
+    assert!(svm.send_transaction(generation_a_topup).is_err());
+    assert_eq!(svm.get_account(&market).unwrap(), market_before_replay);
+    assert_eq!(
+        svm.get_account(&victim_source).unwrap(),
+        source_before_replay
+    );
+    assert_eq!(svm.get_account(&vault).unwrap(), vault_before_replay);
+
+    let mut current_topup_data = vec![9u8];
+    current_topup_data.extend_from_slice(&generation_b.to_le_bytes());
+    current_topup_data.extend_from_slice(&u128::from(CURRENT_AMOUNT).to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &victim],
+        Instruction {
+            program_id: perc_id(),
+            accounts: topup_accounts,
+            data: current_topup_data,
+        },
+    )
+    .expect("fresh generation-B top-up remains live");
+    assert_eq!(token_amount(&svm, &victim_source), AMOUNT);
+    assert_eq!(token_amount(&svm, &vault), CURRENT_AMOUNT);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TerminalSourceDustTradePath {
     Single,
