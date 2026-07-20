@@ -2061,8 +2061,9 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
         return Err(ProgramError::InvalidInstructionData);
     }
     let now = Clock::get()?.slot;
-    if config.config_kind == CONFIG_KIND_REWARD_EPOCH
-        && (now < config.emission_start_slot || now >= config.emission_end_slot)
+    // Legacy fixed configs also committed to an emission end; only their start is implicitly zero.
+    if now >= config.emission_end_slot
+        || (config.config_kind == CONFIG_KIND_REWARD_EPOCH && now < config.emission_start_slot)
     {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -2199,14 +2200,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(ProgramError::InvalidAccountData); // sealed or frozen -> denominators are final
     }
     let now = Clock::get()?.slot;
-    let post_emission_finalize = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
-        if now < config.emission_start_slot {
-            return Err(ProgramError::InvalidInstructionData);
-        }
-        now > config.emission_end_slot
-    } else {
-        false
-    };
+    if config.config_kind == CONFIG_KIND_REWARD_EPOCH && now < config.emission_start_slot {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    // Both config formats share the same inclusive point-growth cutoff and finalize window.
+    let post_emission_finalize = now > config.emission_end_slot;
     let stake_data_len = stake_account.data_len();
     let mut stake = Stake::deserialize(&stake_account.try_borrow_data()?)?;
     if stake.cohort > COHORT_FUNDING_PAYER {
