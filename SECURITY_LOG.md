@@ -14455,3 +14455,33 @@ Subledger and TWAP SBF checksums are
 `ec680da6320be1ff39e8d0de150ec32f2a37fc10265c3c96c3d039d007b7cf6f` and
 `1bbaf170d35a259f3a83dcf98ca4997ae5aca00953890b03491a215c5e78f85d`. No account layout, signer,
 authority, recipient, token path, custody path, or admin surface was added.
+
+## Tick - stale Genesis vote authorization crossed a position incarnation (surface B, REAL DOS)
+
+Current Genesis actions were bound only to the ballot nonce, and current configs also accepted the
+predecessor action-only retract while that nonce was zero. A relayer could obtain a retract before the
+canonical ballot existed, let the owner create and back the first ballot, then land the stale action
+after backing closed. The same ballot-only authorization remained live across a Subledger top-up.
+After the stale retract removed sole qualifying support, the immutable 100%-supply distribution had
+no winner and no admissible transaction could restore the vote. Tokens still remained owner-only;
+the loss was the depositor's irrecoverable Genesis vote and reward opportunity.
+
+The retained clean-room LiteSVM regressions sign action-only, nonce-only, and position-bound retracts
+before ballot creation, then prove the first vote makes every old authorization stale before backing
+closes. A second probe signs against a live five-unit ballot, adds a sixth unit in the final deposit
+slot under the same blockhash, and proves neither the retired ballot-only wire nor the stale current
+snapshot can remove the original five counted votes. The original action-only probe is mutation-sharp
+against parent `024800c`, whose vulnerable Genesis checksum is
+`6283fe343de44bd612f3b604c2b8424d8b27fee128caab278014ed357336aaeb`.
+
+FIX: both current back and retract actions now commit to the ballot nonce plus the Subledger
+position's exact principal, start slot, and monotonic action nonce. The first vote-lock transition,
+every top-up, and every owner withdrawal therefore invalidate an older authorization even when its
+principal and ballot nonce happen to match. Action-only retract remains exit-only for genuinely
+legacy config layouts, and existing current ballots remain owner-recoverable by reading their live
+position snapshot. The fixed Genesis checksum is
+`b070b8cef1cf2da2153d7a0f7736cecd2626b79b653bb7d2895fd2555c5c1e6c`; the pinned Percolator checksum
+is `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. All seven presigned-action
+lifecycle probes, every legacy Genesis ballot-generation recovery probe, all 28 Genesis
+unit/integration tests, and both affected full-chain lifecycle tests pass. No account, state, signer,
+authority, recipient, CPI, token path, custody path, or admin surface was added.
