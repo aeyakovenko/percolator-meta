@@ -1,0 +1,21 @@
+[package]
+name = "auth-matcher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+# Keep the SBF Cargo 1.84 graph off blake3's Edition 2024 digest dependencies.
+blake3 = "=1.8.2"
+solana-program = "=1.18.26"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+overflow-checks = true
