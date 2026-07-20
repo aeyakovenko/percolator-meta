@@ -53897,6 +53897,7 @@ struct TerminalSourceDustOutcome {
 fn run_controller_terminal_source_dust_case(
     path: TerminalSourceDustTradePath,
     with_dust_round_trip: bool,
+    require_full_cleanup: bool,
 ) -> TerminalSourceDustOutcome {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -53913,6 +53914,7 @@ fn run_controller_terminal_source_dust_case(
             ..solana_program_runtime::compute_budget::ComputeBudget::default()
         });
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
     svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
         .unwrap();
 
@@ -54445,13 +54447,207 @@ fn run_controller_terminal_source_dust_case(
     .unwrap();
     assert_eq!(terminal_group.vault as u64, stable_vault);
 
-    TerminalSourceDustOutcome {
+    let outcome = TerminalSourceDustOutcome {
         attacker_withdrawn: token_amount(&svm, &directional_destination) as u128
             + token_amount(&svm, &dust_long_destination) as u128
             + token_amount(&svm, &dust_short_destination) as u128,
         victim_withdrawn: token_amount(&svm, &victim_destination) as u128,
         vault_remaining: terminal_group.vault,
+    };
+
+    if require_full_cleanup {
+        let retired_market = retired_market_pda(&market_key, &perc_id());
+        for (owner, portfolio, _) in payouts {
+            let archive = rd_portfolio_archive_pda(&market_key, &owner, &portfolio);
+            send(
+                &mut svm,
+                &[&payer],
+                Instruction {
+                    program_id: controller_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(governance.pubkey(), false),
+                        AccountMeta::new_readonly(controller, false),
+                        AccountMeta::new(market_key, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new_readonly(perc_id(), false),
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new(archive, false),
+                        AccountMeta::new_readonly(rd_id(), false),
+                        AccountMeta::new_readonly(system_program::ID, false),
+                        AccountMeta::new_readonly(retired_market, false),
+                    ],
+                    data: vec![11u8],
+                },
+            )
+            .expect("unaffiliated cranker archives telemetry and retires each terminal portfolio");
+        }
+        let (_, portfolio_free_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market_key).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            portfolio_free_group.materialized_portfolio_count, 0,
+            "abandoned attacker portfolios cannot remain a terminal blocker"
+        );
+
+        let governance_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &governance_destination,
+            &collateral_mint,
+            &governance.pubkey(),
+            0,
+        );
+        let insurance_amount = read_asset_insurance_remaining(&svm, &market_key, 1);
+        if insurance_amount != 0 {
+            let insurance_transit = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &insurance_transit,
+                &collateral_mint,
+                &controller,
+                0,
+            );
+            let insurance_ledger = Pubkey::new_unique();
+            svm.set_account(
+                insurance_ledger,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; percolator_prog::state::insurance_ledger_account_len()],
+                    owner: perc_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            send(
+                &mut svm,
+                &[&payer],
+                controller_return_resolved_asset_insurance_ix(
+                    &governance.pubkey(),
+                    &controller,
+                    &market_key,
+                    &governance_destination,
+                    &insurance_transit,
+                    &percolator_vault,
+                    &vault_authority,
+                    &insurance_ledger,
+                    &perc_id(),
+                    1,
+                ),
+            )
+            .expect("unaffiliated cranker returns terminal controller insurance");
+        }
+
+        let backing_balances = percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&market_key).unwrap().data,
+            1,
+        )
+        .unwrap();
+        if backing_balances
+            .iter()
+            .any(|balance| balance.principal_atoms != 0 || balance.earnings_atoms != 0)
+        {
+            let backing_transit = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &backing_transit,
+                &collateral_mint,
+                &controller,
+                0,
+            );
+            let ledger_len = percolator_prog::state::backing_domain_ledger_account_len();
+            let long_ledger = Pubkey::new_unique();
+            let short_ledger = Pubkey::new_unique();
+            for ledger in [long_ledger, short_ledger] {
+                svm.set_account(
+                    ledger,
+                    Account {
+                        lamports: 1_000_000_000,
+                        data: vec![0u8; ledger_len],
+                        owner: perc_id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+            }
+            send(
+                &mut svm,
+                &[&payer],
+                controller_return_resolved_asset_backing_ix(
+                    &governance.pubkey(),
+                    &controller,
+                    &market_key,
+                    &governance_destination,
+                    &backing_transit,
+                    &percolator_vault,
+                    &vault_authority,
+                    &long_ledger,
+                    &short_ledger,
+                    &perc_id(),
+                    1,
+                ),
+            )
+            .expect("unaffiliated cranker returns every terminal controller backing domain");
+        }
+
+        assert!(
+            percolator_accounting::market_is_resolved_and_empty(
+                &svm.get_account(&market_key).unwrap().data,
+            )
+            .unwrap(),
+            "fixed public continuations must make the attacked market terminally empty"
+        );
+        let close_transit = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &close_transit,
+            &collateral_mint,
+            &controller,
+            0,
+        );
+        svm.set_account(
+            controller,
+            Account {
+                lamports: 1,
+                data: vec![],
+                owner: system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new(governance.pubkey(), true),
+                    AccountMeta::new(controller, false),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new(close_transit, false),
+                    AccountMeta::new(governance_destination, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new(retired_market, false),
+                ],
+                data: vec![5u8],
+            },
+        )
+        .expect("governance closes the fully drained attacked slab");
+        assert!(
+            svm.get_account(&market_key)
+                .map_or(true, |account| account.lamports == 0),
+            "the attack leaves no permanent market account"
+        );
     }
+
+    outcome
 }
 
 // PUBLIC LIFECYCLE LoF REGRESSION: an attacker-controlled one-quantum round trip must not use a
@@ -54469,8 +54665,12 @@ fn e2e_terminal_source_dust_cannot_erase_independent_controller_market_payout() 
     .map(|path| {
         (
             path,
-            run_controller_terminal_source_dust_case(path, false),
-            run_controller_terminal_source_dust_case(path, true),
+            run_controller_terminal_source_dust_case(path, false, false),
+            run_controller_terminal_source_dust_case(
+                path,
+                true,
+                matches!(path, TerminalSourceDustTradePath::Single),
+            ),
         )
     });
     for (path, control, attack) in &outcomes {
