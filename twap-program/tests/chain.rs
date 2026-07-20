@@ -53887,6 +53887,12 @@ enum TerminalSourceDustTradePath {
     Batch,
 }
 
+#[derive(Clone, Copy)]
+enum TerminalSourceDustPayoutOrder {
+    VictimFirst,
+    AttackersFirst,
+}
+
 #[derive(Debug)]
 struct TerminalSourceDustOutcome {
     attacker_withdrawn: u128,
@@ -53898,6 +53904,7 @@ fn run_controller_terminal_source_dust_case(
     path: TerminalSourceDustTradePath,
     with_dust_round_trip: bool,
     require_full_cleanup: bool,
+    payout_order: TerminalSourceDustPayoutOrder,
 ) -> TerminalSourceDustOutcome {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -54341,7 +54348,7 @@ fn run_controller_terminal_source_dust_case(
     let directional_destination = Pubkey::new_unique();
     let dust_long_destination = Pubkey::new_unique();
     let dust_short_destination = Pubkey::new_unique();
-    let payouts = [
+    let mut payouts = [
         (
             victim.pubkey(),
             victim_portfolio.pubkey(),
@@ -54363,6 +54370,9 @@ fn run_controller_terminal_source_dust_case(
             dust_short_destination,
         ),
     ];
+    if matches!(payout_order, TerminalSourceDustPayoutOrder::AttackersFirst) {
+        payouts.rotate_left(1);
+    }
     for (owner, _, destination) in payouts {
         set_token(
             &mut svm,
@@ -54665,11 +54675,17 @@ fn e2e_terminal_source_dust_cannot_erase_independent_controller_market_payout() 
     .map(|path| {
         (
             path,
-            run_controller_terminal_source_dust_case(path, false, false),
+            run_controller_terminal_source_dust_case(
+                path,
+                false,
+                false,
+                TerminalSourceDustPayoutOrder::VictimFirst,
+            ),
             run_controller_terminal_source_dust_case(
                 path,
                 true,
                 matches!(path, TerminalSourceDustTradePath::Single),
+                TerminalSourceDustPayoutOrder::VictimFirst,
             ),
         )
     });
@@ -54689,4 +54705,18 @@ fn e2e_terminal_source_dust_cannot_erase_independent_controller_market_payout() 
         }),
         "one atom of attacker loss erased an independent terminal payout or left value without a live claim: {outcomes:?}"
     );
+}
+
+#[test]
+fn e2e_terminal_source_dust_payout_is_order_independent() {
+    let attack = run_controller_terminal_source_dust_case(
+        TerminalSourceDustTradePath::Single,
+        true,
+        true,
+        TerminalSourceDustPayoutOrder::AttackersFirst,
+    );
+
+    assert_eq!(attack.attacker_withdrawn, 20_000_001_999);
+    assert_eq!(attack.victim_withdrawn, 20_000_000_000);
+    assert!(attack.vault_remaining <= 1);
 }
