@@ -91,6 +91,68 @@ fn create_real_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> P
     svm.send_transaction(Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &[payer, &mint], bh)).unwrap();
     mint.pubkey()
 }
+fn create_real_token_account(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) -> Pubkey {
+    let token = Keypair::new();
+    let rent = svm.minimum_balance_for_rent_exemption(165);
+    let ixs = [
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &token.pubkey(),
+            rent,
+            165,
+            &spl_token::ID,
+        ),
+        spl_token::instruction::initialize_account3(
+            &spl_token::ID,
+            &token.pubkey(),
+            mint,
+            owner,
+        )
+        .unwrap(),
+    ];
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&payer.pubkey()),
+        &[payer, &token],
+        bh,
+    ))
+    .unwrap();
+    token.pubkey()
+}
+fn mint_real_tokens(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    mint: &Pubkey,
+    authority: &Keypair,
+    destination: &Pubkey,
+    amount: u64,
+) {
+    let ix = spl_token::instruction::mint_to(
+        &spl_token::ID,
+        mint,
+        destination,
+        &authority.pubkey(),
+        &[],
+        amount,
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[payer, authority],
+        bh,
+    ))
+    .unwrap();
+}
 fn pix(accounts: Vec<AccountMeta>, ix: PIx) -> Instruction { Instruction { program_id: perc_id(), accounts, data: ix.encode() } }
 fn read_u128_at(svm: &LiteSVM, pf: &Pubkey, off: usize) -> u128 {
     let d = svm.get_account(pf).unwrap().data;
@@ -1608,4 +1670,518 @@ fn crossed_trade_cannot_self_finance_preexisting_oi_reduction() {
     assert_eq!(svm.get_account(&portfolio_a).unwrap(), portfolio_a_before);
     assert_eq!(svm.get_account(&portfolio_b).unwrap(), portfolio_b_before);
     assert_eq!(svm.get_account(&vault).unwrap(), vault_before);
+}
+
+// An authenticated EWMA rebound can remain pending while the circuit-bounded engine price catches
+// up. Public wash trades must pay enough to overwrite that target; otherwise the coalition can
+// resolve at the displaced mark and withdraw PnL taken from an unrelated directional trader.
+#[test]
+fn pending_ewma_target_override_cannot_extract_independent_victim_pnl() {
+    const BASIS: u64 = 10_000_000;
+    const DIRECTIONAL_Q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    const WASH_Q: i128 = 100 * percolator::POS_SCALE as i128;
+    const DIRECTIONAL_DEPOSIT: u64 = 20_000_000_000;
+    const WASH_DEPOSIT: u64 = 2_000_000_000;
+    const ATTACKER_DEPOSITS: u128 =
+        DIRECTIONAL_DEPOSIT as u128 + 2 * WASH_DEPOSIT as u128;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let honest_oracle = Keypair::new();
+    let victim = Keypair::new();
+    let directional_attacker = Keypair::new();
+    let wash_long = Keypair::new();
+    let wash_short = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    for signer in [
+        &admin,
+        &honest_oracle,
+        &victim,
+        &directional_attacker,
+        &wash_long,
+        &wash_short,
+    ] {
+        svm.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let collateral = create_real_mint(&mut svm, &payer, &admin.pubkey());
+    let market = Pubkey::new_unique();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0; market_len],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let vault_authority = perc_vault_authority(&market);
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+
+    let send = |svm: &mut LiteSVM, ix: Instruction, signers: &[&Keypair]| {
+        svm.expire_blockhash();
+        let blockhash = svm.latest_blockhash();
+        let mut all_signers = vec![&payer];
+        all_signers.extend_from_slice(signers);
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &all_signers,
+            blockhash,
+        ))
+    };
+
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: BASIS,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 5_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+        &[&admin],
+    )
+    .expect("initialize public EWMA market");
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: BASIS,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+        &[&admin],
+    )
+    .expect("configure EWMA oracle");
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(honest_oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: percolator_prog::processor::ASSET_AUTH_ORACLE,
+                new_pubkey: honest_oracle.pubkey().to_bytes(),
+            },
+        ),
+        &[&admin, &honest_oracle],
+    )
+    .expect("separate honest oracle from attacker coalition");
+
+    let victim_portfolio = Pubkey::new_unique();
+    let directional_attacker_portfolio = Pubkey::new_unique();
+    let wash_long_portfolio = Pubkey::new_unique();
+    let wash_short_portfolio = Pubkey::new_unique();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let participants = [
+        (&victim, victim_portfolio, DIRECTIONAL_DEPOSIT),
+        (
+            &directional_attacker,
+            directional_attacker_portfolio,
+            DIRECTIONAL_DEPOSIT,
+        ),
+        (&wash_long, wash_long_portfolio, WASH_DEPOSIT),
+        (&wash_short, wash_short_portfolio, WASH_DEPOSIT),
+    ];
+    let mut collateral_accounts = Vec::new();
+    for (owner, portfolio, deposit) in participants {
+        svm.set_account(
+            portfolio,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0; portfolio_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::InitPortfolio,
+            ),
+            &[owner],
+        )
+        .expect("initialize public portfolio");
+        let token = create_real_token_account(&mut svm, &payer, &collateral, &owner.pubkey());
+        mint_real_tokens(
+            &mut svm,
+            &payer,
+            &collateral,
+            &admin,
+            &token,
+            deposit,
+        );
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(token, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(deposit),
+                },
+            ),
+            &[owner],
+        )
+        .expect("deposit real SPL collateral");
+        collateral_accounts.push(token);
+    }
+    let victim_collateral = collateral_accounts[0];
+    let directional_attacker_collateral = collateral_accounts[1];
+    let wash_long_collateral = collateral_accounts[2];
+    let wash_short_collateral = collateral_accounts[3];
+
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(directional_attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio, false),
+                AccountMeta::new(directional_attacker_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: DIRECTIONAL_Q,
+                exec_price: BASIS,
+                fee_bps: 0,
+            },
+        ),
+        &[&victim, &directional_attacker],
+    )
+    .expect("open independent directional exposure");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+            &[],
+        )
+    };
+    let push = |svm: &mut LiteSVM, slot: u64, mark_e6: u64| {
+        send(
+            svm,
+            pix(
+                vec![
+                    AccountMeta::new(honest_oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushEwmaMark {
+                    asset_index: 0,
+                    now_slot: slot,
+                    mark_e6,
+                },
+            ),
+            &[&honest_oracle],
+        )
+    };
+    let set_slot = |svm: &mut LiteSVM, slot: u64| {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+    };
+
+    for slot in 2..=5 {
+        set_slot(&mut svm, slot);
+        push(&mut svm, slot, 1).expect("honest oracle publishes bounded down move");
+        crank(&mut svm, victim_portfolio, slot).expect("settle victim down move");
+        crank(&mut svm, directional_attacker_portfolio, slot)
+            .expect("settle counterparty down move");
+    }
+    let low_price = percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
+        .unwrap()
+        .1
+        .assets[0]
+        .effective_price;
+    assert!(low_price < BASIS / 5, "setup must create a large real move");
+
+    set_slot(&mut svm, 6);
+    crank(&mut svm, victim_portfolio, 6).expect("advance victim at low mark");
+    crank(&mut svm, directional_attacker_portfolio, 6)
+        .expect("advance counterparty at low mark");
+    let rebound_input = BASIS
+        .checked_mul(2)
+        .unwrap()
+        .checked_sub(low_price)
+        .unwrap();
+    push(&mut svm, 6, rebound_input).expect("honest oracle authenticates full rebound");
+    let profile_before_attack = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(profile_before_attack.mark_ewma_e6, BASIS);
+    assert_eq!(
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
+            .unwrap()
+            .1
+            .assets[0]
+            .effective_price,
+        low_price,
+        "authenticated rebound must still be circuit-breaker pending"
+    );
+
+    set_slot(&mut svm, 7);
+    let insurance_before = read_insurance(&svm, &market);
+    for (size_q, exec_price) in [(WASH_Q, 1), (-WASH_Q, low_price)] {
+        send(
+            &mut svm,
+            pix(
+                vec![
+                    AccountMeta::new(wash_long.pubkey(), true),
+                    AccountMeta::new(wash_short.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(wash_long_portfolio, false),
+                    AccountMeta::new(wash_short_portfolio, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q,
+                    exec_price,
+                    fee_bps: 0,
+                },
+            ),
+            &[&wash_long, &wash_short],
+        )
+        .expect("public wash route remains executable");
+    }
+    let movement_fee = read_insurance(&svm, &market) - insurance_before;
+    let displaced_target = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .mark_ewma_e6;
+    assert!(
+        displaced_target < BASIS,
+        "public wash must overwrite the authenticated rebound"
+    );
+    assert!(movement_fee > 0, "target overwrite must charge a real fee");
+
+    let mut slot = 7u64;
+    loop {
+        crank(&mut svm, victim_portfolio, slot).expect("publish target for victim");
+        crank(&mut svm, directional_attacker_portfolio, slot)
+            .expect("publish target for counterparty");
+        let effective =
+            percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
+                .unwrap()
+                .1
+                .assets[0]
+                .effective_price;
+        if effective == displaced_target {
+            break;
+        }
+        slot += 1;
+        assert!(slot < 24, "bounded target convergence must complete");
+        set_slot(&mut svm, slot);
+    }
+
+    send(
+        &mut svm,
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        ),
+        &[&admin],
+    )
+    .expect("honest admin resolves at the converged authenticated mark");
+
+    let close_resolved = |svm: &mut LiteSVM,
+                          owner: Pubkey,
+                          portfolio: Pubkey,
+                          destination: Pubkey| {
+        send(
+            svm,
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+            &[],
+        )
+    };
+    for _ in 0..4 {
+        close_resolved(
+            &mut svm,
+            victim.pubkey(),
+            victim_portfolio,
+            victim_collateral,
+        )
+        .expect("bounded victim terminal settlement");
+        close_resolved(
+            &mut svm,
+            directional_attacker.pubkey(),
+            directional_attacker_portfolio,
+            directional_attacker_collateral,
+        )
+        .expect("bounded counterparty terminal settlement");
+    }
+    close_resolved(
+        &mut svm,
+        wash_long.pubkey(),
+        wash_long_portfolio,
+        wash_long_collateral,
+    )
+    .expect("settle flat wash long");
+    close_resolved(
+        &mut svm,
+        wash_short.pubkey(),
+        wash_short_portfolio,
+        wash_short_collateral,
+    )
+    .expect("settle flat wash short");
+
+    let claim_topup = |svm: &mut LiteSVM,
+                       owner: Pubkey,
+                       portfolio: Pubkey,
+                       destination: Pubkey| {
+        send(
+            svm,
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::ClaimResolvedPayoutTopup,
+            ),
+            &[],
+        )
+    };
+    for (owner, portfolio, destination) in [
+        (victim.pubkey(), victim_portfolio, victim_collateral),
+        (
+            directional_attacker.pubkey(),
+            directional_attacker_portfolio,
+            directional_attacker_collateral,
+        ),
+        (wash_long.pubkey(), wash_long_portfolio, wash_long_collateral),
+        (
+            wash_short.pubkey(),
+            wash_short_portfolio,
+            wash_short_collateral,
+        ),
+    ] {
+        let _ = claim_topup(&mut svm, owner, portfolio, destination);
+    }
+
+    let attacker_withdrawn = u128::from(token_amount(
+        &svm,
+        &directional_attacker_collateral,
+    )) + u128::from(token_amount(&svm, &wash_long_collateral))
+        + u128::from(token_amount(&svm, &wash_short_collateral));
+    let victim_withdrawn = u128::from(token_amount(&svm, &victim_collateral));
+    assert!(
+        attacker_withdrawn <= ATTACKER_DEPOSITS,
+        "pending-target override paid attacker coalition {attacker_withdrawn} from {ATTACKER_DEPOSITS} deposited; victim withdrew {victim_withdrawn}; movement fee {movement_fee}"
+    );
+    let victim_loss = (DIRECTIONAL_DEPOSIT as u128).saturating_sub(victim_withdrawn);
+    assert!(
+        victim_loss > 0,
+        "probe did not exercise pending-target price displacement"
+    );
+    assert!(
+        movement_fee >= victim_loss,
+        "movement fee {movement_fee} failed to cover independent victim loss {victim_loss}"
+    );
 }
