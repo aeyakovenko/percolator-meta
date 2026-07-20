@@ -50093,9 +50093,14 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         bh,
     ))
     .expect("loser (owner_b) opens long vs winner short");
+    let loss_slot = if cleanup == OrganicRewardCleanup::PostEmissionLoss {
+        510
+    } else {
+        110
+    };
     svm.set_sysvar(&Clock {
-        slot: 110,
-        unix_timestamp: 110,
+        slot: loss_slot,
+        unix_timestamp: loss_slot as i64,
         ..Clock::default()
     });
     // adverse move: the asset already has open interest, so the oracle anchor can't be RESET
@@ -50110,7 +50115,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             ],
             PIx::PushAuthMark {
                 asset_index: 0,
-                now_slot: 110,
+                now_slot: loss_slot,
                 mark_e6: initial_price / 2,
             },
         )],
@@ -50147,10 +50152,10 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         ))
     };
     // Crank the counterparty first (updates the asset's shared b-accumulator), then the loser.
-    crank(&mut svm, &winner_pf, 110).expect("auto-crank winner settlement");
-    crank(&mut svm, &winner_pf, 110).expect("auto-crank winner refresh after settlement");
-    crank(&mut svm, &loser_pf, 110).expect("auto-crank loser settlement");
-    crank(&mut svm, &loser_pf, 110).expect("auto-crank loser refresh after settlement");
+    crank(&mut svm, &winner_pf, loss_slot).expect("auto-crank winner settlement");
+    crank(&mut svm, &winner_pf, loss_slot).expect("auto-crank winner refresh after settlement");
+    crank(&mut svm, &loser_pf, loss_slot).expect("auto-crank loser settlement");
+    crank(&mut svm, &loser_pf, loss_slot).expect("auto-crank loser refresh after settlement");
     let crystallized = read_portfolio_crystallized(&svm, &loser_pf);
     assert!(
         crystallized > 0,
@@ -50178,7 +50183,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         )
         .expect("both public traders flatten at the moved mark");
         for pf in [&winner_pf, &loser_pf] {
-            crank(&mut svm, pf, 110).expect("settle flattened portfolio");
+            crank(&mut svm, pf, loss_slot).expect("settle flattened portfolio");
         }
 
         let (_, before_convert_group) = percolator_prog::state::read_market(
@@ -50343,7 +50348,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         .expect("flatten the loss-bearing asset through the pending-domain barrier");
         for pf in [&winner_pf, &loser_pf] {
             for _ in 0..8 {
-                crank(&mut svm, pf, 110).expect("settle flattened recovery portfolio");
+                crank(&mut svm, pf, loss_slot).expect("settle flattened recovery portfolio");
             }
             let state = percolator_prog::state::read_portfolio(
                 &svm.get_account(pf).unwrap().data,
@@ -50487,7 +50492,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         ))
         .expect("flatten organic loss portfolios");
         for pf in [&winner_pf, &loser_pf] {
-            crank(&mut svm, pf, 110).expect("settle flattened portfolio");
+            crank(&mut svm, pf, loss_slot).expect("settle flattened portfolio");
         }
 
         let loser_state = svm.get_account(&loser_pf).unwrap();
@@ -50843,8 +50848,8 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     };
     assert_eq!(
         token_amount(&svm, &reward_coin),
-        supply,
-        "trader cohort earns the organically-settled residual loss"
+        expected_reward,
+        "trader cohort only earns residual loss settled during the reward period"
     );
 
     if legacy_pre_id_cleanup {

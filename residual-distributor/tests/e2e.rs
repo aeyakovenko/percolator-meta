@@ -3688,7 +3688,7 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     let env = setup(&mut svm, &payer, supply); // no fee -> isolate the time-weight
 
     let r = 9_000u128; // IDENTICAL net residual for both stakers
-                       // EARLY: register at slot 100 (residual-empty), manufacture R only at slot 10_000 -> tenure 9_900, log2=13.
+                       // EARLY: register at slot 100 (residual-empty), manufacture R only at slot 1_124 -> tenure 1_024, log2=10.
     let early = Keypair::new();
     let early_pf = Pubkey::new_unique();
     set_slot(&mut svm, 100);
@@ -3711,10 +3711,10 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
         COHORT_TRADER,
     )
     .expect("reg early");
-    // LATE: register at slot 9_000 -> crystallize at 10_000 gives tenure 1_000, log2=9 (same R).
+    // LATE: register at slot 1_000 -> crystallize at 1_124 gives tenure 124, log2=6 (same R).
     let late = Keypair::new();
     let late_pf = Pubkey::new_unique();
-    set_slot(&mut svm, 9_000);
+    set_slot(&mut svm, 1_000);
     set_portfolio(
         &mut svm,
         &late_pf,
@@ -3736,7 +3736,7 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     .expect("reg late");
 
     // Both manufacture the SAME loss at the SAME slot, then crystallize together.
-    set_slot(&mut svm, 10_000);
+    set_slot(&mut svm, 1_124);
     set_portfolio(
         &mut svm,
         &early_pf,
@@ -3765,30 +3765,30 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     claim(&mut svm, &payer, &env, &early, &early_ata, None).expect("early claim");
     claim(&mut svm, &payer, &env, &late, &late_ata, None).expect("late claim");
 
-    // points: early = 13*9_000 = 117_000, late = 9*9_000 = 81_000; denom = 198_000; cohort = 400_000.
+    // points: early = 10*9_000 = 90_000, late = 6*9_000 = 54_000; denom = 144_000; cohort = 400_000.
     let early_paid = token_amount(&svm, &early_ata);
     let late_paid = token_amount(&svm, &late_ata);
     assert_eq!(
         early_paid,
-        400_000u64 * 117_000 / 198_000,
-        "early registrant captures the log2(9_900)=13 multiplier"
+        400_000u64 * 90_000 / 144_000,
+        "early registrant captures the log2(1_024)=10 multiplier"
     );
     assert_eq!(
         late_paid,
-        400_000u64 * 81_000 / 198_000,
-        "late registrant only gets log2(1_000)=9 on the SAME residual"
+        400_000u64 * 54_000 / 144_000,
+        "late registrant only gets log2(124)=6 on the SAME residual"
     );
-    // The pin: SAME residual, different registration -> early over-captures (~59% vs ~41%). The weight rewards
+    // The pin: SAME residual, different registration -> early over-captures (62.5% vs 37.5%). The weight rewards
     // stake-tenure, not how long the loss was held; the bound is the cost to manufacture R, not the multiplier.
     assert!(
         early_paid > late_paid,
         "pre-registration over-captures vs a late registrant with identical residual"
     );
-    // Conserved: the two split the whole cohort up to 1 atom of independent-floor rounding dust (stays locked).
+    // Conserved: the exact ratio divides the whole cohort with no rounding dust.
     assert_eq!(
         early_paid + late_paid,
-        399_999,
-        "cohort fully shared between the two minus 1-atom floor dust"
+        400_000,
+        "cohort fully shared between the two"
     );
     assert!(
         400_000 - (early_paid + late_paid) <= 1,
@@ -5722,7 +5722,7 @@ fn funding_payer_points_are_accumulator_delta_without_age_multiplier() {
     )
     .expect("register early funding payer");
 
-    set_slot(&mut svm, 9_000);
+    set_slot(&mut svm, 1_000);
     set_portfolio_funding(
         &mut svm,
         &late_pf,
@@ -5745,7 +5745,7 @@ fn funding_payer_points_are_accumulator_delta_without_age_multiplier() {
     )
     .expect("register late funding payer");
 
-    set_slot(&mut svm, 10_000);
+    set_slot(&mut svm, 1_124);
     set_portfolio_funding(
         &mut svm,
         &early_pf,
@@ -5850,8 +5850,8 @@ fn funding_payer_100_case_no_age_replay_and_claim_redirect_sweep() {
         let late_pf = Pubkey::new_unique();
         let receiver_pf = Pubkey::new_unique();
         let start_slot = 100 + case_idx as u64;
-        let late_slot = start_slot + 500 + ((case_idx as u64 * 13) % 3_000);
-        let final_slot = late_slot + 1 + ((case_idx as u64 * 29) % 6_000);
+        let late_slot = start_slot + 200 + ((case_idx as u64 * 13) % 500);
+        let final_slot = late_slot + 1 + ((case_idx as u64 * 29) % 500);
 
         let early_baseline_long = ((case_idx as u128 * 17) % 2_000) + 3;
         let early_baseline_short = ((case_idx as u128 * 19) % 2_000) + 5;
@@ -6265,7 +6265,7 @@ fn funding_payer_100_case_config_sweep_preserves_payer_only_payouts() {
         )
         .expect("register short receiver canary");
 
-        set_slot(&mut svm, start_slot + 2 + ((case_idx as u64 * 19) % 4_096));
+        set_slot(&mut svm, start_slot + 2 + ((case_idx as u64 * 19) % 1_500));
         set_portfolio_funding(
             &mut svm,
             &long_pf,
@@ -9118,6 +9118,158 @@ fn finalize_window_removes_recovered_trader_loss_without_admitting_fresh_loss() 
     );
 }
 
+// Legacy fixed configs carry the same immutable emission end as reusable reward epochs. A public
+// trader must not be able to wait until that period is over, realize a fresh loss, and dilute a
+// trader whose loss was crystallized in-window. Portfolio bytes are an external Percolator fixture;
+// the chain test exercises the same counter transition through the pinned Percolator SBF.
+#[test]
+fn legacy_fixed_epoch_post_end_loss_cannot_dilute_honest_trader() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+
+    let honest = Keypair::new();
+    let attacker = Keypair::new();
+    let honest_pf = Pubkey::new_unique();
+    let attacker_pf = Pubkey::new_unique();
+    set_slot(&mut svm, 100);
+    for (portfolio, owner) in [
+        (honest_pf, honest.pubkey()),
+        (attacker_pf, attacker.pubkey()),
+    ] {
+        set_portfolio_full(
+            &mut svm,
+            &portfolio,
+            &env.stub_perc,
+            &env.market,
+            &owner,
+            0,
+            0,
+            0,
+        );
+    }
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &honest,
+        &honest.pubkey(),
+        &honest_pf,
+        COHORT_TRADER,
+    )
+    .expect("honest trader registers during the reward period");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &attacker_pf,
+        COHORT_TRADER,
+    )
+    .expect("attacker registers during the reward period");
+
+    set_slot(&mut svm, env.emission_end);
+    set_portfolio_full(
+        &mut svm,
+        &honest_pf,
+        &env.stub_perc,
+        &env.market,
+        &honest.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &honest, &honest_pf)
+        .expect("honest loss crystallizes at the inclusive configured end");
+
+    set_slot(&mut svm, env.emission_end + 1);
+    set_portfolio_full(
+        &mut svm,
+        &attacker_pf,
+        &env.stub_perc,
+        &env.market,
+        &attacker.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    crystallize_as(
+        &mut svm,
+        &payer,
+        &env,
+        &payer,
+        &attacker.pubkey(),
+        &attacker_pf,
+    )
+    .expect("finalize remains available to remove stale trader eligibility");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze legacy fixed epoch");
+    let honest_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &honest.pubkey());
+    let attacker_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &attacker.pubkey());
+    claim(&mut svm, &payer, &env, &honest, &honest_ata, None).expect("honest claim");
+    claim_as(
+        &mut svm,
+        &payer,
+        &env,
+        &payer,
+        &attacker.pubkey(),
+        &attacker_ata,
+        None,
+    )
+    .expect("zero-point attacker stake remains consumable");
+
+    assert_eq!(
+        token_amount(&svm, &honest_ata),
+        400_000,
+        "post-end loss cannot dilute the honest trader cohort claim"
+    );
+    assert_eq!(
+        token_amount(&svm, &attacker_ata),
+        0,
+        "post-end loss earns no fixed COIN"
+    );
+}
+
+#[test]
+fn legacy_fixed_epoch_registration_closes_at_emission_end() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    let late = Keypair::new();
+    let late_pf = Pubkey::new_unique();
+    set_portfolio_full(
+        &mut svm,
+        &late_pf,
+        &env.stub_perc,
+        &env.market,
+        &late.pubkey(),
+        0,
+        0,
+        0,
+    );
+
+    set_slot(&mut svm, env.emission_end);
+    assert!(
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            &late,
+            &late.pubkey(),
+            &late_pf,
+            COHORT_TRADER,
+        )
+        .is_err(),
+        "legacy registration is half-open and closes at emission_end"
+    );
+}
+
 #[test]
 fn trader_fresh_post_freeze_loss_cannot_revive_recovered_frozen_points() {
     let mut svm = LiteSVM::new();
@@ -9431,7 +9583,7 @@ fn cross_cohort_trader_loss_then_lp_recovery_cannot_double_dip_the_same_loss() {
     // (2) self-dealt LP RECOVERY of that exact loss: percolator raises trader.spent AND lp.received together.
     // (3) crystallize the LP leg so it banks the recovered 6_000 as LP points (60_000). Trader leg NOT
     //     re-crystallized -> its frozen 60_000 trader points are now STALE (live net is 0).
-    set_slot(&mut svm, 100 + 2048);
+    set_slot(&mut svm, 1_900);
     set_portfolio_full(
         &mut svm,
         &tr_pf,
