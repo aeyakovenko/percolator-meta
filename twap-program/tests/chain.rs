@@ -4358,13 +4358,28 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
 }
 
-// PUBLIC LOF: an independently operated AuthMark oracle can sign a report for an empty asset,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedOracleAction {
+    Report,
+    Configure,
+}
+
+// PUBLIC LOF: an independently operated AuthMark oracle can sign an action for an empty asset,
 // retain the complete transaction, and submit it after the constrained controller has shut down
-// and restarted that slot. The report must be bound to the old asset generation: otherwise it can
-// move the mark against positions opened only after restart and the beneficiary can withdraw the
-// victim's transferred collateral through ordinary public instructions.
+// and restarted that slot. The action must be bound to the old asset generation: otherwise it can
+// move or reset the mark against positions opened only after restart, and the beneficiary can
+// withdraw the victim's transferred collateral through ordinary public instructions.
 #[test]
 fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
+    run_retained_oracle_action_across_controller_restart(RetainedOracleAction::Report);
+}
+
+#[test]
+fn e2e_signed_auth_config_cannot_cross_controller_asset_restart() {
+    run_retained_oracle_action_across_controller_restart(RetainedOracleAction::Configure);
+}
+
+fn run_retained_oracle_action_across_controller_restart(action: RetainedOracleAction) {
     use percolator_prog::ix::Instruction as PIx;
 
     const PRICE: u64 = 100;
@@ -4485,17 +4500,25 @@ fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
     .expect("independent oracle configures generation A");
 
     let retained_blockhash = svm.latest_blockhash();
-    let retained_report = Transaction::new_signed_with_payer(
+    let retained_instruction = match action {
+        RetainedOracleAction::Report => PIx::PushAuthMark {
+            asset_index: 0,
+            now_slot: 100,
+            mark_e6: STALE_PRICE,
+        },
+        RetainedOracleAction::Configure => PIx::ConfigureAuthMark {
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: STALE_PRICE,
+        },
+    };
+    let retained_action = Transaction::new_signed_with_payer(
         &[pix(
             vec![
                 AccountMeta::new_readonly(oracle.pubkey(), true),
                 AccountMeta::new(market, false),
             ],
-            PIx::PushAuthMark {
-                asset_index: 0,
-                now_slot: 100,
-                mark_e6: STALE_PRICE,
-            },
+            retained_instruction,
         )],
         Some(&payer.pubkey()),
         &[&payer, &oracle],
@@ -4722,10 +4745,12 @@ fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
         )
         .expect("public user deposits independent collateral");
     }
-    send(
-        &mut svm,
-        &[&payer, &victim, &counterparty],
-        pix(
+    let trade_size = match action {
+        RetainedOracleAction::Report => SIZE_Q,
+        RetainedOracleAction::Configure => -SIZE_Q,
+    };
+    let mut honest_trade = Some(Transaction::new_signed_with_payer(
+        &[pix(
             vec![
                 AccountMeta::new(victim.pubkey(), true),
                 AccountMeta::new(counterparty.pubkey(), true),
@@ -4735,20 +4760,26 @@ fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
             ],
             PIx::TradeNoCpi {
                 asset_index: 0,
-                size_q: SIZE_Q,
+                size_q: trade_size,
                 exec_price: PRICE,
                 fee_bps: 0,
             },
-        ),
-    )
-    .expect("fresh generation-B users open balanced exposure");
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &victim, &counterparty],
+        svm.latest_blockhash(),
+    ));
+    if action == RetainedOracleAction::Report {
+        svm.send_transaction(honest_trade.take().unwrap())
+            .expect("fresh generation-B users open balanced exposure");
+    }
 
     let market_before = svm.get_account(&market).unwrap();
     let victim_before = svm.get_account(&victim_portfolio.pubkey()).unwrap();
     let counterparty_before = svm.get_account(&counterparty_portfolio.pubkey()).unwrap();
     svm.send_transaction(retained_blockhash_control)
-        .expect("the retained report's blockhash is still valid at replay time");
-    let replay = svm.send_transaction(retained_report);
+        .expect("the retained oracle action's blockhash is still valid at replay time");
+    let replay = svm.send_transaction(retained_action);
     if replay.is_ok() {
         let profile = percolator_prog::state::read_asset_oracle_profile(
             &svm.get_account(&market).unwrap().data,
@@ -4757,13 +4788,35 @@ fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
         .unwrap();
         assert_eq!(
             profile.oracle_target_price_e6, STALE_PRICE,
-            "the generation-A report reached generation B"
+            "the generation-A oracle action reached generation B"
         );
+        if action == RetainedOracleAction::Configure {
+            svm.send_transaction(honest_trade.take().unwrap())
+                .expect("the already-signed generation-B trade lands after the stale reset");
+        }
         svm.set_sysvar(&Clock {
             slot: 103,
             unix_timestamp: 103,
             ..Clock::default()
         });
+        if action == RetainedOracleAction::Configure {
+            send(
+                &mut svm,
+                &[&payer, &oracle],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(oracle.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::PushAuthMark {
+                        asset_index: 0,
+                        now_slot: 103,
+                        mark_e6: PRICE,
+                    },
+                ),
+            )
+            .expect("the current oracle honestly restores the visible generation-B mark");
+        }
         for portfolio in [victim_portfolio.pubkey(), counterparty_portfolio.pubkey()] {
             let mut progressed = false;
             for _ in 0..4 {
@@ -4868,8 +4921,11 @@ fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
                 ],
                 PIx::TradeNoCpi {
                     asset_index: 0,
-                    size_q: SIZE_Q,
-                    exec_price: STALE_PRICE,
+                    size_q: trade_size,
+                    exec_price: match action {
+                        RetainedOracleAction::Report => STALE_PRICE,
+                        RetainedOracleAction::Configure => PRICE,
+                    },
                     fee_bps: 0,
                 },
             ),
@@ -4933,25 +4989,29 @@ fn e2e_signed_auth_mark_cannot_cross_controller_asset_restart() {
         .expect("beneficiary withdraws through the ordinary public custody path");
         assert_eq!(token_amount(&svm, &destination) as u128, withdrawable);
         assert!(withdrawable > DEPOSIT);
+        let action_name = match action {
+            RetainedOracleAction::Report => "report",
+            RetainedOracleAction::Configure => "configuration",
+        };
         panic!(
-            "generation-A oracle report reduced fresh victim equity from {DEPOSIT} to {victim_equity} and let the beneficiary withdraw {withdrawable}"
+            "generation-A oracle {action_name} reduced fresh victim equity from {DEPOSIT} to {victim_equity} and let the beneficiary withdraw {withdrawable}"
         );
     }
 
     assert_eq!(
         svm.get_account(&market).unwrap(),
         market_before,
-        "rejected stale report leaves generation-B market bytes unchanged"
+        "rejected stale oracle action leaves generation-B market bytes unchanged"
     );
     assert_eq!(
         svm.get_account(&victim_portfolio.pubkey()).unwrap(),
         victim_before,
-        "rejected stale report leaves the victim unchanged"
+        "rejected stale oracle action leaves the victim unchanged"
     );
     assert_eq!(
         svm.get_account(&counterparty_portfolio.pubkey()).unwrap(),
         counterparty_before,
-        "rejected stale report leaves the counterparty unchanged"
+        "rejected stale oracle action leaves the counterparty unchanged"
     );
 }
 
