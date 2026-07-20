@@ -53898,6 +53898,11 @@ struct TerminalSourceDustOutcome {
     attacker_withdrawn: u128,
     victim_withdrawn: u128,
     vault_remaining: u128,
+    victim_preclose_pnl: u128,
+    victim_initial_receipt_present: bool,
+    backing_remaining: u128,
+    backing_provider_withdrawn: u128,
+    governance_cleanup_received: u128,
 }
 
 fn run_controller_terminal_source_dust_case(
@@ -53905,6 +53910,7 @@ fn run_controller_terminal_source_dust_case(
     with_dust_round_trip: bool,
     require_full_cleanup: bool,
     payout_order: TerminalSourceDustPayoutOrder,
+    external_backing_amount: u64,
 ) -> TerminalSourceDustOutcome {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -53928,7 +53934,8 @@ fn run_controller_terminal_source_dust_case(
     let payer = Keypair::new();
     let governance = Keypair::new();
     let honest_oracle = Keypair::new();
-    for signer in [&payer, &governance, &honest_oracle] {
+    let backing_provider = Keypair::new();
+    for signer in [&payer, &governance, &honest_oracle, &backing_provider] {
         svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
             .unwrap();
     }
@@ -54035,7 +54042,11 @@ fn run_controller_terminal_source_dust_case(
             initial_price: BASIS,
             insurance_authority: controller.to_bytes(),
             insurance_operator: controller.to_bytes(),
-            backing_bucket_authority: controller.to_bytes(),
+            backing_bucket_authority: if external_backing_amount == 0 {
+                controller.to_bytes()
+            } else {
+                backing_provider.pubkey().to_bytes()
+            },
             oracle_authority: honest_oracle.pubkey().to_bytes(),
         }
         .encode(),
@@ -54074,6 +54085,36 @@ fn run_controller_terminal_source_dust_case(
         ),
     )
     .expect("independent oracle configures the bounded EWMA");
+
+    if external_backing_amount != 0 {
+        let backing_source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &backing_source,
+            &collateral_mint,
+            &backing_provider.pubkey(),
+            external_backing_amount,
+        );
+        send(
+            &mut svm,
+            &[&payer, &backing_provider],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(backing_provider.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(backing_source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::TopUpBackingBucket {
+                    domain: 3,
+                    amount: external_backing_amount as u128,
+                    expiry_slot: 1_000,
+                },
+            ),
+        )
+        .expect("external provider supplies real long-side source backing");
+    }
 
     let victim = Keypair::new();
     let directional_counterparty = Keypair::new();
@@ -54344,6 +54385,17 @@ fn run_controller_terminal_source_dust_case(
     )
     .expect("governance resolves through the constrained controller");
 
+    let victim_preclose_pnl = percolator_prog::state::read_portfolio(
+        &svm
+            .get_account(&victim_portfolio.pubkey())
+            .unwrap()
+            .data,
+    )
+    .unwrap()
+    .pnl
+    .get()
+    .max(0) as u128;
+
     let victim_destination = Pubkey::new_unique();
     let directional_destination = Pubkey::new_unique();
     let dust_long_destination = Pubkey::new_unique();
@@ -54403,6 +54455,7 @@ fn run_controller_terminal_source_dust_case(
             },
         )
     };
+    let mut victim_initial_receipt_present = false;
     for (owner, portfolio, destination) in payouts {
         send(
             &mut svm,
@@ -54410,6 +54463,15 @@ fn run_controller_terminal_source_dust_case(
             payout_ix(owner, portfolio, destination, false),
         )
         .expect("unaffiliated caller starts each resolved payout");
+        if portfolio == victim_portfolio.pubkey() {
+            victim_initial_receipt_present = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio).unwrap().data,
+            )
+            .unwrap()
+            .resolved_payout_receipt
+            .present
+                != 0;
+        }
     }
 
     // Drive every bounded public payout continuation to a fixed point. A stable nonzero vault after
@@ -54457,12 +54519,25 @@ fn run_controller_terminal_source_dust_case(
     .unwrap();
     assert_eq!(terminal_group.vault as u64, stable_vault);
 
-    let outcome = TerminalSourceDustOutcome {
+    let backing_remaining = percolator_accounting::read_asset_backing_balances(
+        &svm.get_account(&market_key).unwrap().data,
+        1,
+    )
+    .unwrap()
+    .iter()
+    .map(|balance| balance.principal_atoms + balance.earnings_atoms)
+    .sum();
+    let mut outcome = TerminalSourceDustOutcome {
         attacker_withdrawn: token_amount(&svm, &directional_destination) as u128
             + token_amount(&svm, &dust_long_destination) as u128
             + token_amount(&svm, &dust_short_destination) as u128,
         victim_withdrawn: token_amount(&svm, &victim_destination) as u128,
         vault_remaining: terminal_group.vault,
+        victim_preclose_pnl,
+        victim_initial_receipt_present,
+        backing_remaining,
+        backing_provider_withdrawn: 0,
+        governance_cleanup_received: 0,
     };
 
     if require_full_cleanup {
@@ -54554,7 +54629,46 @@ fn run_controller_terminal_source_dust_case(
             1,
         )
         .unwrap();
-        if backing_balances
+        if external_backing_amount != 0 {
+            assert_eq!(
+                backing_balances[0].principal_atoms + backing_balances[0].earnings_atoms,
+                0,
+                "the full-source fixture must not create value in the opposite domain"
+            );
+            assert_eq!(
+                backing_balances[1].earnings_atoms, 0,
+                "the fee-free source path must not synthesize provider earnings"
+            );
+            let provider_destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &provider_destination,
+                &collateral_mint,
+                &backing_provider.pubkey(),
+                0,
+            );
+            send(
+                &mut svm,
+                &[&payer, &backing_provider],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(backing_provider.pubkey(), true),
+                        AccountMeta::new(market_key, false),
+                        AccountMeta::new(provider_destination, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::WithdrawBackingBucket {
+                        domain: 3,
+                        amount: backing_balances[1].principal_atoms,
+                    },
+                ),
+            )
+            .expect("external provider withdraws all unconsumed terminal backing");
+            outcome.backing_provider_withdrawn =
+                token_amount(&svm, &provider_destination) as u128;
+        } else if backing_balances
             .iter()
             .any(|balance| balance.principal_atoms != 0 || balance.earnings_atoms != 0)
         {
@@ -54600,6 +54714,42 @@ fn run_controller_terminal_source_dust_case(
                 ),
             )
             .expect("unaffiliated cranker returns every terminal controller backing domain");
+        }
+
+        if external_backing_amount != 0 {
+            let terminal_backing = percolator_accounting::read_asset_backing_balances(
+                &svm.get_account(&market_key).unwrap().data,
+                1,
+            )
+            .unwrap();
+            assert!(terminal_backing.iter().all(|balance| {
+                balance.principal_atoms == 0 && balance.earnings_atoms == 0
+            }));
+            assert_eq!(read_asset_insurance_remaining(&svm, &market_key, 1), 0);
+            let (_, stranded_group) = percolator_prog::state::read_market(
+                &svm.get_account(&market_key).unwrap().data,
+            )
+            .unwrap();
+            assert_eq!(stranded_group.c_tot, 0);
+            assert_eq!(stranded_group.insurance, 0);
+            assert_eq!(stranded_group.materialized_portfolio_count, 0);
+            assert_eq!(
+                stranded_group.vault,
+                outcome
+                    .vault_remaining
+                    .checked_sub(outcome.backing_provider_withdrawn)
+                    .unwrap()
+            );
+            assert_eq!(
+                stranded_group.vault,
+                (external_backing_amount as u128)
+                    .checked_sub(outcome.backing_provider_withdrawn)
+                    .unwrap()
+            );
+            assert!(
+                stranded_group.vault > 0,
+                "the probe must reach an accounted terminal residual"
+            );
         }
 
         assert!(
@@ -54649,7 +54799,9 @@ fn run_controller_terminal_source_dust_case(
                 data: vec![5u8],
             },
         )
-        .expect("governance closes the fully drained attacked slab");
+        .expect("governance drains the unattributed terminal residual and closes the slab");
+        outcome.governance_cleanup_received =
+            token_amount(&svm, &governance_destination) as u128;
         assert!(
             svm.get_account(&market_key)
                 .map_or(true, |account| account.lamports == 0),
@@ -54680,12 +54832,14 @@ fn e2e_terminal_source_dust_cannot_erase_independent_controller_market_payout() 
                 false,
                 false,
                 TerminalSourceDustPayoutOrder::VictimFirst,
+                0,
             ),
             run_controller_terminal_source_dust_case(
                 path,
                 true,
                 matches!(path, TerminalSourceDustTradePath::Single),
                 TerminalSourceDustPayoutOrder::VictimFirst,
+                0,
             ),
         )
     });
@@ -54714,9 +54868,40 @@ fn e2e_terminal_source_dust_payout_is_order_independent() {
         true,
         true,
         TerminalSourceDustPayoutOrder::AttackersFirst,
+        0,
     );
 
     assert_eq!(attack.attacker_withdrawn, 20_000_001_999);
     assert_eq!(attack.victim_withdrawn, 20_000_000_000);
     assert!(attack.vault_remaining <= 1);
+}
+
+// PUBLIC LIFECYCLE DOS: one effective source atom is removed from the winner's receipt face but
+// remains in the junior residual. After users and the external backing provider exit, no remaining
+// claim can debit that atom and CloseSlab rejects the nonzero accounted vault.
+#[test]
+fn e2e_terminal_one_effective_source_atom_cannot_strand_protocol_residual() {
+    let outcome = run_controller_terminal_source_dust_case(
+        TerminalSourceDustTradePath::Single,
+        false,
+        true,
+        TerminalSourceDustPayoutOrder::VictimFirst,
+        2,
+    );
+
+    assert!(outcome.victim_preclose_pnl > 0);
+    assert!(
+        outcome.victim_initial_receipt_present,
+        "a partial source payment must preserve the winner's remaining receipt: {outcome:?}"
+    );
+    assert_eq!(outcome.victim_withdrawn, 20_000_000_000);
+    assert_eq!(outcome.attacker_withdrawn, 20_000_002_000);
+    assert_eq!(
+        outcome.backing_provider_withdrawn,
+        outcome.backing_remaining
+    );
+    assert_eq!(
+        outcome.backing_provider_withdrawn + outcome.governance_cleanup_received,
+        2
+    );
 }
