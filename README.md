@@ -218,8 +218,10 @@ slot-only wire remains valid only for predecessor books that are exit-only under
    initial risk takers redeem up to their loss-adjusted principal. If TWAP already holds custody,
    a signing owner can use the fixed atomic live path to return the roles and fully redeem their own
    remaining position without DAO cooperation. After resolution, returning the roles is
-   permissionless while the bound market is empty and the pool still has owner principal. After the
-   bootstrap deadline, any cranker can immediately retire an absent owner's full principal- or
+   permissionless while the bound market is empty and the pool still has owner principal.
+   Owner-signed partial, full, and backing-vault exits bind the live principal, last deposit slot,
+   and monotonic position-action nonce, so a withheld signature cannot consume a replacement balance.
+   After the bootstrap deadline, any cranker can immediately retire an absent owner's full principal- or
    with-surplus-policy position into a clean token account owned by the depositor after a proposal
    seals. If none seals, permissionless returns open after the additional trigger phase described
    above. The first such fallback atomically closes the election, and every return subtracts its exact

@@ -362,6 +362,7 @@ fn withdraw_ix(
     } else {
         data.extend_from_slice(&0u64.to_le_bytes());
     }
+    data.extend_from_slice(&position.data[80..88]); // action nonce
     Instruction {
         program_id: program_id(),
         accounts: vec![

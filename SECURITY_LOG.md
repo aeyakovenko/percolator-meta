@@ -14429,3 +14429,29 @@ remain unconverted so their separate maximum-source compute path is not conflate
 liveness. The fixed SBF checksum is
 `15e43cb3939f365fdc7f5f3e3b4c9a6c0046db4306a48aa226af78da847b396d`. The pin adds no Meta account,
 signer, authority, recipient, CPI, custody, or collateral-moving surface.
+
+## Tick - stale signed partial insurance exit retired replacement capital (surface B, REAL DOS)
+
+Subledger's owner-signed partial insurance withdrawal committed only to its amount. A relayer could
+withhold a five-unit withdrawal signed against ten live Genesis units, let the owner land a distinct
+replacement five-unit withdrawal, and then submit the old transaction after deposits closed. The stale
+authorization consumed the five-unit remainder and permanently retired the one-per-owner position.
+Tokens still returned only to the owner, but the owner irrecoverably lost the replacement position's
+Genesis vote and reward opportunity after admission closed.
+
+Retained clean-room LiteSVM test commit `6378bbe` reproduces the public path against parent `4bfb7ed`
+with one valid blockhash and the real Subledger, Genesis Vote, Distribution, and pinned Percolator SBF
+binaries. The vulnerable Subledger checksum is
+`d42f1eca476d0956d37c15442f0220716276ebb3818ed8a502b7bd8d76f2aea2`; the pinned Percolator checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. A second retained probe restores
+both visible principal and last-deposit slot in one slot, proving those two witnesses alone are
+insufficient.
+
+FIX: active positions reuse their existing withdrawn-amount word as a monotonic action nonce. Every
+deposit, owner withdrawal, and vote-lock transition advances it once; partial, full, own-vault, and
+TWAP-forwarded owner exits commit to principal, last-deposit slot, and nonce. Permissionless terminal
+return still overwrites that word with the immutable principal-at-risk reward snapshot. The fixed
+Subledger and TWAP SBF checksums are
+`ec680da6320be1ff39e8d0de150ec32f2a37fc10265c3c96c3d039d007b7cf6f` and
+`1bbaf170d35a259f3a83dcf98ca4997ae5aca00953890b03491a215c5e78f85d`. No account layout, signer,
+authority, recipient, token path, custody path, or admin surface was added.

@@ -1179,7 +1179,8 @@ fn process_accept_custody<'a>(
 //   subledger_program, owner(signer, optional), position(w, optional),
 //   owner_destination(w, optional), pool_holding(w, optional),
 //   percolator_vault(w, optional), vault_authority(optional), token_program(optional)]
-// data: owner exit = expected_principal(u64) | expected_start_slot(u64);
+// data: owner exit = expected_principal(u64) | expected_start_slot(u64) |
+//   expected_action_nonce(u64);
 //       no-owner governance/resolved return = empty
 //
 // This is the only recovery key transition exposed by the TWAP. It cannot select an
@@ -1243,7 +1244,7 @@ fn process_return_to_subledger(
     };
     let owner_exit_requested = owner_exit.is_some();
     let owner_exit_witness = if owner_exit_requested {
-        if data.len() != 16 {
+        if data.len() != 24 {
             return Err(ProgramError::InvalidInstructionData);
         }
         Some(data)
