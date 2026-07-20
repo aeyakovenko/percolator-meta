@@ -53880,3 +53880,613 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     );
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
+
+#[derive(Clone, Copy, Debug)]
+enum TerminalSourceDustTradePath {
+    Single,
+    Batch,
+}
+
+#[derive(Debug)]
+struct TerminalSourceDustOutcome {
+    attacker_withdrawn: u128,
+    victim_withdrawn: u128,
+    vault_remaining: u128,
+}
+
+fn run_controller_terminal_source_dust_case(
+    path: TerminalSourceDustTradePath,
+    with_dust_round_trip: bool,
+) -> TerminalSourceDustOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const BASIS: u64 = 10_000_000;
+    const DIRECTIONAL_Q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    const DIRECTIONAL_DEPOSIT: u64 = 20_000_000_000;
+    const DUST_DEPOSIT: u64 = 1_000;
+    const ASSET_INDEX: u16 = 1;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let honest_oracle = Keypair::new();
+    for signer in [&payer, &governance, &honest_oracle] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    let set_slot = |svm: &mut LiteSVM, slot: u64| {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+    };
+    set_slot(&mut svm, 1);
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_key = market.pubkey();
+    let initial_market_len =
+        percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let expanded_market_len =
+        percolator_prog::state::market_account_len_for_capacity(2).unwrap();
+    let expanded_market_rent = svm.minimum_balance_for_rent_exemption(expanded_market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_key,
+            expanded_market_rent,
+            initial_market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public caller allocates the market slab");
+
+    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(
+        &PIx::InitMarket {
+            max_portfolio_assets: 1,
+            h_min: 0,
+            h_max: 10,
+            initial_price: BASIS,
+            min_nonzero_mm_req: 1,
+            min_nonzero_im_req: 2,
+            maintenance_margin_bps: 10_000,
+            initial_margin_bps: 10_000,
+            max_trading_fee_bps: 10_000,
+            trade_fee_base_bps: 0,
+            liquidation_fee_bps: 0,
+            liquidation_fee_cap: 0,
+            min_liquidation_abs: 0,
+            max_price_move_bps_per_slot: 5_000,
+            max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 1,
+            max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1,
+            max_bankrupt_close_lifetime_slots: 100,
+            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+            maintenance_fee_per_slot: 0,
+        }
+        .encode(),
+    );
+    send(
+        &mut svm,
+        &[&payer, &market],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market_key, &perc_id()),
+                    false,
+                ),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller market initialization");
+
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let generation_zero_witness =
+        market_controller_program::asset_generation_witness_address(&market_key, 1, 0).0;
+    let mut activate = vec![0u8]; // controller IX_PROXY_ADMIN
+    activate.extend_from_slice(
+        &PIx::UpdateAssetLifecycle {
+            action: 0,
+            asset_index: ASSET_INDEX,
+            now_slot: 1,
+            initial_price: BASIS,
+            insurance_authority: controller.to_bytes(),
+            insurance_operator: controller.to_bytes(),
+            backing_bucket_authority: controller.to_bytes(),
+            oracle_authority: honest_oracle.pubkey().to_bytes(),
+        }
+        .encode(),
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(generation_zero_witness, false),
+            ],
+            data: activate,
+        },
+    )
+    .expect("governance activates a controller-backed asset with an independent oracle");
+    send(
+        &mut svm,
+        &[&payer, &honest_oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(honest_oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigureEwmaMark {
+                asset_index: ASSET_INDEX,
+                now_slot: 1,
+                initial_mark_e6: BASIS,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            },
+        ),
+    )
+    .expect("independent oracle configures the bounded EWMA");
+
+    let victim = Keypair::new();
+    let directional_counterparty = Keypair::new();
+    let dust_long = Keypair::new();
+    let dust_short = Keypair::new();
+    let victim_portfolio = Keypair::new();
+    let directional_counterparty_portfolio = Keypair::new();
+    let dust_long_portfolio = Keypair::new();
+    let dust_short_portfolio = Keypair::new();
+    let actors = [
+        (&victim, &victim_portfolio, DIRECTIONAL_DEPOSIT),
+        (
+            &directional_counterparty,
+            &directional_counterparty_portfolio,
+            DIRECTIONAL_DEPOSIT,
+        ),
+        (&dust_long, &dust_long_portfolio, DUST_DEPOSIT),
+        (&dust_short, &dust_short_portfolio, DUST_DEPOSIT),
+    ];
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio, deposit) in actors {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public trader allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public trader initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            deposit,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: deposit as u128,
+                },
+            ),
+        )
+        .expect("public trader deposits collateral");
+    }
+
+    let trade = |svm: &mut LiteSVM,
+                 path: TerminalSourceDustTradePath,
+                 owner_a: &Keypair,
+                 portfolio_a: Pubkey,
+                 owner_b: &Keypair,
+                 portfolio_b: Pubkey,
+                 size_q: i128,
+                 exec_price: u64| {
+        let accounts = vec![
+            AccountMeta::new(owner_a.pubkey(), true),
+            AccountMeta::new(owner_b.pubkey(), true),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new(portfolio_a, false),
+            AccountMeta::new(portfolio_b, false),
+        ];
+        let ix = match path {
+            TerminalSourceDustTradePath::Single => pix(
+                accounts,
+                PIx::TradeNoCpi {
+                    asset_index: ASSET_INDEX,
+                    size_q,
+                    exec_price,
+                    fee_bps: 0,
+                },
+            ),
+            TerminalSourceDustTradePath::Batch => pix(
+                accounts,
+                PIx::BatchTradeNoCpi {
+                    legs: vec![percolator_prog::ix::BatchTradeLeg {
+                        asset_index: ASSET_INDEX,
+                        size_q,
+                        exec_price,
+                        fee_bps: 0,
+                    }],
+                },
+            ),
+        };
+        send(svm, &[&payer, owner_a, owner_b], ix)
+    };
+    trade(
+        &mut svm,
+        TerminalSourceDustTradePath::Single,
+        &victim,
+        victim_portfolio.pubkey(),
+        &directional_counterparty,
+        directional_counterparty_portfolio.pubkey(),
+        DIRECTIONAL_Q,
+        BASIS,
+    )
+    .expect("directional users open at the initial mark");
+
+    let push_mark = |svm: &mut LiteSVM, slot: u64, mark_e6: u64| {
+        send(
+            svm,
+            &[&payer, &honest_oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(honest_oracle.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                ],
+                PIx::PushEwmaMark {
+                    asset_index: ASSET_INDEX,
+                    now_slot: slot,
+                    mark_e6,
+                },
+            ),
+        )
+    };
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: ASSET_INDEX,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+    let crank_directional = |svm: &mut LiteSVM, slot: u64| {
+        crank(svm, victim_portfolio.pubkey(), slot)?;
+        crank(svm, directional_counterparty_portfolio.pubkey(), slot)
+    };
+    let effective_price = |svm: &LiteSVM| {
+        percolator_prog::state::read_market(&svm.get_account(&market_key).unwrap().data)
+            .unwrap()
+            .1
+            .assets[ASSET_INDEX as usize]
+            .effective_price
+    };
+
+    for slot in 2..=5 {
+        set_slot(&mut svm, slot);
+        push_mark(&mut svm, slot, 1).expect("honest oracle drives the bounded adverse segment");
+        crank_directional(&mut svm, slot).expect("public cranks settle the adverse segment");
+    }
+    let low_price = effective_price(&svm);
+    assert!(
+        low_price < BASIS / 5,
+        "the bounded oracle path reaches the low-rate source-credit regime"
+    );
+
+    if with_dust_round_trip {
+        trade(
+            &mut svm,
+            path,
+            &dust_long,
+            dust_long_portfolio.pubkey(),
+            &dust_short,
+            dust_short_portfolio.pubkey(),
+            1,
+            low_price,
+        )
+        .expect("public dust pair opens one raw position quantum");
+    }
+
+    set_slot(&mut svm, 6);
+    crank_directional(&mut svm, 6).expect("public cranks commit the low-price segment");
+    let rebound_input = BASIS.checked_mul(2).unwrap().checked_sub(low_price).unwrap();
+    push_mark(&mut svm, 6, rebound_input).expect("honest oracle starts the bounded rebound");
+    let rebound_profile = percolator_prog::state::read_asset_oracle_profile(
+        &svm.get_account(&market_key).unwrap().data,
+        ASSET_INDEX as usize,
+    )
+    .unwrap();
+    assert_eq!(rebound_profile.mark_ewma_e6, BASIS);
+
+    let mut rebound_slot = 7u64;
+    loop {
+        set_slot(&mut svm, rebound_slot);
+        crank_directional(&mut svm, rebound_slot)
+            .expect("public cranks converge to the honest rebound target");
+        if effective_price(&svm) == BASIS {
+            break;
+        }
+        rebound_slot += 1;
+        assert!(rebound_slot < 24, "bounded target convergence must finish");
+    }
+
+    if with_dust_round_trip {
+        trade(
+            &mut svm,
+            path,
+            &dust_long,
+            dust_long_portfolio.pubkey(),
+            &dust_short,
+            dust_short_portfolio.pubkey(),
+            -1,
+            BASIS,
+        )
+        .expect("public dust pair closes at the recovered mark");
+    }
+    trade(
+        &mut svm,
+        TerminalSourceDustTradePath::Single,
+        &victim,
+        victim_portfolio.pubkey(),
+        &directional_counterparty,
+        directional_counterparty_portfolio.pubkey(),
+        -DIRECTIONAL_Q,
+        BASIS,
+    )
+    .expect("directional users complete an honest round trip");
+
+    let mut resolve_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+    let resolve_witness = controller_market_generation_witness(&svm, &market_key);
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(resolve_witness, false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves through the constrained controller");
+
+    let victim_destination = Pubkey::new_unique();
+    let directional_destination = Pubkey::new_unique();
+    let dust_long_destination = Pubkey::new_unique();
+    let dust_short_destination = Pubkey::new_unique();
+    let payouts = [
+        (
+            victim.pubkey(),
+            victim_portfolio.pubkey(),
+            victim_destination,
+        ),
+        (
+            directional_counterparty.pubkey(),
+            directional_counterparty_portfolio.pubkey(),
+            directional_destination,
+        ),
+        (
+            dust_long.pubkey(),
+            dust_long_portfolio.pubkey(),
+            dust_long_destination,
+        ),
+        (
+            dust_short.pubkey(),
+            dust_short_portfolio.pubkey(),
+            dust_short_destination,
+        ),
+    ];
+    for (owner, _, destination) in payouts {
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &owner,
+            0,
+        );
+    }
+
+    let payout_ix = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey, topup: bool| {
+        pix(
+            vec![
+                AccountMeta::new_readonly(owner, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            if topup {
+                PIx::ClaimResolvedPayoutTopup
+            } else {
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                }
+            },
+        )
+    };
+    for (owner, portfolio, destination) in payouts {
+        send(
+            &mut svm,
+            &[&payer],
+            payout_ix(owner, portfolio, destination, false),
+        )
+        .expect("unaffiliated caller starts each resolved payout");
+    }
+
+    // Drive every bounded public payout continuation to a fixed point. A stable nonzero vault after
+    // this pass has no remaining receipt capable of claiming it.
+    for _ in 0..16 {
+        let before = token_amount(&svm, &percolator_vault);
+        for (owner, portfolio, destination) in payouts {
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                payout_ix(owner, portfolio, destination, false),
+            );
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                payout_ix(owner, portfolio, destination, true),
+            );
+        }
+        if token_amount(&svm, &percolator_vault) == before {
+            break;
+        }
+    }
+    let stable_vault = token_amount(&svm, &percolator_vault);
+    for (owner, portfolio, destination) in payouts {
+        let before = token_amount(&svm, &destination);
+        let _ = send(
+            &mut svm,
+            &[&payer],
+            payout_ix(owner, portfolio, destination, false),
+        );
+        let _ = send(
+            &mut svm,
+            &[&payer],
+            payout_ix(owner, portfolio, destination, true),
+        );
+        assert_eq!(
+            token_amount(&svm, &destination),
+            before,
+            "both public payout routes are exhausted at the fixed point"
+        );
+    }
+    let (_, terminal_group) = percolator_prog::state::read_market(
+        &svm.get_account(&market_key).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(terminal_group.vault as u64, stable_vault);
+
+    TerminalSourceDustOutcome {
+        attacker_withdrawn: token_amount(&svm, &directional_destination) as u128
+            + token_amount(&svm, &dust_long_destination) as u128
+            + token_amount(&svm, &dust_short_destination) as u128,
+        victim_withdrawn: token_amount(&svm, &victim_destination) as u128,
+        vault_remaining: terminal_group.vault,
+    }
+}
+
+// PUBLIC LIFECYCLE LoF REGRESSION: an attacker-controlled one-quantum round trip must not use a
+// nearly-zero source-credit rate to erase an unrelated round-trip depositor's terminal receipt.
+// The attacker neither controls the oracle nor resolution, and all settlement calls are public.
+#[test]
+fn e2e_terminal_source_dust_cannot_erase_independent_controller_market_payout() {
+    const ATTACKER_DEPOSITS: u128 = 20_000_002_000;
+    const VICTIM_DEPOSIT: u128 = 20_000_000_000;
+
+    let outcomes = [
+        TerminalSourceDustTradePath::Single,
+        TerminalSourceDustTradePath::Batch,
+    ]
+    .map(|path| {
+        (
+            path,
+            run_controller_terminal_source_dust_case(path, false),
+            run_controller_terminal_source_dust_case(path, true),
+        )
+    });
+    for (path, control, attack) in &outcomes {
+        assert_eq!(control.attacker_withdrawn, ATTACKER_DEPOSITS);
+        assert_eq!(control.victim_withdrawn, VICTIM_DEPOSIT);
+        assert_eq!(control.vault_remaining, 0);
+        assert_eq!(
+            attack.attacker_withdrawn + 1,
+            ATTACKER_DEPOSITS,
+            "{path:?}: the attacker must pay for the one-atom source loss"
+        );
+    }
+    assert!(
+        outcomes.iter().all(|(_, _, attack)| {
+            attack.victim_withdrawn == VICTIM_DEPOSIT && attack.vault_remaining <= 1
+        }),
+        "one atom of attacker loss erased an independent terminal payout or left value without a live claim: {outcomes:?}"
+    );
+}
