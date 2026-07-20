@@ -14718,6 +14718,29 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         &controller,
         0,
     );
+    let transit_dust = 7u64;
+    let dust_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &dust_source,
+        &collateral_mint,
+        &payer.pubkey(),
+        transit_dust,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &dust_source,
+            &clean_controller_transit,
+            &payer.pubkey(),
+            &[],
+            transit_dust,
+        )
+        .unwrap(),
+    )
+    .expect("an unaffiliated account can dust the public return transit");
     assert!(
         send(
             &mut svm,
@@ -14814,20 +14837,13 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
     assert_eq!(token_amount(&svm, &provider_destination), 0);
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
-    assert!(
-        svm.get_account(&clean_controller_transit)
-            .map_or(true, |account| account.lamports == 0),
-        "fallback controller transit closes after the terminal return"
+    assert_eq!(
+        token_amount(&svm, &clean_controller_transit),
+        transit_dust,
+        "the provider receives only slab-attributed backing, never unsolicited transit value"
     );
 
-    let close_transit = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &close_transit,
-        &collateral_mint,
-        &controller,
-        0,
-    );
+    let close_transit = clean_controller_transit;
     let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
@@ -14887,6 +14903,16 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         close_market(close_transit),
     )
     .expect("the recovered backing and frozen canonical transit no longer block real CloseSlab");
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
+        transit_dust,
+        "terminal reclaim forwards only the unattributed transit remainder to governance"
+    );
+    assert!(
+        svm.get_account(&close_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "the dusted return transit closes during terminal reclaim"
+    );
     assert!(
         svm.get_account(&slab)
             .map_or(true, |account| account.lamports == 0),
