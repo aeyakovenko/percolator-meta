@@ -94,6 +94,9 @@ const OWN_VAULT_BOOTSTRAP_DELAY_SLOTS: u64 = 0;
 pub const POS_POOL_OFF: usize = 8;
 pub const POS_OWNER_OFF: usize = 40;
 pub const POS_PRINCIPAL_OFF: usize = 72;
+// Active positions use this field as an action nonce. A permissionless terminal
+// return overwrites it with the principal-at-risk reward snapshot.
+pub const POS_ACTION_NONCE_OFF: usize = 80;
 pub const POS_WITHDRAWN_AMOUNT_OFF: usize = 80;
 pub const POS_WITHDRAWN_OFF: usize = 88;
 pub const POS_START_SLOT_OFF: usize = 89;
@@ -199,8 +202,9 @@ const IX_ASSERT_PRINCIPAL: u8 = 11;
 // retires the complete position and can pay only a clean token account owned by
 // that depositor.
 const IX_RETURN_FINALIZED_POSITION: u8 = 12;
-// Owner-signed full exit, committed to the position's principal and last deposit
-// slot. TWAP forwards the same signed witness after returning established custody.
+// Owner-signed full exit, committed to the position's principal, last deposit
+// slot, and action nonce. TWAP forwards the same signed witness after returning
+// established custody.
 const IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 
 // Percolator CPI tags (verified against the pinned v16 program, percolator-prog 7eea209).
@@ -622,6 +626,8 @@ struct Position {
     /// Live principal (current deposit, less any withdrawal). Genesis reads this
     /// directly: one principal base unit contributes one vote.
     principal: u64,
+    /// Monotonic action nonce while the position is active. A permissionless
+    /// terminal return reuses it for the principal-at-risk reward snapshot.
     withdrawn_amount: u64,
     withdrawn: bool,
     /// Last-write-time of this position (set on deposit). Topping up resets it so
@@ -1660,6 +1666,7 @@ fn process_deposit(
     // Last-write-time: topping up resets the vote clock, so late additions don't
     // earn early-join weight.
     position.start_slot = Clock::get()?.slot;
+    advance_position_nonce(&mut position);
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
@@ -1667,7 +1674,7 @@ fn process_deposit(
 }
 
 // withdraw accounts: [owner(s,w), pool(w), position(w), owner_ata(w), vault(w), token_program]
-// data: expected_principal(u64) | expected_start_slot(u64)
+// data: expected_principal(u64) | expected_start_slot(u64) | expected_action_nonce(u64)
 fn process_withdraw(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1699,7 +1706,7 @@ fn process_withdraw(
     if pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
     }
-    require_full_exit_snapshot(data, &position)?;
+    require_position_snapshot(data, &position)?;
 
     // Match the exact historical PDA schema implied by this deployed account.
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
@@ -1792,7 +1799,7 @@ fn process_withdraw(
     )?;
     position.shares = 0;
     position.withdrawn = true;
-    position.withdrawn_amount = paid;
+    advance_position_nonce(&mut position);
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
@@ -2270,6 +2277,7 @@ fn process_insurance_deposit(
         .ok_or(ProgramError::ArithmeticOverflow)?;
     // Last-write-time: topping up resets the vote clock.
     position.start_slot = Clock::get()?.slot;
+    advance_position_nonce(&mut position);
 
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
@@ -2279,7 +2287,8 @@ fn process_insurance_deposit(
 // insurance_withdraw accounts: [owner(s,w), pool(w), position(w), owner_ata(w),
 //   holding(w, pool-PDA-owned token acct), market_slab(w), percolator_vault(w),
 //   vault_authority, percolator_program, token_program]
-// data: amount (u64)
+// data: amount(u64) | expected_principal(u64) | expected_start_slot(u64) |
+//   expected_action_nonce(u64)
 //
 // Owner-bound, principal-only exit: `amount <= position.principal`. The pool PDA
 // (asset-0 insurance operator) signs WithdrawInsuranceAsset (tag 57). NOTE: the
@@ -2292,13 +2301,23 @@ fn process_insurance_withdraw(
     accounts: &[AccountInfo],
     data: &mut &[u8],
 ) -> ProgramResult {
-    process_insurance_withdraw_impl(program_id, accounts, data, false)
+    let position_account = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    if position_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    let amount = read_u64(data)?;
+    require_position_snapshot(data, &position)?;
+    let amount_bytes = amount.to_le_bytes();
+    let mut amount_data: &[u8] = &amount_bytes;
+    process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
 }
 
 // insurance_withdraw_full has the same accounts as insurance_withdraw. Data is
-// expected_principal(u64) | expected_start_slot(u64), binding the owner signature
-// to the exact deposit incarnation it removes. All owner, destination, pool,
-// market, and payout checks stay centralized in the ordinary withdrawal implementation.
+// expected_principal(u64) | expected_start_slot(u64) | expected_action_nonce(u64),
+// binding the owner signature to the exact position incarnation it removes. All
+// owner, destination, pool, market, and payout checks stay centralized in the
+// ordinary withdrawal implementation.
 fn process_insurance_withdraw_full(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2309,23 +2328,33 @@ fn process_insurance_withdraw_full(
         return Err(ProgramError::IllegalOwner);
     }
     let position = Position::deserialize(&position_account.try_borrow_data()?)?;
-    require_full_exit_snapshot(data, &position)?;
+    require_position_snapshot(data, &position)?;
     let principal = position.principal;
     let amount_bytes = principal.to_le_bytes();
     let mut amount_data: &[u8] = &amount_bytes;
     process_insurance_withdraw_impl(program_id, accounts, &mut amount_data, false)
 }
 
-fn require_full_exit_snapshot(data: &mut &[u8], position: &Position) -> ProgramResult {
+fn require_position_snapshot(data: &mut &[u8], position: &Position) -> ProgramResult {
     let expected_principal = read_u64(data)?;
     let expected_start_slot = read_u64(data)?;
+    let expected_action_nonce = read_u64(data)?;
     if !data.is_empty()
         || expected_principal != position.principal
         || expected_start_slot != position.start_slot
+        || expected_action_nonce != position.withdrawn_amount
     {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(())
+}
+
+fn advance_position_nonce(position: &mut Position) {
+    // Historical binaries stored cumulative payout telemetry here and could
+    // saturate it after a bounded number of large withdrawal cycles. Wrapping
+    // preserves upgrade liveness; repeating a nonce within one valid signature
+    // lifetime would require 2^64 successful position mutations.
+    position.withdrawn_amount = position.withdrawn_amount.wrapping_add(1);
 }
 
 // return_finalized_position accounts: [owner, pool(w), position(w), owner_ata(w),
@@ -2796,11 +2825,11 @@ fn process_insurance_withdraw_impl(
     // u64 even though every individual balance and principal remains valid. A
     // permissionless terminal return instead records the remaining principal at
     // risk, preserving a frozen reward cap without restoring earlier withdrawals.
-    position.withdrawn_amount = if terminal {
-        amount
+    if terminal {
+        position.withdrawn_amount = amount;
     } else {
-        position.withdrawn_amount.saturating_add(owed)
-    };
+        advance_position_nonce(&mut position);
+    }
     if position.principal == 0 {
         position.withdrawn = true;
         if terminal {
@@ -2874,6 +2903,7 @@ fn process_set_vote_lock(
         return Err(ProgramError::InvalidAccountData);
     }
     position.vote_locked = locked == 1;
+    advance_position_nonce(&mut position);
     position.serialize(&mut position_account.try_borrow_mut_data()?)?;
     Ok(())
 }

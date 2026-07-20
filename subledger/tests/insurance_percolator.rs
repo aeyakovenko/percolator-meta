@@ -420,8 +420,13 @@ impl Env {
         signer: &Keypair,
         amount: u64,
     ) -> Result<(), String> {
+        let (expected_principal, expected_start_slot, _) = self.read_position(&owner.pubkey());
+        let expected_action_nonce = self.position_action_nonce(&owner.pubkey());
         let mut data = vec![5u8]; // IX_INSURANCE_WITHDRAW
         data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&expected_principal.to_le_bytes());
+        data.extend_from_slice(&expected_start_slot.to_le_bytes());
+        data.extend_from_slice(&expected_action_nonce.to_le_bytes());
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -452,6 +457,11 @@ impl Env {
     fn position_shares(&self, owner: &Pubkey) -> u128 {
         let acc = self.svm.get_account(&self.position_pda(owner)).unwrap();
         u128::from_le_bytes(acc.data[104..120].try_into().unwrap())
+    }
+
+    fn position_action_nonce(&self, owner: &Pubkey) -> u64 {
+        let acc = self.svm.get_account(&self.position_pda(owner)).unwrap();
+        u64::from_le_bytes(acc.data[80..88].try_into().unwrap())
     }
 
     fn position_share_generation(&self, owner: &Pubkey) -> u64 {
@@ -1877,9 +1887,11 @@ fn pre_share_insurance_pool_attests_live_principal_and_preserves_owner_exit() {
 
     let legacy_holding = create_holding(&mut env, &legacy_pool);
     let historical_snapshot = env.read_position(&alice.pubkey());
+    let historical_action_nonce = env.position_action_nonce(&alice.pubkey());
     let mut full_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
     full_exit_data.extend_from_slice(&historical_snapshot.0.to_le_bytes());
     full_exit_data.extend_from_slice(&historical_snapshot.1.to_le_bytes());
+    full_exit_data.extend_from_slice(&historical_action_nonce.to_le_bytes());
     let exit_accounts = vec![
         AccountMeta::new(alice.pubkey(), true),
         AccountMeta::new(legacy_pool, false),
@@ -4148,7 +4160,12 @@ fn foreign_market_slab_cannot_inflate_the_haircut() {
     }).unwrap();
 
     // ATTACK: withdraw with market_slab pointing at the HEALTHY foreign market to read its 2M basis.
-    let mut d = vec![5u8]; d.extend_from_slice(&amount.to_le_bytes());
+    let (expected_principal, expected_start_slot, _) = env.read_position(&alice.pubkey());
+    let mut d = vec![5u8];
+    d.extend_from_slice(&amount.to_le_bytes());
+    d.extend_from_slice(&expected_principal.to_le_bytes());
+    d.extend_from_slice(&expected_start_slot.to_le_bytes());
+    d.extend_from_slice(&env.position_action_nonce(&alice.pubkey()).to_le_bytes());
     let attack = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -5020,6 +5037,8 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
         .expect("bob deposits the principal covered by the incarnation signature");
     let alice_snapshot = env.read_position(&alice.pubkey());
     let bob_snapshot = env.read_position(&bob.pubkey());
+    let alice_action_nonce = env.position_action_nonce(&alice.pubkey());
+    let bob_action_nonce = env.position_action_nonce(&bob.pubkey());
     assert_eq!(alice_snapshot, (1, start, false));
     assert_eq!(bob_snapshot, (5, start, false));
 
@@ -5056,6 +5075,7 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     let mut alice_exact_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
     alice_exact_exit_data.extend_from_slice(&alice_snapshot.0.to_le_bytes());
     alice_exact_exit_data.extend_from_slice(&alice_snapshot.1.to_le_bytes());
+    alice_exact_exit_data.extend_from_slice(&alice_action_nonce.to_le_bytes());
     let withheld_alice_exact_exit = Transaction::new_signed_with_payer(
         &[
             ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
@@ -5073,6 +5093,7 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     let mut bob_exact_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
     bob_exact_exit_data.extend_from_slice(&bob_snapshot.0.to_le_bytes());
     bob_exact_exit_data.extend_from_slice(&bob_snapshot.1.to_le_bytes());
+    bob_exact_exit_data.extend_from_slice(&bob_action_nonce.to_le_bytes());
     let withheld_bob_exact_exit = Transaction::new_signed_with_payer(
         &[
             ComputeBudgetInstruction::set_compute_unit_limit(1_399_997),
@@ -5130,6 +5151,9 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
 
     let mut bob_withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
     bob_withdraw_data.extend_from_slice(&1u64.to_le_bytes());
+    bob_withdraw_data.extend_from_slice(&bob_snapshot.0.to_le_bytes());
+    bob_withdraw_data.extend_from_slice(&bob_snapshot.1.to_le_bytes());
+    bob_withdraw_data.extend_from_slice(&bob_action_nonce.to_le_bytes());
     let bob_withdraw = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -5232,6 +5256,217 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     gv_vote(&mut env, &ve, &bob, &gv_proposal, 1)
         .expect("the same-principal redepositor retains the Genesis vote opportunity");
     assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
+}
+
+// STALE PARTIAL-EXIT REPLAY: an amount-only withdrawal signed against ten units
+// must not consume the five-unit remainder after a replacement withdrawal lands.
+// Otherwise a relayer can turn one authorized partial exit into a terminal exit
+// after deposits close, permanently deleting the owner's Genesis participation.
+#[test]
+fn presigned_partial_withdraw_cannot_retire_the_remainder_after_deposits_close() {
+    let start = 100u64;
+    let deposit_window = 10u64;
+    let bootstrap_delay = 100u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        deposit_window,
+        start,
+        bootstrap_delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(deposit_window),
+        Some(start),
+    );
+    let ve = setup_vote(&mut env);
+    let (_, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 10)
+        .expect("alice deposits ten vote units");
+    let initial_snapshot = env.read_position(&alice.pubkey());
+    let initial_action_nonce = env.position_action_nonce(&alice.pubkey());
+    assert_eq!(initial_snapshot, (10, start, false));
+
+    env.warp_slot(start + deposit_window - 1);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let accounts = vec![
+        AccountMeta::new(alice.pubkey(), true),
+        AccountMeta::new(env.pool, false),
+        AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+        AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    withdraw_data.extend_from_slice(&5u64.to_le_bytes());
+    withdraw_data.extend_from_slice(&initial_snapshot.0.to_le_bytes());
+    withdraw_data.extend_from_slice(&initial_snapshot.1.to_le_bytes());
+    withdraw_data.extend_from_slice(&initial_action_nonce.to_le_bytes());
+    let withheld = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            Instruction {
+                program_id: sub_id(),
+                accounts: accounts.clone(),
+                data: withdraw_data.clone(),
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let replacement = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            Instruction {
+                program_id: sub_id(),
+                accounts,
+                data: withdraw_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    env.svm
+        .send_transaction(replacement)
+        .expect("the replacement five-unit withdrawal lands");
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.token_amount(&alice_ata), 5);
+
+    env.warp_slot(start + deposit_window);
+    let stale_result = env.svm.send_transaction(withheld);
+    if stale_result.is_ok() {
+        assert_eq!(env.read_position(&alice.pubkey()), (0, start, true));
+        assert_eq!(env.token_amount(&alice_ata), 10);
+        assert!(
+            gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+            "the stale partial exit permanently removes the post-cutoff vote",
+        );
+        panic!("one partial-withdraw authorization retired the replacement remainder");
+    }
+
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.token_amount(&alice_ata), 5);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("rejecting the stale withdrawal preserves five vote units");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+}
+
+#[test]
+fn same_slot_round_trip_cannot_restore_a_stale_withdrawal_snapshot() {
+    let start = 100u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        10,
+        start,
+        100,
+    );
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(10), Some(start));
+    let (alice, alice_ata) = new_depositor(&mut env, 20);
+    let pool = env.pool;
+    let position = env.position_pda(&alice.pubkey());
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 10)
+        .expect("initial same-slot deposit");
+    let initial_snapshot = env.read_position(&alice.pubkey());
+    let initial_action_nonce = env.position_action_nonce(&alice.pubkey());
+    assert_eq!(initial_snapshot, (10, start, false));
+
+    let withdraw_accounts = vec![
+        AccountMeta::new(alice.pubkey(), true),
+        AccountMeta::new(pool, false),
+        AccountMeta::new(position, false),
+        AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    withdraw_data.extend_from_slice(&5u64.to_le_bytes());
+    withdraw_data.extend_from_slice(&initial_snapshot.0.to_le_bytes());
+    withdraw_data.extend_from_slice(&initial_snapshot.1.to_le_bytes());
+    withdraw_data.extend_from_slice(&initial_action_nonce.to_le_bytes());
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let withheld = Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: sub_id(),
+            accounts: withdraw_accounts.clone(),
+            data: withdraw_data.clone(),
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    let mut redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    redeposit_data.extend_from_slice(&5u64.to_le_bytes());
+    let redeposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: redeposit_data,
+    };
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                Instruction {
+                    program_id: sub_id(),
+                    accounts: withdraw_accounts,
+                    data: withdraw_data,
+                },
+                redeposit,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("same-slot withdraw and redeposit restores the visible balance");
+    assert_eq!(
+        env.read_position(&alice.pubkey()),
+        initial_snapshot,
+        "principal and deposit slot alone repeat after the round trip",
+    );
+    assert_eq!(
+        env.position_action_nonce(&alice.pubkey()),
+        initial_action_nonce + 2,
+    );
+    assert!(
+        env.svm.send_transaction(withheld).is_err(),
+        "the action nonce invalidates the otherwise identical stale snapshot",
+    );
+
+    env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 5)
+        .expect("a fresh nonce-bound partial withdrawal remains live");
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.token_amount(&alice_ata), 15);
 }
 
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
@@ -5676,6 +5911,7 @@ fn vote_locked_insurance_position_cannot_be_drained_via_own_vault_withdraw() {
     let mut tag2_data = vec![2u8];
     tag2_data.extend_from_slice(&snapshot_principal.to_le_bytes());
     tag2_data.extend_from_slice(&snapshot_start.to_le_bytes());
+    tag2_data.extend_from_slice(&env.position_action_nonce(&alice.pubkey()).to_le_bytes());
     let tag2 = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -6029,7 +6265,13 @@ fn veto_exit_retract_and_withdraw_in_one_atomic_tx() {
 
     // THE VETO-EXIT: retract + withdraw in ONE transaction.
     let retract_ix = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2);
-    let mut wdata = vec![5u8]; wdata.extend_from_slice(&amount.to_le_bytes());
+    let (expected_principal, expected_start_slot, _) = env.read_position(&alice.pubkey());
+    let expected_action_nonce = env.position_action_nonce(&alice.pubkey()).wrapping_add(1);
+    let mut wdata = vec![5u8];
+    wdata.extend_from_slice(&amount.to_le_bytes());
+    wdata.extend_from_slice(&expected_principal.to_le_bytes());
+    wdata.extend_from_slice(&expected_start_slot.to_le_bytes());
+    wdata.extend_from_slice(&expected_action_nonce.to_le_bytes());
     let withdraw_ix = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -7269,6 +7511,7 @@ fn own_vault_withdraw_is_rejected_on_an_insurance_pool() {
     let mut attack_data = vec![2u8]; // IX_WITHDRAW (own-vault)
     attack_data.extend_from_slice(&snapshot_principal.to_le_bytes());
     attack_data.extend_from_slice(&snapshot_start.to_le_bytes());
+    attack_data.extend_from_slice(&env.position_action_nonce(&alice.pubkey()).to_le_bytes());
     let attack = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -7312,11 +7555,12 @@ fn top_up_resets_the_position_start_slot() {
     assert!(start1 > start0, "late capital does not inherit earlier reward tenure");
 }
 
-// LIVENESS BOUNDARY: withdrawn_amount is historical telemetry, not a custody
-// limit. Repeated valid partial exits can saturate it while principal remains.
-// Its representational ceiling must not permanently block that principal exit.
+// LIVENESS BOUNDARY: large withdrawal amounts must advance the position nonce
+// once per state change, not consume nonce space proportional to value. The same
+// bounded recycling sequence that saturated historical payout telemetry must
+// leave the nonce far from its representational ceiling and preserve final exit.
 #[test]
-fn withdrawn_amount_counter_saturation_cannot_trap_remaining_insurance_principal() {
+fn large_cumulative_withdrawals_cannot_exhaust_the_position_action_nonce() {
     let mut env = Env::new();
     env.init_insurance_pool();
     let live_limit = u64::try_from(percolator::MAX_VAULT_TVL).unwrap();
@@ -7346,8 +7590,16 @@ fn withdrawn_amount_counter_saturation_cannot_trap_remaining_insurance_principal
             .expect("counter reaches u64::MAX");
     }
 
+    let expected_nonce_before_final = full_cycles
+        .checked_mul(2)
+        .and_then(|nonce| nonce.checked_add(u64::from(remainder > 0) * 2))
+        .unwrap();
     let position = env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap();
-    assert_eq!(u64::from_le_bytes(position.data[80..88].try_into().unwrap()), u64::MAX);
+    assert_eq!(
+        u64::from_le_bytes(position.data[80..88].try_into().unwrap()),
+        expected_nonce_before_final,
+        "withdrawal value cannot accelerate nonce exhaustion",
+    );
     assert_eq!(env.read_position(&alice.pubkey()).0, 1);
     assert_eq!(env.pool_outstanding(), 1);
     assert_eq!(env.token_amount(&env.perc_vault), 1);
@@ -7361,8 +7613,8 @@ fn withdrawn_amount_counter_saturation_cannot_trap_remaining_insurance_principal
     let position = env.svm.get_account(&env.position_pda(&alice.pubkey())).unwrap();
     assert_eq!(
         u64::from_le_bytes(position.data[80..88].try_into().unwrap()),
-        u64::MAX,
-        "historical telemetry remains saturated instead of wrapping"
+        expected_nonce_before_final + 1,
+        "the final exit advances the nonce exactly once"
     );
     assert_eq!(env.pool_outstanding(), 0);
     assert_eq!(env.token_amount(&env.perc_vault), 0);
