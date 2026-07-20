@@ -3792,6 +3792,18 @@ fn perc_so() -> String {
     pinned
 }
 
+fn auth_matcher_so() -> String {
+    let fixture = format!(
+        "{}/tests/fixtures/auth_matcher/target/deploy/auth_matcher.so",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    assert!(
+        std::path::Path::new(&fixture).exists(),
+        "missing matcher fixture SBF at {fixture}; run `cargo build-sbf --manifest-path twap-program/tests/fixtures/auth_matcher/Cargo.toml -- --locked`"
+    );
+    fixture
+}
+
 fn controller_init_market_data(max_assets: u16) -> Vec<u8> {
     controller_init_market_data_with_maintenance(max_assets, 0)
 }
@@ -54804,4 +54816,631 @@ fn e2e_terminal_source_dust_payout_is_order_independent() {
     assert_eq!(attack.attacker_withdrawn, 20_000_001_999);
     assert_eq!(attack.victim_withdrawn, 20_000_000_000);
     assert!(attack.vault_remaining <= 1);
+}
+
+// PUBLIC LOF: an LP authorizes a matcher, not the taker's unsigned caller fee. A Genesis COIN
+// holder must not be able to charge 100% on both sides of a round trip, turn the LP's principal
+// into protocol surplus, and sell the fixed-supply COIN into the resulting 50/50 buyback.
+#[test]
+fn e2e_unsigned_cpi_fee_cannot_recycle_lp_principal_into_a_genesis_buyback() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const DEPOSIT: u64 = 2_100_000;
+    const TRADE_FEE_BPS: u64 = 10_000;
+    const TRADE_NOTIONAL: u64 = 1_000_000;
+    const CONFIGURED_FEE_LOSS_PER_TRADER: u64 = 600;
+    const CONFIGURED_BUYBACK_USD: u64 = 960;
+    const MATCHER_CONTEXT_LEN: usize = 97;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let matcher_program = Pubkey::new_unique();
+    svm.add_program_from_file(matcher_program, auth_matcher_so())
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    send(
+        &mut svm,
+        &[&payer, &create_key],
+        multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&dao.pubkey()),
+            1,
+            &[(dao.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        ),
+    )
+    .expect("initialize the MetaDAO Squads vault");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let collateral_mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(
+        &mut svm,
+        &payer,
+        &collateral_mint_authority.pubkey(),
+    );
+    let coin_mint_authority = Keypair::new();
+    let coin_mint = create_real_mint(&mut svm, &payer, &coin_mint_authority.pubkey());
+
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &slab_signer],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &slab,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate a fresh market account through the System Program");
+    let controller = controller_pda(&squads_vault, &slab, &perc_id());
+    let mut init_market_data = vec![1u8];
+    init_market_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &slab_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
+            ],
+            data: init_market_data,
+        },
+    )
+    .expect("permissionlessly initialize a controller-owned market");
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &perc_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let pool = sub_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8];
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut pool_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(perc_vault, false),
+                AccountMeta::new_readonly(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_authority, false),
+                AccountMeta::new_readonly(coin_mint, false),
+            ],
+            data: pool_data,
+        },
+    )
+    .expect("initialize the canonical empty Genesis pool");
+
+    let twap_init = init_config_ix(
+        &payer.pubkey(),
+        &coin_mint,
+        &slab,
+        &multisig,
+        &dao.pubkey(),
+        &perc_id(),
+    );
+    send(&mut svm, &[&payer], twap_init).expect("initialize TWAP custody");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+
+    let grant =
+        build_controller_grant_pool_message(&squads_vault, &controller, &pool, &slab, &perc_id());
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        1,
+        &grant,
+        &[
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ],
+    )
+    .expect("grant empty asset custody to the canonical Subledger pool");
+
+    let configure_oracle = build_configure_ewma_mark_message(
+        &squads_vault,
+        &slab,
+        &perc_id(),
+        100,
+        TRADE_NOTIONAL,
+        1,
+        0,
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        2,
+        &configure_oracle,
+        &[
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+    )
+    .expect("configure the externally cranked production oracle mode");
+
+    let handoff = build_subledger_handoff_to_twap_message(
+        &squads_vault,
+        &pool,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        3,
+        &handoff,
+        &[
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+        ],
+    )
+    .expect("handoff the empty Genesis pool to constrained TWAP custody");
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), 0);
+
+    let auction_share = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        4,
+        &auction_share,
+        &[
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("configure 80% of post-launch surplus for buybacks");
+
+    let env = HandoffEnv {
+        squads,
+        multisig,
+        dao,
+        squads_vault,
+        slab,
+        collateral_mint,
+        coin_mint,
+        coin_mint_authority,
+        twap_cfg,
+        twap_authority,
+        perc_vault,
+        vault_authority,
+        principal: 0,
+        surplus: 0,
+    };
+    let reward_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &reward_vault,
+        &env.coin_mint,
+        &Pubkey::new_unique(),
+        0,
+    );
+    let book = setup_auction(&mut svm, &payer, &env, 1, 1, Some(reward_vault), 0);
+    let economics = build_set_economics_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &reward_vault,
+        0,
+        5_000,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &economics,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(reward_vault, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("configure the advertised 50/50 reward and burn split");
+
+    let attacker = Keypair::new();
+    let lp = Keypair::new();
+    for owner in [&attacker, &lp] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let attacker_collateral = coin_ata_of(&attacker.pubkey(), &env.collateral_mint);
+    let lp_collateral = coin_ata_of(&lp.pubkey(), &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &attacker_collateral,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+        DEPOSIT,
+    );
+    set_token(
+        &mut svm,
+        &lp_collateral,
+        &env.collateral_mint,
+        &lp.pubkey(),
+        DEPOSIT,
+    );
+
+    let attacker_coin = coin_ata_of(&attacker.pubkey(), &env.coin_mint);
+    set_token(
+        &mut svm,
+        &attacker_coin,
+        &env.coin_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    mint_coin(
+        &mut svm,
+        &payer,
+        &env.coin_mint,
+        &env.coin_mint_authority,
+        &attacker_coin,
+        2,
+    );
+    send(
+        &mut svm,
+        &[&payer, &env.coin_mint_authority],
+        spl_token::instruction::set_authority(
+            &spl_token::ID,
+            &env.coin_mint,
+            None,
+            spl_token::instruction::AuthorityType::MintTokens,
+            &env.coin_mint_authority.pubkey(),
+            &[],
+        )
+        .unwrap(),
+    )
+    .expect("freeze the attacker's two-atom Genesis allocation");
+    assert_eq!(mint_supply(&svm, &env.coin_mint), 2);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let attacker_portfolio = Keypair::new();
+    let lp_portfolio = Keypair::new();
+    for (owner, portfolio, source) in [
+        (&attacker, &attacker_portfolio, attacker_collateral),
+        (&lp, &lp_portfolio, lp_collateral),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate a public portfolio account");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a public portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: DEPOSIT as u128,
+                },
+            ),
+        )
+        .expect("deposit real SPL collateral");
+    }
+
+    let matcher_context = Keypair::new();
+    let matcher_context_rent = svm.minimum_balance_for_rent_exemption(MATCHER_CONTEXT_LEN);
+    send(
+        &mut svm,
+        &[&payer, &matcher_context],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &matcher_context.pubkey(),
+            matcher_context_rent,
+            MATCHER_CONTEXT_LEN as u64,
+            &matcher_program,
+        ),
+    )
+    .expect("allocate the LP's matcher context");
+    let matcher_delegate = Pubkey::find_program_address(
+        &[
+            b"matcher",
+            env.slab.as_ref(),
+            lp_portfolio.pubkey().as_ref(),
+            lp.pubkey().as_ref(),
+            matcher_program.as_ref(),
+            matcher_context.pubkey().as_ref(),
+        ],
+        &perc_id(),
+    )
+    .0;
+    send(
+        &mut svm,
+        &[&payer, &lp],
+        Instruction {
+            program_id: matcher_program,
+            accounts: vec![
+                AccountMeta::new_readonly(lp.pubkey(), true),
+                AccountMeta::new_readonly(matcher_delegate, false),
+                AccountMeta::new(matcher_context.pubkey(), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(env.slab, false),
+                AccountMeta::new_readonly(lp_portfolio.pubkey(), false),
+            ],
+            data: vec![2u8],
+        },
+    )
+    .expect("LP authorizes the exact matcher delegate");
+    send(
+        &mut svm,
+        &[&payer, &lp],
+        pix(
+            vec![
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new_readonly(env.slab, false),
+                AccountMeta::new(lp_portfolio.pubkey(), false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new_readonly(matcher_context.pubkey(), false),
+                AccountMeta::new_readonly(matcher_delegate, false),
+            ],
+            PIx::SetMatcherConfig { enabled: 1 },
+        ),
+    )
+    .expect("LP enables permissionless fills through the approved matcher");
+
+    let cpi_trade = |size_q: i128| {
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(lp_portfolio.pubkey(), false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(matcher_context.pubkey(), false),
+                AccountMeta::new_readonly(matcher_delegate, false),
+            ],
+            PIx::TradeCpi {
+                asset_index: 0,
+                size_q,
+                fee_bps: TRADE_FEE_BPS,
+                limit_price: TRADE_NOTIONAL,
+            },
+        )
+    };
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        cpi_trade(percolator::POS_SCALE as i128),
+    )
+    .expect("attacker opens against the LP with an unsigned 100% fee");
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        cpi_trade(-(percolator::POS_SCALE as i128)),
+    )
+    .expect("attacker closes against the LP with the same unsigned fee");
+    assert_eq!(read_asset0_oi(&svm, &env.slab), (0, 0));
+    let insurance = read_asset0_insurance(&svm, &env.slab);
+    let loss_per_trader = u64::try_from(insurance / 2).unwrap();
+    let buyback_usd = u64::try_from(insurance * 8_000 / 10_000).unwrap();
+
+    let capital = |svm: &LiteSVM, portfolio: Pubkey| {
+        percolator_prog::state::read_portfolio(&svm.get_account(&portfolio).unwrap().data)
+            .unwrap()
+            .capital
+            .get()
+    };
+    for (owner, portfolio, destination) in [
+        (&attacker, attacker_portfolio.pubkey(), attacker_collateral),
+        (&lp, lp_portfolio.pubkey(), lp_collateral),
+    ] {
+        let amount = capital(&svm, portfolio);
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(env.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount },
+            ),
+        )
+        .expect("withdraw the collateral left after the fee round trip");
+    }
+    assert_eq!(
+        token_amount(&svm, &attacker_collateral),
+        DEPOSIT - loss_per_trader
+    );
+    assert_eq!(
+        token_amount(&svm, &lp_collateral),
+        DEPOSIT - loss_per_trader
+    );
+
+    send(
+        &mut svm,
+        &[&attacker],
+        place_bid_ix(
+            &attacker.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &attacker_coin,
+            &attacker_collateral,
+            &env.coin_mint,
+            &env.collateral_mint,
+            2,
+            buyback_usd as u128,
+            None,
+        ),
+    )
+    .expect("Genesis holder offers the fixed supply into its victim-funded buyback");
+    let round_end = {
+        let data = svm.get_account(&book.book).unwrap().data;
+        u64::from_le_bytes(data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            Some(reward_vault),
+        ),
+    )
+    .expect("permissionless 50/50 buyback settles the fee-funded budget");
+    assert_eq!(token_amount(&svm, &reward_vault), 1);
+    assert_eq!(mint_supply(&svm, &env.coin_mint), 1);
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.settlement_usd,
+            &book.coin_escrow,
+            &attacker_collateral,
+            &attacker_coin,
+            0,
+        ),
+    )
+    .expect("permissionless claim pays the Genesis seller");
+
+    let attacker_extracted = token_amount(&svm, &attacker_collateral);
+    let victim_recovered = token_amount(&svm, &lp_collateral);
+    let configured_attacker_ceiling =
+        DEPOSIT - CONFIGURED_FEE_LOSS_PER_TRADER + CONFIGURED_BUYBACK_USD;
+    assert!(
+        attacker_extracted <= configured_attacker_ceiling,
+        "unsigned CPI fees collected {insurance}, let a Genesis holder deposit {DEPOSIT} and extract {attacker_extracted} (configured-fee ceiling {configured_attacker_ceiling}), and forced an independent LP down to {victim_recovered}"
+    );
+    assert!(
+        victim_recovered >= DEPOSIT - CONFIGURED_FEE_LOSS_PER_TRADER,
+        "an LP that authorized the matcher but not the caller fee recovered only {victim_recovered} of {DEPOSIT}"
+    );
 }
