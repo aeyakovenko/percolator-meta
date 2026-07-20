@@ -11320,6 +11320,373 @@ fn e2e_twap_handoff_rejects_a_mismatched_market_controller() {
     assert_eq!(token_amount(&svm, &env.perc_vault), 0);
 }
 
+// PUBLIC LOF: an external backing provider may self-rotate its role, but that signed consent must
+// not cross a controller shutdown/restart boundary. Otherwise the incoming key can retain a fully
+// signed generation-A rotation, replay it after the provider funds generation B, and withdraw the
+// replacement backing through Percolator's ordinary public custody path.
+#[test]
+fn e2e_stale_backing_rotation_cannot_take_replacement_generation_principal() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const BACKING: u64 = 250_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let provider = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &governance, &provider, &attacker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(2).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public payer allocates a fresh market");
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionless controller initialization creates the live market");
+
+    let proxy = |instruction: PIx, witness: Pubkey| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&instruction.encode());
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(witness, false),
+            ],
+            data,
+        }
+    };
+    let policy_witness = controller_market_generation_witness(&svm, &market);
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 1,
+            },
+            policy_witness,
+        ),
+    )
+    .expect("governance configures a bounded empty-asset restart");
+
+    let initial_asset_witness =
+        market_controller_program::asset_generation_witness_address(&market, 1, 0).0;
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 0,
+                asset_index: 1,
+                now_slot: 100,
+                initial_price: 1_000_000,
+                insurance_authority: controller.to_bytes(),
+                insurance_operator: controller.to_bytes(),
+                backing_bucket_authority: provider.pubkey().to_bytes(),
+                oracle_authority: provider.pubkey().to_bytes(),
+            },
+            initial_asset_witness,
+        ),
+    )
+    .expect("controller activates generation A with an external backing provider");
+    let generation_a = percolator_accounting::read_asset_market_id(
+        &svm.get_account(&market).unwrap().data,
+        1,
+    )
+    .unwrap();
+
+    let retained_blockhash = svm.latest_blockhash();
+    let retained_rotation = Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 1,
+                kind: 3,
+                new_pubkey: attacker.pubkey().to_bytes(),
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &provider, &attacker],
+        retained_blockhash,
+    );
+    let retained_blockhash_control = Transaction::new_signed_with_payer(
+        &[solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &governance.pubkey(),
+            1,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        retained_blockhash,
+    );
+
+    let generation_a_witness = market_controller_program::asset_generation_witness_address(
+        &market,
+        1,
+        generation_a,
+    )
+    .0;
+    svm.set_sysvar(&Clock {
+        slot: 101,
+        unix_timestamp: 101,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 1,
+                now_slot: 101,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            },
+            generation_a_witness,
+        ),
+    )
+    .expect("controller shuts down empty generation A");
+    svm.set_sysvar(&Clock {
+        slot: 102,
+        unix_timestamp: 102,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            PIx::RestartAssetOracle {
+                asset_index: 1,
+                now_slot: 102,
+                initial_price: 1_000_000,
+            },
+            generation_a_witness,
+        ),
+    )
+    .expect("controller replaces the empty slot with generation B");
+    let generation_b = percolator_accounting::read_asset_market_id(
+        &svm.get_account(&market).unwrap().data,
+        1,
+    )
+    .unwrap();
+    assert!(generation_b > generation_a);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&market).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        provider.pubkey().to_bytes(),
+        "restart preserves the consenting provider, not the old incoming key"
+    );
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let provider_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_source,
+        &collateral_mint,
+        &provider.pubkey(),
+        BACKING,
+    );
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: 2,
+                amount: BACKING as u128,
+                expiry_slot: 103,
+            },
+        ),
+    )
+    .expect("provider deposits fresh backing into generation B");
+    assert_eq!(token_amount(&svm, &provider_source), 0);
+
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let vault_before_replay = svm.get_account(&percolator_vault).unwrap();
+    svm.send_transaction(retained_blockhash_control)
+        .expect("the generation-A rotation blockhash remains valid");
+    let replay = svm.send_transaction(retained_rotation);
+    if replay.is_ok() {
+        assert_eq!(
+            percolator_accounting::read_asset_backing_authority(
+                &svm.get_account(&market).unwrap().data,
+                1,
+            )
+            .unwrap(),
+            attacker.pubkey().to_bytes(),
+            "the retained generation-A consent seized generation-B backing"
+        );
+        svm.set_sysvar(&Clock {
+            slot: 103,
+            unix_timestamp: 103,
+            ..Clock::default()
+        });
+        let attacker_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &attacker_destination,
+            &collateral_mint,
+            &attacker.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &attacker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(attacker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(attacker_destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::WithdrawBackingBucket {
+                    domain: 2,
+                    amount: BACKING as u128,
+                },
+            ),
+        )
+        .expect("stale incoming authority withdraws the provider's replacement backing");
+        assert_eq!(token_amount(&svm, &attacker_destination), BACKING);
+        assert_eq!(token_amount(&svm, &percolator_vault), 0);
+        panic!(
+            "generation-A backing rotation let the attacker withdraw {BACKING} atoms deposited by the provider in generation B"
+        );
+    }
+
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_replay,
+        "rejected stale rotation leaves the replacement market byte-identical"
+    );
+    assert_eq!(
+        svm.get_account(&percolator_vault).unwrap(),
+        vault_before_replay,
+        "rejected stale rotation leaves provider custody unchanged"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&market).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        provider.pubkey().to_bytes()
+    );
+
+    svm.set_sysvar(&Clock {
+        slot: 103,
+        unix_timestamp: 103,
+        ..Clock::default()
+    });
+    let provider_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral_mint,
+        &provider.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::WithdrawBackingBucket {
+                domain: 2,
+                amount: BACKING as u128,
+            },
+        ),
+    )
+    .expect("the current provider remains able to recover all replacement backing");
+    assert_eq!(token_amount(&svm, &provider_destination), BACKING);
+}
+
 // PUBLIC VALUE LEAK: secondary activation must not install any raw external insurance operator.
 // Split roles let governance steal a provider deposit; equal but unfunded roles let the external
 // key collect trade fees before risking capital. Backing and oracle providers remain independent.
