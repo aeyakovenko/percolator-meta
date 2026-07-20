@@ -252,6 +252,7 @@ fn read_pubkey(data: &[u8], off: usize) -> Result<Pubkey, ProgramError> {
 pub const SUB_POS_POOL: usize = 8; // Position.pool @ 8 (real layout: disc@0, pool@8..40, owner@40..72).
 pub const SUB_POS_OWNER: usize = 40; // Position.owner @ 40. The depositor owed this position's COIN.
 pub const SUB_POS_PRINCIPAL: usize = 72;
+pub const SUB_POS_ACTION_NONCE: usize = 80;
 pub const SUB_POS_WITHDRAWN_AMOUNT: usize = 80;
 pub const SUB_POS_WITHDRAWN: usize = 88;
 pub const SUB_POS_START_SLOT: usize = 89;
@@ -319,6 +320,16 @@ fn read_terminal_return_snapshot(data: &[u8]) -> Result<Option<(u128, Option<u64
 pub fn read_subledger_start_slot(data: &[u8]) -> Result<u64, ProgramError> {
     let bytes = data
         .get(SUB_POS_START_SLOT..SUB_POS_START_SLOT + 8)
+        .ok_or(ProgramError::AccountDataTooSmall)?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// Monotonic authorization nonce for a live Subledger position. Terminal return reuses this word
+/// for its principal-at-risk snapshot; either transition changes the signed crystallize witness.
+pub fn read_subledger_action_nonce(data: &[u8]) -> Result<u64, ProgramError> {
+    validate_subledger_position(data)?;
+    let bytes = data
+        .get(SUB_POS_ACTION_NONCE..SUB_POS_ACTION_NONCE + 8)
         .ok_or(ProgramError::AccountDataTooSmall)?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
@@ -1402,7 +1413,7 @@ pub fn process_instruction(
     match *tag {
         IX_INIT => init(program_id, accounts, rest),
         IX_REGISTER_START => register_start(program_id, accounts, rest),
-        IX_CRYSTALLIZE => crystallize(program_id, accounts),
+        IX_CRYSTALLIZE => crystallize(program_id, accounts, rest),
         IX_FREEZE => freeze(program_id, accounts),
         IX_CLAIM => claim(program_id, accounts),
         IX_INIT_REWARD_EPOCH => init_reward_epoch(program_id, accounts, rest),
@@ -2170,7 +2181,9 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 
 // crystallize accounts: [cranker(s), config(w), stake(w), backing_ledger,
 //   portfolio_archive, retired_market_marker (portfolio cohorts only)]
-fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+// capital data: expected_principal(u64) | expected_start_slot(u64) |
+//   expected_position_action_nonce(u64); portfolio-flow data: none
+fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let cranker = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
@@ -2199,6 +2212,21 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     if stake.cohort > COHORT_FUNDING_PAYER {
         return Err(ProgramError::InvalidAccountData);
     }
+    let capital_witness = if matches!(stake.cohort, COHORT_INSURANCE | COHORT_BACKING) {
+        if data.len() != 24 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Some((
+            u64::from_le_bytes(data[0..8].try_into().unwrap()),
+            u64::from_le_bytes(data[8..16].try_into().unwrap()),
+            u64::from_le_bytes(data[16..24].try_into().unwrap()),
+        ))
+    } else {
+        if !data.is_empty() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        None
+    };
     let portfolio_context = if matches!(
         stake.cohort,
         COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER
@@ -2262,6 +2290,15 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
             let data = backing_ledger.try_borrow_data()?;
             let (principal, withdrawn) = read_subledger_principal(&data)?;
             let position_start_slot = read_subledger_start_slot(&data)?;
+            let position_action_nonce = read_subledger_action_nonce(&data)?;
+            let (expected_principal, expected_start_slot, expected_action_nonce) =
+                capital_witness.ok_or(ProgramError::InvalidInstructionData)?;
+            if principal != expected_principal as u128
+                || position_start_slot != expected_start_slot
+                || position_action_nonce != expected_action_nonce
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
             let now = Clock::get()?.slot;
             let terminal_snapshot = read_terminal_return_snapshot(&data)?;
             if post_emission_finalize {

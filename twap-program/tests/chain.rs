@@ -44054,6 +44054,50 @@ fn rd_register_ix(
     }
 }
 
+struct RdCrystallizeRequest {
+    cranker: Pubkey,
+    config: Pubkey,
+    owner: Pubkey,
+    market: Pubkey,
+    linked: Pubkey,
+    cohort: u8,
+}
+
+impl TestInstruction for RdCrystallizeRequest {
+    fn build(self, svm: &LiteSVM) -> Instruction {
+        let mut accounts = vec![
+            AccountMeta::new(self.cranker, true),
+            AccountMeta::new(self.config, false),
+            AccountMeta::new(
+                rd_stake_pda(&self.config, &self.owner, &self.linked, self.cohort),
+                false,
+            ),
+            AccountMeta::new_readonly(self.linked, false),
+        ];
+        let mut data = vec![2];
+        if matches!(self.cohort, 0 | 1) {
+            let position = svm.get_account(&self.linked).expect("capital position");
+            data.extend_from_slice(&position.data[72..80]);
+            data.extend_from_slice(&position.data[89..97]);
+            data.extend_from_slice(&position.data[80..88]);
+        } else {
+            accounts.push(AccountMeta::new_readonly(
+                rd_portfolio_archive_pda(&self.market, &self.owner, &self.linked),
+                false,
+            ));
+            accounts.push(AccountMeta::new_readonly(
+                retired_market_pda(&self.market, &perc_id()),
+                false,
+            ));
+        }
+        Instruction {
+            program_id: rd_id(),
+            accounts,
+            data,
+        }
+    }
+}
+
 fn rd_crystallize_ix(
     cranker: &Pubkey,
     config: &Pubkey,
@@ -44061,27 +44105,14 @@ fn rd_crystallize_ix(
     market: &Pubkey,
     linked: &Pubkey,
     cohort: u8,
-) -> Instruction {
-    let mut accounts = vec![
-        AccountMeta::new(*cranker, true),
-        AccountMeta::new(*config, false),
-        AccountMeta::new(rd_stake_pda(config, owner, linked, cohort), false),
-        AccountMeta::new_readonly(*linked, false),
-    ];
-    if matches!(cohort, 2 | 3 | 4) {
-        accounts.push(AccountMeta::new_readonly(
-            rd_portfolio_archive_pda(market, owner, linked),
-            false,
-        ));
-        accounts.push(AccountMeta::new_readonly(
-            retired_market_pda(market, &perc_id()),
-            false,
-        ));
-    }
-    Instruction {
-        program_id: rd_id(),
-        accounts,
-        data: vec![2],
+) -> RdCrystallizeRequest {
+    RdCrystallizeRequest {
+        cranker: *cranker,
+        config: *config,
+        owner: *owner,
+        market: *market,
+        linked: *linked,
+        cohort,
     }
 }
 
@@ -45325,26 +45356,25 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         "closing preserves both paid-side accumulators on one portfolio"
     );
 
-    let cry_a = Instruction {
-        program_id: rd_id(),
-        accounts: vec![
-            AccountMeta::new(alice.pubkey(), true),
-            AccountMeta::new(rd_config, false),
-            AccountMeta::new(a_stake, false),
-            AccountMeta::new_readonly(position, false),
-        ],
-        data: vec![2u8],
-    }; // insurance: share-value crystallize is owner-gated (finding KO)
-    let cry_bob = Instruction {
-        program_id: rd_id(),
-        accounts: vec![
-            AccountMeta::new(bob.pubkey(), true),
-            AccountMeta::new(rd_config, false),
-            AccountMeta::new(bob_stake, false),
-            AccountMeta::new_readonly(backing_position, false),
-        ],
-        data: vec![2u8],
-    }; // backing: share-value crystallize is owner-gated (finding KO)
+    // Capital crystallize is owner-gated and commits to the exact live Subledger position.
+    let cry_a = rd_crystallize_ix(
+        &alice.pubkey(),
+        &rd_config,
+        &alice.pubkey(),
+        &slab,
+        &position,
+        0,
+    )
+    .build(&svm);
+    let cry_bob = rd_crystallize_ix(
+        &bob.pubkey(),
+        &rd_config,
+        &bob.pubkey(),
+        &slab,
+        &backing_position,
+        1,
+    )
+    .build(&svm);
     let cry_long_payer = Instruction {
         program_id: rd_id(),
         accounts: vec![
