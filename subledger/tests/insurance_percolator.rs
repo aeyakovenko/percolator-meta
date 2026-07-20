@@ -5234,6 +5234,107 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     assert_eq!(gv_proposal_support(&env, &gv_proposal), (10, 10));
 }
 
+// STALE PARTIAL-EXIT REPLAY: an amount-only withdrawal signed against ten units
+// must not consume the five-unit remainder after a replacement withdrawal lands.
+// Otherwise a relayer can turn one authorized partial exit into a terminal exit
+// after deposits close, permanently deleting the owner's Genesis participation.
+#[test]
+fn presigned_partial_withdraw_cannot_retire_the_remainder_after_deposits_close() {
+    let start = 100u64;
+    let deposit_window = 10u64;
+    let bootstrap_delay = 100u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        deposit_window,
+        start,
+        bootstrap_delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(
+        POLICY_PRINCIPAL,
+        Some(deposit_window),
+        Some(start),
+    );
+    let ve = setup_vote(&mut env);
+    let (_, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 10);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 10)
+        .expect("alice deposits ten vote units");
+    assert_eq!(env.read_position(&alice.pubkey()), (10, start, false));
+
+    env.warp_slot(start + deposit_window - 1);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let accounts = vec![
+        AccountMeta::new(alice.pubkey(), true),
+        AccountMeta::new(env.pool, false),
+        AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+        AccountMeta::new(alice_ata, false),
+        AccountMeta::new(holding, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    let mut withdraw_data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+    withdraw_data.extend_from_slice(&5u64.to_le_bytes());
+    let withheld = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            Instruction {
+                program_id: sub_id(),
+                accounts: accounts.clone(),
+                data: withdraw_data.clone(),
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let replacement = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            Instruction {
+                program_id: sub_id(),
+                accounts,
+                data: withdraw_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    env.svm
+        .send_transaction(replacement)
+        .expect("the replacement five-unit withdrawal lands");
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.token_amount(&alice_ata), 5);
+
+    env.warp_slot(start + deposit_window);
+    let stale_result = env.svm.send_transaction(withheld);
+    if stale_result.is_ok() {
+        assert_eq!(env.read_position(&alice.pubkey()), (0, start, true));
+        assert_eq!(env.token_amount(&alice_ata), 10);
+        assert!(
+            gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
+            "the stale partial exit permanently removes the post-cutoff vote",
+        );
+        panic!("one partial-withdraw authorization retired the replacement remainder");
+    }
+
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.token_amount(&alice_ata), 5);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
+        .expect("rejecting the stale withdrawal preserves five vote units");
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), (5, 5));
+}
+
 // DEPOSIT != VOTE (top-up while a ballot is LIVE must not inflate the tally nor unlock the pledge):
 // insurance_deposit checks p.withdrawn but NOT vote_locked, and it never touches the gv tallies (those are
 // gv-owned state). So a voter may add capital while voted, but doing so must (a) NOT silently raise their
