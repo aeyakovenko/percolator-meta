@@ -17893,13 +17893,15 @@ fn gv_vote_data_e2e(
         .unwrap_or(0);
     let mut data = vec![3u8, action];
     data.extend_from_slice(&vote_nonce.to_le_bytes());
-    if action == 1 {
-        let principal = svm
-            .get_account(position)
-            .filter(|account| account.data.len() >= 80)
-            .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
-            .unwrap_or(0);
-        data.extend_from_slice(&principal.to_le_bytes());
+    if let Some(position) = svm
+        .get_account(position)
+        .filter(|account| account.data.len() >= 97)
+    {
+        data.extend_from_slice(&position.data[72..80]);
+        data.extend_from_slice(&position.data[89..97]);
+        data.extend_from_slice(&position.data[80..88]);
+    } else {
+        data.extend_from_slice(&[0u8; 24]);
     }
     data
 }
@@ -32146,6 +32148,10 @@ fn e2e_full_genesis_to_buy_burn() {
 
     let mut retract_data = vec![3u8, 2u8];
     retract_data.extend_from_slice(&svm.get_account(&gv_ballot).unwrap().data[96..104]);
+    let retract_position = svm.get_account(&position).unwrap();
+    retract_data.extend_from_slice(&retract_position.data[72..80]);
+    retract_data.extend_from_slice(&retract_position.data[89..97]);
+    retract_data.extend_from_slice(&retract_position.data[80..88]);
     let retract = Instruction {
         program_id: gv_id_e2e(),
         accounts: vec![
@@ -51769,31 +51775,44 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         ],
         data: interleaved_withdraw_data,
     };
-    let vote_after_return = |action: u8, vote_nonce: u64, expected_principal: Option<u64>| {
-        let mut data = vec![3u8, action];
-        data.extend_from_slice(&vote_nonce.to_le_bytes());
-        if action == 1 {
-            data.extend_from_slice(
-                &expected_principal
-                    .expect("a back must commit to its post-transaction principal")
-                    .to_le_bytes(),
-            );
-        }
-        Instruction {
-            program_id: gv_id_e2e(),
-            accounts: vec![
-                AccountMeta::new(depositor.pubkey(), true),
-                AccountMeta::new(env.gv_config, false),
-                AccountMeta::new(depositor_ballot, false),
-                AccountMeta::new(depositor_proposal, false),
-                AccountMeta::new(position, false),
-                AccountMeta::new_readonly(env.pool, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(sub_id(), false),
-            ],
-            data,
-        }
-    };
+    let position_before_interleaved_exit = svm.get_account(&position).unwrap();
+    let live_principal = u64::from_le_bytes(
+        position_before_interleaved_exit.data[72..80]
+            .try_into()
+            .unwrap(),
+    );
+    let live_start_slot = u64::from_le_bytes(
+        position_before_interleaved_exit.data[89..97]
+            .try_into()
+            .unwrap(),
+    );
+    let live_action_nonce = u64::from_le_bytes(
+        position_before_interleaved_exit.data[80..88]
+            .try_into()
+            .unwrap(),
+    );
+    let vote_after_return =
+        |action: u8, vote_nonce: u64, position_snapshot: (u64, u64, u64)| {
+            let mut data = vec![3u8, action];
+            data.extend_from_slice(&vote_nonce.to_le_bytes());
+            data.extend_from_slice(&position_snapshot.0.to_le_bytes());
+            data.extend_from_slice(&position_snapshot.1.to_le_bytes());
+            data.extend_from_slice(&position_snapshot.2.to_le_bytes());
+            Instruction {
+                program_id: gv_id_e2e(),
+                accounts: vec![
+                    AccountMeta::new(depositor.pubkey(), true),
+                    AccountMeta::new(env.gv_config, false),
+                    AccountMeta::new(depositor_ballot, false),
+                    AccountMeta::new(depositor_proposal, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new_readonly(env.pool, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(sub_id(), false),
+                ],
+                data,
+            }
+        };
     let vote_nonce = u64::from_le_bytes(
         svm.get_account(&depositor_ballot).unwrap().data[96..104]
             .try_into()
@@ -51804,12 +51823,20 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     let blockhash = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[
-            vote_after_return(2, vote_nonce, None),
+            vote_after_return(
+                2,
+                vote_nonce,
+                (live_principal, live_start_slot, live_action_nonce),
+            ),
             interleaved_withdraw,
             vote_after_return(
                 1,
                 next_vote_nonce,
-                Some(principal - interleaved_exit),
+                (
+                    principal - interleaved_exit,
+                    live_start_slot,
+                    live_action_nonce.checked_add(2).unwrap(),
+                ),
             ),
         ],
         Some(&payer.pubkey()),

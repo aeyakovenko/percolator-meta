@@ -1702,14 +1702,16 @@ fn gv_vote_ix(
             .map(|account| u64::from_le_bytes(account.data[96..104].try_into().unwrap()))
             .unwrap_or(0);
         ix.data.extend_from_slice(&vote_nonce.to_le_bytes());
-        if action == 1 {
-            let principal = env
-                .svm
-                .get_account(&env.position_pda(voter))
-                .filter(|account| account.data.len() >= 80)
-                .map(|account| u64::from_le_bytes(account.data[72..80].try_into().unwrap()))
-                .unwrap_or(0);
-            ix.data.extend_from_slice(&principal.to_le_bytes());
+        if let Some(position) = env
+            .svm
+            .get_account(&env.position_pda(voter))
+            .filter(|account| account.data.len() >= 97)
+        {
+            ix.data.extend_from_slice(&position.data[72..80]);
+            ix.data.extend_from_slice(&position.data[89..97]);
+            ix.data.extend_from_slice(&position.data[80..88]);
+        } else {
+            ix.data.extend_from_slice(&[0u8; 24]);
         }
     }
     ix
@@ -4796,6 +4798,222 @@ fn presigned_retract_cannot_remove_a_replacement_vote_after_bootstrap_deadline()
     gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
         .expect("the intact replacement vote seals the distribution");
     assert_eq!(env.svm.get_account(&gv_proposal).unwrap().data[96], 1);
+}
+
+// PRE-BALLOT RETRACT REPLAY: a transaction signed while the canonical ballot does not exist
+// must not become valid after the voter's first ballot is created. This covers both predecessor
+// encodings and the current position-incarnation wire: the first vote's lock transition must make
+// every pre-ballot authorization stale before backing closes.
+#[test]
+fn presigned_preballot_retracts_cannot_remove_a_later_first_vote() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+    let ve = setup_vote(&mut env);
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, amount)
+        .expect("alice deposits");
+    let (dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let bootstrap_end = env.bootstrap_end_slot();
+    env.warp_slot(bootstrap_end - 4);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+
+    // The canonical ballot is still absent when this predecessor retract is signed.
+    let ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            ve.gv_config.as_ref(),
+            alice.pubkey().as_ref(),
+        ],
+        &gv_id(),
+    )
+    .0;
+    assert!(env.svm.get_account(&ballot).is_none());
+    let mut old_exact_retract = legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2);
+    old_exact_retract.data.extend_from_slice(&0u64.to_le_bytes());
+    let withheld_old_exact_retract = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            old_exact_retract,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_legacy_retract = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_position_bound_retract = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
+            gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    let first_back = gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 1);
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_997),
+                first_back,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice creates and backs her first ballot");
+    let first_support = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!(first_support.1, amount);
+
+    env.warp_slot(bootstrap_end);
+    assert!(
+        env.svm.send_transaction(withheld_old_exact_retract).is_err(),
+        "the prior nonce-only wire must not act on a later first ballot"
+    );
+    assert!(
+        env.svm.send_transaction(withheld_legacy_retract).is_err(),
+        "the predecessor action-only wire must not act on a later first ballot"
+    );
+    assert!(
+        env.svm
+            .send_transaction(withheld_position_bound_retract)
+            .is_err(),
+        "the first vote's position-lock transition must stale a pre-ballot retract"
+    );
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        first_support,
+        "the first vote remains counted after the pre-ballot replay"
+    );
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("the intact first vote seals the distribution");
+}
+
+// POSITION-INCARNATION RETRACT REPLAY: topping up a live ballot intentionally leaves its counted
+// contribution unchanged. A retract signed before that top-up must not remain valid against the
+// later Subledger position, especially when deposits and backing share a final admissible slot.
+#[test]
+fn presigned_retract_cannot_cross_a_later_position_top_up() {
+    let start = 100u64;
+    let delay = 10u64;
+    let mut env = Env::new_for_policy_with_bootstrap_schedule(
+        POLICY_PRINCIPAL,
+        delay,
+        start,
+        delay,
+    );
+    env.init_insurance_pool_policy_with_schedule(POLICY_PRINCIPAL, Some(delay), Some(start));
+    let ve = setup_vote(&mut env);
+    let (dist_proposal, gv_proposal) =
+        create_and_register_proposal(&mut env, &ve, 1, &Pubkey::new_unique());
+
+    let (alice, alice_ata) = new_depositor(&mut env, 6);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&alice, &alice_ata, &holding, 5)
+        .expect("alice deposits five voting units");
+    env.warp_slot(start + 1);
+    gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).expect("alice backs five units");
+    let original_support = gv_proposal_support(&env, &gv_proposal);
+    assert_eq!(original_support.1, 5);
+
+    env.warp_slot(start + delay - 1);
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            ve.gv_config.as_ref(),
+            alice.pubkey().as_ref(),
+        ],
+        &gv_id(),
+    )
+    .0;
+    let vote_nonce = env.svm.get_account(&ballot).unwrap().data[96..104].to_vec();
+    let mut old_exact_retract = legacy_gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2);
+    old_exact_retract.data.extend_from_slice(&vote_nonce);
+    let withheld_old_exact = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            old_exact_retract,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+    let withheld_position_bound = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            gv_vote_ix(&env, &ve, &alice.pubkey(), &gv_proposal, 2),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &alice],
+        held_blockhash,
+    );
+
+    let mut top_up_data = vec![4u8];
+    top_up_data.extend_from_slice(&1u64.to_le_bytes());
+    let top_up = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(alice.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&alice.pubkey()), false),
+            AccountMeta::new(alice_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: top_up_data,
+    };
+    env.svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(1_399_998),
+                top_up,
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &alice],
+            held_blockhash,
+        ))
+        .expect("alice tops up in the final deposit slot");
+    assert_eq!(
+        gv_proposal_support(&env, &gv_proposal),
+        original_support,
+        "a top-up does not silently change the live ballot"
+    );
+
+    env.warp_slot(start + delay);
+    assert!(
+        env.svm.send_transaction(withheld_old_exact).is_err(),
+        "the prior ballot-only wire cannot retract a later position incarnation"
+    );
+    assert!(
+        env.svm.send_transaction(withheld_position_bound).is_err(),
+        "the current wire must reject the stale position snapshot"
+    );
+    assert_eq!(gv_proposal_support(&env, &gv_proposal), original_support);
+    gv_trigger_now(&mut env, &ve, &gv_proposal, &dist_proposal)
+        .expect("the intact five-of-six support still seals the distribution");
 }
 
 // PRESIGNED BACK REPLAY: after a voter lands and then retracts a vote, a relayer must not be able

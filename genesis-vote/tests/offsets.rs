@@ -9,7 +9,8 @@
 use genesis_vote_program::{
     SUB_POOL_BOOTSTRAP_DELAY_OFF, SUB_POOL_DEPOSIT_DEADLINE_OFF,
     SUB_POOL_DEPOSIT_START_OFF, SUB_POOL_DEPOSIT_WINDOW_OFF, SUB_POOL_OUTSTANDING_OFF,
-    SUB_POS_OWNER_OFF, SUB_POS_POOL_OFF, SUB_POS_PRINCIPAL_OFF,
+    SUB_POS_ACTION_NONCE_OFF, SUB_POS_OWNER_OFF, SUB_POS_POOL_OFF, SUB_POS_PRINCIPAL_OFF,
+    SUB_POS_START_SLOT_OFF,
 };
 
 #[test]
@@ -17,6 +18,16 @@ fn subledger_mirror_offsets_match_the_real_subledger_layout() {
     assert_eq!(SUB_POS_POOL_OFF, subledger_program::POS_POOL_OFF, "Position.pool offset");
     assert_eq!(SUB_POS_OWNER_OFF, subledger_program::POS_OWNER_OFF, "Position.owner offset");
     assert_eq!(SUB_POS_PRINCIPAL_OFF, subledger_program::POS_PRINCIPAL_OFF, "Position.principal (vote weight) offset");
+    assert_eq!(
+        SUB_POS_START_SLOT_OFF,
+        subledger_program::POS_START_SLOT_OFF,
+        "Position.start_slot (vote authorization) offset"
+    );
+    assert_eq!(
+        SUB_POS_ACTION_NONCE_OFF,
+        subledger_program::POS_ACTION_NONCE_OFF,
+        "Position.action_nonce (vote authorization) offset"
+    );
     assert_eq!(
         SUB_POOL_OUTSTANDING_OFF, subledger_program::POOL_OUTSTANDING_PRINCIPAL_OFF,
         "Pool.outstanding_principal (quorum denominator) offset"
