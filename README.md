@@ -487,6 +487,8 @@ cargo build-sbf --manifest-path distribution/Cargo.toml
 cargo build-sbf --manifest-path genesis-vote/Cargo.toml
 cargo build-sbf --manifest-path residual-distributor/Cargo.toml
 cargo build-sbf --manifest-path twap-program/Cargo.toml
+cargo build-sbf --manifest-path tests/fixtures/auth_matcher/Cargo.toml \
+  --sbf-out-dir "$PWD/target/deploy"
 
 cargo test --workspace
 
