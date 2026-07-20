@@ -7,8 +7,8 @@ solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 solana-sdk = "1.18"
 litesvm = "0.1"
-percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "c1a058f3f6057838e78a6ada51509af336fd4ed6" }
-percolator-prog = { git = "file:///home/anatoly/percolator-prog", rev = "cf69b40e095bf4ee6b750af56c68f1c3c05b9c0a", default-features = false, features = ["no-entrypoint"] }
+percolator = { git = "https://github.com/aeyakovenko/percolator", rev = "4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3" }
+percolator-prog = { git = "file:///home/anatoly/percolator-prog", rev = "19f3b494049b2dfcbf8881366443c611c4e09290", default-features = false, features = ["no-entrypoint"] }
 
 [profile.release]
 lto = "fat"
