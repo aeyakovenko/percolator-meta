@@ -57602,6 +57602,8 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
         .unwrap();
     let env = setup_cross_backing_genesis(&mut svm, &payer);
+    let (distribution_proposal, genesis_proposal) =
+        register_proposal(&mut svm, &payer, &env, 1, &Pubkey::new_unique(), 100);
     let oracle = Keypair::new();
     install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
 
@@ -57660,6 +57662,36 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         [0, 1],
     );
     assert_eq!(token_amount(&svm, &pool_holding), 1);
+
+    let ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            env.gv_config.as_ref(),
+            depositor.pubkey().as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    let vote_data = gv_vote_data_e2e(&svm, &ballot, &position, 1);
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(genesis_proposal, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: vote_data,
+        },
+    )
+    .expect("the sole staged-principal depositor backs the complete distribution");
 
     send(
         &mut svm,
@@ -57740,6 +57772,62 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         &donate_remaining,
     )
     .expect("donate lifecycle control while TWAP retains constrained custody");
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let market_before_earnings_route = svm.get_account(&env.slab).unwrap();
+    let vault_before_earnings_route = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            subledger_route_cross_backing_earnings_ix(
+                &env.pool,
+                &env.squads_vault,
+                &env.slab,
+                &pool_holding,
+                &env.perc_vault,
+                &perc_vault_authority(&env.slab, &perc_id()),
+                &env.long_backing_ledger,
+                &env.short_backing_ledger,
+                &perc_id(),
+                &twap_cfg,
+                &governance_destination,
+            ),
+        )
+        .is_err(),
+        "protocol routing cannot classify staged owner backing as earnings",
+    );
+    assert_eq!(token_amount(&svm, &pool_holding), 1);
+    assert_eq!(token_amount(&svm, &governance_destination), 0);
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_earnings_route);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_earnings_route);
+
+    advance_to_test_bootstrap_end(&mut svm);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(genesis_proposal, false),
+                AccountMeta::new_readonly(dist_id_e2e(), false),
+                AccountMeta::new(env.dist_config, false),
+                AccountMeta::new(distribution_proposal, false),
+                AccountMeta::new_readonly(env.pool, false),
+            ],
+            data: vec![4u8],
+        },
+    )
+    .expect("any cranker seals the staged depositor's winning distribution");
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
     let resolve = build_controller_generation_proxy_message(
@@ -57854,19 +57942,11 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     )
     .unwrap();
     let controller_transit = Pubkey::new_unique();
-    let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
         &controller_transit,
         &env.collateral_mint,
         &controller,
-        0,
-    );
-    set_token(
-        &mut svm,
-        &governance_destination,
-        &env.collateral_mint,
-        &env.squads_vault,
         0,
     );
     let close = build_controller_close_and_reclaim_message(
@@ -57972,14 +58052,13 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     )
     .expect("any cranker returns live owner custody to the bound Subledger pool");
 
-    let exit_data = subledger_insurance_withdraw_data(&svm, &position, 1, 0);
     send(
         &mut svm,
-        &[&payer, &depositor],
+        &[&payer],
         Instruction {
             program_id: sub_id(),
             accounts: vec![
-                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new_readonly(depositor.pubkey(), false),
                 AccountMeta::new(env.pool, false),
                 AccountMeta::new(position, false),
                 AccountMeta::new(depositor_ata, false),
@@ -57994,13 +58073,26 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
                 AccountMeta::new(env.short_backing_ledger, false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(genesis_proposal, false),
+                AccountMeta::new_readonly(gv_id_e2e(), false),
             ],
-            data: exit_data,
+            data: vec![12u8], // IX_RETURN_FINALIZED_POSITION
         },
     )
-    .expect("the owner recovers the staged base unit before market retirement");
+    .expect("any cranker returns the absent voter's staged unit before market retirement");
     assert_eq!(token_amount(&svm, &depositor_ata), 1);
     assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(
+        Pubkey::new_from_array(
+            svm.get_account(&ballot).unwrap().data[40..72]
+                .try_into()
+                .unwrap(),
+        ),
+        Pubkey::default(),
+        "the refunded Genesis vote becomes worthless",
+    );
     assert_eq!(
         u64::from_le_bytes(
             svm.get_account(&env.pool).unwrap().data[80..88]
