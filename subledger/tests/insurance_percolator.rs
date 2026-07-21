@@ -3442,6 +3442,191 @@ fn repeated_near_total_public_losses_preserve_one_atom_deposit_liveness() {
     assert_eq!(asset_insurance_remaining(&env, 0), 3);
 }
 
+// PUBLIC HANDOFF-LIVENESS PROBE: capacity rescaling is lazy for positions. A sufficiently
+// large same-generation scale delta can round an untouched holder to zero shares, so that
+// holder cannot recover later fees. Its nominal principal must not remain in the first TWAP
+// floor, where only the absent owner could retire it.
+#[test]
+fn public_capacity_rescaling_cannot_leave_zero_share_principal_in_the_twap_floor() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let victim_principal = 1_000_000u64;
+    let (victim, victim_ata) = new_depositor(&mut env, victim_principal);
+    let pool = env.pool;
+    let victim_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&victim, &victim_ata, &victim_holding, victim_principal)
+        .expect("fund a material untouched current-generation position");
+    let victim_initial_shares = env.position_shares(&victim.pubkey());
+
+    let high_entry = 1_000_000_110u64;
+    let high_capital = 100_000u64.checked_mul(high_entry).unwrap();
+    let domain_tranche = 900_000u64
+        .checked_mul(high_entry)
+        .unwrap()
+        .checked_sub(100_000_000)
+        .unwrap();
+    let tranche = domain_tranche.checked_mul(2).unwrap();
+    let (attacker, attacker_ata) = new_depositor(&mut env, tranche.checked_mul(4).unwrap());
+    let attacker_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &attacker,
+        &attacker_ata,
+        &attacker_holding,
+        tranche.checked_sub(victim_principal).unwrap(),
+    )
+        .expect("fund the first near-total loss cycle");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+
+    let mut slot = 100;
+    run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        10_000_000,
+        high_entry,
+        high_capital.checked_add(1).unwrap(),
+        domain_tranche,
+        1,
+    );
+
+    let victim_position = env.position_pda(&victim.pubkey());
+    let retire_protection_ix = || Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(pool, false),
+            AccountMeta::new(victim_position, false),
+        ],
+        data: vec![14u8], // IX_RETIRE_ZERO_SHARE_PROTECTION
+    };
+    let pool_before_early_repair = env.svm.get_account(&pool).unwrap();
+    let position_before_early_repair = env.svm.get_account(&victim_position).unwrap();
+    assert!(
+        env.send(&[retire_protection_ix()], &[]).is_err(),
+        "a cranker cannot retire protection while any priced share survives",
+    );
+    assert_eq!(env.svm.get_account(&pool).unwrap(), pool_before_early_repair);
+    assert_eq!(
+        env.svm.get_account(&victim_position).unwrap(),
+        position_before_early_repair,
+    );
+
+    let mut scale_epoch = 0;
+    for _ in 0..3 {
+        env.insurance_deposit(&attacker, &attacker_ata, &attacker_holding, tranche)
+            .expect("recapitalize the one-atom residual at the amplified share price");
+        scale_epoch = env.pool_share_generation() >> 20;
+        if scale_epoch >= u64::from(victim_initial_shares.ilog2()) + 1 {
+            break;
+        }
+        run_complete_public_insurance_loss(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            100,
+            10_000_000,
+            high_entry,
+            high_capital,
+            domain_tranche,
+            1,
+        );
+    }
+
+    assert!(
+        scale_epoch >= u64::from(victim_initial_shares.ilog2()) + 1,
+        "the public replay must make the untouched material position round to zero",
+    );
+    assert_eq!(
+        env.position_share_generation(&victim.pubkey()),
+        0,
+        "the absent holder remains lazily encoded at its original scale",
+    );
+    let pool_before = env.svm.get_account(&pool).unwrap();
+    let protected_before = u64::from_le_bytes(pool_before.data[272..280].try_into().unwrap());
+
+    env.send(
+        &[retire_protection_ix()],
+        &[],
+    )
+    .expect("any cranker retires only the absent holder's zero-share floor protection");
+    let pool_after_repair = env.svm.get_account(&pool).unwrap();
+    let protected_after_repair =
+        u64::from_le_bytes(pool_after_repair.data[272..280].try_into().unwrap());
+    assert_eq!(
+        protected_before - protected_after_repair,
+        victim_principal,
+        "the bounded public continuation removes material zero-share floor principal",
+    );
+    assert_eq!(env.position_shares(&victim.pubkey()), 0);
+    let repaired_position = env.svm.get_account(&victim_position).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(repaired_position.data[72..80].try_into().unwrap()),
+        victim_principal,
+        "floor cleanup cannot alter gross principal used by genesis and rewards",
+    );
+    assert_eq!(
+        u64::from_le_bytes(repaired_position.data[120..128].try_into().unwrap()),
+        0,
+    );
+    let pool_before_replay = env.svm.get_account(&pool).unwrap();
+    let position_before_replay = env.svm.get_account(&victim_position).unwrap();
+    assert!(
+        env.send(&[retire_protection_ix()], &[]).is_err(),
+        "zero-share protection can be retired only once",
+    );
+    assert_eq!(env.svm.get_account(&pool).unwrap(), pool_before_replay);
+    assert_eq!(
+        env.svm.get_account(&victim_position).unwrap(),
+        position_before_replay,
+    );
+
+    env.insurance_withdraw(
+        &victim,
+        &victim_ata,
+        &victim_holding,
+        &victim,
+        victim_principal,
+    )
+    .expect("the holder can retire its economically zero position");
+    assert_eq!(env.token_amount(&victim_ata), 0);
+    assert_eq!(env.position_shares(&victim.pubkey()), 0);
+    let pool_after = env.svm.get_account(&pool).unwrap();
+    let protected_after = u64::from_le_bytes(pool_after.data[272..280].try_into().unwrap());
+    assert_eq!(
+        protected_after, protected_after_repair,
+        "the later owner exit cannot retire floor protection twice",
+    );
+}
+
 // SHARE-INFLATION FIRST-DEPOSITOR THEFT (finding HB, surface B). The classic ERC4626 attack: a dust first
 // depositor DONATES into the fund to inflate the live share PRICE (balance >> total_shares) so a later
 // depositor's shares round toward ZERO; that principal then lands in the fund for 0 shares and the attacker's

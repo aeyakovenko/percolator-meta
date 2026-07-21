@@ -213,6 +213,11 @@ const IX_RETURN_FINALIZED_POSITION: u8 = 12;
 // slot, and action nonce. TWAP forwards the same signed witness after returning
 // established custody.
 const IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
+// Permissionless accounting-only continuation for capacity-rescaled insurance
+// positions. It can retire floor protection only after lazy normalization proves
+// that the position has exactly zero priced shares; gross principal, votes, and
+// reward eligibility remain owner-bound.
+const IX_RETIRE_ZERO_SHARE_PROTECTION: u8 = 14;
 
 // Percolator CPI tags (verified against the pinned v16 program, percolator-prog 7eea209).
 const PERC_IX_TOP_UP_INSURANCE_DOMAIN: u8 = 56;
@@ -1409,6 +1414,9 @@ pub fn process_instruction(
         }
         IX_INSURANCE_WITHDRAW_FULL => {
             process_insurance_withdraw_full(program_id, accounts, &mut data)
+        }
+        IX_RETIRE_ZERO_SHARE_PROTECTION => {
+            process_retire_zero_share_protection(program_id, accounts, &mut data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -3271,6 +3279,72 @@ fn process_handoff_to_twap(
             twap_program.clone(),
         ],
     )
+}
+
+// retire_zero_share_protection accounts: [pool(w), position(w)]
+// data: none
+//
+// Capacity rescaling advances the pool scale lazily. An untouched position can
+// therefore retain nominal current-generation principal even after its shares
+// normalize to zero. Such a position can never recover later insurance, so any
+// cranker may remove only that dead amount from the first-TWAP-handoff floor.
+// The owner's gross principal remains intact for genesis votes and rewards, and
+// the owner may still retire it through the ordinary zero-payout exit.
+fn process_retire_zero_share_protection(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let pool_account = next_account_info(iter)?;
+    let position_account = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if pool_account.owner != program_id || position_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if pool_account.data_len() < POOL_SIZE || position_account.data_len() < POSITION_SIZE {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    let mut position = Position::deserialize(&position_account.try_borrow_data()?)?;
+    if !pool.is_insurance()
+        || pool.policy != POLICY_PRINCIPAL
+        || pool.domain != DOMAIN_INSURANCE
+        || position.withdrawn
+        || position.pool != *pool_account.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    validate_pool_pda(program_id, pool_account, &pool)?;
+    let expected_position = Pubkey::find_program_address(
+        &position_seeds(pool_account.key, &position.owner),
+        program_id,
+    )
+    .0;
+    if *position_account.key != expected_position {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let shares_are_current = move_position_to_current_share_generation(&mut position, &pool)?;
+    let protection_to_retire = position.current_generation_principal;
+    if !shares_are_current || position.shares != 0 || protection_to_retire == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    pool.current_generation_principal = pool
+        .current_generation_principal
+        .checked_sub(protection_to_retire)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    position.current_generation_principal = 0;
+
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    position.serialize(&mut position_account.try_borrow_mut_data()?)?;
+    Ok(())
 }
 
 // assert_no_principal accounts: [pool]
