@@ -2810,7 +2810,7 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     )
     .expect("configure the independent authenticated mark");
     let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
-    let (_long, long_portfolio, short, short_portfolio) =
+    let (long, long_portfolio, short, short_portfolio) =
         open_public_pair(&mut env, 100_000_000_000, 100, 1_000_000);
     let mut slot = 100;
     advance_public_mark(&mut env, &oracle, observer_portfolio, &mut slot, 89, 10);
@@ -2844,6 +2844,59 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     assert_eq!(env.token_amount(&first_ata), 0);
     assert_eq!(env.token_amount(&second_ata), 0);
     assert_eq!(env.token_amount(&third_ata), 0);
+
+    let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(pool_data.len(), 289, "current cross-backed pool layout");
+    assert_eq!(
+        [
+            u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_data[281..289].try_into().unwrap()),
+        ],
+        [1, 0],
+        "the incompatible long-domain atom remains explicit owner principal",
+    );
+    assert_eq!(env.token_amount(&pool_holding), 1);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve after the deposit window attack");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&observer, observer_portfolio),
+            (&long, long_portfolio),
+            (&short, short_portfolio),
+        ],
+    );
+
+    for (owner, destination) in [
+        (&first, &first_ata),
+        (&second, &second_ata),
+        (&third, &third_ata),
+    ] {
+        env.cross_backing_withdraw(owner, destination, &pool_holding, 1)
+            .expect("each one-vote depositor retains an owner-bound exit");
+        assert_eq!(env.token_amount(destination), 1);
+    }
+    let final_pool_data = env.svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        [
+            u64::from_le_bytes(final_pool_data[273..281].try_into().unwrap()),
+            u64::from_le_bytes(final_pool_data[281..289].try_into().unwrap()),
+        ],
+        [0, 0],
+        "all staged owner principal is retired with the final claim",
+    );
+    assert_eq!(env.pool_outstanding(), 0);
 }
 
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
