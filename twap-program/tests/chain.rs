@@ -52233,6 +52233,38 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
         4,
     );
 
+    // Model the exact engine-valid state emitted by the separately covered
+    // backing-utilization fee path. The owner-return CPI must sweep these atoms
+    // into the canonical pool escrow without adding them to either owner claim.
+    let long_backing_earnings = 1u64;
+    let short_backing_earnings = 2u64;
+    let backing_earnings = long_backing_earnings + short_backing_earnings;
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &vault_authority,
+        2 * principal + backing_earnings,
+    );
+    let mut market_with_earnings = svm.get_account(&env.slab).unwrap();
+    {
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut market_with_earnings.data).unwrap();
+        group.header.vault =
+            percolator::V16PodU128::new(group.header.vault.get() + u128::from(backing_earnings));
+        group.header.backing_provider_earnings_total = percolator::V16PodU128::new(
+            group.header.backing_provider_earnings_total.get() + u128::from(backing_earnings),
+        );
+        group.markets[0].engine.backing_long.utilization_fee_earnings =
+            percolator::V16PodU128::new(u128::from(long_backing_earnings));
+        group.markets[0].engine.backing_short.utilization_fee_earnings =
+            percolator::V16PodU128::new(u128::from(short_backing_earnings));
+        group
+            .validate_shape()
+            .expect("the backing-earnings fixture remains engine-valid");
+    }
+    svm.set_account(env.slab, market_with_earnings).unwrap();
+
     send(
         &mut svm,
         &[&payer],
@@ -52336,7 +52368,7 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
     )
     .expect("first cross-backer atomically returns custody and exits");
     assert_eq!(token_amount(&svm, alice_destination), principal);
-    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(token_amount(&svm, &pool_holding), backing_earnings);
     assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 2);
     assert_eq!(
         percolator_accounting::read_asset_backing_balances(
@@ -52359,7 +52391,7 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
     send(&mut svm, &[&payer, bob], bob_exit)
         .expect("second cross-backer atomically returns custody and exits");
     assert_eq!(token_amount(&svm, bob_destination), principal);
-    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(token_amount(&svm, &pool_holding), backing_earnings);
     assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 0);
     assert!(
         percolator_accounting::read_asset_backing_balances(
@@ -52375,6 +52407,42 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
     send(&mut svm, &[&payer], permissionless_rehandoff())
         .expect("unrelated cranker resumes zero-principal TWAP custody");
     assert_eq!(read_reserved_floor(&svm, &twap_config), 0);
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        subledger_route_cross_backing_earnings_ix(
+            &env.pool,
+            &env.squads_vault,
+            &env.slab,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            &perc_id(),
+            &twap_config,
+            &governance_destination,
+        ),
+    )
+    .expect("any cranker routes only the isolated earnings to bound governance");
+    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(token_amount(&svm, &governance_destination), backing_earnings);
+    assert_eq!(
+        token_amount(&svm, alice_destination)
+            + token_amount(&svm, bob_destination)
+            + token_amount(&svm, &governance_destination),
+        2 * principal + backing_earnings,
+        "owner principal and protocol earnings conserve across both custody cycles",
+    );
 }
 
 // EXTERNAL-BACKING CAPTURE: a cross-backed genesis pool needs the backing role,
