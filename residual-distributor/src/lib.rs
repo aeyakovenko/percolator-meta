@@ -2199,6 +2199,16 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         return Err(ProgramError::InvalidAccountData); // sealed or frozen -> denominators are final
     }
     let now = Clock::get()?.slot;
+    let freeze_cutoff = config
+        .emission_end_slot
+        .checked_add(config.finalize_window)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    // The first freeze-eligible slot is freeze-only. Otherwise a public trader refresh can race
+    // freeze, remove another stake from the denominator after the published finalize window, and
+    // redistribute that capped share to the remaining claimants.
+    if now >= freeze_cutoff {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     let post_emission_finalize = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
         if now < config.emission_start_slot {
             return Err(ProgramError::InvalidInstructionData);
@@ -2301,15 +2311,6 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             }
             let now = Clock::get()?.slot;
             let terminal_snapshot = read_terminal_return_snapshot(&data)?;
-            if post_emission_finalize {
-                let freeze_cutoff = config
-                    .emission_end_slot
-                    .checked_add(config.finalize_window)
-                    .ok_or(ProgramError::InvalidInstructionData)?;
-                if now >= freeze_cutoff {
-                    return Err(ProgramError::InvalidInstructionData);
-                }
-            }
             let accrual_cutoff = if config.config_kind == CONFIG_KIND_REWARD_EPOCH {
                 core::cmp::min(now, config.emission_end_slot)
             } else {
