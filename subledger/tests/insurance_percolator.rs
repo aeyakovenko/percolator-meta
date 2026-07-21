@@ -3615,6 +3615,149 @@ fn public_trader_backing_cannot_inflate_final_cross_backer_exit() {
     );
 }
 
+// PUBLIC LOF PROBE: a fresh owner can split an exit while part of the pool's
+// backing remains staged outside Percolator. Partial-share rounding and the
+// pending-first debit order must not improve that owner's payout or transfer a
+// surviving co-depositor's claim.
+#[test]
+fn split_exit_cannot_farm_staged_backing_or_strand_a_codepositor() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let run = |exit_chunks: &[u64]| {
+        let mut env = Env::new_cross_backing();
+        let oracle = Keypair::new();
+        let observer = Keypair::new();
+        for owner in [&oracle, &observer] {
+            env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        }
+        install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+        env.init_cross_backing_genesis_pool();
+        let pool_holding = create_canonical_pool_holding(&mut env);
+
+        let (old_owner, old_destination) = new_depositor(&mut env, 1);
+        env.cross_backing_deposit(&old_owner, &old_destination, &pool_holding, 1)
+            .expect("seed only the canonical short backing bucket");
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: 100,
+                    initial_mark_e6: 100,
+                }
+                .encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("configure the independent authenticated mark");
+        let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+        let (long, long_portfolio, short, short_portfolio) =
+            open_public_pair(&mut env, 100_000_000_000, 100, 1_000_000);
+        let mut slot = 100;
+        advance_public_mark(&mut env, &oracle, observer_portfolio, &mut slot, 89, 10);
+        liquidate_stale_public_loser(&mut env, long_portfolio, slot);
+        clear_stale_public_winner_with_backing(&mut env, &short, short_portfolio, slot);
+
+        let market = env.svm.get_account(&env.slab).unwrap();
+        let sources =
+            percolator_accounting::read_asset_backing_source_credits(&market.data, 0).unwrap();
+        assert!(sources[0].exact_positive_claim_num > 0);
+
+        let fresh_principal = 6u64;
+        let (fresh_owner, fresh_destination) = new_depositor(&mut env, fresh_principal);
+        env.cross_backing_deposit(
+            &fresh_owner,
+            &fresh_destination,
+            &pool_holding,
+            fresh_principal,
+        )
+        .expect("fresh capital enters despite the incompatible source expiry");
+        let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+        let pending_before = [
+            u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_data[281..289].try_into().unwrap()),
+        ];
+        assert!(pending_before[0] > 0, "long backing is staged outside Percolator");
+        assert_eq!(
+            env.token_amount(&pool_holding),
+            pending_before.into_iter().sum::<u64>(),
+        );
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ResolveMarket.encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("resolve after staging fresh backing");
+        close_resolved_portfolios(
+            &mut env,
+            &[
+                (&observer, observer_portfolio),
+                (&long, long_portfolio),
+                (&short, short_portfolio),
+            ],
+        );
+
+        assert_eq!(exit_chunks.iter().copied().sum::<u64>(), fresh_principal);
+        for &chunk in exit_chunks {
+            env.cross_backing_withdraw(
+                &fresh_owner,
+                &fresh_destination,
+                &pool_holding,
+                chunk,
+            )
+            .expect("each fresh-owner exit tranche remains live");
+        }
+        env.cross_backing_withdraw(&old_owner, &old_destination, &pool_holding, 1)
+            .expect("the original backing provider remains able to exit");
+
+        let market = env.svm.get_account(&env.slab).unwrap();
+        let final_backing =
+            percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+        assert!(
+            final_backing.iter().all(|balance| {
+                balance.principal_atoms == 0
+                    && balance.valid_liened_principal_atoms == 0
+                    && balance.earnings_atoms == 0
+            }),
+            "terminal backing custody: {final_backing:?}",
+        );
+        let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+        let pending_after = [
+            u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_data[281..289].try_into().unwrap()),
+        ];
+
+        (
+            env.token_amount(&fresh_destination),
+            env.token_amount(&old_destination),
+            env.token_amount(&pool_holding),
+            env.token_amount(&env.perc_vault),
+            env.pool_outstanding(),
+            pending_after,
+        )
+    };
+
+    let control = run(&[6]);
+    let split = run(&[1, 2, 3]);
+    assert_eq!(control, split, "exit partitioning cannot improve a payout");
+    assert!(control.0 <= 6 && control.1 <= 1, "owners cannot extract more than principal");
+    assert_eq!(control.3, 0, "terminal cleanup empties Percolator custody");
+    assert_eq!(control.4, 0);
+    assert_eq!(control.5, [0, 0]);
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
