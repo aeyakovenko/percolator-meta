@@ -53354,6 +53354,73 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
     )
     .expect("Squads donates lifecycle control while custody remains constrained");
 
+    // PUBLIC LOF PROBE: the controller shutdown instruction accepts a raw backing
+    // domain and an external-provider destination. Asset 0 must never acquire the
+    // secondary-asset shutdown override, or a caller could move Genesis backing to
+    // a noncanonical pool-owned token account that the Subledger cannot redeem.
+    let noncanonical_pool_destination = Pubkey::new_unique();
+    let shutdown_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &noncanonical_pool_destination,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &shutdown_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    let shutdown_ledger = Pubkey::new_unique();
+    svm.set_account(
+        shutdown_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::backing_domain_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let market_before_shutdown_probe = svm.get_account(&env.slab).unwrap();
+    let vault_before_shutdown_probe = svm.get_account(&env.perc_vault).unwrap();
+    let ledger_before_shutdown_probe = svm.get_account(&shutdown_ledger).unwrap();
+    let shutdown_probe = send(
+        &mut svm,
+        &[&payer],
+        controller_return_shutdown_backing_ix(
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &noncanonical_pool_destination,
+            &shutdown_transit,
+            &env.perc_vault,
+            &vault_authority,
+            &shutdown_ledger,
+            &perc_id(),
+            0,
+            1,
+            0,
+        ),
+    )
+    .expect_err("market authority cannot exercise a shutdown override over Genesis backing");
+    assert!(
+        shutdown_probe.contains("Custom(8)"),
+        "the real Percolator must reject the otherwise valid controller path as unauthorized: {shutdown_probe}",
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_shutdown_probe);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_shutdown_probe);
+    assert_eq!(
+        svm.get_account(&shutdown_ledger).unwrap(),
+        ledger_before_shutdown_probe,
+    );
+    assert_eq!(token_amount(&svm, &noncanonical_pool_destination), 0);
+    assert_eq!(token_amount(&svm, &shutdown_transit), 0);
+
     let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
