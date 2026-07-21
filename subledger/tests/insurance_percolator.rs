@@ -2899,6 +2899,133 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     assert_eq!(env.pool_outstanding(), 0);
 }
 
+// PUBLIC DOS PROBE: a trader can choose either side of a loss sequence. If both
+// transient source-backed buckets carry an incompatible expiry before Genesis,
+// every backing atom must remain staged without blocking deposits or owner exits.
+#[test]
+fn bilateral_transient_sources_cannot_block_genesis_backing_or_refunds() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_cross_backing_genesis_pool();
+    let pool_holding = create_canonical_pool_holding(&mut env);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the independent authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+
+    let position_q = 100_000_000_000i128;
+    let (first_long, first_long_portfolio, first_short, first_short_portfolio) =
+        open_public_pair(&mut env, position_q, 100, 1_000_000);
+    let mut slot = 100;
+    advance_public_mark(&mut env, &oracle, observer_portfolio, &mut slot, 89, 10);
+    liquidate_stale_public_loser(&mut env, first_long_portfolio, slot);
+    clear_stale_public_winner_with_backing(
+        &mut env,
+        &first_short,
+        first_short_portfolio,
+        slot,
+    );
+
+    let (second_long, second_long_portfolio, second_short, second_short_portfolio) =
+        open_public_pair(&mut env, position_q, 89, 1_000_000);
+    advance_public_mark(&mut env, &oracle, observer_portfolio, &mut slot, 100, 10);
+    liquidate_stale_public_loser(&mut env, second_short_portfolio, slot);
+    clear_stale_public_winner_with_backing(
+        &mut env,
+        &second_long,
+        second_long_portfolio,
+        slot,
+    );
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let sources =
+        percolator_accounting::read_asset_backing_source_credits(&market.data, 0).unwrap();
+    assert!(sources[0].exact_positive_claim_num > 0);
+    assert!(sources[1].exact_positive_claim_num > 0);
+    for domain in 0..2u16 {
+        let ledger = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .unwrap();
+        assert!(
+            !percolator_prog::state::is_initialized(&ledger.data),
+            "both buckets contain trader source backing only",
+        );
+    }
+
+    let mut depositors = Vec::new();
+    for _ in 0..4 {
+        let (owner, destination) = new_depositor(&mut env, 1);
+        env.cross_backing_deposit(&owner, &destination, &pool_holding, 1)
+            .expect("bilateral source expiry cannot veto a Genesis base unit");
+        depositors.push((owner, destination));
+    }
+    let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        [
+            u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_data[281..289].try_into().unwrap()),
+        ],
+        [1, 1],
+        "both incompatible backing atoms remain segregated owner principal",
+    );
+    assert_eq!(env.pool_outstanding(), 4);
+    assert_eq!(env.token_amount(&pool_holding), 2);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve after both public source buckets are materialized");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&observer, observer_portfolio),
+            (&first_long, first_long_portfolio),
+            (&first_short, first_short_portfolio),
+            (&second_long, second_long_portfolio),
+            (&second_short, second_short_portfolio),
+        ],
+    );
+
+    for (owner, destination) in depositors {
+        env.cross_backing_withdraw(&owner, &destination, &pool_holding, 1)
+            .expect("each bilateral-source Genesis unit remains owner-recoverable");
+        assert_eq!(env.token_amount(&destination), 1);
+    }
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.token_amount(&pool_holding), 0);
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
