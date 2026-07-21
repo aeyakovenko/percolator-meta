@@ -57,7 +57,9 @@ const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // and `coin_mint` (Pubkey @208) so the genesis-vote authority is part of the pool namespace.
 // Position grows by `shares` (u128 @104). Reserved bytes hold a pool share
 // generation (u40 @91) and an active-position generation (u40 @99); terminal
-// positions continue to use @99 for their return slot. All cross-program reads (genesis-vote
+// positions continue to use @99 for their return slot. Current layouts append the
+// nominal principal belonging to that share generation (pool u64 @272, position
+// u64 @120). All cross-program reads (genesis-vote
 // principal@72 / start_slot@89 / outstanding@80) keep their offsets — the new fields are
 // appended, so those programs are unaffected.
 // Historical accounts cannot be reallocated by an upgrade. Keep every deployed
@@ -71,10 +73,12 @@ const POOL_SIZE_DEADLINE_ONLY: usize = 216;
 const POOL_SIZE_COIN: usize = 240;
 const POOL_SIZE_WINDOW: usize = 256;
 const POOL_SIZE_START: usize = 264;
-const POOL_SIZE: usize = 272;
+const POOL_SIZE_BOOTSTRAP: usize = 272;
+const POOL_SIZE: usize = 280;
 const POSITION_SIZE_BASE: usize = 96;
 const POSITION_SIZE_TENURE: usize = 104;
-const POSITION_SIZE: usize = 120;
+const POSITION_SIZE_SHARES: usize = 120;
+const POSITION_SIZE: usize = 128;
 // One week at ~400ms/slot. `init_insurance_pool` accepts an optional explicit
 // slot window, but defaults to this short bootstrap deposit window.
 const DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS: u64 = 1_512_000;
@@ -114,6 +118,8 @@ pub const POOL_DEPOSIT_DEADLINE_SLOT_OFF: usize = 240;
 pub const POOL_DEPOSIT_WINDOW_SLOTS_OFF: usize = 248;
 pub const POOL_DEPOSIT_START_SLOT_OFF: usize = 256;
 pub const POOL_BOOTSTRAP_DELAY_SLOTS_OFF: usize = 264;
+pub const POOL_CURRENT_GENERATION_PRINCIPAL_OFF: usize = 272;
+pub const POS_CURRENT_GENERATION_PRINCIPAL_OFF: usize = 120;
 
 const POLICY_PRINCIPAL: u8 = 0;
 const POLICY_WITH_SURPLUS: u8 = 1;
@@ -186,7 +192,8 @@ const IX_SET_VOTE_LOCK: u8 = 6;
 // later reassigning the operator to itself and bypassing owner-bound withdrawals.
 const IX_ACCEPT_OPERATOR: u8 = 7;
 // Governance-authorized, hardcoded pool -> TWAP custody handoff. Principal pools carry
-// their protected floor; with-surplus pools are accepted only after all owner claims exit.
+// their current-generation protected floor; with-surplus pools are accepted only after all
+// owner claims exit.
 // The pool remains current asset_admin until TWAP atomically receives all three roles.
 const IX_HANDOFF_TO_TWAP: u8 = 8;
 // Permissionless resolved-mode backing return. The pool signs only the controller's
@@ -328,6 +335,10 @@ struct Pool {
     /// Delay from `deposit_start_slot` until genesis may be triggered. Insurance
     /// pools bind this to the genesis-vote config; own-vault pools use zero.
     bootstrap_delay_slots: u64,
+    /// Nominal principal whose priced shares belong to `share_generation`.
+    /// Fully impaired earlier generations remain in `outstanding_principal` for
+    /// voting and rewards but cannot raise TWAP's custody floor.
+    current_generation_principal: u64,
 }
 
 impl Pool {
@@ -340,11 +351,12 @@ impl Pool {
         if policy > POLICY_WITH_SURPLUS || domain > DOMAIN_BACKING {
             return Err(ProgramError::InvalidAccountData);
         }
-        Ok(Self {
+        let outstanding_principal = u64::from_le_bytes(data[80..88].try_into().unwrap());
+        let pool = Self {
             mint: Pubkey::new_from_array(data[8..40].try_into().unwrap()),
             asset_id: u64::from_le_bytes(data[40..48].try_into().unwrap()),
             vault: Pubkey::new_from_array(data[48..80].try_into().unwrap()),
-            outstanding_principal: u64::from_le_bytes(data[80..88].try_into().unwrap()),
+            outstanding_principal,
             policy,
             domain,
             bump: data[89],
@@ -395,12 +407,28 @@ impl Pool {
             } else {
                 OWN_VAULT_DEPOSIT_START_SLOT
             },
-            bootstrap_delay_slots: if data.len() >= POOL_SIZE {
+            bootstrap_delay_slots: if data.len() >= POOL_SIZE_BOOTSTRAP {
                 u64::from_le_bytes(data[264..272].try_into().unwrap())
             } else {
                 OWN_VAULT_BOOTSTRAP_DELAY_SLOTS
             },
-        })
+            current_generation_principal: if data.len() >= POOL_SIZE {
+                u64::from_le_bytes(
+                    data[POOL_CURRENT_GENERATION_PRINCIPAL_OFF
+                        ..POOL_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                // Historical layouts cannot distinguish reset generations. The
+                // gross fallback may overprotect but can never expose principal.
+                outstanding_principal
+            },
+        };
+        if pool.current_generation_principal > pool.outstanding_principal {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(pool)
     }
 
     fn serialize(&self, data: &mut [u8]) -> ProgramResult {
@@ -442,8 +470,12 @@ impl Pool {
         if data.len() >= POOL_SIZE_START {
             data[256..264].copy_from_slice(&self.deposit_start_slot.to_le_bytes());
         }
-        if data.len() >= POOL_SIZE {
+        if data.len() >= POOL_SIZE_BOOTSTRAP {
             data[264..272].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        }
+        if data.len() >= POOL_SIZE {
+            data[POOL_CURRENT_GENERATION_PRINCIPAL_OFF..POOL_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+                .copy_from_slice(&self.current_generation_principal.to_le_bytes());
         }
         Ok(())
     }
@@ -475,7 +507,7 @@ fn supported_pool_size(size: usize) -> bool {
             | POOL_SIZE_COIN
             | POOL_SIZE_WINDOW
             | POOL_SIZE_START
-    ) || size >= POOL_SIZE
+    ) || size >= POOL_SIZE_BOOTSTRAP
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,7 +618,7 @@ fn pool_seed_version(
         POOL_SIZE_COIN => COIN_OR_POLICY,
         POOL_SIZE_WINDOW => WINDOW,
         POOL_SIZE_START => START,
-        size if size >= POOL_SIZE => BOOTSTRAP,
+        size if size >= POOL_SIZE_BOOTSTRAP => BOOTSTRAP,
         _ => return Err(ProgramError::InvalidAccountData),
     };
     let seed_bytes = PoolSeedBytes::new(pool);
@@ -651,6 +683,9 @@ struct Position {
     /// shares for both payout policies so residual-distributor live caps track
     /// remaining capital; own-vault POLICY_PRINCIPAL deposits keep this at 0.
     shares: u128,
+    /// Portion of `principal` deposited in `share_generation`. A position may
+    /// retain obsolete nominal principal for voting after topping up a reset pool.
+    current_generation_principal: u64,
 }
 
 impl Position {
@@ -664,12 +699,12 @@ impl Position {
         } else {
             0
         };
-        let terminal_returned = if data.len() >= POSITION_SIZE {
+        let terminal_returned = if data.len() >= POSITION_SIZE_SHARES {
             data[POS_TERMINAL_RETURNED_OFF]
         } else {
             0
         };
-        let generation_or_terminal_slot = if data.len() >= POSITION_SIZE {
+        let generation_or_terminal_slot = if data.len() >= POSITION_SIZE_SHARES {
             decode_u40(&data[POS_TERMINAL_RETURN_SLOT_OFF..POS_TERMINAL_RETURN_SLOT_OFF + 5])
         } else {
             0
@@ -687,10 +722,11 @@ impl Position {
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        Ok(Self {
+        let principal = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let position = Self {
             pool: Pubkey::new_from_array(data[8..40].try_into().unwrap()),
             owner: Pubkey::new_from_array(data[40..72].try_into().unwrap()),
-            principal: u64::from_le_bytes(data[72..80].try_into().unwrap()),
+            principal,
             withdrawn_amount: u64::from_le_bytes(data[80..88].try_into().unwrap()),
             withdrawn: withdrawn == 1,
             start_slot: if data.len() >= POSITION_SIZE_TENURE {
@@ -706,12 +742,28 @@ impl Position {
             } else {
                 0
             },
-            shares: if data.len() >= POSITION_SIZE {
+            shares: if data.len() >= POSITION_SIZE_SHARES {
                 u128::from_le_bytes(data[104..120].try_into().unwrap())
             } else {
                 0
             },
-        })
+            current_generation_principal: if data.len() >= POSITION_SIZE {
+                u64::from_le_bytes(
+                    data[POS_CURRENT_GENERATION_PRINCIPAL_OFF
+                        ..POS_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                // Historical positions are treated conservatively as current
+                // until a reset generation proves otherwise.
+                principal
+            },
+        };
+        if position.current_generation_principal > position.principal {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(position)
     }
 
     fn serialize(&self, data: &mut [u8]) -> ProgramResult {
@@ -729,7 +781,7 @@ impl Position {
         } else {
             data[89..97].copy_from_slice(&self.start_slot.to_le_bytes());
             data[97] = self.vote_locked as u8;
-            if data.len() >= POSITION_SIZE {
+            if data.len() >= POSITION_SIZE_SHARES {
                 data[POS_TERMINAL_RETURNED_OFF] = self.terminal_returned as u8;
                 if !self.terminal_returned && self.terminal_return_slot.is_some() {
                     return Err(ProgramError::InvalidAccountData);
@@ -754,12 +806,16 @@ impl Position {
                 data[98..104].fill(0);
             }
         }
+        if data.len() >= POSITION_SIZE {
+            data[POS_CURRENT_GENERATION_PRINCIPAL_OFF..POS_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+                .copy_from_slice(&self.current_generation_principal.to_le_bytes());
+        }
         Ok(())
     }
 }
 
 fn supported_position_size(size: usize) -> bool {
-    matches!(size, POSITION_SIZE_BASE | POSITION_SIZE_TENURE) || size >= POSITION_SIZE
+    matches!(size, POSITION_SIZE_BASE | POSITION_SIZE_TENURE) || size >= POSITION_SIZE_SHARES
 }
 
 // ---------------------------------------------------------------------------
@@ -771,6 +827,18 @@ fn mul_div_floor(a: u64, b: u64, denom: u64) -> Option<u64> {
         return None;
     }
     Some((a as u128 * b as u128 / denom as u128) as u64)
+}
+
+fn generation_principal_to_retire(
+    current_generation_principal: u64,
+    amount: u64,
+    position_principal: u64,
+) -> Result<u64, ProgramError> {
+    if amount == position_principal {
+        return Ok(current_generation_principal);
+    }
+    mul_div_floor(current_generation_principal, amount, position_principal)
+        .ok_or(ProgramError::ArithmeticOverflow)
 }
 
 /// Exact quotient and remainder for `a * b / denom` without requiring the product
@@ -1032,6 +1100,7 @@ fn begin_fully_impaired_recapitalization(pool: &mut Pool, priced_balance: u64) -
             .checked_add(1)
             .ok_or(ProgramError::ArithmeticOverflow)?;
         pool.share_generation = encode_share_generation(reset_generation, 0)?;
+        pool.current_generation_principal = 0;
     }
     pool.total_shares = 0;
     Ok(())
@@ -1122,6 +1191,7 @@ fn move_position_to_current_share_generation(
     let reset_generation_is_current = position_reset == pool_reset;
     if position_reset < pool_reset {
         position.shares = 0;
+        position.current_generation_principal = 0;
     } else if position_scale < pool_scale {
         let shift = pool_scale - position_scale;
         position.shares = if shift >= u128::BITS as u64 {
@@ -1510,6 +1580,7 @@ fn process_init_pool(
         deposit_window_slots: OWN_VAULT_DEPOSIT_WINDOW_SLOTS,
         deposit_start_slot: OWN_VAULT_DEPOSIT_START_SLOT,
         bootstrap_delay_slots: OWN_VAULT_BOOTSTRAP_DELAY_SLOTS,
+        current_generation_principal: 0,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -1599,13 +1670,14 @@ fn process_deposit(
             terminal_return_slot: None,
             share_generation: pool.share_generation,
             shares: 0,
+            current_generation_principal: 0,
         }
     } else {
         if position_account.owner != program_id {
             return Err(ProgramError::IllegalOwner);
         }
         let p = Position::deserialize(&position_account.try_borrow_data()?)?;
-        if position_account.data_len() < POSITION_SIZE {
+        if position_account.data_len() < POSITION_SIZE_SHARES {
             return Err(ProgramError::InvalidAccountData);
         }
         if p.owner != *owner.key || p.pool != *pool_account.key {
@@ -1731,7 +1803,7 @@ fn process_withdraw(
     // full own-vault exit burns all of the position's shares. POLICY_PRINCIPAL keeps the pro-rata/
     // principal payout.
     let share_accounting = pool_account.data_len() >= POOL_SIZE_SHARES;
-    if share_accounting && position_account.data_len() < POSITION_SIZE {
+    if share_accounting && position_account.data_len() < POSITION_SIZE_SHARES {
         return Err(ProgramError::InvalidAccountData);
     }
     let (paid, shares_to_retire) = if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
@@ -2041,6 +2113,7 @@ fn process_init_insurance_pool(
         deposit_window_slots,
         deposit_start_slot,
         bootstrap_delay_slots,
+        current_generation_principal: 0,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2191,6 +2264,7 @@ fn process_insurance_deposit(
             terminal_return_slot: None,
             share_generation: pool.share_generation,
             shares: 0,
+            current_generation_principal: 0,
         }
     } else {
         if position_account.owner != program_id {
@@ -2206,6 +2280,14 @@ fn process_insurance_deposit(
         p
     };
     move_position_to_current_share_generation(&mut position, &pool)?;
+    let current_generation_principal_after = pool
+        .current_generation_principal
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let position_current_generation_principal_after = position
+        .current_generation_principal
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
 
     // 1) User -> holding (user-signed; the user is moving their own funds).
     invoke(
@@ -2261,10 +2343,12 @@ fn process_insurance_deposit(
     }
 
     pool.outstanding_principal = outstanding_after;
+    pool.current_generation_principal = current_generation_principal_after;
     position.principal = position
         .principal
         .checked_add(amount)
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    position.current_generation_principal = position_current_generation_principal_after;
     // Mint the priced shares (a top-up mints at the current price, accumulating onto the
     // position — its total shares represent its principal-weighted entry).
     pool.total_shares = pool
@@ -2482,8 +2566,8 @@ fn process_insurance_withdraw_impl(
     if terminal {
         let (genesis_config, genesis_ballot, genesis_proposal, genesis_program) =
             genesis_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
-        if pool_account.data_len() < POOL_SIZE
-            || position_account.data_len() < POSITION_SIZE
+        if pool_account.data_len() < POOL_SIZE_BOOTSTRAP
+            || position_account.data_len() < POSITION_SIZE_SHARES
             || pool.domain != DOMAIN_INSURANCE
             || pool.vote_authority != *genesis_config.key
             || *genesis_program.key != GENESIS_VOTE_PROGRAM_ID
@@ -2579,7 +2663,7 @@ fn process_insurance_withdraw_impl(
     // WITH_SURPLUS redeems the live share value; PRINCIPAL uses it only as a loss cap
     // and never pays more than requested principal.
     let share_accounting = pool_account.data_len() >= POOL_SIZE_SHARES;
-    if share_accounting && position_account.data_len() < POSITION_SIZE {
+    if share_accounting && position_account.data_len() < POSITION_SIZE_SHARES {
         return Err(ProgramError::InvalidAccountData);
     }
     let shares_are_current = if share_accounting {
@@ -2596,6 +2680,18 @@ fn process_insurance_withdraw_impl(
         wide_mul_div_floor(position.shares, amount as u128, position.principal as u128)
             .ok_or(ProgramError::ArithmeticOverflow)?
     };
+    let current_generation_principal_to_retire = if !shares_are_current {
+        0
+    } else {
+        generation_principal_to_retire(
+            position.current_generation_principal,
+            amount,
+            position.principal,
+        )?
+    };
+    if current_generation_principal_to_retire > pool.current_generation_principal {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let owed = if !shares_are_current {
         0
     } else if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
@@ -2796,7 +2892,20 @@ fn process_insurance_withdraw_impl(
     // The full requested principal leaves the outstanding accounting (the loss, if any, is
     // realized); the owner collected `owed` (their pro-rata share).
     pool.outstanding_principal = outstanding_after;
+    pool.current_generation_principal = pool
+        .current_generation_principal
+        .checked_sub(current_generation_principal_to_retire)
+        .ok_or(ProgramError::InvalidAccountData)?;
     position.principal -= amount;
+    position.current_generation_principal = position
+        .current_generation_principal
+        .checked_sub(current_generation_principal_to_retire)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    if pool.current_generation_principal > outstanding_after
+        || position.current_generation_principal > position.principal
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // The position retires its nominal shares. The pool burns only the rate-safe
     // subset; the difference is unowned reserve that keeps floor dust out of a
     // later holder's redemption. Empty principal pools reset for terminal custody;
@@ -3125,8 +3234,18 @@ fn process_handoff_to_twap(
 
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
 
+    // Nominal principal remains the vote/reward unit after an impairment, but an
+    // obsolete share generation has no claim on later recapitalization. Importing
+    // that stale nominal amount into TWAP would permanently overstate its monotonic
+    // floor. Protect the current generation's full nominal principal so later fee
+    // recovery remains owner-bound even while its live value is temporarily impaired.
+    let protected_value = if pool.policy == POLICY_PRINCIPAL {
+        pool.current_generation_principal
+    } else {
+        0
+    };
     let mut handoff_data = vec![TWAP_IX_ACCEPT_FROM_SUBLEDGER];
-    handoff_data.extend_from_slice(&(pool.outstanding_principal as u128).to_le_bytes());
+    handoff_data.extend_from_slice(&(protected_value as u128).to_le_bytes());
     invoke_signed_for_pool(
         &pool,
         pool_seed_version,
@@ -3438,6 +3557,7 @@ mod tests {
             terminal_return_slot: None,
             share_generation: 3,
             shares: 0,
+            current_generation_principal: 0x1122_3344_5566_7788,
         };
         let mut d = vec![0u8; POSITION_SIZE];
         p.serialize(&mut d).unwrap();
@@ -3464,6 +3584,14 @@ mod tests {
             decode_u40(&d[POS_SHARE_GENERATION_OFF..POS_SHARE_GENERATION_OFF + 5]),
             3,
         );
+        assert_eq!(
+            u64::from_le_bytes(
+                d[POS_CURRENT_GENERATION_PRINCIPAL_OFF..POS_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            p.current_generation_principal,
+        );
 
         let terminal = Position {
             pool,
@@ -3477,6 +3605,7 @@ mod tests {
             terminal_return_slot: Some(66),
             share_generation: 0,
             shares: 0,
+            current_generation_principal: 0,
         };
         terminal.serialize(&mut d).unwrap();
         assert_eq!(d[POS_TERMINAL_RETURNED_OFF], 1);
@@ -3604,6 +3733,7 @@ mod tests {
             terminal_return_slot: None,
             share_generation: pool.share_generation,
             shares: pool.total_shares,
+            current_generation_principal: u64::MAX,
         };
         let old_virtual = insurance_virtual_shares(pool.share_generation).unwrap();
         let old_claim = redeem_shares_with_virtual_offset(
@@ -3660,13 +3790,27 @@ mod tests {
             terminal_return_slot: None,
             share_generation: pool.share_generation,
             shares: 1u128 << 119,
+            current_generation_principal: 1,
         };
 
         begin_fully_impaired_recapitalization(&mut pool, 0).unwrap();
         assert_eq!(share_generation_parts(pool.share_generation).unwrap(), (12, 0));
         assert_eq!(pool.total_shares, 0);
+        assert_eq!(pool.current_generation_principal, 0);
         move_position_to_current_share_generation(&mut position, &pool).unwrap();
         assert_eq!(position.shares, 0);
+        assert_eq!(position.current_generation_principal, 0);
+    }
+
+    #[test]
+    fn mixed_generation_partial_exit_never_retires_more_protection_than_shares() {
+        // One obsolete vote unit plus one current deposit share may coexist in a
+        // position after recapitalization. Fractional exits round both ownership
+        // measures down; the eventual full exit clears the exact remainder.
+        assert_eq!(generation_principal_to_retire(1, 1, 2).unwrap(), 0);
+        assert_eq!(generation_principal_to_retire(1, 2, 2).unwrap(), 1);
+        assert_eq!(generation_principal_to_retire(7, 3, 10).unwrap(), 2);
+        assert!(generation_principal_to_retire(5, 1, 0).is_err());
     }
 
     #[test]
@@ -3813,6 +3957,7 @@ mod tests {
             deposit_window_slots: 99,
             deposit_start_slot: 12_345,
             bootstrap_delay_slots: 30_000,
+            current_generation_principal: 12_000,
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf).unwrap();
@@ -3863,6 +4008,7 @@ mod tests {
         assert_eq!(d.deposit_window_slots, 99);
         assert_eq!(d.deposit_start_slot, 12_345);
         assert_eq!(d.bootstrap_delay_slots, 30_000);
+        assert_eq!(d.current_generation_principal, 12_000);
         assert_eq!(
             u64::from_le_bytes(
                 buf[POOL_DEPOSIT_START_SLOT_OFF..POOL_DEPOSIT_START_SLOT_OFF + 8]
@@ -3881,6 +4027,16 @@ mod tests {
             30_000,
             "Pool.bootstrap_delay_slots must serialize at POOL_BOOTSTRAP_DELAY_SLOTS_OFF"
         );
+        assert_eq!(
+            u64::from_le_bytes(
+                buf[POOL_CURRENT_GENERATION_PRINCIPAL_OFF
+                    ..POOL_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            12_000,
+            "current-generation principal must remain append-only",
+        );
         assert!(d.is_insurance());
 
         let pos = Position {
@@ -3895,6 +4051,7 @@ mod tests {
             terminal_return_slot: None,
             share_generation: 9,
             shares: 5_555,
+            current_generation_principal: 900,
         };
         let mut pbuf = [0u8; POSITION_SIZE];
         pos.serialize(&mut pbuf).unwrap();
@@ -3907,6 +4064,7 @@ mod tests {
         assert!(!dp.terminal_returned);
         assert_eq!(dp.share_generation, 9);
         assert_eq!(dp.shares, 5_555);
+        assert_eq!(dp.current_generation_principal, 900);
     }
 
     fn historical_pool_fixture() -> Pool {
@@ -3928,6 +4086,7 @@ mod tests {
             deposit_window_slots: 600,
             deposit_start_slot: 100,
             bootstrap_delay_slots: 1_000,
+            current_generation_principal: 90,
         }
     }
 
@@ -3935,6 +4094,7 @@ mod tests {
     fn terminal_claim_attestation_distinguishes_unowned_share_reserve() {
         let mut pool = historical_pool_fixture();
         pool.outstanding_principal = 0;
+        pool.current_generation_principal = 0;
         pool.total_shares = 2 * VIRTUAL_SHARES;
         assert!(
             pool.owner_claims_cleared(),
@@ -3942,9 +4102,11 @@ mod tests {
         );
 
         pool.outstanding_principal = 1;
+        pool.current_generation_principal = 1;
         assert!(!pool.owner_claims_cleared());
 
         pool.outstanding_principal = 0;
+        pool.current_generation_principal = 0;
         pool.policy = POLICY_PRINCIPAL;
         assert!(!pool.owner_claims_cleared());
         pool.total_shares = 0;
@@ -3963,6 +4125,7 @@ mod tests {
             POOL_SIZE_COIN,
             POOL_SIZE_WINDOW,
             POOL_SIZE_START,
+            POOL_SIZE_BOOTSTRAP,
             POOL_SIZE,
         ] {
             let mut data = vec![0u8; size];
@@ -3972,6 +4135,14 @@ mod tests {
             assert_eq!(decoded.mint, pool.mint);
             assert_eq!(decoded.asset_id, pool.asset_id);
             assert_eq!(decoded.outstanding_principal, pool.outstanding_principal);
+            assert_eq!(
+                decoded.current_generation_principal,
+                if size >= POOL_SIZE {
+                    pool.current_generation_principal
+                } else {
+                    pool.outstanding_principal
+                },
+            );
             assert_eq!(decoded.policy, pool.policy);
             assert_eq!(decoded.domain, pool.domain);
             assert_eq!(decoded.bump, pool.bump);
@@ -4033,8 +4204,14 @@ mod tests {
             terminal_return_slot: None,
             share_generation: 21,
             shares: 777,
+            current_generation_principal: 50,
         };
-        for size in [POSITION_SIZE_BASE, POSITION_SIZE_TENURE, POSITION_SIZE] {
+        for size in [
+            POSITION_SIZE_BASE,
+            POSITION_SIZE_TENURE,
+            POSITION_SIZE_SHARES,
+            POSITION_SIZE,
+        ] {
             let mut data = vec![0u8; size];
             position.serialize(&mut data).unwrap();
             let decoded = Position::deserialize(&data).unwrap();
@@ -4049,9 +4226,16 @@ mod tests {
             assert!(!decoded.terminal_returned);
             assert_eq!(
                 decoded.share_generation,
-                if size >= POSITION_SIZE { 21 } else { 0 }
+                if size >= POSITION_SIZE_SHARES { 21 } else { 0 }
             );
-            assert_eq!(decoded.shares, if size >= POSITION_SIZE { 777 } else { 0 });
+            assert_eq!(
+                decoded.shares,
+                if size >= POSITION_SIZE_SHARES { 777 } else { 0 }
+            );
+            assert_eq!(
+                decoded.current_generation_principal,
+                if size >= POSITION_SIZE { 50 } else { 55 }
+            );
         }
 
         for size in [

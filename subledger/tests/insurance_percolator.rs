@@ -6185,11 +6185,14 @@ fn a_revote_after_reducing_capital_uses_the_live_principal_not_stale_weight() {
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 2).expect("retract");
 
     // SIMULATE a partial insurance withdraw: process_insurance_withdraw eager-decrements
-    // position.principal (lib.rs:1267); a 9/10 withdraw leaves principal = 100_000, withdrawn = false.
+    // both gross and current-generation principal; a 9/10 withdraw leaves 100_000 active.
     // (Mocked directly because the real tag-23 withdraw CPI is fail-closed post-rebuild.)
     let pos_key = env.position_pda(&alice.pubkey());
     let mut pos = env.svm.get_account(&pos_key).unwrap();
     pos.data[72..80].copy_from_slice(&100_000u64.to_le_bytes());
+    pos.data[subledger_program::POS_CURRENT_GENERATION_PRINCIPAL_OFF
+        ..subledger_program::POS_CURRENT_GENERATION_PRINCIPAL_OFF + 8]
+        .copy_from_slice(&100_000u64.to_le_bytes());
     env.svm.set_account(pos_key, pos).unwrap();
     let (live_principal, _s, withdrawn) = env.read_position(&alice.pubkey());
     assert_eq!(live_principal, 100_000, "live principal reduced 10x");

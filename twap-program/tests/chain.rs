@@ -26,7 +26,52 @@ fn twap_id() -> Pubkey {
 
 #[test]
 fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
+    run_zero_payout_custody_lifecycle(ZeroPayoutHandoff::BeforeLoss);
+}
+
+// PUBLIC DOS: a fully impaired position keeps nominal principal for voting and reward
+// accounting, but its obsolete share generation has no claim on a later recapitalization.
+// The first TWAP handoff must protect only current-generation principal. Importing gross nominal
+// principal makes the stale component permanent because TWAP's floor is monotonic and
+// only the absent owner can retire the position while the market remains live.
+#[test]
+fn e2e_fully_impaired_principal_cannot_overstate_the_first_twap_floor() {
+    run_zero_payout_custody_lifecycle(ZeroPayoutHandoff::AfterFullImpairment);
+}
+
+// A stale-generation fix must not expose a current depositor's nominal recovery cap.
+// Later fees can restore a partially impaired current share, so TWAP must reserve the
+// full two-unit principal even while only one live insurance unit remains.
+#[test]
+fn e2e_partial_impairment_preserves_current_generation_twap_floor() {
+    run_zero_payout_custody_lifecycle(ZeroPayoutHandoff::AfterPartialImpairment);
+}
+
+// A recapitalizing owner can hold obsolete voting principal and current priced
+// principal in one PDA. A zero-payout partial exit retires the obsolete tranche
+// first and must leave the current generation's floor intact.
+#[test]
+fn e2e_mixed_generation_partial_exit_preserves_current_twap_floor() {
+    run_zero_payout_custody_lifecycle(ZeroPayoutHandoff::AfterMixedRecapitalization);
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ZeroPayoutHandoff {
+    BeforeLoss,
+    AfterFullImpairment,
+    AfterPartialImpairment,
+    AfterMixedRecapitalization,
+}
+
+fn run_zero_payout_custody_lifecycle(handoff_timing: ZeroPayoutHandoff) {
     use percolator_prog::ix::Instruction as PIx;
+
+    let initial_principal: u64 = if handoff_timing == ZeroPayoutHandoff::AfterPartialImpairment {
+        2
+    } else {
+        1
+    };
+    let handoff_before_loss = handoff_timing == ZeroPayoutHandoff::BeforeLoss;
 
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -255,17 +300,23 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
     let depositor_token = Pubkey::new_unique();
     let pool_holding = Pubkey::new_unique();
+    let depositor_token_balance = if handoff_timing == ZeroPayoutHandoff::AfterMixedRecapitalization
+    {
+        2
+    } else {
+        initial_principal
+    };
     set_token(
         &mut svm,
         &depositor_token,
         &collateral,
         &depositor.pubkey(),
-        1,
+        depositor_token_balance,
     );
     set_token(&mut svm, &pool_holding, &collateral, &pool, 0);
     let position = sub_position_pda(&pool, &depositor.pubkey());
     let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
-    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    deposit_data.extend_from_slice(&initial_principal.to_le_bytes());
     send(
         &mut svm,
         &[&payer, &depositor],
@@ -286,8 +337,15 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
             data: deposit_data,
         },
     )
-    .expect("owner deposits one base unit into live insurance");
-    assert_eq!(read_asset_insurance_domains(&svm, &market, 0), [0, 1]);
+    .expect("owner deposits base units into live insurance");
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &market, 0),
+        if initial_principal == 1 {
+            [0, 1]
+        } else {
+            [1, 1]
+        }
+    );
 
     send(
         &mut svm,
@@ -323,18 +381,39 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
-    squads_execute(
-        &mut svm,
-        &squads,
-        &multisig,
-        &dao,
-        &payer,
-        2,
-        &handoff,
-        &handoff_remaining,
-    )
-    .expect("pool hands funded custody to TWAP");
-    assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
+    if handoff_before_loss {
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            2,
+            &handoff,
+            &handoff_remaining,
+        )
+        .expect("pool hands funded custody to TWAP");
+        assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
+    } else {
+        let pre_handoff_policy =
+            build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 10_000);
+        let pre_handoff_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            2,
+            &pre_handoff_policy,
+            &pre_handoff_remaining,
+        )
+        .expect("preserve the Squads transaction sequence before delayed handoff");
+    }
 
     let owner_exit_witness = subledger_full_exit_witness(&svm, &position);
     let owner_exit_ix = || {
@@ -394,7 +473,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         twap_authority,
         perc_vault: vault,
         vault_authority,
-        principal: 1,
+        principal: initial_principal,
         surplus: 0,
     };
     let book = setup_auction(&mut svm, &payer, &handoff_env, 10, 0, None, 0);
@@ -550,38 +629,41 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     }
     assert_eq!(read_asset0_effective_price(&svm, &market), 399);
 
-    // PUBLIC LOF: another portfolio has fully advanced the market-level mark, but the exposed
-    // loser still carries its pre-mark certificate. The pinned Percolator withdrawal gate does
-    // not see that stale account, so returning TWAP custody would let this owner remove the one
-    // insurance atom immediately before public liquidation needs it.
-    let market_before_exposed_exit = svm.get_account(&market).unwrap();
-    let pool_before_exposed_exit = svm.get_account(&pool).unwrap();
-    let position_before_exposed_exit = svm.get_account(&position).unwrap();
-    let config_before_exposed_exit = svm.get_account(&twap_cfg).unwrap();
-    let vault_before_exposed_exit = svm.get_account(&vault).unwrap();
-    let owner_balance_before_exposed_exit = token_amount(&svm, &depositor_token);
-    assert!(
-        send(
-            &mut svm,
-            &[&payer, &depositor],
-            owner_exit_ix(),
-        )
-        .is_err(),
-        "live insurance must remain locked while a stale exposed portfolio can realize a loss"
-    );
-    assert_eq!(svm.get_account(&market).unwrap(), market_before_exposed_exit);
-    assert_eq!(svm.get_account(&pool).unwrap(), pool_before_exposed_exit);
-    assert_eq!(
-        svm.get_account(&position).unwrap(),
-        position_before_exposed_exit
-    );
-    assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_exposed_exit);
-    assert_eq!(svm.get_account(&vault).unwrap(), vault_before_exposed_exit);
-    assert_eq!(
-        token_amount(&svm, &depositor_token),
-        owner_balance_before_exposed_exit
-    );
-    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+    if handoff_before_loss {
+        // PUBLIC LOF: another portfolio has fully advanced the market-level mark, but the exposed
+        // loser still carries its pre-mark certificate. The pinned Percolator withdrawal gate does
+        // not see that stale account, so returning TWAP custody would let this owner remove the one
+        // insurance atom immediately before public liquidation needs it.
+        let market_before_exposed_exit = svm.get_account(&market).unwrap();
+        let pool_before_exposed_exit = svm.get_account(&pool).unwrap();
+        let position_before_exposed_exit = svm.get_account(&position).unwrap();
+        let config_before_exposed_exit = svm.get_account(&twap_cfg).unwrap();
+        let vault_before_exposed_exit = svm.get_account(&vault).unwrap();
+        let owner_balance_before_exposed_exit = token_amount(&svm, &depositor_token);
+        assert!(
+            send(&mut svm, &[&payer, &depositor], owner_exit_ix(),).is_err(),
+            "live insurance must remain locked while a stale exposed portfolio can realize a loss"
+        );
+        assert_eq!(
+            svm.get_account(&market).unwrap(),
+            market_before_exposed_exit
+        );
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_exposed_exit);
+        assert_eq!(
+            svm.get_account(&position).unwrap(),
+            position_before_exposed_exit
+        );
+        assert_eq!(
+            svm.get_account(&twap_cfg).unwrap(),
+            config_before_exposed_exit
+        );
+        assert_eq!(svm.get_account(&vault).unwrap(), vault_before_exposed_exit);
+        assert_eq!(
+            token_amount(&svm, &depositor_token),
+            owner_balance_before_exposed_exit
+        );
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+    }
 
     for _ in 0..5 {
         send(
@@ -601,12 +683,205 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         )
         .expect("settle and liquidate the long");
     }
-    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+    let insurance_after_loss = u128::from(initial_principal - 1);
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &market, 0),
+        insurance_after_loss
+    );
     let protected_loser = percolator_prog::state::read_portfolio(
         &svm.get_account(&traders[0].1.pubkey()).unwrap().data,
     )
     .unwrap();
     assert_eq!(protected_loser.close_progress.insurance_spent.get(), 1);
+
+    if handoff_timing == ZeroPayoutHandoff::AfterMixedRecapitalization {
+        let mut recapitalization = vec![4u8]; // IX_INSURANCE_DEPOSIT
+        recapitalization.extend_from_slice(&1u64.to_le_bytes());
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(depositor.pubkey(), true),
+                    AccountMeta::new(pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(depositor_token, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: recapitalization,
+            },
+        )
+        .expect("the impaired owner adds one current-generation unit");
+
+        let partial_exit_data = subledger_insurance_withdraw_data(&svm, &position, 1, 0);
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(depositor.pubkey(), true),
+                    AccountMeta::new(pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(depositor_token, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: partial_exit_data,
+            },
+        )
+        .expect("the zero-value partial exit retires only obsolete principal");
+
+        let pool_state = svm.get_account(&pool).unwrap();
+        let position_state = svm.get_account(&position).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(pool_state.data[80..88].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u64::from_le_bytes(pool_state.data[272..280].try_into().unwrap()),
+            1,
+            "the pool retains the active generation's nominal protection"
+        );
+        assert_eq!(
+            u64::from_le_bytes(position_state.data[72..80].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u64::from_le_bytes(position_state.data[120..128].try_into().unwrap()),
+            1,
+            "the mixed position retains only current-generation principal"
+        );
+
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            7,
+            &handoff,
+            &handoff_remaining,
+        )
+        .expect("the mixed-generation pool completes its first TWAP handoff");
+        assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
+        return;
+    }
+
+    if handoff_timing == ZeroPayoutHandoff::AfterPartialImpairment {
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            7,
+            &handoff,
+            &handoff_remaining,
+        )
+        .expect("the partially impaired pool completes its first TWAP handoff");
+        assert_eq!(
+            read_reserved_floor(&svm, &twap_cfg),
+            2,
+            "temporary impairment cannot expose current-generation fee recovery"
+        );
+        return;
+    }
+
+    if handoff_timing == ZeroPayoutHandoff::AfterFullImpairment {
+        let recapitalizer = Keypair::new();
+        svm.airdrop(&recapitalizer.pubkey(), 1_000_000_000).unwrap();
+        let recapitalizer_token = Pubkey::new_unique();
+        let recapitalizer_holding = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &recapitalizer_token,
+            &collateral,
+            &recapitalizer.pubkey(),
+            1,
+        );
+        set_token(&mut svm, &recapitalizer_holding, &collateral, &pool, 0);
+        let recapitalizer_position = sub_position_pda(&pool, &recapitalizer.pubkey());
+        let mut recapitalization = vec![4u8]; // IX_INSURANCE_DEPOSIT
+        recapitalization.extend_from_slice(&1u64.to_le_bytes());
+        send(
+            &mut svm,
+            &[&payer, &recapitalizer],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(recapitalizer.pubkey(), true),
+                    AccountMeta::new(pool, false),
+                    AccountMeta::new(recapitalizer_position, false),
+                    AccountMeta::new(recapitalizer_token, false),
+                    AccountMeta::new(recapitalizer_holding, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: recapitalization,
+            },
+        )
+        .expect("a fresh owner recapitalizes the fully impaired live pool");
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+        assert_eq!(
+            u64::from_le_bytes(
+                svm.get_account(&pool).unwrap().data[80..88]
+                    .try_into()
+                    .unwrap()
+            ),
+            2,
+            "the obsolete and current positions retain distinct nominal principal"
+        );
+
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            7,
+            &handoff,
+            &handoff_remaining,
+        )
+        .expect("the recapitalized pool completes its first TWAP handoff");
+
+        let repair_floor = build_set_reserved_floor_message(&squads_vault, &twap_cfg, 1);
+        let repair_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            8,
+            &repair_floor,
+            &repair_remaining,
+        )
+        .expect("stale zero-value principal must not make the TWAP floor irreversibly too high");
+        assert_eq!(
+            read_reserved_floor(&svm, &twap_cfg),
+            1,
+            "only the current generation's one live atom is protected"
+        );
+        return;
+    }
 
     let direct_exit = Instruction {
         program_id: sub_id(),
