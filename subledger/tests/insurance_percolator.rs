@@ -3401,6 +3401,62 @@ fn bilateral_transient_sources_cannot_block_genesis_backing_or_refunds() {
     assert_eq!(env.token_amount(&pool_holding), 0);
 }
 
+#[test]
+fn cross_backing_one_atom_sybil_churn_cannot_erode_an_incumbent() {
+    let protection = |env: &Env| {
+        let market = env.svm.get_account(&env.slab).unwrap();
+        let insurance =
+            percolator_accounting::read_asset_insurance_balance(&market.data, 0).unwrap();
+        let backing =
+            percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+        (
+            insurance.domains.map(|domain| domain.remaining_atoms),
+            backing.map(|domain| domain.principal_atoms),
+        )
+    };
+
+    for incumbent_principal in [7u64, 8] {
+        let mut env = Env::new_cross_backing();
+        env.init_cross_backing_genesis_pool();
+        let (incumbent, incumbent_ata) = new_depositor(&mut env, incumbent_principal);
+        let pool_holding = create_canonical_pool_holding(&mut env);
+        env.cross_backing_deposit(
+            &incumbent,
+            &incumbent_ata,
+            &pool_holding,
+            incumbent_principal,
+        )
+        .expect("incumbent deposits across both protection classes");
+        let baseline = protection(&env);
+        let baseline_shares = env.pool_total_shares();
+
+        for _ in 0..16 {
+            let (sybil, sybil_ata) = new_depositor(&mut env, 1);
+            env.cross_backing_deposit(&sybil, &sybil_ata, &pool_holding, 1)
+                .expect("fresh identity deposits one atom");
+            env.cross_backing_withdraw(&sybil, &sybil_ata, &pool_holding, 1)
+                .expect("fresh identity exits without shifting incumbent protection");
+            assert_eq!(env.token_amount(&sybil_ata), 1);
+            assert_eq!(env.pool_outstanding(), incumbent_principal);
+            assert_eq!(protection(&env), baseline);
+            assert_eq!(env.pool_total_shares(), baseline_shares);
+            assert_eq!(env.token_amount(&pool_holding), 0);
+        }
+
+        env.cross_backing_withdraw(
+            &incumbent,
+            &incumbent_ata,
+            &pool_holding,
+            incumbent_principal,
+        )
+        .expect("incumbent exits after public one-atom churn");
+        assert_eq!(env.token_amount(&incumbent_ata), incumbent_principal);
+        assert_eq!(env.pool_outstanding(), 0);
+        assert_eq!(env.token_amount(&env.perc_vault), 0);
+        assert_eq!(env.token_amount(&pool_holding), 0);
+    }
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
