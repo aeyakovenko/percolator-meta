@@ -1629,6 +1629,68 @@ fn clear_stale_public_winner(
     ));
 }
 
+fn clear_stale_public_winner_with_backing(
+    env: &mut Env,
+    owner: &Keypair,
+    portfolio: Pubkey,
+    slot: u64,
+) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    public_percolator_crank(env, portfolio, slot, false)
+        .expect("refresh the source-backed reset winner");
+    for _ in 0..256 {
+        let state = percolator_prog::state::read_portfolio(
+            &env.svm.get_account(&portfolio).unwrap().data,
+        )
+        .unwrap();
+        if percolator::active_bitmap_is_empty(
+            state.active_bitmap.map(percolator::V16PodU64::get),
+        ) {
+            break;
+        }
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                data: PIx::ForfeitRecoveryLeg {
+                    asset_index: 0,
+                    b_delta_budget: percolator::MAX_VAULT_TVL,
+                }
+                .encode(),
+            }],
+            &[owner],
+        )
+        .expect("owner advances the bounded source-backed stale leg");
+    }
+    let state = percolator_prog::state::read_portfolio(
+        &env.svm.get_account(&portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(percolator::active_bitmap_is_empty(
+        state.active_bitmap.map(percolator::V16PodU64::get),
+    ));
+    for side in [0, 1] {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![AccountMeta::new(env.slab, false)],
+                data: PIx::FinalizeResetSide {
+                    asset_index: 0,
+                    side,
+                }
+                .encode(),
+            }],
+            &[],
+        )
+        .expect("permissionless source-backed side reset completes");
+    }
+}
+
 fn run_complete_public_insurance_loss(
     env: &mut Env,
     oracle: &Keypair,
@@ -2504,6 +2566,131 @@ fn bootstrap_unlock_cannot_expire_genesis_backing_before_provider_exit() {
     assert_eq!(env.token_amount(&env.perc_vault), 0);
     assert_eq!(env.token_amount(&pool_holding), 0);
     assert_eq!(env.pool_outstanding(), 0);
+}
+
+// PUBLIC LOF: a bankrupt trade temporarily materializes counterparty backing
+// that is not owned by the genesis provider ledgers. A fresh depositor entering
+// after every leg is cleared must not price against value that deterministic
+// resolved-portfolio cleanup will remove, or the old owner captures fresh funds.
+#[test]
+fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_cross_backing_genesis_pool();
+
+    let principal = 4u64;
+    let (old_owner, old_ata) = new_depositor(&mut env, principal);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(&old_owner, &old_ata, &pool_holding, principal)
+        .expect("fund the loss-bearing genesis position");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let (long, long_portfolio, short, short_portfolio) = open_public_pair(
+        &mut env,
+        percolator::POS_SCALE as i128,
+        100,
+        1_000,
+    );
+    let mut slot = 100;
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        1_102,
+        300,
+    );
+    liquidate_stale_public_loser(&mut env, short_portfolio, slot);
+    clear_stale_public_winner_with_backing(&mut env, &long, long_portfolio, slot);
+
+    let transient_backing = percolator_accounting::read_asset_backing_balances(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|balance| balance.protected_principal_atoms().unwrap())
+    .sum::<u128>();
+    assert!(
+        transient_backing > u128::from(principal),
+        "the public loss must materialize non-provider trader backing",
+    );
+
+    let (fresh_owner, fresh_ata) = new_depositor(&mut env, principal);
+    env.cross_backing_deposit(&fresh_owner, &fresh_ata, &pool_holding, principal)
+        .expect("fresh owner deposits after every public leg is cleared");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve without exposing the fresh deposit to another trade");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&observer, observer_portfolio),
+            (&long, long_portfolio),
+            (&short, short_portfolio),
+        ],
+    );
+
+    let protected_after_cleanup = asset_insurance_remaining(&env, 0)
+        .checked_add(
+            percolator_accounting::read_asset_backing_balances(
+                &env.svm.get_account(&env.slab).unwrap().data,
+                0,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|balance| balance.protected_principal_atoms().unwrap())
+            .sum::<u128>(),
+        )
+        .unwrap();
+    assert_eq!(protected_after_cleanup, 6);
+
+    let old_before = env.token_amount(&old_ata);
+    let fresh_before = env.token_amount(&fresh_ata);
+    env.cross_backing_withdraw(&old_owner, &old_ata, &pool_holding, principal)
+        .expect("old owner realizes only the pre-deposit market loss");
+    env.cross_backing_withdraw(&fresh_owner, &fresh_ata, &pool_holding, principal)
+        .expect("fresh owner exits after taking no additional market risk");
+    assert_eq!(env.token_amount(&old_ata) - old_before, 2);
+    assert_eq!(
+        env.token_amount(&fresh_ata) - fresh_before,
+        principal,
+        "the old generation cannot capture any of the fresh deposit",
+    );
 }
 
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
