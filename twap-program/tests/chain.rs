@@ -57805,7 +57805,12 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         )
         .unwrap()
         .into_iter()
-        .all(|balance| !balance.has_any_state())
+        .all(|balance| {
+            balance.principal_atoms == 0
+                && balance.valid_liened_principal_atoms == 0
+                && balance.earnings_atoms == 0
+        }),
+        "the exit sweeps every liquid backing atom while preserving consumed-loss telemetry"
     );
     assert_eq!(
         u64::from_le_bytes(

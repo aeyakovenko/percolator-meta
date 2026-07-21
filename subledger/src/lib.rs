@@ -3485,40 +3485,63 @@ fn process_insurance_withdraw_impl(
 
         if backing_withdrawal > 0 {
             let ledgers = backing_ledgers.ok_or(ProgramError::NotEnoughAccountKeys)?;
+            let provider_principals =
+                backing_ledger_principals.ok_or(ProgramError::NotEnoughAccountKeys)?;
             for (domain, amount) in backing_debit.into_iter().enumerate() {
                 if amount == 0 {
                     continue;
                 }
-                let mut ix_data = vec![PERC_IX_WITHDRAW_BACKING_BUCKET];
-                ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
-                ix_data.extend_from_slice(&amount.to_le_bytes());
-                invoke_signed_for_pool(
-                    &pool,
-                    pool_seed_version,
-                    &Instruction {
-                        program_id: *percolator_program.key,
-                        accounts: vec![
-                            AccountMeta::new_readonly(*pool_account.key, true),
-                            AccountMeta::new(*market_slab.key, false),
-                            AccountMeta::new(*holding.key, false),
-                            AccountMeta::new(*percolator_vault.key, false),
-                            AccountMeta::new_readonly(*vault_authority.key, false),
-                            AccountMeta::new_readonly(*token_program.key, false),
-                            AccountMeta::new(*ledgers[domain].key, false),
-                        ],
-                        data: ix_data,
-                    },
-                    &[
+                // Funding and settlement can leave fresh whole atoms above this
+                // provider's ledger principal. Debit only attributed principal
+                // through the ledger; the excess is protocol surplus and uses
+                // Percolator's ledgerless path. Both amounts are derived from
+                // canonical state and move to the same pool-owned escrow.
+                let provider_debit = core::cmp::min(amount, provider_principals[domain]);
+                let protocol_debit = amount
+                    .checked_sub(provider_debit)
+                    .ok_or(ProgramError::InvalidAccountData)?;
+                for (debit, ledger) in [
+                    (provider_debit, Some(ledgers[domain])),
+                    (protocol_debit, None),
+                ] {
+                    if debit == 0 {
+                        continue;
+                    }
+                    let mut ix_data = vec![PERC_IX_WITHDRAW_BACKING_BUCKET];
+                    ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
+                    ix_data.extend_from_slice(&debit.to_le_bytes());
+                    let mut instruction_accounts = vec![
+                        AccountMeta::new_readonly(*pool_account.key, true),
+                        AccountMeta::new(*market_slab.key, false),
+                        AccountMeta::new(*holding.key, false),
+                        AccountMeta::new(*percolator_vault.key, false),
+                        AccountMeta::new_readonly(*vault_authority.key, false),
+                        AccountMeta::new_readonly(*token_program.key, false),
+                    ];
+                    let mut account_infos = vec![
                         pool_account.clone(),
                         market_slab.clone(),
                         holding.clone(),
                         percolator_vault.clone(),
                         vault_authority.clone(),
                         token_program.clone(),
-                        ledgers[domain].clone(),
-                        percolator_program.clone(),
-                    ],
-                )?;
+                    ];
+                    if let Some(ledger) = ledger {
+                        instruction_accounts.push(AccountMeta::new(*ledger.key, false));
+                        account_infos.push(ledger.clone());
+                    }
+                    account_infos.push(percolator_program.clone());
+                    invoke_signed_for_pool(
+                        &pool,
+                        pool_seed_version,
+                        &Instruction {
+                            program_id: *percolator_program.key,
+                            accounts: instruction_accounts,
+                            data: ix_data,
+                        },
+                        &account_infos,
+                    )?;
+                }
             }
         }
 
