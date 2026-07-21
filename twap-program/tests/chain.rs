@@ -17793,6 +17793,8 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
         .unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
     let payer = Keypair::new();
     let governance = Keypair::new();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
@@ -17886,6 +17888,54 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
     svm.airdrop(&controller, 777).unwrap();
     let retired_market = retired_market_pda(&slab, &perc_id());
 
+    // Reproduce a supported historical market-bound Subledger pool with no owner
+    // principal. Its exact PDA and live asset roles make the terminal custody proof
+    // authoritative while the configured secondary vault exercises the trailing
+    // optional-account parser in the same close.
+    let asset_id = 0u64;
+    let (pool, pool_bump) = Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            primary_mint.as_ref(),
+            &asset_id.to_le_bytes(),
+        ],
+        &sub_id(),
+    );
+    let mut pool_data = vec![0u8; 160];
+    pool_data[..8].copy_from_slice(b"SUBPOOL1");
+    pool_data[8..40].copy_from_slice(primary_mint.as_ref());
+    pool_data[40..48].copy_from_slice(&asset_id.to_le_bytes());
+    pool_data[48..80].copy_from_slice(primary_vault.as_ref());
+    pool_data[88] = POLICY_PRINCIPAL;
+    pool_data[89] = pool_bump;
+    pool_data[90] = DOMAIN_INSURANCE;
+    pool_data[96..128].copy_from_slice(slab.as_ref());
+    pool_data[128..160].copy_from_slice(perc_id().as_ref());
+    svm.set_account(
+        pool,
+        Account {
+            lamports: 1_000_000_000,
+            data: pool_data,
+            owner: sub_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let mut constrained_market = svm.get_account(&slab).unwrap();
+    let mut profile =
+        percolator_prog::state::read_asset_oracle_profile(&constrained_market.data, 0).unwrap();
+    profile.asset_admin = pool.to_bytes();
+    profile.insurance_authority = pool.to_bytes();
+    profile.insurance_operator = pool.to_bytes();
+    percolator_prog::state::write_asset_oracle_profile(
+        &mut constrained_market.data,
+        0,
+        &profile,
+    )
+    .unwrap();
+    svm.set_account(slab, constrained_market).unwrap();
+
     let close_accounts = |include_secondary: bool| {
         let mut accounts = vec![
             AccountMeta::new(governance.pubkey(), true),
@@ -17899,6 +17949,9 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new(retired_market, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(sub_id(), false),
         ];
         if include_secondary {
             accounts.extend_from_slice(&[
