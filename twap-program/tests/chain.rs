@@ -58105,3 +58105,164 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
 }
+
+// PUBLIC TERMINAL-DOS PROBE: InitPortfolio accepts a program-owned account larger than the
+// canonical portfolio layout, and ClosePortfolio clears the complete supplied account before
+// reclaiming it. Exercise the 10 MiB runtime maximum: an attacker can legitimately materialize
+// that account while the market is live, but cannot make the controller's permissionless
+// post-resolution cleanup exceed the transaction compute limit or leave the slab count stuck.
+#[test]
+fn e2e_maximum_size_abandoned_portfolio_cannot_dos_terminal_cleanup() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &governance, &attacker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut init_data = vec![1u8];
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &slab_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("initialize controller-owned market");
+
+    let portfolio = Keypair::new();
+    let len = 10 * 1024 * 1024;
+    let rent = svm.minimum_balance_for_rent_exemption(len);
+    send(
+        &mut svm,
+        &[&attacker, &portfolio],
+        solana_sdk::system_instruction::create_account(
+            &attacker.pubkey(),
+            &portfolio.pubkey(),
+            rent,
+            len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("attacker creates a maximum-size program-owned account");
+
+    svm.expire_blockhash();
+    let init = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(attacker.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                percolator_prog::ix::Instruction::InitPortfolio,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &attacker],
+            svm.latest_blockhash(),
+        ))
+        .expect("maximum-size account is publicly materializable as a portfolio");
+
+    let witness = controller_market_generation_witness(&svm, &slab);
+    let mut resolve_data = vec![0u8];
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(witness, false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves around the abandoned maximum-size portfolio");
+
+    svm.expire_blockhash();
+    let close = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![11u8],
+            }],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .expect("permissionless controller cleanup closes the maximum-size portfolio");
+    eprintln!(
+        "10 MiB portfolio: init={} CU, controller close={} CU",
+        init.compute_units_consumed, close.compute_units_consumed
+    );
+    assert!(
+        close.compute_units_consumed < 1_200_000,
+        "maximum-size controller cleanup needs bounded compute headroom, used {} CU",
+        close.compute_units_consumed
+    );
+    assert!(
+        svm.get_account(&portfolio.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "terminal cleanup dematerializes the attacker account"
+    );
+    let (_, group) =
+        percolator_prog::state::read_market(&svm.get_account(&slab).unwrap().data).unwrap();
+    assert_eq!(
+        group.materialized_portfolio_count, 0,
+        "maximum-size cleanup removes the terminal CloseSlab blocker"
+    );
+}
