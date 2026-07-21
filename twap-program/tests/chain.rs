@@ -53795,12 +53795,32 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
         .unwrap();
     let env = setup_genesis(&mut svm, &payer);
+    let standing_bidder = Keypair::new();
+    svm.airdrop(&standing_bidder.pubkey(), 1_000_000_000)
+        .unwrap();
+    let standing_bidder_coin = coin_ata_of(&standing_bidder.pubkey(), &env.coin_mint);
+    let standing_bidder_usd =
+        coin_ata_of(&standing_bidder.pubkey(), &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &standing_bidder_coin,
+        &env.coin_mint,
+        &standing_bidder.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &standing_bidder_usd,
+        &env.collateral_mint,
+        &standing_bidder.pubkey(),
+        0,
+    );
     let (depositor_distribution, depositor_proposal) = register_proposal(
         &mut svm,
         &payer,
         &env,
         1,
-        &Pubkey::new_unique(),
+        &standing_bidder.pubkey(),
         100,
     );
     let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
@@ -54252,33 +54272,30 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &init_book_remaining,
     )
     .expect("futarchy initializes the continuous 50/50 auction");
+    let execute_round = || Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new(twap_budget_holding, false),
+            AccountMeta::new(settlement_usd, false),
+            AccountMeta::new_readonly(book_escrow, false),
+            AccountMeta::new(coin_escrow, false),
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![8u8], // IX_EXECUTE
+    };
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot += 2;
     svm.set_sysvar(&clock);
-    send(
-        &mut svm,
-        &[&payer],
-        Instruction {
-            program_id: twap_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(twap_cfg, false),
-                AccountMeta::new(book, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new(env.perc_vault, false),
-                AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new(twap_budget_holding, false),
-                AccountMeta::new(settlement_usd, false),
-                AccountMeta::new_readonly(book_escrow, false),
-                AccountMeta::new(coin_escrow, false),
-                AccountMeta::new(env.coin_mint, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: vec![8u8], // IX_EXECUTE
-        },
-    )
+    send(&mut svm, &[&payer], execute_round())
     .expect("permissionless empty-book round ratchets the retained half into insurance");
     let retained_floor = total_principal as u128 + retained_protocol_insurance as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
@@ -54565,6 +54582,54 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     )
     .expect("permissionless trigger seals the reduced re-backed vote before resolution");
 
+    send(&mut svm, &[&payer], execute_round())
+    .expect("permissionless crank rolls the expired empty round while custody is at the pool");
+
+    // The fixed supply becomes available only after Genesis seals the winning
+    // 100% distribution. Claim through that public path, then keep a real
+    // bidder-funded order open across resolution and permissionless re-handoff.
+    let mut distribution_claim_data = vec![4u8];
+    distribution_claim_data.extend_from_slice(&0u32.to_le_bytes());
+    send(
+        &mut svm,
+        &[&standing_bidder],
+        Instruction {
+            program_id: dist_id_e2e(),
+            accounts: vec![
+                AccountMeta::new_readonly(standing_bidder.pubkey(), true),
+                AccountMeta::new_readonly(env.dist_config, false),
+                AccountMeta::new(depositor_distribution, false),
+                AccountMeta::new(env.dist_vault, false),
+                AccountMeta::new(standing_bidder_coin, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: distribution_claim_data,
+        },
+    )
+    .expect("winning recipient claims the fixed coin supply");
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 100);
+    send(
+        &mut svm,
+        &[&standing_bidder],
+        place_bid_ix(
+            &standing_bidder.pubkey(),
+            &twap_cfg,
+            &book,
+            &book_escrow,
+            &coin_escrow,
+            &standing_bidder_coin,
+            &standing_bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            1,
+            1,
+            None,
+        ),
+    )
+    .expect("post-Genesis bidder escrows one coin before resolution");
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+    assert_eq!(token_amount(&svm, &coin_escrow), 1);
+
     // Resolution can race the external re-handoff crank after these owner exits. The
     // established pending permit must remain usable in resolved mode; otherwise this ordinary
     // governance lifecycle transition would leave custody on the pool until another DAO action.
@@ -54617,6 +54682,21 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         retained_floor - exiting_principal as u128 - interleaved_exit as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
+    let standing_round_end = u64::from_le_bytes(
+        svm.get_account(&book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    warp_to(&mut svm, standing_round_end);
+
+    send(&mut svm, &[&payer], execute_round())
+    .expect("standing bid settles after resolved-mode re-handoff");
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
+    assert_eq!(token_amount(&svm, &standing_bidder_usd), 0);
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+    assert_eq!(token_amount(&svm, &coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &settlement_usd), 1);
     let market_before_replayed_exit = svm.get_account(&env.slab).unwrap();
     let config_before_replayed_exit = svm.get_account(&twap_cfg).unwrap();
     assert!(
@@ -55230,6 +55310,26 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             .map_or(true, |account| account.lamports == 0),
         "resolved market closes after every user and protocol balance exits"
     );
+    send(
+        &mut svm,
+        &[&payer],
+        claim_ix(
+            &payer.pubkey(),
+            &twap_cfg,
+            &book,
+            &book_escrow,
+            &settlement_usd,
+            &coin_escrow,
+            &standing_bidder_usd,
+            &standing_bidder_coin,
+            0,
+        ),
+    )
+    .expect("settled bidder claim remains live after the market slab closes");
+    assert_eq!(token_amount(&svm, &standing_bidder_usd), 1);
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+    assert_eq!(token_amount(&svm, &coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &settlement_usd), 0);
 }
 
 // PUBLIC DOS: a one-unit genesis voter can disappear after the winning distribution is
