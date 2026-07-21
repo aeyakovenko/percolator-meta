@@ -52143,6 +52143,240 @@ fn e2e_public_same_key_rematerialization_cannot_strand_frozen_lp_reward() {
     );
 }
 
+// PUBLIC LIVENESS PROBE: TWAP owns the insurance roles after handoff while the
+// owner-bound genesis pool still owns both backing buckets. A cross-backed owner
+// exit therefore exercises the wider fixed CPI shape. Each owner must be able to
+// recover exactly their own 50/50 principal, and an unrelated cranker must be able
+// to resume TWAP custody without another governance round-trip.
+#[test]
+fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_cross_backing_genesis(&mut svm, &payer);
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+    let pool_holding = canonical_insurance_vault(&env.pool, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+
+    let principal = 4u64;
+    let mut owners = Vec::new();
+    for _ in 0..2 {
+        let owner = Keypair::new();
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            principal,
+        );
+        let position = sub_position_pda(&env.pool, &owner.pubkey());
+        let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+        deposit_data.extend_from_slice(&principal.to_le_bytes());
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new(env.long_backing_ledger, false),
+                    AccountMeta::new(env.short_backing_ledger, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: deposit_data,
+            },
+        )
+        .expect("cross-backer deposits before handoff");
+        owners.push((owner, destination, position));
+    }
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 4);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>(),
+        4,
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize TWAP config");
+    let twap_config = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_config.as_ref()], &twap_id()).0;
+    let handoff = build_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_config,
+        &twap_authority,
+        &perc_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_config, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("genesis pool hands insurance custody to TWAP");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 4);
+
+    let owner_exit = |svm: &LiteSVM, owner: &Pubkey, destination: &Pubkey, position: &Pubkey| {
+        let mut exit = twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_config,
+            &twap_authority,
+            &perc_id(),
+        );
+        exit.accounts[1] = AccountMeta::new(twap_config, false);
+        exit.accounts[3] = AccountMeta::new(env.pool, false);
+        exit.accounts
+            .push(AccountMeta::new_readonly(*owner, true));
+        exit.accounts.push(AccountMeta::new(*position, false));
+        exit.accounts.push(AccountMeta::new(*destination, false));
+        exit.accounts.push(AccountMeta::new(pool_holding, false));
+        exit.accounts.push(AccountMeta::new(env.perc_vault, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(vault_authority, false));
+        exit.accounts
+            .push(AccountMeta::new(env.long_backing_ledger, false));
+        exit.accounts
+            .push(AccountMeta::new(env.short_backing_ledger, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(spl_token::ID, false));
+        bind_subledger_full_exit_witness(svm, &mut exit, position);
+        exit
+    };
+    let permissionless_rehandoff = || Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new(twap_config, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+        data: vec![8u8], // IX_HANDOFF_TO_TWAP
+    };
+
+    let (alice, alice_destination, alice_position) = &owners[0];
+    let alice_exit = owner_exit(
+        &svm,
+        &alice.pubkey(),
+        alice_destination,
+        alice_position,
+    );
+    send(
+        &mut svm,
+        &[&payer, alice],
+        alice_exit,
+    )
+    .expect("first cross-backer atomically returns custody and exits");
+    assert_eq!(token_amount(&svm, alice_destination), principal);
+    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 2);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>(),
+        2,
+    );
+
+    send(&mut svm, &[&payer], permissionless_rehandoff())
+        .expect("unrelated cranker resumes TWAP after the first exit");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 2);
+
+    let (bob, bob_destination, bob_position) = &owners[1];
+    let bob_exit = owner_exit(&svm, &bob.pubkey(), bob_destination, bob_position);
+    send(&mut svm, &[&payer, bob], bob_exit)
+        .expect("second cross-backer atomically returns custody and exits");
+    assert_eq!(token_amount(&svm, bob_destination), principal);
+    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 0);
+    assert!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|balance| !balance.has_any_state())
+    );
+    assert_eq!(token_amount(&svm, &env.perc_vault), 0);
+
+    send(&mut svm, &[&payer], permissionless_rehandoff())
+        .expect("unrelated cranker resumes zero-principal TWAP custody");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 0);
+}
+
 // EXTERNAL-BACKING CAPTURE: a cross-backed genesis pool needs the backing role,
 // but it may take that role only from an empty backing state. Otherwise the pool
 // could become the withdrawal authority for principal supplied by somebody else.
