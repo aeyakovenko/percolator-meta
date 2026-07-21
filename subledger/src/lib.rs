@@ -3064,6 +3064,25 @@ fn process_insurance_withdraw_impl(
         .outstanding_principal
         .checked_sub(amount)
         .ok_or(ProgramError::InvalidAccountData)?;
+    if pool.cross_backing
+        && outstanding_after == 0
+        && backing_balances
+            .iter()
+            .any(|balance| balance.valid_liened_principal_atoms != 0)
+    {
+        // The final owner action is the only principal-surplus cleanup for a
+        // cross-backed pool. Keep it live until every valid lien is externally
+        // released, then atomically collect the complete fresh remainder below.
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let final_cross_backing_sweep = pool.cross_backing
+        && outstanding_after == 0
+        && backing_balances.iter().any(|balance| {
+            balance.principal_atoms != 0 || balance.earnings_atoms != 0
+        });
+    if final_cross_backing_sweep && live_asset_exposed {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // Debit the larger protection class first, reversing the aggregate deposit
     // tie-break. A haircut retires the unpaid nominal claim without moving state.
     let protection_debit = if pool.cross_backing {
@@ -3129,13 +3148,23 @@ fn process_insurance_withdraw_impl(
 
     // The pool PDA (asset-0 insurance operator) signs WithdrawInsuranceAsset,
     // moving Percolator insurance -> pool-PDA-owned holding.
-    // A fully-impaired exit (owed == 0, insurance wiped) still retires the position below; only
-    // move tokens when there is something to pay (percolator rejects a zero-amount withdraw).
-    if owed > 0 {
-        let backing_debit = insurance_withdraw_domain_delta(
+    // A fully-impaired exit normally retires without a zero-amount CPI. A final
+    // cross-backed exit additionally isolates any unowned principal/earnings
+    // remainder, even when the owner's own payout rounds to zero.
+    if owed > 0 || final_cross_backing_sweep {
+        let claim_backing_debit = insurance_withdraw_domain_delta(
             backing_protected_domains,
             backing_owed,
         );
+        // Once the final owner claim is retired, any fresh whole-atom share
+        // remainder is protocol surplus. Isolate it in the same canonical escrow
+        // as backing earnings; otherwise cross-backed pools have no authorized
+        // whole-principal cleanup and one rounding atom can keep the market funded.
+        let backing_debit = if pool.cross_backing && outstanding_after == 0 {
+            backing_balances.map(|balance| balance.principal_atoms)
+        } else {
+            claim_backing_debit
+        };
         for (domain, debit) in backing_debit.into_iter().enumerate() {
             if debit > backing_balances[domain].principal_atoms {
                 // Valid liens remain part of share value, but they are not liquid.
@@ -3148,7 +3177,16 @@ fn process_insurance_withdraw_impl(
         // earnings remain. Sweep both exact live counters into the pool's canonical
         // escrow before any principal debit so an owner exit never depends on TWAP
         // having been configured. This transaction remains atomic on any later error.
-        let swept_backing_earnings = if backing_owed > 0 {
+        let backing_withdrawal = backing_debit
+            .into_iter()
+            .try_fold(0u128, |sum, amount| sum.checked_add(amount))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let protocol_backing_surplus = backing_withdrawal
+            .checked_sub(u128::from(backing_owed))
+            .ok_or(ProgramError::InvalidAccountData)?;
+        let protocol_backing_surplus = u64::try_from(protocol_backing_surplus)
+            .map_err(|_| ProgramError::ArithmeticOverflow)?;
+        let swept_backing_earnings = if backing_withdrawal > 0 || final_cross_backing_sweep {
             let earnings = backing_balances.map(|balance| balance.earnings_atoms);
             let total = earnings
                 .into_iter()
@@ -3278,7 +3316,7 @@ fn process_insurance_withdraw_impl(
             }
         }
 
-        if backing_owed > 0 {
+        if backing_withdrawal > 0 {
             let ledgers = backing_ledgers.ok_or(ProgramError::NotEnoughAccountKeys)?;
             for (domain, amount) in backing_debit.into_iter().enumerate() {
                 if amount == 0 {
@@ -3319,6 +3357,7 @@ fn process_insurance_withdraw_impl(
 
         let escrow_after = holding_balance_before
             .checked_add(swept_backing_earnings)
+            .and_then(|balance| balance.checked_add(protocol_backing_surplus))
             .ok_or(ProgramError::ArithmeticOverflow)?;
         let holding_before_payout = escrow_after
             .checked_add(owed)
@@ -3328,26 +3367,29 @@ fn process_insurance_withdraw_impl(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        // holding -> owner's ATA, signed by the pool PDA. The only path out, bounded by the
-        // owner's pro-rata share, so the program can never pay more than is owed.
-        invoke_signed_for_pool(
-            &pool,
-            pool_seed_version,
-            &spl_token::instruction::transfer(
-                token_program.key,
-                holding.key,
-                owner_ata.key,
-                pool_account.key,
-                &[],
-                owed,
-            )?,
-            &[
-                holding.clone(),
-                owner_ata.clone(),
-                pool_account.clone(),
-                token_program.clone(),
-            ],
-        )?;
+        if owed > 0 {
+            // holding -> owner's ATA, signed by the pool PDA. The only path out,
+            // bounded by the owner's pro-rata share, so the program can never pay
+            // more than is owed. Protocol surplus remains in the canonical escrow.
+            invoke_signed_for_pool(
+                &pool,
+                pool_seed_version,
+                &spl_token::instruction::transfer(
+                    token_program.key,
+                    holding.key,
+                    owner_ata.key,
+                    pool_account.key,
+                    &[],
+                    owed,
+                )?,
+                &[
+                    holding.clone(),
+                    owner_ata.clone(),
+                    pool_account.clone(),
+                    token_program.clone(),
+                ],
+            )?;
+        }
         if spl_token::state::Account::unpack(&holding.try_borrow_data()?)?.amount != escrow_after {
             return Err(ProgramError::InvalidAccountData);
         }

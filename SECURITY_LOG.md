@@ -14538,3 +14538,32 @@ The fixed Subledger SBF checksum is
 `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`, and unchanged TWAP remains
 `e9a2aa0b1e8e76f4e0660bf848170eafaecb4513d84db92b6a6af94e0940f07f`. No account layout,
 instruction, signer, authority, recipient, DAO-controlled amount, or admin surface was added.
+
+## Tick - ownerless backing rounding reserve blocked terminal cleanup (surface B/C, REAL DOS/LOF)
+
+Cross-backed principal used the same non-appreciating share-floor rule as insurance, but the final
+exit withdrew only the owner's rounded claim. In the retained real-Percolator LiteSVM regression,
+Alice deposits 1,000,000 units, the insurance half is lost, and Bob recapitalizes with another
+1,000,000. Their fair exits pay 500,000 and 999,999 units. Against parent `ac36e88` and Subledger
+checksum `2c315f147d09fb34f1046cbfe041bf63a39981d39c25a54bffda60ac40f2404d`, the remaining whole atom
+stayed in Percolator backing after pool outstanding principal reached zero. The legacy whole-backing
+cleanup intentionally rejects cross-backed pools, while the fixed reward route moves only earnings
+and escrowed protocol value. No owner action or allowed public cleanup could remove that principal
+atom, so terminal market cleanup could remain blocked. The atom was protocol reserve rather than a
+user claim, and no tested path could redirect user principal.
+
+FIX: the final cross-backed owner action cannot retire while valid backing liens remain. Once they
+are externally released, it withdraws every fresh backing atom plus both exact earnings counters
+before completing the final claim. It transfers exactly the owner's loss-adjusted `owed` amount and
+leaves every excess atom in the canonical clean pool escrow for the existing fixed Squads-vault
+route. The same logic runs when the owner payout itself is zero, without issuing a zero-value token
+CPI. No principal-moving route, caller-selected amount, destination, signer, authority, instruction,
+account layout, or admin surface was added.
+
+The regression is mutation-sharp on the old binary and now proves both exact user payouts, the
+one-atom protocol escrow, a zero Percolator vault, zero outstanding principal, and empty long/short
+backing state. All 98 direct Subledger/Percolator tests pass; the complete chain is 234 passing with
+only the separately tracked pinned Percolator source-capacity expected-red probe. The fixed
+Subledger SBF checksum is
+`2a7cb5a40e7a487eca2ee80fe730bddd042f05578f91f2b7ee5df1707586592b`; pinned Percolator remains
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.

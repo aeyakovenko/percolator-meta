@@ -2218,6 +2218,91 @@ fn genesis_cross_backing_splits_globally_and_returns_only_owner_principal() {
     assert_eq!(env.token_amount(&env.perc_vault), 0);
 }
 
+// PUBLIC DOS/LOF: fair share rounding can leave a whole protocol atom after the
+// last owner claim is retired. If that atom remains in cross backing, the legacy
+// whole-backing cleanup is intentionally unavailable and the market cannot become
+// empty. The final exit must isolate it in the canonical protocol escrow without
+// increasing either owner's payout.
+#[test]
+fn cross_backing_rounding_reserve_cannot_remain_ownerless_in_percolator() {
+    let mut env = Env::new_cross_backing();
+    env.init_cross_backing_genesis_pool();
+
+    let amount = 1_000_000u64;
+    let (alice, alice_ata) = new_depositor(&mut env, amount);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(&alice, &alice_ata, &pool_holding, amount)
+        .expect("Alice deposits before the insurance loss");
+
+    // Consume the insurance half while preserving the real backing half. The
+    // existing helper updates every insurance-domain counter; restore only the
+    // aggregate vault value that belongs to still-live backing.
+    impair_market(&mut env, 0);
+    let backing_after_loss = percolator_accounting::read_asset_backing_balances(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|balance| balance.principal_atoms)
+    .sum::<u128>();
+    assert_eq!(backing_after_loss, u128::from(amount / 2));
+    let mut market_after_loss = env.svm.get_account(&env.slab).unwrap();
+    {
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut market_after_loss.data).unwrap();
+        group.header.vault = percolator::V16PodU128::new(backing_after_loss);
+        group
+            .validate_shape()
+            .expect("insurance loss plus preserved backing remains engine-valid");
+    }
+    env.svm.set_account(env.slab, market_after_loss).unwrap();
+    env.svm
+        .set_account(
+            env.perc_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(
+                    &env.mint,
+                    &env.vault_authority,
+                    backing_after_loss as u64,
+                ),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let (bob, bob_ata) = new_depositor(&mut env, amount);
+    env.cross_backing_deposit(&bob, &bob_ata, &pool_holding, amount)
+        .expect("Bob recapitalizes after Alice's loss");
+    env.cross_backing_withdraw(&alice, &alice_ata, &pool_holding, amount)
+        .expect("Alice realizes only her tenure loss");
+    env.cross_backing_withdraw(&bob, &bob_ata, &pool_holding, amount)
+        .expect("Bob recovers his later capital without inheriting Alice's loss");
+
+    assert_eq!(env.token_amount(&alice_ata), amount / 2);
+    assert_eq!(env.token_amount(&bob_ata), amount - 1);
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(
+        env.token_amount(&pool_holding),
+        1,
+        "the final whole-atom reserve is isolated as protocol surplus",
+    );
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert!(
+        percolator_accounting::read_asset_backing_balances(
+            &env.svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|balance| !balance.has_any_state()),
+        "no ownerless backing state can block terminal market cleanup",
+    );
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
