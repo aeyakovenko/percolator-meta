@@ -14510,3 +14510,31 @@ crystallize remains data-empty and permissionless. The fixed Residual checksum i
 the complete Genesis-to-buy/burn path, the market-to-45-day 50/50 buyback/burn lifecycle, and terminal-return
 capital crystallization pass. No account, state, signer, authority, recipient, CPI, token path, custody path,
 or admin surface was added.
+
+## Tick - backing earnings blocked final cross-backed principal exit (surface B, REAL DOS/LOF)
+
+Pinned Percolator rejects a backing-bucket principal withdrawal that would empty the bucket while
+`utilization_fee_earnings` remains nonzero. The cross-backed Genesis exit previously attempted the
+principal debit directly. Once ordinary market activity accrued backing earnings, a depositor's
+otherwise liquid final principal atom therefore depended on someone first configuring TWAP and
+routing protocol rewards. The clean-room LiteSVM regression reproduced the public owner path against
+the real pinned binary with no TWAP config and failed at the Percolator CPI with `Custom(14)`. The
+distinct permissionless absent-owner terminal wire had the same dependency. No tested path could
+redirect principal, but custody could remain unavailable for reasons unrelated to the owner's claim.
+
+FIX: every cross-backed owner exit now reads both exact live earnings counters and atomically sweeps
+them to the canonical clean pool ATA before any backing-principal debit. The payout preserves that
+ATA's complete starting balance and transfers exactly the owner's loss-adjusted claim. The fixed
+amountless reward route combines that escrow with any later live counters and still forwards the
+complete amount only through TWAP to a clean token account owned by the config-bound Squads vault.
+A caller-selected pool-owned holding is rejected before mutation. Retained LiteSVM probes cover the
+ordinary owner path without TWAP, the absent-owner terminal path, atomic noncanonical-account
+rejection, an escrow-plus-live-counter route while principal survives, and a second earnings tranche
+before final exit. All 97 direct Subledger/Percolator tests pass; the complete chain is 234 passing
+with only the separately tracked pinned Percolator source-capacity expected-red probe.
+
+The fixed Subledger SBF checksum is
+`2c315f147d09fb34f1046cbfe041bf63a39981d39c25a54bffda60ac40f2404d`; pinned Percolator remains
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`, and unchanged TWAP remains
+`e9a2aa0b1e8e76f4e0660bf848170eafaecb4513d84db92b6a6af94e0940f07f`. No account layout,
+instruction, signer, authority, recipient, DAO-controlled amount, or admin surface was added.

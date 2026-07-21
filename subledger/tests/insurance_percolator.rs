@@ -986,6 +986,27 @@ fn create_holding(env: &mut Env, owner_pool: &Pubkey) -> Pubkey {
     acc.pubkey()
 }
 
+fn create_canonical_pool_holding(env: &mut Env) -> Pubkey {
+    let holding = Pubkey::find_program_address(
+        &[env.pool.as_ref(), spl_token::ID.as_ref(), env.mint.as_ref()],
+        &ATA_PROGRAM_ID,
+    )
+    .0;
+    env.svm
+        .set_account(
+            holding,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &env.pool, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    holding
+}
+
 /// Slab base offset of the percolator `MarketGroupV16` header
 /// from the pinned wrapper API. Never duplicate this number in the canary.
 const MARKET_GROUP_OFF: usize = percolator_prog::constants::MARKET_GROUP_OFF;
@@ -2134,13 +2155,11 @@ fn genesis_cross_backing_splits_globally_and_returns_only_owner_principal() {
 
     let (alice, alice_ata) = new_depositor(&mut env, 1);
     let (bob, bob_ata) = new_depositor(&mut env, 1);
-    let pool = env.pool;
-    let alice_holding = create_holding(&mut env, &pool);
-    let bob_holding = create_holding(&mut env, &pool);
+    let pool_holding = create_canonical_pool_holding(&mut env);
 
-    env.cross_backing_deposit(&alice, &alice_ata, &alice_holding, 1)
+    env.cross_backing_deposit(&alice, &alice_ata, &pool_holding, 1)
         .expect("alice deposits one base unit");
-    env.cross_backing_deposit(&bob, &bob_ata, &bob_holding, 1)
+    env.cross_backing_deposit(&bob, &bob_ata, &pool_holding, 1)
         .expect("bob deposits one base unit");
 
     let market = env.svm.get_account(&env.slab).unwrap();
@@ -2180,9 +2199,9 @@ fn genesis_cross_backing_splits_globally_and_returns_only_owner_principal() {
     }
     assert_eq!(ledger_principal, 1);
 
-    env.cross_backing_withdraw(&alice, &alice_ata, &alice_holding, 1)
+    env.cross_backing_withdraw(&alice, &alice_ata, &pool_holding, 1)
         .expect("alice recovers only her base unit");
-    env.cross_backing_withdraw(&bob, &bob_ata, &bob_holding, 1)
+    env.cross_backing_withdraw(&bob, &bob_ata, &pool_holding, 1)
         .expect("bob recovers only his base unit");
     assert_eq!(env.token_amount(&alice_ata), 1);
     assert_eq!(env.token_amount(&bob_ata), 1);

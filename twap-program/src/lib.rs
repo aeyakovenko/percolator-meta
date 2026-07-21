@@ -1780,9 +1780,9 @@ fn process_return_resolved_asset0_backing(
 //  governance_destination(w), percolator_program, token_program]
 // data: exact earnings amount (u64)
 //
-// Subledger derives the amount from both live Percolator backing-earnings
-// counters and enters with its canonical pool PDA signer. This fixed second leg
-// can only empty that pool-owned transit into a clean token account owned by the
+// Subledger derives the amount from its canonical pool escrow plus both live
+// backing-earnings counters and enters with its canonical pool PDA signer. This
+// fixed leg can empty only that escrow into a clean token account owned by the
 // config-bound Squads vault. It exposes no principal withdrawal or admin action.
 fn process_accept_cross_backing_earnings(
     program_id: &Pubkey,
