@@ -53778,8 +53778,15 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
 // re-handoff intentionally preserves that floor, so the auction cannot pull it while CloseSlab
 // cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
 // exact residual through an empty TWAP-owned transit only to the bound Squads vault.
-#[test]
-fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
+#[derive(Clone, Copy)]
+enum TerminalAuctionExit {
+    SettledClaim,
+    UnsettledCancel,
+}
+
+fn run_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
+    auction_exit: TerminalAuctionExit,
+) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -54688,21 +54695,28 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         retained_floor - exiting_principal as u128 - interleaved_exit as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
-    let standing_round_end = u64::from_le_bytes(
-        svm.get_account(&book).unwrap().data[240..248]
-            .try_into()
-            .unwrap(),
-    );
-    warp_to(&mut svm, standing_round_end);
-
-    send(&mut svm, &[&payer], execute_round())
-    .expect("standing bid settles after resolved-mode re-handoff");
+    match auction_exit {
+        TerminalAuctionExit::SettledClaim => {
+            let standing_round_end = u64::from_le_bytes(
+                svm.get_account(&book).unwrap().data[240..248]
+                    .try_into()
+                    .unwrap(),
+            );
+            warp_to(&mut svm, standing_round_end);
+            send(&mut svm, &[&payer], execute_round())
+                .expect("standing bid settles after resolved-mode re-handoff");
+            assert_eq!(token_amount(&svm, &coin_escrow), 0);
+            assert_eq!(token_amount(&svm, &settlement_usd), 1);
+        }
+        TerminalAuctionExit::UnsettledCancel => {
+            assert_eq!(token_amount(&svm, &coin_escrow), 1);
+            assert_eq!(token_amount(&svm, &settlement_usd), 0);
+        }
+    }
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
     assert_eq!(token_amount(&svm, &standing_bidder_usd), 0);
     assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
-    assert_eq!(token_amount(&svm, &coin_escrow), 0);
-    assert_eq!(token_amount(&svm, &settlement_usd), 1);
     let market_before_replayed_exit = svm.get_account(&env.slab).unwrap();
     let config_before_replayed_exit = svm.get_account(&twap_cfg).unwrap();
     assert!(
@@ -55316,26 +55330,67 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
             .map_or(true, |account| account.lamports == 0),
         "resolved market closes after every user and protocol balance exits"
     );
-    send(
-        &mut svm,
-        &[&payer],
-        claim_ix(
-            &payer.pubkey(),
-            &twap_cfg,
-            &book,
-            &book_escrow,
-            &settlement_usd,
-            &coin_escrow,
-            &standing_bidder_usd,
-            &standing_bidder_coin,
-            0,
-        ),
-    )
-    .expect("settled bidder claim remains live after the market slab closes");
-    assert_eq!(token_amount(&svm, &standing_bidder_usd), 1);
-    assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+    match auction_exit {
+        TerminalAuctionExit::SettledClaim => {
+            send(
+                &mut svm,
+                &[&payer],
+                claim_ix(
+                    &payer.pubkey(),
+                    &twap_cfg,
+                    &book,
+                    &book_escrow,
+                    &settlement_usd,
+                    &coin_escrow,
+                    &standing_bidder_usd,
+                    &standing_bidder_coin,
+                    0,
+                ),
+            )
+            .expect("settled bidder claim remains live after the market slab closes");
+            assert_eq!(token_amount(&svm, &standing_bidder_usd), 1);
+            assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+        }
+        TerminalAuctionExit::UnsettledCancel => {
+            let now = svm.get_sysvar::<Clock>().slot;
+            warp_to(&mut svm, now.saturating_add(2));
+            send(
+                &mut svm,
+                &[&standing_bidder],
+                cancel_ix(
+                    &standing_bidder.pubkey(),
+                    &twap_cfg,
+                    &book,
+                    &book_escrow,
+                    &coin_escrow,
+                    &standing_bidder_coin,
+                    0,
+                ),
+            )
+            .expect("unsettled bidder recovers escrow after the market slab closes");
+            assert_eq!(token_amount(&svm, &standing_bidder_usd), 0);
+            assert_eq!(token_amount(&svm, &standing_bidder_coin), 100);
+        }
+    }
     assert_eq!(token_amount(&svm, &coin_escrow), 0);
     assert_eq!(token_amount(&svm, &settlement_usd), 0);
+}
+
+#[test]
+fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
+    run_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
+        TerminalAuctionExit::SettledClaim,
+    );
+}
+
+// PUBLIC LOF PROBE: terminal market cleanup is independent of an open auction book. If the
+// market closes while a real bidder is still committed, the durable TWAP escrow must remain
+// owner-recoverable after its anti-spoof cooldown even though the Percolator slab is gone.
+#[test]
+fn e2e_unsettled_bidder_recovers_after_terminal_market_close() {
+    run_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
+        TerminalAuctionExit::UnsettledCancel,
+    );
 }
 
 // PUBLIC DOS: a one-unit genesis voter can disappear after the winning distribution is
