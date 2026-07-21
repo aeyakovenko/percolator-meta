@@ -37,6 +37,7 @@ const CONTROLLER_SEED: &[u8] = b"market-controller";
 const ASSET_GENERATION_SEED: &[u8] = b"asset-generation";
 const MARKET_GENERATION_SEED: &[u8] = b"market-generation";
 const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
+const SHUTDOWN_BACKING_AUTHORITY_SEED: &[u8] = b"shutdown-backing";
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
 pub const RETIRED_MARKET_SIZE: usize = 72;
@@ -167,6 +168,17 @@ pub fn shutdown_insurance_operator_address(controller: &Pubkey, asset_index: u16
     Pubkey::find_program_address(
         &[
             SHUTDOWN_INSURANCE_OPERATOR_SEED,
+            controller.as_ref(),
+            &asset_index.to_le_bytes(),
+        ],
+        &id(),
+    )
+}
+
+pub fn shutdown_backing_authority_address(controller: &Pubkey, asset_index: u16) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SHUTDOWN_BACKING_AUTHORITY_SEED,
             controller.as_ref(),
             &asset_index.to_le_bytes(),
         ],
@@ -1200,7 +1212,8 @@ fn reject_shutdown_return_after_stale_resolution_matures(market: &AccountInfo) -
 // return_shutdown_backing accounts:
 // [governance, controller_pda, market(w), provider_owned_token_account(w),
 //  controller_owned_transit(w), percolator_vault(w), vault_authority,
-//  controller_backing_ledger(w), percolator_program, token_program]
+//  controller_backing_ledger(w), percolator_program, token_program,
+//  shutdown_backing_authority(optional, required for controller-owned backing)]
 // data: domain(u16) | principal(u128) | earnings(u128)
 //
 // Permissionless after Percolator's own asset-shutdown delay and empty-state checks.
@@ -1236,6 +1249,7 @@ fn process_return_shutdown_backing<'a>(
     let backing_ledger = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let shutdown_backing_authority = iter.next();
     if iter.next().is_some()
         || !market.is_writable
         || !provider_destination.is_writable
@@ -1294,6 +1308,45 @@ fn process_return_shutdown_backing<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    let asset_index = domain / 2;
+    let asset_index_bytes = asset_index.to_le_bytes();
+    let shutdown_bump = if controller_owned {
+        let shutdown_backing_authority =
+            shutdown_backing_authority.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let (expected, shutdown_bump) =
+            shutdown_backing_authority_address(controller.key, asset_index);
+        if *shutdown_backing_authority.key != expected
+            || shutdown_backing_authority.is_signer
+            || shutdown_backing_authority.is_writable
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        shutdown_bump
+    } else {
+        if shutdown_backing_authority.is_some() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        0
+    };
+    let shutdown_bump_seed = [shutdown_bump];
+    let shutdown_seeds: [&[u8]; 4] = [
+        SHUTDOWN_BACKING_AUTHORITY_SEED,
+        controller.key.as_ref(),
+        &asset_index_bytes,
+        &shutdown_bump_seed,
+    ];
+    if controller_owned {
+        rotate_asset_role_between_program_authorities(
+            controller,
+            shutdown_backing_authority.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            market,
+            percolator_program,
+            &seeds,
+            &shutdown_seeds,
+            asset_index,
+            ASSET_AUTH_BACKING_BUCKET,
+        )?;
+    }
     let return_amount = principal
         .checked_add(earnings)
         .ok_or(ProgramError::ArithmeticOverflow)?;
@@ -1324,6 +1377,18 @@ fn process_return_shutdown_backing<'a>(
         domain,
         principal,
     )?;
+    if controller_owned {
+        rotate_asset_role_between_program_authorities(
+            shutdown_backing_authority.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            controller,
+            market,
+            percolator_program,
+            &shutdown_seeds,
+            &seeds,
+            asset_index,
+            ASSET_AUTH_BACKING_BUCKET,
+        )?;
+    }
     forward_exact_and_close_if_empty(
         controller,
         provider_destination,
@@ -1591,6 +1656,41 @@ fn rotate_asset_role_to_controller<'a>(
             percolator_program.clone(),
         ],
         &[signer_seeds],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rotate_asset_role_between_program_authorities<'a>(
+    current: &AccountInfo<'a>,
+    next: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    current_signer_seeds: &[&[u8]],
+    next_signer_seeds: &[&[u8]],
+    asset_index: u16,
+    kind: u8,
+) -> ProgramResult {
+    let mut data = vec![PERC_IX_UPDATE_ASSET_AUTHORITY];
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.push(kind);
+    data.extend_from_slice(next.key.as_ref());
+    invoke_signed(
+        &Instruction {
+            program_id: *percolator_program.key,
+            accounts: vec![
+                AccountMeta::new_readonly(*current.key, true),
+                AccountMeta::new_readonly(*next.key, true),
+                AccountMeta::new(*market.key, false),
+            ],
+            data,
+        },
+        &[
+            current.clone(),
+            next.clone(),
+            market.clone(),
+            percolator_program.clone(),
+        ],
+        &[current_signer_seeds, next_signer_seeds],
     )
 }
 

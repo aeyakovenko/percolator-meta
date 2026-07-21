@@ -8079,6 +8079,7 @@ fn controller_return_shutdown_backing_ix(
     vault_authority: &Pubkey,
     backing_ledger: &Pubkey,
     percolator_program: &Pubkey,
+    controller_owned: bool,
     domain: u16,
     principal: u128,
     earnings: u128,
@@ -8087,20 +8088,31 @@ fn controller_return_shutdown_backing_ix(
     data.extend_from_slice(&domain.to_le_bytes());
     data.extend_from_slice(&principal.to_le_bytes());
     data.extend_from_slice(&earnings.to_le_bytes());
+    let mut accounts = vec![
+        AccountMeta::new_readonly(*governance, false),
+        AccountMeta::new_readonly(*controller, false),
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*provider_destination, false),
+        AccountMeta::new(*controller_transit, false),
+        AccountMeta::new(*vault, false),
+        AccountMeta::new_readonly(*vault_authority, false),
+        AccountMeta::new(*backing_ledger, false),
+        AccountMeta::new_readonly(*percolator_program, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    if controller_owned {
+        accounts.push(AccountMeta::new_readonly(
+            market_controller_program::shutdown_backing_authority_address(
+                controller,
+                domain / 2,
+            )
+            .0,
+            false,
+        ));
+    }
     Instruction {
         program_id: controller_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(*governance, false),
-            AccountMeta::new_readonly(*controller, false),
-            AccountMeta::new(*market, false),
-            AccountMeta::new(*provider_destination, false),
-            AccountMeta::new(*controller_transit, false),
-            AccountMeta::new(*vault, false),
-            AccountMeta::new_readonly(*vault_authority, false),
-            AccountMeta::new(*backing_ledger, false),
-            AccountMeta::new_readonly(*percolator_program, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
+        accounts,
         data,
     }
 }
@@ -15430,6 +15442,7 @@ fn e2e_controller_freezes_shutdown_returns_when_stale_resolution_matures() {
             &vault_authority,
             &long_backing_ledger,
             &perc_id(),
+            false,
             2,
             backing_amount as u128,
             0,
@@ -16116,6 +16129,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &vault_authority,
         &backing_ledger,
         &perc_id(),
+        false,
         2,
         1,
         0,
@@ -16288,6 +16302,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &vault_authority,
         &backing_ledger,
         &perc_id(),
+        false,
         2,
         1,
         0,
@@ -16502,6 +16517,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &vault_authority,
         &backing_ledger,
         &perc_id(),
+        false,
         2,
         abandoned_amount as u128 + 1,
         live_provider_earnings as u128,
@@ -16535,6 +16551,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &vault_authority,
         &backing_ledger,
         &perc_id(),
+        false,
         2,
         abandoned_amount as u128,
         live_provider_earnings as u128,
@@ -16642,6 +16659,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &vault_authority,
         &backing_ledger,
         &perc_id(),
+        false,
         3,
         resolved_only_backing_amount as u128,
         0,
@@ -48171,6 +48189,77 @@ fn e2e_controller_owned_secondary_returns_organic_backing() {
         &governance.pubkey(),
         0,
     );
+    // PUBLIC DOS: the shutdown-return program signs as both marketauth and the
+    // controller-owned backing provider. Percolator must not accept that as an
+    // ordinary provider withdrawal while the asset is still live, or any caller
+    // can remove protocol backing before the configured shutdown delay.
+    let live_return_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &live_return_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let live_return_ledger = Pubkey::new_unique();
+    svm.set_account(
+        live_return_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::backing_domain_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let (live_return_domain, live_return_principal, live_return_earnings) =
+        if organic_backing_balances[0].earnings_atoms != 0 {
+            (2u16, 0u128, 1u128)
+        } else if organic_backing_balances[0].principal_atoms != 0 {
+            (2u16, 1u128, 0u128)
+        } else if organic_backing_balances[1].earnings_atoms != 0 {
+            (3u16, 0u128, 1u128)
+        } else {
+            (3u16, 1u128, 0u128)
+        };
+    let live_market_before = svm.get_account(&market_key).unwrap();
+    let live_vault_before = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_shutdown_backing_ix(
+                &governance.pubkey(),
+                &controller,
+                &market_key,
+                &governance_destination,
+                &live_return_transit,
+                &percolator_vault,
+                &vault_authority,
+                &live_return_ledger,
+                &perc_id(),
+                true,
+                live_return_domain,
+                live_return_principal,
+                live_return_earnings,
+            ),
+        )
+        .is_err(),
+        "controller-owned backing cannot leave before shutdown starts and matures"
+    );
+    assert_eq!(svm.get_account(&market_key).unwrap(), live_market_before);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), live_vault_before);
+    assert_eq!(token_amount(&svm, &governance_destination), 0);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&market_key).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        controller.to_bytes(),
+        "the rejected rotation is byte-atomic",
+    );
     let shutdown_generation_witness =
         market_controller_program::asset_generation_witness_address(
             &market_key,
@@ -48256,6 +48345,7 @@ fn e2e_controller_owned_secondary_returns_organic_backing() {
             &vault_authority,
             &shutdown_backing_ledger,
             &perc_id(),
+            true,
             shutdown_domain,
             shutdown_principal,
             shutdown_earnings,
@@ -48264,6 +48354,15 @@ fn e2e_controller_owned_secondary_returns_organic_backing() {
     .expect("permissionless shutdown cleanup returns controller-owned backing");
     let shutdown_returned = shutdown_principal + shutdown_earnings;
     assert_eq!(token_amount(&svm, &governance_destination), 1);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(
+            &svm.get_account(&market_key).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        controller.to_bytes(),
+        "successful cleanup restores the constrained backing authority",
+    );
     assert!(
         svm.get_account(&shutdown_transit)
             .map_or(true, |account| account.lamports == 0),
