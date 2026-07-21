@@ -3923,6 +3923,8 @@ fn permissionless_resolved_close_unblocks_owner_exit_after_public_insurance_loss
     }
     let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
     let short_portfolio = create_percolator_portfolio(&mut env, &short, 200);
+    let initial_vault_atoms = env.token_amount(&env.perc_vault);
+    assert_eq!(initial_vault_atoms, 1_000_000 + 200 + 4);
     env.send(
         &[Instruction {
             program_id: perc_id(),
@@ -4074,14 +4076,46 @@ fn permissionless_resolved_close_unblocks_owner_exit_after_public_insurance_loss
         )
         .expect("each permissionless resolved-close step makes bounded progress");
         resolved_steps += 1;
-        if env.token_amount(&long_destination) == 1_000_200 {
+        let state = percolator_prog::state::read_portfolio(
+            &env.svm.get_account(&long_portfolio).unwrap().data,
+        )
+        .unwrap();
+        if percolator::active_bitmap_is_empty(
+            state.active_bitmap.map(percolator::V16PodU64::get),
+        ) && state.capital.get() == 0
+            && state.pnl.get() == 0
+        {
             break;
         }
     }
+    let (_, payout_group) = percolator_prog::state::read_market(
+        &env.svm.get_account(&env.slab).unwrap().data,
+    )
+    .unwrap();
+    let payout_ledger = payout_group.resolved_payout_ledger;
+    assert_eq!(payout_ledger.terminal_claim_bound_unreceipted_num, 0);
     assert_eq!(
-        env.token_amount(&long_destination),
-        1_000_200,
-        "resolved payout is the winner's principal plus the loser's crystallized capital",
+        payout_ledger.terminal_claim_exact_receipts_num % percolator::BOUND_SCALE,
+        0,
+    );
+    let receipt_face =
+        payout_ledger.terminal_claim_exact_receipts_num / percolator::BOUND_SCALE;
+    let source_realized = payout_group
+        .payout_snapshot_pnl_pos_tot
+        .checked_sub(receipt_face)
+        .unwrap();
+    let receipt_payout = receipt_face
+        .checked_mul(payout_ledger.current_payout_rate_num)
+        .unwrap()
+        / payout_ledger.current_payout_rate_den;
+    let expected_winner_payout = 1_000_000u128
+        .checked_add(source_realized)
+        .and_then(|value| value.checked_add(receipt_payout))
+        .unwrap();
+    assert_eq!(
+        u128::from(env.token_amount(&long_destination)),
+        expected_winner_payout,
+        "resolved payout follows the terminal market-wide haircut rate",
     );
     assert!(resolved_steps < 512, "the absent winner has a bounded public close path");
     env.send(
@@ -4102,8 +4136,8 @@ fn permissionless_resolved_close_unblocks_owner_exit_after_public_insurance_loss
     )
     .expect("the destination-bound topup path is also permissionless");
     assert_eq!(
-        env.token_amount(&long_destination),
-        1_000_200,
+        u128::from(env.token_amount(&long_destination)),
+        expected_winner_payout,
         "consumed insurance is protocol residual, not a second trader payout",
     );
     let payer = clone_kp(&env.payer);
@@ -4170,12 +4204,11 @@ fn permissionless_resolved_close_unblocks_owner_exit_after_public_insurance_loss
     .unwrap();
     assert_eq!(final_group.c_tot, 0);
     assert_eq!(final_group.insurance, 0);
-    assert_eq!(env.token_amount(&env.perc_vault), 2);
     assert_eq!(
         env.token_amount(&long_destination)
             + env.token_amount(&depositor_ata)
             + env.token_amount(&env.perc_vault),
-        1_000_000 + 200 + 4,
+        initial_vault_atoms,
         "trader principal, surviving insurance, and consumed-loss residual conserve exactly",
     );
 }
