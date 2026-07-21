@@ -57,7 +57,9 @@ const TWAP_CONFIG_SIZE: usize = 272;
 const TWAP_CUSTODY_MODE_POOL_BOUND: u8 = 1;
 const TWAP_CUSTODY_MODE_POOLLESS_EMPTY: u8 = 2;
 const SUBLEDGER_POOL_SEED: &[u8] = b"subledger_pool";
+const SUBLEDGER_CROSS_BACKING_POOL_SEED: &[u8] = b"cross-backing";
 const SUBLEDGER_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
+const SUBLEDGER_MARKET_POOL_SIZE: usize = 160;
 const SUBLEDGER_POOL_SIZE: usize = 272;
 
 const IX_PROXY_ADMIN: u8 = 0;
@@ -110,6 +112,7 @@ const ASSET_AUTH_INSURANCE_OPERATOR: u8 = 2;
 const ASSET_AUTH_BACKING_BUCKET: u8 = 3;
 const ASSET_AUTH_ORACLE: u8 = 4;
 const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
+const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_program::entrypoint!(process_instruction);
@@ -380,7 +383,7 @@ fn validate_twap_custody_admin(
     }
 }
 
-fn validate_subledger_custody_admin(
+fn validate_terminal_subledger_custody(
     market: &AccountInfo,
     percolator_program: &AccountInfo,
     pool: &AccountInfo,
@@ -392,10 +395,9 @@ fn validate_subledger_custody_admin(
         return Err(ProgramError::IllegalOwner);
     }
     let data = pool.try_borrow_data()?;
-    if data.len() < SUBLEDGER_POOL_SIZE
+    if data.len() < SUBLEDGER_MARKET_POOL_SIZE
         || data[..8] != SUBLEDGER_POOL_DISC
-        || data[40..48] != 0u64.to_le_bytes()
-        || data[88] != 0
+        || data[88] > 1
         || data[90] != 0
         || data[96..128] != market.key.to_bytes()
         || data[128..160] != percolator_program.key.to_bytes()
@@ -421,26 +423,58 @@ fn validate_subledger_custody_admin(
     if data[48..80] != expected_vault.to_bytes() {
         return Err(ProgramError::InvalidAccountData);
     }
+    Ok(())
+}
 
+fn validate_subledger_custody_admin(
+    market: &AccountInfo,
+    percolator_program: &AccountInfo,
+    pool: &AccountInfo,
+    asset_admin: [u8; 32],
+    insurance_authority: [u8; 32],
+    insurance_operator: [u8; 32],
+) -> ProgramResult {
+    validate_terminal_subledger_custody(
+        market,
+        percolator_program,
+        pool,
+        asset_admin,
+        insurance_authority,
+        insurance_operator,
+    )?;
+    let data = pool.try_borrow_data()?;
+    if data.len() < SUBLEDGER_POOL_SIZE
+        || data[40..48] != 0u64.to_le_bytes()
+        || data[88] != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let cross_backing = match data.get(272).copied().unwrap_or(0) {
+        0 => false,
+        1 => true,
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
     let bump = [data[89]];
-    let expected_pool = Pubkey::create_program_address(
-        &[
-            SUBLEDGER_POOL_SEED,
-            &data[8..40],
-            &data[40..48],
-            market.key.as_ref(),
-            percolator_program.key.as_ref(),
-            &data[208..240],
-            &data[88..89],
-            &data[90..91],
-            &data[248..256],
-            &data[256..264],
-            &data[264..272],
-            &bump,
-        ],
-        &SUBLEDGER_PROGRAM_ID,
-    )
-    .map_err(|_| ProgramError::InvalidSeeds)?;
+    let mut pool_seeds: alloc::vec::Vec<&[u8]> = vec![
+        SUBLEDGER_POOL_SEED,
+        &data[8..40],
+        &data[40..48],
+        market.key.as_ref(),
+        percolator_program.key.as_ref(),
+        &data[208..240],
+        &data[88..89],
+        &data[90..91],
+        &data[248..256],
+        &data[256..264],
+        &data[264..272],
+    ];
+    if cross_backing {
+        pool_seeds.push(SUBLEDGER_CROSS_BACKING_POOL_SEED);
+    }
+    pool_seeds.push(&bump);
+    let expected_pool = Pubkey::create_program_address(&pool_seeds, &SUBLEDGER_PROGRAM_ID)
+        .map_err(|_| ProgramError::InvalidSeeds)?;
     if *pool.key != expected_pool {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -478,6 +512,75 @@ fn validate_constrained_custody_admin(
     } else {
         Err(ProgramError::IllegalOwner)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_constrained_custody_cleared<'a>(
+    governance: &AccountInfo<'a>,
+    market: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    custody_state: &AccountInfo<'a>,
+    custody_pool_or_system: &AccountInfo<'a>,
+    subledger_program_or_system: &AccountInfo<'a>,
+    asset_admin: [u8; 32],
+    insurance_authority: [u8; 32],
+    insurance_operator: [u8; 32],
+) -> ProgramResult {
+    let claim_pool = if custody_state.owner == &TWAP_PROGRAM_ID {
+        validate_twap_custody_admin(
+            governance,
+            market,
+            percolator_program,
+            custody_state,
+            asset_admin,
+            insurance_authority,
+            insurance_operator,
+        )?;
+        let data = custody_state.try_borrow_data()?;
+        let custody_pool = Pubkey::new_from_array(data[225..257].try_into().unwrap());
+        match data[265] {
+            TWAP_CUSTODY_MODE_POOL_BOUND if *custody_pool_or_system.key == custody_pool => {
+                custody_pool_or_system
+            }
+            TWAP_CUSTODY_MODE_POOLLESS_EMPTY
+                if *custody_pool_or_system.key == solana_program::system_program::ID
+                    && *subledger_program_or_system.key
+                        == solana_program::system_program::ID =>
+            {
+                return Ok(())
+            }
+            _ => return Err(ProgramError::InvalidAccountData),
+        }
+    } else if custody_state.owner == &SUBLEDGER_PROGRAM_ID {
+        validate_terminal_subledger_custody(
+            market,
+            percolator_program,
+            custody_state,
+            asset_admin,
+            insurance_authority,
+            insurance_operator,
+        )?;
+        if *custody_pool_or_system.key != solana_program::system_program::ID {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        custody_state
+    } else {
+        return Err(ProgramError::IllegalOwner);
+    };
+
+    if *subledger_program_or_system.key != SUBLEDGER_PROGRAM_ID
+        || !subledger_program_or_system.executable
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    invoke(
+        &Instruction {
+            program_id: *subledger_program_or_system.key,
+            accounts: vec![AccountMeta::new_readonly(*claim_pool.key, false)],
+            data: vec![SUBLEDGER_IX_ASSERT_NO_PRINCIPAL],
+        },
+        &[claim_pool.clone(), subledger_program_or_system.clone()],
+    )
 }
 
 /// Exact pinned-v16 generic governance surface. Every value mover, authority
@@ -2283,6 +2386,8 @@ fn process_close_resolved_portfolio<'a>(
 // [governance(s,w), controller(w), market(w), vault_authority,
 //  primary_vault(w), controller_primary_transit(w), governance_primary_dest(w),
 //  percolator_program, token_program, system_program, retired_market_marker(w),
+//  custody_state, custody_pool_or_system, subledger_program_or_system
+//    (required only when canonical Subledger/TWAP state owns asset_admin),
 //  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w)]
 //
 // Percolator's CloseSlab requires its current marketauth to receive the slab rent,
@@ -2316,6 +2421,25 @@ fn process_close_market_and_reclaim<'a>(
     let token_program = next_account_info(iter)?;
     let system_program = next_account_info(iter)?;
     let retired_market = next_account_info(iter)?;
+    let constrained_custody = {
+        let market_data = market.try_borrow_data()?;
+        let asset_admin = percolator_accounting::read_asset_admin(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if asset_admin == controller.key.to_bytes() {
+            None
+        } else {
+            Some((
+                next_account_info(iter)?,
+                next_account_info(iter)?,
+                next_account_info(iter)?,
+                asset_admin,
+                percolator_accounting::read_asset_insurance_authority(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+                percolator_accounting::read_asset_insurance_operator(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+            ))
+        }
+    };
     let optional: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
     let secondary = match optional.as_slice() {
         [] => None,
@@ -2358,6 +2482,27 @@ fn process_close_market_and_reclaim<'a>(
         market,
         percolator_program,
     )?;
+    if let Some((
+        custody_state,
+        custody_pool_or_system,
+        subledger_program_or_system,
+        asset_admin,
+        insurance_authority,
+        insurance_operator,
+    )) = constrained_custody
+    {
+        assert_constrained_custody_cleared(
+            governance,
+            market,
+            percolator_program,
+            custody_state,
+            custody_pool_or_system,
+            subledger_program_or_system,
+            asset_admin,
+            insurance_authority,
+            insurance_operator,
+        )?;
+    }
     let bump_seed = [bump];
     let seeds = signer_seeds(
         governance.key,
