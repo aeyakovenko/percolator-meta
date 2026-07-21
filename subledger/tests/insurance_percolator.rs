@@ -6210,6 +6210,50 @@ fn lamport_prefund_cannot_brick_insurance_pool_init() {
     assert!(acc.data.len() >= 88, "pool data initialized");
 }
 
+// A cross-backed genesis init creates two Subledger-derived PDAs owned by the
+// Percolator program, in addition to its own pool PDA. Exercise a public System
+// transfer against all three addresses so the foreign-owner allocate/assign CPI
+// path cannot regress into a permissionless initialization DoS.
+#[test]
+fn lamport_prefund_cannot_brick_cross_backing_genesis_init() {
+    let mut env = Env::new_cross_backing();
+    let backing_ledgers = [
+        cross_backing_ledger_pda(&env.pool, 0),
+        cross_backing_ledger_pda(&env.pool, 1),
+    ];
+
+    for address in [env.pool, backing_ledgers[0], backing_ledgers[1]] {
+        let prefund = system_instruction::transfer(&env.payer.pubkey(), &address, 1);
+        env.send(&[prefund], &[])
+            .expect("an arbitrary sender can prefund a deterministic PDA");
+        let account = env.svm.get_account(&address).expect("prefunded PDA");
+        assert_eq!(account.owner, solana_sdk::system_program::ID);
+        assert!(account.data.is_empty());
+        assert_eq!(account.lamports, 1);
+    }
+
+    env.init_cross_backing_genesis_pool();
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().owner, sub_id());
+    for ledger in backing_ledgers {
+        let account = env.svm.get_account(&ledger).expect("created backing ledger");
+        assert_eq!(account.owner, perc_id());
+        assert_eq!(
+            account.data.len(),
+            percolator_accounting::backing_domain_ledger_account_len(),
+        );
+    }
+
+    let principal = 4;
+    let (depositor, depositor_ata) = new_depositor(&mut env, principal);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(&depositor, &depositor_ata, &pool_holding, principal)
+        .expect("prefunded-ledger pool accepts a deposit");
+    env.cross_backing_withdraw(&depositor, &depositor_ata, &pool_holding, principal)
+        .expect("prefunded-ledger pool returns the owner's principal");
+    assert_eq!(env.token_amount(&depositor_ata), principal);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 // RE-INIT PROTECTION (regression guard for finding AI): the finding-AI fix relaxed the init guard
 // from `lamports() != 0 || data_len() != 0` to `data_len() != 0` so a dusted-but-empty PDA can still
 // be created. This must NOT weaken re-init protection — an already-initialized pool has data, so a
