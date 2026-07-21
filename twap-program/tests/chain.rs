@@ -31838,13 +31838,15 @@ fn e2e_full_genesis_to_buy_burn() {
     .expect("dao reconfigure (obsolete policy step)");
 
     // operator -> twap.
-    let op_msg = build_subledger_handoff_to_twap_message(
+    let op_msg = build_cross_backing_subledger_handoff_to_twap_message(
         &squads_vault,
         &pool,
         &slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
+        &long_genesis_backing_ledger,
+        &short_genesis_backing_ledger,
     );
     let op_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -31855,6 +31857,8 @@ fn e2e_full_genesis_to_buy_burn() {
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(long_genesis_backing_ledger, false),
+        AccountMeta::new_readonly(short_genesis_backing_ledger, false),
     ];
     squads_execute(
         &mut svm,
@@ -52536,6 +52540,11 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
         &env.pool,
         escrow_donation,
     );
+    let staged_principal = 1u64;
+    let mut pool_with_staged_backing = svm.get_account(&env.pool).unwrap();
+    pool_with_staged_backing.data[273..281]
+        .copy_from_slice(&staged_principal.to_le_bytes());
+    svm.set_account(env.pool, pool_with_staged_backing).unwrap();
 
     // Model the exact state emitted by Percolator's separately covered backing-fee
     // path, then exercise every withdrawal through the pinned SBF binary.
@@ -52588,13 +52597,13 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
         &[&payer],
         route_earnings(&governance_destination),
     )
-    .expect("route the canonical escrow and newly accrued earnings together");
-    let routed_before_exit = escrow_donation + backing_earnings;
+    .expect("route only non-principal escrow and newly accrued earnings");
+    let routed_while_staged = escrow_donation - staged_principal + backing_earnings;
     assert_eq!(
         token_amount(&svm, &governance_destination),
-        routed_before_exit,
+        routed_while_staged,
     );
-    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(token_amount(&svm, &pool_holding), staged_principal);
     assert_eq!(
         percolator_accounting::read_asset_backing_balances(
             &svm.get_account(&env.slab).unwrap().data,
@@ -52607,6 +52616,26 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
         (principal / 2) as u128,
         "routing protocol earnings cannot move owner backing principal",
     );
+
+    // This fixture injected the staged counter after the handoff to isolate the
+    // route boundary. Restore it to ordinary protocol escrow before continuing
+    // the existing terminal lifecycle assertions.
+    let mut pool_without_staged_backing = svm.get_account(&env.pool).unwrap();
+    pool_without_staged_backing.data[273..281].fill(0);
+    svm.set_account(env.pool, pool_without_staged_backing)
+        .unwrap();
+    send(
+        &mut svm,
+        &[&payer],
+        route_earnings(&governance_destination),
+    )
+    .expect("route escrow after its staged-principal classification is removed");
+    let routed_before_exit = escrow_donation + backing_earnings;
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
+        routed_before_exit,
+    );
+    assert_eq!(token_amount(&svm, &pool_holding), 0);
 
     // A later earnings tranche remains independent: the owner exit must isolate
     // it in the same escrow before debiting the final backing principal.

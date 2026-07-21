@@ -2207,7 +2207,7 @@ fn legacy_genesis_pool_cannot_squat_cross_backing_genesis_address() {
         .expect("cross-backed genesis init remains available after legacy init");
 
     assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 272);
-    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 273);
+    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 289);
 }
 
 #[test]

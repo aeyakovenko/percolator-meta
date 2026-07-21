@@ -69,6 +69,17 @@ pub struct BackingDomainBalance {
     /// Principal attached to an impaired lien.
     pub impaired_principal_atoms: u128,
     pub earnings_atoms: u128,
+    pub expiry_slot: u64,
+    pub status: BackingDomainStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackingDomainStatus {
+    #[default]
+    Empty,
+    Fresh,
+    Expired,
+    Impaired,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,6 +97,14 @@ pub struct BackingSourceCredit {
 }
 
 impl BackingDomainBalance {
+    pub fn accepts_top_up_expiry(self, expiry_slot: u64) -> bool {
+        match self.status {
+            BackingDomainStatus::Empty | BackingDomainStatus::Expired => true,
+            BackingDomainStatus::Fresh => self.expiry_slot == expiry_slot,
+            BackingDomainStatus::Impaired => false,
+        }
+    }
+
     pub fn protected_principal_atoms(self) -> Result<u128, ReadError> {
         self.principal_atoms
             .checked_add(self.valid_liened_principal_atoms)
@@ -857,6 +876,20 @@ pub fn read_asset_backing_balances(
                 data,
                 bucket + offset_of!(BackingBucketV16Account, utilization_fee_earnings),
             )?,
+            expiry_slot: read_u64(
+                data,
+                bucket + offset_of!(BackingBucketV16Account, expiry_slot),
+            )?,
+            status: match *data
+                .get(bucket + offset_of!(BackingBucketV16Account, status))
+                .ok_or(ReadError::Truncated)?
+            {
+                0 => BackingDomainStatus::Empty,
+                1 => BackingDomainStatus::Fresh,
+                2 => BackingDomainStatus::Expired,
+                3 => BackingDomainStatus::Impaired,
+                _ => return Err(ReadError::InvalidAccounting),
+            },
         })
     };
     Ok([
@@ -1728,6 +1761,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn backing_top_up_expiry_compatibility_matches_pinned_engine() {
+        let with = |status, expiry_slot| BackingDomainBalance {
+            status,
+            expiry_slot,
+            ..BackingDomainBalance::default()
+        };
+        assert!(with(BackingDomainStatus::Empty, 0).accepts_top_up_expiry(100));
+        assert!(with(BackingDomainStatus::Expired, 7).accepts_top_up_expiry(100));
+        assert!(with(BackingDomainStatus::Fresh, 100).accepts_top_up_expiry(100));
+        assert!(!with(BackingDomainStatus::Fresh, 99).accepts_top_up_expiry(100));
+        assert!(!with(BackingDomainStatus::Impaired, 100).accepts_top_up_expiry(100));
     }
 
     #[test]

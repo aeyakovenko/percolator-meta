@@ -72,8 +72,10 @@ const POOL_SIZE_COIN: usize = 240;
 const POOL_SIZE_WINDOW: usize = 256;
 const POOL_SIZE_START: usize = 264;
 const POOL_SIZE: usize = 272;
-const POOL_SIZE_CROSS_BACKING: usize = 273;
+const POOL_SIZE_CROSS_BACKING_V1: usize = 273;
+const POOL_SIZE_CROSS_BACKING: usize = 289;
 const POOL_CROSS_BACKING_OFF: usize = 272;
+const POOL_PENDING_BACKING_OFF: usize = 273;
 const POSITION_SIZE_BASE: usize = 96;
 const POSITION_SIZE_TENURE: usize = 104;
 const POSITION_SIZE: usize = 120;
@@ -349,6 +351,10 @@ struct Pool {
     /// aggregate deposit across insurance and backing. Historical layouts leave
     /// this false and retain their insurance-only behavior.
     cross_backing: bool,
+    /// Genesis backing that could not enter a Percolator domain because public
+    /// trader-source capital fixed a conflicting bucket expiry. These atoms stay
+    /// in the canonical pool ATA and remain owner principal, segregated by domain.
+    pending_backing: [u64; 2],
 }
 
 impl Pool {
@@ -358,7 +364,7 @@ impl Pool {
         }
         let policy = data[88];
         let domain = data[90];
-        let cross_backing = if data.len() >= POOL_SIZE_CROSS_BACKING {
+        let cross_backing = if data.len() >= POOL_SIZE_CROSS_BACKING_V1 {
             match data[POOL_CROSS_BACKING_OFF] {
                 0 => false,
                 1 => true,
@@ -434,6 +440,22 @@ impl Pool {
                 OWN_VAULT_BOOTSTRAP_DELAY_SLOTS
             },
             cross_backing,
+            pending_backing: if data.len() >= POOL_SIZE_CROSS_BACKING {
+                [
+                    u64::from_le_bytes(
+                        data[POOL_PENDING_BACKING_OFF..POOL_PENDING_BACKING_OFF + 8]
+                            .try_into()
+                            .unwrap(),
+                    ),
+                    u64::from_le_bytes(
+                        data[POOL_PENDING_BACKING_OFF + 8..POOL_PENDING_BACKING_OFF + 16]
+                            .try_into()
+                            .unwrap(),
+                    ),
+                ]
+            } else {
+                [0, 0]
+            },
         })
     }
 
@@ -479,9 +501,17 @@ impl Pool {
         if data.len() >= POOL_SIZE {
             data[264..272].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
         }
-        if data.len() >= POOL_SIZE_CROSS_BACKING {
+        if data.len() >= POOL_SIZE_CROSS_BACKING_V1 {
             data[POOL_CROSS_BACKING_OFF] = self.cross_backing as u8;
         } else if self.cross_backing {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data.len() >= POOL_SIZE_CROSS_BACKING {
+            data[POOL_PENDING_BACKING_OFF..POOL_PENDING_BACKING_OFF + 8]
+                .copy_from_slice(&self.pending_backing[0].to_le_bytes());
+            data[POOL_PENDING_BACKING_OFF + 8..POOL_PENDING_BACKING_OFF + 16]
+                .copy_from_slice(&self.pending_backing[1].to_le_bytes());
+        } else if self.pending_backing != [0, 0] {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
@@ -493,6 +523,7 @@ impl Pool {
 
     fn owner_claims_cleared(&self) -> bool {
         self.outstanding_principal == 0
+            && self.pending_backing == [0, 0]
             && match self.policy {
                 POLICY_PRINCIPAL => self.total_shares == 0,
                 // Empty share pools normalize any whole-atom rounding reserve
@@ -500,6 +531,12 @@ impl Pool {
                 POLICY_WITH_SURPLUS => true,
                 _ => false,
             }
+    }
+
+    fn pending_backing_total(&self) -> Result<u64, ProgramError> {
+        self.pending_backing[0]
+            .checked_add(self.pending_backing[1])
+            .ok_or(ProgramError::InvalidAccountData)
     }
 }
 
@@ -632,7 +669,7 @@ fn pool_seed_version(
     const CROSS_BACKING: &[PoolSeedVersion] = &[PoolSeedVersion::CrossBacking];
 
     let candidates = if pool.cross_backing {
-        if pool_data_len < POOL_SIZE_CROSS_BACKING {
+        if pool_data_len < POOL_SIZE_CROSS_BACKING_V1 {
             return Err(ProgramError::InvalidAccountData);
         }
         CROSS_BACKING
@@ -1641,6 +1678,7 @@ fn process_init_pool(
         deposit_start_slot: OWN_VAULT_DEPOSIT_START_SLOT,
         bootstrap_delay_slots: OWN_VAULT_BOOTSTRAP_DELAY_SLOTS,
         cross_backing: false,
+        pending_backing: [0, 0],
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2314,6 +2352,7 @@ fn process_init_insurance_pool(
         deposit_start_slot,
         bootstrap_delay_slots,
         cross_backing,
+        pending_backing: [0, 0],
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2373,7 +2412,9 @@ fn process_insurance_deposit(
     // Historical genesis layouts either had no deposit deadline or did not bind
     // the complete bootstrap schedule into their PDA. Upgrades preserve exits,
     // never reopen those pools to late capital.
-    if pool_account.data_len() < POOL_SIZE {
+    if pool_account.data_len() < POOL_SIZE
+        || (pool.cross_backing && pool_account.data_len() < POOL_SIZE_CROSS_BACKING)
+    {
         return Err(ProgramError::InvalidAccountData);
     }
     // Genesis deposits are only accepted during the configured window. Binding
@@ -2418,7 +2459,13 @@ fn process_insurance_deposit(
     // Cross-backed pools use one discoverable, clean pool ATA as both their
     // transfer transit and protocol-earnings escrow. Legacy pools preserve their
     // historical pool-owned holding behavior.
-    validate_insurance_holding(pool_account, &pool, holding)?;
+    let holding_balance_before = validate_insurance_holding(pool_account, &pool, holding)?;
+    let pending_backing_before = pool.pending_backing_total()?;
+    if holding_balance_before < pending_backing_before
+        || pending_backing_before > pool.outstanding_principal
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Price shares before the top-up. WITH_SURPLUS uses the complete live balance so
     // pre-existing yield stays with earlier capital. PRINCIPAL excludes protocol surplus
@@ -2459,8 +2506,16 @@ fn process_insurance_deposit(
         (None, None, None) => [0, 0],
         _ => return Err(ProgramError::InvalidAccountData),
     };
-    let backing_before = backing_protected_domains[0]
-        .checked_add(backing_protected_domains[1])
+    let backing_effective_domains = [
+        backing_protected_domains[0]
+            .checked_add(u128::from(pool.pending_backing[0]))
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+        backing_protected_domains[1]
+            .checked_add(u128::from(pool.pending_backing[1]))
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    ];
+    let backing_before = backing_effective_domains[0]
+        .checked_add(backing_effective_domains[1])
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let protected_before = insurance_balance_before
         .remaining_atoms
@@ -2512,7 +2567,7 @@ fn process_insurance_deposit(
         u64::try_from(protection_deposit[0]).map_err(|_| ProgramError::ArithmeticOverflow)?,
     );
     let backing_deposit = insurance_deposit_domain_delta(
-        backing_protected_domains,
+        backing_effective_domains,
         u64::try_from(protection_deposit[1]).map_err(|_| ProgramError::ArithmeticOverflow)?,
     );
     // Position PDA (one per owner per pool).
@@ -2622,10 +2677,21 @@ fn process_insurance_deposit(
         // an unlock. Safe Genesis exit is enforced by this pool's vote,
         // owner-signature, valid-lien, and live-exposure gates instead.
         let expiry_slot = u64::MAX;
-        for (domain, domain_amount) in backing_deposit.into_iter().enumerate() {
-            if domain_amount == 0 {
+        let balances = backing_balance_before.ok_or(ProgramError::InvalidAccountData)?;
+        for (domain, new_amount) in backing_deposit.into_iter().enumerate() {
+            let staged_amount = pool.pending_backing[domain]
+                .checked_add(
+                    u64::try_from(new_amount).map_err(|_| ProgramError::ArithmeticOverflow)?,
+                )
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            if staged_amount == 0 {
                 continue;
             }
+            if !balances[domain].accepts_top_up_expiry(expiry_slot) {
+                pool.pending_backing[domain] = staged_amount;
+                continue;
+            }
+            let domain_amount = u128::from(staged_amount);
             let mut ix_data = vec![PERC_IX_TOP_UP_BACKING_BUCKET];
             ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
             ix_data.extend_from_slice(&domain_amount.to_le_bytes());
@@ -2655,7 +2721,20 @@ fn process_insurance_deposit(
                     percolator_program.clone(),
                 ],
             )?;
+            pool.pending_backing[domain] = 0;
         }
+    }
+
+    let pending_backing_after = pool.pending_backing_total()?;
+    if pending_backing_after > outstanding_after {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let expected_holding_after = holding_balance_before
+        .checked_sub(pending_backing_before)
+        .and_then(|escrow| escrow.checked_add(pending_backing_after))
+        .ok_or(ProgramError::InvalidAccountData)?;
+    if token_balance(holding)? != expected_holding_after {
+        return Err(ProgramError::InvalidAccountData);
     }
 
     pool.outstanding_principal = outstanding_after;
@@ -2896,6 +2975,12 @@ fn process_insurance_withdraw_impl(
     // by the operator. For a cross-backed pool this is also the canonical protocol-
     // earnings escrow, whose starting balance must survive the owner's payout.
     let holding_balance_before = validate_insurance_holding(pool_account, &pool, holding)?;
+    let pending_backing_before = pool.pending_backing_total()?;
+    if holding_balance_before < pending_backing_before
+        || pending_backing_before > pool.outstanding_principal
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
     // Position identity is always owner-bound. Ordinary exits additionally need
     // that owner's signature; terminal exits prove finality below.
     if position.owner != *owner.key || position.pool != *pool_account.key {
@@ -3026,8 +3111,16 @@ fn process_insurance_withdraw_impl(
     } else {
         [0, 0]
     };
-    let backing = backing_protected_domains[0]
-        .checked_add(backing_protected_domains[1])
+    let backing_effective_domains = [
+        backing_protected_domains[0]
+            .checked_add(u128::from(pool.pending_backing[0]))
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+        backing_protected_domains[1]
+            .checked_add(u128::from(pool.pending_backing[1]))
+            .ok_or(ProgramError::ArithmeticOverflow)?,
+    ];
+    let backing = backing_effective_domains[0]
+        .checked_add(backing_effective_domains[1])
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let protected_balance = u128::from(insurance)
         .checked_add(backing)
@@ -3122,9 +3215,10 @@ fn process_insurance_withdraw_impl(
     }
     let final_cross_backing_sweep = pool.cross_backing
         && outstanding_after == 0
-        && backing_balances.iter().any(|balance| {
-            balance.principal_atoms != 0 || balance.earnings_atoms != 0
-        });
+        && (pending_backing_before != 0
+            || backing_balances.iter().any(|balance| {
+                balance.principal_atoms != 0 || balance.earnings_atoms != 0
+            }));
     if final_cross_backing_sweep && live_asset_exposed {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -3156,6 +3250,38 @@ fn process_insurance_withdraw_impl(
         .map_err(|_| ProgramError::ArithmeticOverflow)?;
     let backing_owed = u64::try_from(protection_debit[1])
         .map_err(|_| ProgramError::ArithmeticOverflow)?;
+    let backing_claim_debit =
+        insurance_withdraw_domain_delta(backing_effective_domains, backing_owed);
+    let mut pending_backing_debit = [0u64; 2];
+    let mut canonical_backing_debit = [0u128; 2];
+    for domain in 0..2 {
+        let pending = u128::from(pool.pending_backing[domain]);
+        let staged_debit = core::cmp::min(pending, backing_claim_debit[domain]);
+        pending_backing_debit[domain] =
+            u64::try_from(staged_debit).map_err(|_| ProgramError::ArithmeticOverflow)?;
+        canonical_backing_debit[domain] = backing_claim_debit[domain]
+            .checked_sub(staged_debit)
+            .ok_or(ProgramError::InvalidAccountData)?;
+    }
+    let pending_backing_debit_total = pending_backing_debit[0]
+        .checked_add(pending_backing_debit[1])
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let canonical_backing_owed = backing_owed
+        .checked_sub(pending_backing_debit_total)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let mut pending_backing_after = [
+        pool.pending_backing[0]
+            .checked_sub(pending_backing_debit[0])
+            .ok_or(ProgramError::InvalidAccountData)?,
+        pool.pending_backing[1]
+            .checked_sub(pending_backing_debit[1])
+            .ok_or(ProgramError::InvalidAccountData)?,
+    ];
+    if outstanding_after == 0 {
+        // Any whole-atom remainder has no surviving owner claim. Keep the tokens
+        // in escrow, but stop classifying them as protected principal.
+        pending_backing_after = [0, 0];
+    }
     let principal_debit = live_insurance_balance
         .map(|balance| {
             insurance_withdraw_domain_delta(
@@ -3197,10 +3323,6 @@ fn process_insurance_withdraw_impl(
     // cross-backed exit additionally isolates any unowned principal/earnings
     // remainder, even when the owner's own payout rounds to zero.
     if owed > 0 || final_cross_backing_sweep {
-        let claim_backing_debit = insurance_withdraw_domain_delta(
-            backing_protected_domains,
-            backing_owed,
-        );
         // Once the final owner claim is retired, any fresh whole-atom share
         // remainder is protocol surplus. Isolate it in the same canonical escrow
         // as backing earnings; otherwise cross-backed pools have no authorized
@@ -3208,7 +3330,7 @@ fn process_insurance_withdraw_impl(
         let backing_debit = if pool.cross_backing && outstanding_after == 0 {
             backing_balances.map(|balance| balance.principal_atoms)
         } else {
-            claim_backing_debit
+            canonical_backing_debit
         };
         for (domain, debit) in backing_debit.into_iter().enumerate() {
             if debit > backing_balances[domain].principal_atoms {
@@ -3227,7 +3349,7 @@ fn process_insurance_withdraw_impl(
             .try_fold(0u128, |sum, amount| sum.checked_add(amount))
             .ok_or(ProgramError::ArithmeticOverflow)?;
         let protocol_backing_surplus = backing_withdrawal
-            .checked_sub(u128::from(backing_owed))
+            .checked_sub(u128::from(canonical_backing_owed))
             .ok_or(ProgramError::InvalidAccountData)?;
         let protocol_backing_surplus = u64::try_from(protocol_backing_surplus)
             .map_err(|_| ProgramError::ArithmeticOverflow)?;
@@ -3401,9 +3523,10 @@ fn process_insurance_withdraw_impl(
         }
 
         let escrow_after = holding_balance_before
-            .checked_add(swept_backing_earnings)
+            .checked_sub(pending_backing_debit_total)
+            .and_then(|balance| balance.checked_add(swept_backing_earnings))
             .and_then(|balance| balance.checked_add(protocol_backing_surplus))
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+            .ok_or(ProgramError::InvalidAccountData)?;
         let holding_before_payout = escrow_after
             .checked_add(owed)
             .ok_or(ProgramError::ArithmeticOverflow)?;
@@ -3442,6 +3565,7 @@ fn process_insurance_withdraw_impl(
 
     // The full requested principal leaves the outstanding accounting (the loss, if any, is
     // realized); the owner collected `owed` (their pro-rata share).
+    pool.pending_backing = pending_backing_after;
     pool.outstanding_principal = outstanding_after;
     position.principal -= amount;
     // The position retires its nominal shares. The pool burns only the rate-safe
@@ -3853,7 +3977,11 @@ fn process_route_cross_backing_earnings(
         return Err(ProgramError::InvalidAccountData);
     }
     let escrow_before = validate_insurance_holding(pool_account, &pool, pool_transit)?;
-    let total_earnings = escrow_before
+    let pending_backing = pool.pending_backing_total()?;
+    let routeable_escrow = escrow_before
+        .checked_sub(pending_backing)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let total_earnings = routeable_escrow
         .checked_add(live_earnings)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     if total_earnings == 0 {
@@ -3873,13 +4001,16 @@ fn process_route_cross_backing_earnings(
         earnings,
     )?;
     if spl_token::state::Account::unpack(&pool_transit.try_borrow_data()?)?.amount
-        != total_earnings
+        != pending_backing
+            .checked_add(total_earnings)
+            .ok_or(ProgramError::ArithmeticOverflow)?
     {
         return Err(ProgramError::InvalidAccountData);
     }
 
     let mut twap_data = vec![TWAP_IX_ACCEPT_CROSS_BACKING_EARNINGS];
     twap_data.extend_from_slice(&total_earnings.to_le_bytes());
+    twap_data.extend_from_slice(&pending_backing.to_le_bytes());
     invoke_signed_for_pool(
         &pool,
         pool_seed_version,
@@ -3908,7 +4039,11 @@ fn process_route_cross_backing_earnings(
             token_program.clone(),
             twap_program.clone(),
         ],
-    )
+    )?;
+    if token_balance(pool_transit)? != pending_backing {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
 }
 
 // handoff_to_twap accounts:
@@ -4012,6 +4147,13 @@ fn process_handoff_to_twap(
                 )
                 .ok_or(ProgramError::InvalidAccountData)?;
         }
+        let pending_backing = pool.pending_backing_total()?;
+        if pending_backing > pool.outstanding_principal {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        backing = backing
+            .checked_add(u128::from(pending_backing))
+            .ok_or(ProgramError::InvalidAccountData)?;
         u128::from(pool.outstanding_principal).saturating_sub(backing)
     } else {
         u128::from(pool.outstanding_principal)
@@ -4705,6 +4847,7 @@ mod tests {
             deposit_start_slot: 12_345,
             bootstrap_delay_slots: 30_000,
             cross_backing: false,
+            pending_backing: [0, 0],
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf).unwrap();
@@ -4821,6 +4964,7 @@ mod tests {
             deposit_start_slot: 100,
             bootstrap_delay_slots: 1_000,
             cross_backing: false,
+            pending_backing: [0, 0],
         }
     }
 
@@ -4850,11 +4994,21 @@ mod tests {
         pool.policy = POLICY_PRINCIPAL;
         pool.domain = DOMAIN_INSURANCE;
         pool.cross_backing = true;
+        pool.pending_backing = [3, 5];
 
         let mut current = [0u8; POOL_SIZE_CROSS_BACKING];
         pool.serialize(&mut current).unwrap();
         assert_eq!(current[POOL_CROSS_BACKING_OFF], 1);
-        assert!(Pool::deserialize(&current).unwrap().cross_backing);
+        let decoded = Pool::deserialize(&current).unwrap();
+        assert!(decoded.cross_backing);
+        assert_eq!(decoded.pending_backing, [3, 5]);
+
+        pool.pending_backing = [0, 0];
+        let mut predecessor = [0u8; POOL_SIZE_CROSS_BACKING_V1];
+        pool.serialize(&mut predecessor).unwrap();
+        let decoded_predecessor = Pool::deserialize(&predecessor).unwrap();
+        assert!(decoded_predecessor.cross_backing);
+        assert_eq!(decoded_predecessor.pending_backing, [0, 0]);
 
         let mut legacy = [0u8; POOL_SIZE];
         assert!(
@@ -5039,6 +5193,16 @@ mod tests {
                 &crate::id(),
                 &cross_key,
                 POOL_SIZE_CROSS_BACKING,
+                &cross,
+            )
+            .unwrap(),
+            PoolSeedVersion::CrossBacking,
+        );
+        assert_eq!(
+            pool_seed_version(
+                &crate::id(),
+                &cross_key,
+                POOL_SIZE_CROSS_BACKING_V1,
                 &cross,
             )
             .unwrap(),
