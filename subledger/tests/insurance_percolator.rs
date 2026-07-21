@@ -6567,10 +6567,10 @@ fn lamport_prefund_cannot_brick_insurance_pool_init() {
     assert!(acc.data.len() >= 88, "pool data initialized");
 }
 
-// A cross-backed genesis init creates two Subledger-derived PDAs owned by the
-// Percolator program, in addition to its own pool PDA. Exercise a public System
-// transfer against all three addresses so the foreign-owner allocate/assign CPI
-// path cannot regress into a permissionless initialization DoS.
+// A cross-backed genesis init creates two Subledger-derived ledger PDAs in
+// addition to its pool PDA. Exercise a public System transfer against all three
+// addresses, then prove the ledgers move from Subledger quarantine to their
+// canonical Percolator bindings on the first valid deposit.
 #[test]
 fn lamport_prefund_cannot_brick_cross_backing_genesis_init() {
     let mut env = Env::new_cross_backing();
@@ -6593,11 +6593,12 @@ fn lamport_prefund_cannot_brick_cross_backing_genesis_init() {
     assert_eq!(env.svm.get_account(&env.pool).unwrap().owner, sub_id());
     for ledger in backing_ledgers {
         let account = env.svm.get_account(&ledger).expect("created backing ledger");
-        assert_eq!(account.owner, perc_id());
+        assert_eq!(account.owner, sub_id(), "blank ledger stays quarantined");
         assert_eq!(
             account.data.len(),
             percolator_accounting::backing_domain_ledger_account_len(),
         );
+        assert!(account.data.iter().all(|byte| *byte == 0));
     }
 
     let principal = 4;
@@ -6605,6 +6606,15 @@ fn lamport_prefund_cannot_brick_cross_backing_genesis_init() {
     let pool_holding = create_canonical_pool_holding(&mut env);
     env.cross_backing_deposit(&depositor, &depositor_ata, &pool_holding, principal)
         .expect("prefunded-ledger pool accepts a deposit");
+    for (domain, ledger) in backing_ledgers.into_iter().enumerate() {
+        let account = env.svm.get_account(&ledger).expect("bound backing ledger");
+        assert_eq!(account.owner, perc_id());
+        let ledger = percolator_prog::state::read_backing_domain_ledger(&account.data)
+            .expect("first valid deposit binds the ledger");
+        assert_eq!(ledger.market_group, env.slab.to_bytes());
+        assert_eq!(ledger.authority, env.pool.to_bytes());
+        assert_eq!(ledger.domain, domain as u16);
+    }
     env.cross_backing_withdraw(&depositor, &depositor_ata, &pool_holding, principal)
         .expect("prefunded-ledger pool returns the owner's principal");
     assert_eq!(env.token_amount(&depositor_ata), principal);
