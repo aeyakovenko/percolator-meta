@@ -2280,6 +2280,165 @@ fn genesis_cross_backing_splits_globally_and_returns_only_owner_principal() {
     assert_eq!(env.token_amount(&env.perc_vault), 0);
 }
 
+// PUBLIC DOS: a one-atom first deposit lands entirely in insurance, leaving both
+// deterministic backing ledgers blank. A foreign market authority must not be
+// able to bind either ledger through Percolator's public first-write path and
+// permanently block the funded owner's otherwise-valid principal withdrawal.
+#[test]
+fn foreign_market_cannot_claim_a_funded_cross_backing_pools_blank_ledger() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    env.init_cross_backing_genesis_pool();
+
+    let (victim, victim_ata) = new_depositor(&mut env, 1);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(&victim, &victim_ata, &pool_holding, 1)
+        .expect("victim deposits one base unit before the attack");
+    assert_eq!(env.pool_outstanding(), 1);
+    assert_eq!(env.token_amount(&victim_ata), 0);
+    assert_eq!(env.token_amount(&env.perc_vault), 1);
+
+    let attacker = Keypair::new();
+    let attacker_market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = env.svm.minimum_balance_for_rent_exemption(market_len);
+    env.send(
+        &[system_instruction::create_account(
+            &env.payer.pubkey(),
+            &attacker_market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        )],
+        &[&attacker_market],
+    )
+    .expect("attacker publicly allocates an unrelated market");
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(attacker_market.pubkey(), false),
+                AccountMeta::new_readonly(env.mint, false),
+            ],
+            data: PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 5_000,
+                initial_margin_bps: 5_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 4_900,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            }
+            .encode(),
+        }],
+        &[&attacker],
+    )
+    .expect("attacker publicly initializes the unrelated market");
+
+    let payer = clone_kp(&env.payer);
+    let mint_auth = clone_kp(&env.mint_auth);
+    let attacker_source = create_token_account(
+        &mut env.svm,
+        &payer,
+        &env.mint,
+        &attacker.pubkey(),
+    );
+    mint_to(
+        &mut env.svm,
+        &payer,
+        &env.mint,
+        &mint_auth,
+        &attacker_source,
+        1,
+    );
+    let attacker_vault_authority = Pubkey::find_program_address(
+        &[b"vault", attacker_market.pubkey().as_ref()],
+        &perc_id(),
+    )
+    .0;
+    let attacker_vault = Pubkey::find_program_address(
+        &[
+            attacker_vault_authority.as_ref(),
+            spl_token::ID.as_ref(),
+            env.mint.as_ref(),
+        ],
+        &ATA_PROGRAM_ID,
+    )
+    .0;
+    env.svm
+        .set_account(
+            attacker_vault,
+            Account {
+                lamports: 1_000_000,
+                data: token_account_data(&env.mint, &attacker_vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let victim_ledger = cross_backing_ledger_pda(&env.pool, 0);
+    let attack = env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(attacker_market.pubkey(), false),
+                AccountMeta::new(attacker_source, false),
+                AccountMeta::new(attacker_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(victim_ledger, false),
+            ],
+            data: PIx::TopUpBackingBucket {
+                domain: 0,
+                amount: 1,
+                expiry_slot: 10_000,
+            }
+            .encode(),
+        }],
+        &[&attacker],
+    );
+    if attack.is_ok() {
+        let ledger = env.svm.get_account(&victim_ledger).unwrap();
+        let ledger = percolator_prog::state::read_backing_domain_ledger(&ledger.data)
+            .expect("successful attack binds the victim ledger");
+        assert_eq!(ledger.market_group, attacker_market.pubkey().to_bytes());
+        assert_eq!(ledger.authority, attacker.pubkey().to_bytes());
+    }
+
+    let withdrawal = env.cross_backing_withdraw(&victim, &victim_ata, &pool_holding, 1);
+    assert!(
+        attack.is_err() || withdrawal.is_ok(),
+        "a public foreign-market bind must not strand an existing depositor: {withdrawal:?}"
+    );
+    assert!(
+        attack.is_err(),
+        "the deterministic ledger must reject an unrelated market's first write"
+    );
+    withdrawal.expect("victim recovers the deposited base unit");
+    assert_eq!(env.pool_outstanding(), 0);
+    assert_eq!(env.token_amount(&victim_ata), 1);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+}
+
 // PUBLIC DOS/LOF: fair share rounding can leave a whole protocol atom after the
 // last owner claim is retired. If that atom remains in cross backing, the legacy
 // whole-backing cleanup is intentionally unavailable and the market cannot become
