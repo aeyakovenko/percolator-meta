@@ -4,7 +4,8 @@ use core::mem::{offset_of, size_of};
 use percolator::{
     AssetStateV16Account, BackingBucketV16Account, EngineAssetSlotV16Account,
     InsuranceCreditReservationV16Account, Market, MarketGroupV16HeaderAccount,
-    PortfolioAccountV16Account, ProvenanceHeaderV16Account, V16ConfigAccount, BOUND_SCALE,
+    PortfolioAccountV16Account, ProvenanceHeaderV16Account, SourceCreditStateV16Account,
+    V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -70,6 +71,20 @@ pub struct BackingDomainBalance {
     pub earnings_atoms: u128,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackingSourceCredit {
+    pub positive_claim_bound_num: u128,
+    pub exact_positive_claim_num: u128,
+    pub fresh_reserved_backing_num: u128,
+    pub spent_backing_num: u128,
+    pub provider_receivable_num: u128,
+    pub valid_liened_backing_num: u128,
+    pub impaired_liened_backing_num: u128,
+    pub insurance_credit_reserved_num: u128,
+    pub valid_liened_insurance_num: u128,
+    pub impaired_liened_insurance_num: u128,
+}
+
 impl BackingDomainBalance {
     pub fn protected_principal_atoms(self) -> Result<u128, ReadError> {
         self.principal_atoms
@@ -84,10 +99,80 @@ impl BackingDomainBalance {
             || self.impaired_principal_atoms != 0
             || self.earnings_atoms != 0
     }
+
+    /// Net loss-bearing principal attributable to one provider ledger.
+    ///
+    /// The aggregate bucket can temporarily contain trader capital that is
+    /// already owed to a source-attributed positive claim. Net that liability
+    /// before capping the result by canonical provider principal.
+    pub fn provider_protected_principal_atoms(
+        self,
+        provider_principal_atoms: u128,
+        source: BackingSourceCredit,
+    ) -> Result<u128, ReadError> {
+        let protected = self.protected_principal_atoms()?;
+        let protected_num = protected
+            .checked_mul(BOUND_SCALE)
+            .ok_or(ReadError::InvalidAccounting)?;
+        let valid_num = self
+            .valid_liened_principal_atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(ReadError::InvalidAccounting)?;
+        let consumed_num = self
+            .consumed_principal_atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(ReadError::InvalidAccounting)?;
+        let impaired_num = self
+            .impaired_principal_atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(ReadError::InvalidAccounting)?;
+        if source.fresh_reserved_backing_num != protected_num
+            || source.valid_liened_backing_num != valid_num
+            || source.provider_receivable_num != consumed_num
+            || source.impaired_liened_backing_num != impaired_num
+            || source.exact_positive_claim_num > source.positive_claim_bound_num
+            || source.spent_backing_num < source.provider_receivable_num
+            || source.exact_positive_claim_num % BOUND_SCALE != 0
+        {
+            return Err(ReadError::InvalidAccounting);
+        }
+        let exact_claim_atoms = source.exact_positive_claim_num / BOUND_SCALE;
+        Ok(core::cmp::min(
+            protected.saturating_sub(exact_claim_atoms),
+            provider_principal_atoms,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackingDomainLedger {
+    pub market_group: [u8; 32],
+    pub authority: [u8; 32],
+    pub total_principal_atoms: u128,
+    pub domain: u16,
 }
 
 pub fn backing_domain_ledger_account_len() -> usize {
     percolator_prog::state::backing_domain_ledger_account_len()
+}
+
+/// Reads one pinned Percolator provider ledger. A program-owned zeroed PDA is
+/// the valid pre-first-deposit state and carries zero provider principal.
+pub fn read_backing_domain_ledger(data: &[u8]) -> Result<Option<BackingDomainLedger>, ReadError> {
+    if data.len() < backing_domain_ledger_account_len() {
+        return Err(ReadError::Truncated);
+    }
+    if data.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    let ledger = percolator_prog::state::read_backing_domain_ledger(data)
+        .map_err(|_| ReadError::InvalidHeader)?;
+    Ok(Some(BackingDomainLedger {
+        market_group: ledger.market_group,
+        authority: ledger.authority,
+        total_principal_atoms: ledger.total_principal_atoms,
+        domain: ledger.domain,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -777,6 +862,65 @@ pub fn read_asset_backing_balances(
     Ok([
         read_bucket(offset_of!(EngineAssetSlotV16Account, backing_long))?,
         read_bucket(offset_of!(EngineAssetSlotV16Account, backing_short))?,
+    ])
+}
+
+/// Returns the paired source-credit accounting for both backing domains.
+pub fn read_asset_backing_source_credits(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[BackingSourceCredit; 2], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    let engine = asset_engine_offset(asset_index)?;
+    let read_source = |source_offset: usize| -> Result<BackingSourceCredit, ReadError> {
+        let source = engine
+            .checked_add(source_offset)
+            .ok_or(ReadError::Truncated)?;
+        let field = |offset| read_u128(data, source + offset);
+        Ok(BackingSourceCredit {
+            positive_claim_bound_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                positive_claim_bound_num
+            ))?,
+            exact_positive_claim_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                exact_positive_claim_num
+            ))?,
+            fresh_reserved_backing_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                fresh_reserved_backing_num
+            ))?,
+            spent_backing_num: field(offset_of!(SourceCreditStateV16Account, spent_backing_num))?,
+            provider_receivable_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                provider_receivable_num
+            ))?,
+            valid_liened_backing_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                valid_liened_backing_num
+            ))?,
+            impaired_liened_backing_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                impaired_liened_backing_num
+            ))?,
+            insurance_credit_reserved_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                insurance_credit_reserved_num
+            ))?,
+            valid_liened_insurance_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                valid_liened_insurance_num
+            ))?,
+            impaired_liened_insurance_num: field(offset_of!(
+                SourceCreditStateV16Account,
+                impaired_liened_insurance_num
+            ))?,
+        })
+    };
+    Ok([
+        read_source(offset_of!(EngineAssetSlotV16Account, source_credit_long))?,
+        read_source(offset_of!(EngineAssetSlotV16Account, source_credit_short))?,
     ])
 }
 
@@ -1584,6 +1728,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn provider_protection_nets_source_claims_and_caps_to_canonical_principal() {
+        let source_for =
+            |balance: BackingDomainBalance, exact_claim_atoms: u128| BackingSourceCredit {
+                positive_claim_bound_num: exact_claim_atoms * BOUND_SCALE,
+                exact_positive_claim_num: exact_claim_atoms * BOUND_SCALE,
+                fresh_reserved_backing_num: balance.protected_principal_atoms().unwrap()
+                    * BOUND_SCALE,
+                spent_backing_num: balance.consumed_principal_atoms * BOUND_SCALE,
+                provider_receivable_num: balance.consumed_principal_atoms * BOUND_SCALE,
+                valid_liened_backing_num: balance.valid_liened_principal_atoms * BOUND_SCALE,
+                impaired_liened_backing_num: balance.impaired_principal_atoms * BOUND_SCALE,
+                ..BackingSourceCredit::default()
+            };
+
+        let detached_source_claim = BackingDomainBalance {
+            principal_atoms: 1_001_000,
+            ..BackingDomainBalance::default()
+        };
+        assert_eq!(
+            detached_source_claim.provider_protected_principal_atoms(
+                1_000,
+                source_for(detached_source_claim, 1_001_000),
+            ),
+            Ok(0),
+        );
+
+        let recovered = BackingDomainBalance {
+            principal_atoms: 1,
+            ..BackingDomainBalance::default()
+        };
+        assert_eq!(
+            recovered.provider_protected_principal_atoms(1, source_for(recovered, 0)),
+            Ok(1),
+        );
+
+        let partially_available = BackingDomainBalance {
+            principal_atoms: 1,
+            consumed_principal_atoms: 1,
+            ..BackingDomainBalance::default()
+        };
+        assert_eq!(
+            partially_available
+                .provider_protected_principal_atoms(2, source_for(partially_available, 0)),
+            Ok(1),
+        );
+
+        let liened = BackingDomainBalance {
+            valid_liened_principal_atoms: 1,
+            ..BackingDomainBalance::default()
+        };
+        assert_eq!(
+            liened.provider_protected_principal_atoms(1, source_for(liened, 0)),
+            Ok(1),
+        );
+
+        let mismatched = BackingSourceCredit::default();
+        assert_eq!(
+            recovered.provider_protected_principal_atoms(1, mismatched),
+            Err(ReadError::InvalidAccounting),
+        );
+    }
+
+    #[test]
+    fn backing_provider_ledger_view_accepts_only_zero_or_pinned_state() {
+        let mut data = vec![0u8; backing_domain_ledger_account_len()];
+        assert_eq!(read_backing_domain_ledger(&data), Ok(None));
+
+        let ledger = percolator_prog::state::BackingDomainLedgerAccountV16 {
+            market_group: [1u8; 32],
+            authority: [2u8; 32],
+            total_principal_atoms: 7,
+            domain: 1,
+            ..percolator_prog::state::BackingDomainLedgerAccountV16::default()
+        };
+        percolator_prog::state::init_backing_domain_ledger(&mut data, &ledger).unwrap();
+        assert_eq!(
+            read_backing_domain_ledger(&data),
+            Ok(Some(BackingDomainLedger {
+                market_group: [1u8; 32],
+                authority: [2u8; 32],
+                total_principal_atoms: 7,
+                domain: 1,
+            })),
+        );
+
+        data[0] ^= 1;
+        assert_eq!(
+            read_backing_domain_ledger(&data),
+            Err(ReadError::InvalidHeader),
+        );
     }
 
     #[test]

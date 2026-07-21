@@ -2017,10 +2017,11 @@ fn backing_ledger_pda(program_id: &Pubkey, pool: &Pubkey, domain: u16) -> (Pubke
 fn validate_backing_ledger(
     program_id: &Pubkey,
     pool: &Pubkey,
+    market_slab: &Pubkey,
     percolator_program: &Pubkey,
     ledger: &AccountInfo,
     domain: u16,
-) -> ProgramResult {
+) -> Result<u128, ProgramError> {
     let expected = backing_ledger_pda(program_id, pool, domain).0;
     if *ledger.key != expected
         || ledger.owner != percolator_program
@@ -2028,7 +2029,19 @@ fn validate_backing_ledger(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(())
+    let data = ledger.try_borrow_data()?;
+    let Some(provider) = percolator_accounting::read_backing_domain_ledger(&data)
+        .map_err(|_| ProgramError::InvalidAccountData)?
+    else {
+        return Ok(0);
+    };
+    if provider.market_group != market_slab.to_bytes()
+        || provider.authority != pool.to_bytes()
+        || provider.domain != domain
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(provider.total_principal_atoms)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2377,11 +2390,13 @@ fn process_insurance_deposit(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    if let Some(ledgers) = backing_ledgers {
+    let backing_ledger_principals = if let Some(ledgers) = backing_ledgers {
+        let mut principals = [0u128; 2];
         for (domain, ledger) in ledgers.into_iter().enumerate() {
-            validate_backing_ledger(
+            principals[domain] = validate_backing_ledger(
                 program_id,
                 pool_account.key,
+                market_slab.key,
                 percolator_program.key,
                 ledger,
                 domain as u16,
@@ -2396,7 +2411,10 @@ fn process_insurance_deposit(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-    }
+        Some(principals)
+    } else {
+        None
+    };
     // Cross-backed pools use one discoverable, clean pool ATA as both their
     // transfer transit and protocol-earnings escrow. Legacy pools preserve their
     // historical pool-owned holding behavior.
@@ -2405,30 +2423,41 @@ fn process_insurance_deposit(
     // Price shares before the top-up. WITH_SURPLUS uses the complete live balance so
     // pre-existing yield stays with earlier capital. PRINCIPAL excludes protocol surplus
     // and prices only the loss-bearing portion of the pool.
-    let (insurance_balance_before, backing_balance_before) = {
+    let (insurance_balance_before, backing_balance_before, backing_sources_before) = {
         let market_data = market_slab.try_borrow_data()?;
         let insurance = percolator_accounting::read_asset_insurance_balance(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?;
-        let backing = if pool.cross_backing {
-            Some(
-                percolator_accounting::read_asset_backing_balances(&market_data, 0)
-                    .map_err(|_| ProgramError::InvalidAccountData)?,
+        let (backing, sources) = if pool.cross_backing {
+            (
+                Some(
+                    percolator_accounting::read_asset_backing_balances(&market_data, 0)
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                ),
+                Some(
+                    percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                ),
             )
         } else {
-            None
+            (None, None)
         };
-        (insurance, backing)
+        (insurance, backing, sources)
     };
-    let backing_protected_domains = match backing_balance_before {
-        Some(balances) => [
+    let backing_protected_domains = match (
+        backing_balance_before,
+        backing_sources_before,
+        backing_ledger_principals,
+    ) {
+        (Some(balances), Some(sources), Some(principals)) => [
             balances[0]
-                .protected_principal_atoms()
+                .provider_protected_principal_atoms(principals[0], sources[0])
                 .map_err(|_| ProgramError::InvalidAccountData)?,
             balances[1]
-                .protected_principal_atoms()
+                .provider_protected_principal_atoms(principals[1], sources[1])
                 .map_err(|_| ProgramError::InvalidAccountData)?,
         ],
-        None => [0, 0],
+        (None, None, None) => [0, 0],
+        _ => return Err(ProgramError::InvalidAccountData),
     };
     let backing_before = backing_protected_domains[0]
         .checked_add(backing_protected_domains[1])
@@ -2822,11 +2851,13 @@ fn process_insurance_withdraw_impl(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    if let Some(ledgers) = backing_ledgers {
+    let backing_ledger_principals = if let Some(ledgers) = backing_ledgers {
+        let mut principals = [0u128; 2];
         for (domain, ledger) in ledgers.into_iter().enumerate() {
-            validate_backing_ledger(
+            principals[domain] = validate_backing_ledger(
                 program_id,
                 pool_account.key,
+                market_slab.key,
                 percolator_program.key,
                 ledger,
                 domain as u16,
@@ -2841,7 +2872,10 @@ fn process_insurance_withdraw_impl(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-    }
+        Some(principals)
+    } else {
+        None
+    };
     // vault_authority is a passed account, validated by PDA derivation.
     if *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key) {
         return Err(ProgramError::InvalidSeeds);
@@ -2949,7 +2983,7 @@ fn process_insurance_withdraw_impl(
     // Price current positions against every loss-bearing principal atom controlled
     // by this pool. Cross-backing earnings are protocol surplus and never increase
     // a genesis owner's claim.
-    let (insurance, live_insurance_balance, backing_balances, live_asset_exposed) = {
+    let (insurance, live_insurance_balance, backing_balances, backing_sources, live_asset_exposed) = {
         let market_data = market_slab.try_borrow_data()?;
         let insurance = read_asset0_insurance(&market_data)?;
         let live = percolator_accounting::market_is_live(&market_data)
@@ -2965,22 +2999,33 @@ fn process_insurance_withdraw_impl(
         let exposed = live
             && percolator_accounting::asset_has_position_or_loss_state(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
-        let backing = if pool.cross_backing {
-            percolator_accounting::read_asset_backing_balances(&market_data, 0)
-                .map_err(|_| ProgramError::InvalidAccountData)?
+        let (backing, sources) = if pool.cross_backing {
+            (
+                percolator_accounting::read_asset_backing_balances(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+                percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+            )
         } else {
-            [percolator_accounting::BackingDomainBalance::default(); 2]
+            (
+                [percolator_accounting::BackingDomainBalance::default(); 2],
+                [percolator_accounting::BackingSourceCredit::default(); 2],
+            )
         };
-        (insurance, live_balance, backing, exposed)
+        (insurance, live_balance, backing, sources, exposed)
     };
-    let backing_protected_domains = [
-        backing_balances[0]
-            .protected_principal_atoms()
-            .map_err(|_| ProgramError::InvalidAccountData)?,
-        backing_balances[1]
-            .protected_principal_atoms()
-            .map_err(|_| ProgramError::InvalidAccountData)?,
-    ];
+    let backing_protected_domains = if let Some(principals) = backing_ledger_principals {
+        [
+            backing_balances[0]
+                .provider_protected_principal_atoms(principals[0], backing_sources[0])
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+            backing_balances[1]
+                .provider_protected_principal_atoms(principals[1], backing_sources[1])
+                .map_err(|_| ProgramError::InvalidAccountData)?,
+        ]
+    } else {
+        [0, 0]
+    };
     let backing = backing_protected_domains[0]
         .checked_add(backing_protected_domains[1])
         .ok_or(ProgramError::ArithmeticOverflow)?;
@@ -3770,6 +3815,7 @@ fn process_route_cross_backing_earnings(
         validate_backing_ledger(
             program_id,
             pool_account.key,
+            market_slab.key,
             percolator_program.key,
             ledger,
             domain as u16,
