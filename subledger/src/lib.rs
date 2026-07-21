@@ -3913,7 +3913,8 @@ fn process_route_cross_backing_earnings(
 
 // handoff_to_twap accounts:
 // [squads_vault(signer on first handoff), pool(current asset_admin), twap_config,
-//  twap_authority, market_slab(w), percolator_program, twap_program]
+//  twap_authority, market_slab(w), percolator_program,
+//  cross_backing_long_ledger?, cross_backing_short_ledger?, twap_program]
 // data: none
 //
 // Governance authorizes the first handoff but never receives a Percolator role. After
@@ -3942,6 +3943,15 @@ fn process_handoff_to_twap(
     let twap_authority = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    let backing_ledgers = if pool.cross_backing {
+        Some([next_account_info(iter)?, next_account_info(iter)?])
+    } else {
+        None
+    };
     let twap_program = next_account_info(iter)?;
 
     if iter.next().is_some() {
@@ -3950,10 +3960,6 @@ fn process_handoff_to_twap(
     if *twap_program.key != TWAP_PROGRAM_ID || !twap_program.executable {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if pool_account.owner != program_id {
-        return Err(ProgramError::IllegalOwner);
-    }
-    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     if !pool.is_insurance()
         || (pool.policy == POLICY_WITH_SURPLUS && !pool.owner_claims_cleared())
         || *market_slab.key != pool.market_slab
@@ -3965,6 +3971,21 @@ fn process_handoff_to_twap(
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
 
     let protected_insurance_floor = if pool.cross_backing {
+        let mut provider_principals = [0u128; 2];
+        for (domain, ledger) in backing_ledgers
+            .ok_or(ProgramError::NotEnoughAccountKeys)?
+            .into_iter()
+            .enumerate()
+        {
+            provider_principals[domain] = validate_backing_ledger(
+                program_id,
+                pool_account.key,
+                market_slab.key,
+                percolator_program.key,
+                ledger,
+                domain as u16,
+            )?;
+        }
         let market_data = market_slab.try_borrow_data()?;
         if percolator_accounting::read_asset_backing_authority(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?
@@ -3972,15 +3993,25 @@ fn process_handoff_to_twap(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        let backing = percolator_accounting::read_asset_backing_balances(&market_data, 0)
-            .map_err(|_| ProgramError::InvalidAccountData)?
-            .into_iter()
-            .try_fold(0u128, |total, balance| {
-                total
-                    .checked_add(balance.protected_principal_atoms()?)
-                    .ok_or(percolator_accounting::ReadError::InvalidAccounting)
-            })
-            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let backing_balances =
+            percolator_accounting::read_asset_backing_balances(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let backing_sources =
+            percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let mut backing = 0u128;
+        for domain in 0..2 {
+            backing = backing
+                .checked_add(
+                    backing_balances[domain]
+                        .provider_protected_principal_atoms(
+                            provider_principals[domain],
+                            backing_sources[domain],
+                        )
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                )
+                .ok_or(ProgramError::InvalidAccountData)?;
+        }
         u128::from(pool.outstanding_principal).saturating_sub(backing)
     } else {
         u128::from(pool.outstanding_principal)
