@@ -209,9 +209,10 @@ slot-only wire remains valid only for predecessor books that are exit-only under
    `[bootstrap_start, bootstrap_start + deposit_window)`. The default window is about one week and
    cannot extend past bootstrap end. Pool-wide accounting sends 50% of aggregate principal to
    insurance and 50% to cross backing, then balances each class across long and short domains;
-   odd atoms follow the aggregate target rather than a depositor-selected side. Backing expires at
-   bootstrap end. Topping up resets reward tenure but does not alter the Genesis rule that each live
-   principal base unit contributes one vote.
+   odd atoms follow the aggregate target rather than a depositor-selected side. Percolator backing
+   does not expire at bootstrap end: owner-bound vote locks govern voluntary exit, while valid liens
+   and live exposure keep backing unavailable until market risk clears. Topping up resets reward
+   tenure but does not alter the Genesis rule that each live principal base unit contributes one vote.
 3. **Bootstrap vote.** The default bootstrap delay is six 30-day months and is configurable in the
    pool/config PDA. A voter can vote immediately after depositing, and must retract before changing
    proposals or withdrawing. Quorum and the winning strict majority are computed from live,

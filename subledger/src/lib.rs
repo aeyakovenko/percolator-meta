@@ -2589,10 +2589,10 @@ fn process_insurance_deposit(
         )?;
     }
     if let Some(ledgers) = backing_ledgers {
-        let expiry_slot = pool
-            .deposit_start_slot
-            .checked_add(pool.bootstrap_delay_slots)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        // Percolator expiry forfeits fresh backing into junior residual; it is not
+        // an unlock. Safe Genesis exit is enforced by this pool's vote,
+        // owner-signature, valid-lien, and live-exposure gates instead.
+        let expiry_slot = u64::MAX;
         for (domain, domain_amount) in backing_deposit.into_iter().enumerate() {
             if domain_amount == 0 {
                 continue;

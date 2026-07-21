@@ -14567,3 +14567,31 @@ only the separately tracked pinned Percolator source-capacity expected-red probe
 Subledger SBF checksum is
 `2a7cb5a40e7a487eca2ee80fe730bddd042f05578f91f2b7ee5df1707586592b`; pinned Percolator remains
 `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+## Tick - Genesis backing expiry forfeited solvent provider principal (surface B, REAL LOF/DOS)
+
+Cross-backed Genesis deposits configured each Percolator backing bucket to expire at bootstrap end.
+Percolator expiry is a forfeiture transition, not a withdrawal unlock: resolved-close zeroes every
+fresh backing atom in a lapsed source domain and reclassifies it as junior residual. A permissionless
+trader could keep an ordinary source claim open until that boundary, while the pool correctly blocked
+the provider from withdrawing through live exposure. Normal market resolution and trader close then
+expired the bucket before the provider's first admissible exit.
+
+The retained clean-room LiteSVM regression uses the real pinned Percolator binary, two fully solvent
+public portfolios, an independent oracle, a 1% mark move, and 400,000,000 units of Genesis principal.
+Against parent `40f2dbe` and Subledger checksum
+`2a7cb5a40e7a487eca2ee80fe730bddd042f05578f91f2b7ee5df1707586592b`, the provider recovered only
+300,000,000 while 100,000,000 remained in the Percolator vault. No trader deficit consumed backing.
+The regression also submits `u64::MAX` as the oracle's claimed slot and proves deployed time remains
+authenticated by Solana's Clock, so the oracle cannot force the replacement sentinel to mature.
+
+FIX: Genesis deposits use a deployment-horizon Percolator backing expiry. Subledger's existing vote,
+owner-signature, valid-lien, and live-exposure gates continue to control withdrawal; no bootstrap-end
+Percolator expiry transition is used as a lock. The provider now recovers all 400,000,000 units after
+risk clears, with zero balance in both the Percolator vault and canonical pool holding and zero pool
+principal outstanding. All 33 Subledger unit tests, all 100 direct real-Percolator LiteSVM tests, and
+the complete 234-test chain pass, with only the separately tracked pinned Percolator source-capacity
+expected-red probe filtered. The fixed Subledger SBF checksum is
+`72f895d34461cf2a799d23f645ce64f70a2b09ac19dec149e9bc1cc4327f8ad0`; pinned Percolator remains
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. No account layout,
+instruction, signer, authority, recipient, destination, custody path, or admin surface was added.
