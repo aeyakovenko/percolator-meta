@@ -22224,6 +22224,32 @@ fn setup_genesis_with_policy_and_backing(
     pool_policy: u8,
     cross_backing: bool,
 ) -> GenesisEnv {
+    setup_genesis_with_policy_backing_and_funding(
+        svm,
+        payer,
+        pool_policy,
+        cross_backing,
+        false,
+    )
+}
+
+fn setup_cross_backing_funding_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
+    setup_genesis_with_policy_backing_and_funding(
+        svm,
+        payer,
+        POLICY_PRINCIPAL,
+        true,
+        true,
+    )
+}
+
+fn setup_genesis_with_policy_backing_and_funding(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    pool_policy: u8,
+    cross_backing: bool,
+    funding_enabled: bool,
+) -> GenesisEnv {
     let squads = squads_id();
     let treasury = install_squads(svm, &squads, &payer.pubkey());
     let mint_auth = Keypair::new();
@@ -22256,7 +22282,11 @@ fn setup_genesis_with_policy_and_backing(
     let collateral_mint = Pubkey::new_unique();
     let coin_mint = create_real_mint(svm, payer, &mint_auth.pubkey());
     let slab = Pubkey::new_unique();
-    let slab_data = make_live_market(&slab, &collateral_mint, &squads_vault, 1000);
+    let slab_data = if funding_enabled {
+        make_live_funding_market(&slab, &collateral_mint, &squads_vault, 1000)
+    } else {
+        make_live_market(&slab, &collateral_mint, &squads_vault, 1000)
+    };
     svm.set_account(
         slab,
         Account {
@@ -57322,4 +57352,473 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     assert!(svm
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
+}
+
+// PUBLIC DOS/LOF: ordinary funding settlement can leave fresh backing principal above the amount
+// attributed to the Genesis provider ledger. The final owner exit must sweep that protocol surplus
+// separately instead of debiting it as provider principal and underflowing the pinned ledger.
+#[test]
+fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_cross_backing_funding_genesis(&mut svm, &payer);
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+    let pool_holding = canonical_insurance_vault(&env.pool, &env.collateral_mint);
+
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let principal = 1_000_000u64;
+    let depositor_ata = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &depositor_ata,
+        &env.collateral_mint,
+        &depositor.pubkey(),
+        principal,
+    );
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &depositor.pubkey());
+    let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    deposit_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new(env.long_backing_ledger, false),
+                AccountMeta::new(env.short_backing_ledger, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("Genesis owner deposits public cross-backing principal");
+    let initial_backing = percolator_accounting::read_asset_backing_balances(
+        &svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|balance| balance.principal_atoms + balance.earnings_atoms)
+    .sum::<u128>();
+    assert_eq!(initial_backing, u128::from(principal / 2));
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize pool-bound TWAP custody");
+    let twap_cfg = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+    let handoff = build_cross_backing_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(env.long_backing_ledger, false),
+        AccountMeta::new_readonly(env.short_backing_ledger, false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("Genesis hands owner-bound custody to TWAP");
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let oracle_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+    ];
+    let clear_fees = build_set_market_fees_message(
+        &env.squads_vault,
+        &twap_cfg,
+        &twap_authority,
+        &env.slab,
+        &perc_id(),
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let clear_fees_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &clear_fees,
+        &clear_fees_remaining,
+    )
+    .expect("governance isolates funding settlement from configured trade fees");
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio =
+        create_cross_backing_loss_portfolio(&mut svm, &payer, &env, &long, 1_000_000);
+    let short_portfolio =
+        create_cross_backing_loss_portfolio(&mut svm, &payer, &env, &short, 1_000_000);
+    let size_q = (percolator::POS_SCALE / 10) as i128;
+    send(
+        &mut svm,
+        &[&payer, &long, &short],
+        pix(
+            vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("public traders open a balanced funding pair");
+
+    warp_to(&mut svm, 1001);
+    let premium = build_push_ewma_mark_message(
+        &env.squads_vault,
+        &env.slab,
+        &perc_id(),
+        1001,
+        2_000_000,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        4,
+        &premium,
+        &oracle_remaining,
+    )
+    .expect("the external oracle publishes a funding premium");
+    for slot in [1001u64, 1002, 1003] {
+        warp_to(&mut svm, slot);
+        for _ in 0..8 {
+            crank_cross_backing_loss_portfolio(
+                &mut svm,
+                &payer,
+                &env,
+                long_portfolio,
+                slot,
+                true,
+            );
+            crank_cross_backing_loss_portfolio(
+                &mut svm,
+                &payer,
+                &env,
+                short_portfolio,
+                slot,
+                true,
+            );
+        }
+    }
+    assert!(read_portfolio_funding_long_paid(&svm, &long_portfolio) > 0);
+
+    let close_price = read_asset0_effective_price(&svm, &env.slab);
+    send(
+        &mut svm,
+        &[&payer, &long, &short],
+        pix(
+            vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -size_q,
+                exec_price: close_price,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("public traders flatten at the effective price");
+    for portfolio in [long_portfolio, short_portfolio] {
+        for _ in 0..4 {
+            crank_cross_backing_loss_portfolio(
+                &mut svm,
+                &payer,
+                &env,
+                portfolio,
+                1003,
+                true,
+            );
+        }
+    }
+    assert_eq!(read_asset0_oi(&svm, &env.slab), (0, 0));
+    let backing_after_funding = percolator_accounting::read_asset_backing_balances(
+        &svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|balance| balance.principal_atoms + balance.earnings_atoms)
+    .sum::<u128>();
+    assert!(
+        backing_after_funding > initial_backing,
+        "public funding settlement must create organic backing surplus: before={initial_backing}, after={backing_after_funding}"
+    );
+
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &twap_cfg,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("futarchy donates only lifecycle control after public settlement");
+
+    let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
+    let resolve = build_controller_generation_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &[],
+        &resolve_witness,
+        &PIx::ResolveMarket.encode(),
+    );
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(resolve_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        6,
+        &resolve,
+        &resolve_remaining,
+    )
+    .expect("futarchy resolves the flat market");
+
+    for (owner, portfolio) in [(&long, long_portfolio), (&short, short_portfolio)] {
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+        )
+        .expect("public resolved close pays a flat trader");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::ClosePortfolio,
+            ),
+        )
+        .expect("trader removes the empty portfolio");
+    }
+    assert!(
+        percolator_accounting::market_is_resolved_and_empty(
+            &svm.get_account(&env.slab).unwrap().data,
+        )
+        .unwrap()
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker restores the final owner exit path");
+    let owner_withdraw_data = subledger_insurance_withdraw_data(&svm, &position, principal, 0);
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(env.long_backing_ledger, false),
+                AccountMeta::new(env.short_backing_ledger, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: owner_withdraw_data,
+        },
+    )
+    .expect("the final Genesis owner recovers exactly their principal");
+    assert_eq!(token_amount(&svm, &depositor_ata), principal);
+    let protocol_surplus = token_amount(&svm, &pool_holding);
+    assert!(
+        protocol_surplus > 0,
+        "the final exit must isolate organic protocol surplus in canonical pool escrow"
+    );
+    assert!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|balance| {
+            balance.principal_atoms == 0
+                && balance.valid_liened_principal_atoms == 0
+                && balance.earnings_atoms == 0
+        }),
+        "the exit sweeps every liquid backing atom while preserving consumed-loss telemetry"
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&env.pool).unwrap().data[80..88]
+                .try_into()
+                .unwrap(),
+        ),
+        0,
+        "the successful exit retires the complete owner-bound claim"
+    );
 }
