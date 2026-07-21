@@ -8518,6 +8518,43 @@ fn build_subledger_handoff_to_twap_message(
     m
 }
 
+fn build_cross_backing_subledger_handoff_to_twap_message(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(2); // market_slab + twap_config
+    m.push(10); // account_keys count
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market_slab.as_ref()); // 1 writable
+    m.extend_from_slice(twap_config.as_ref()); // 2 writable
+    m.extend_from_slice(pool.as_ref()); // 3
+    m.extend_from_slice(twap_authority.as_ref()); // 4
+    m.extend_from_slice(percolator_program.as_ref()); // 5
+    m.extend_from_slice(twap_id().as_ref()); // 6
+    m.extend_from_slice(sub_id().as_ref()); // 7 program id
+    m.extend_from_slice(long_backing_ledger.as_ref()); // 8
+    m.extend_from_slice(short_backing_ledger.as_ref()); // 9
+    m.push(1); // instructions count
+    m.push(7); // program_id_index -> subledger
+    m.push(9); // account_indexes count
+    for index in [0u8, 3, 2, 4, 1, 5, 8, 9, 6] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(8); // IX_HANDOFF_TO_TWAP
+    m.push(0); // address_table_lookups
+    m
+}
+
 // Squads -> twap.return_to_subledger -> subledger.accept_operator -> Percolator.
 fn build_return_to_subledger_message(
     squads_vault: &Pubkey,
@@ -51838,13 +51875,15 @@ fn e2e_transient_trader_backing_cannot_lower_the_twap_principal_floor() {
     let twap_cfg = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
-    let handoff = build_subledger_handoff_to_twap_message(
+    let handoff = build_cross_backing_subledger_handoff_to_twap_message(
         &env.squads_vault,
         &env.pool,
         &env.slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
     );
     let remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -51855,14 +51894,46 @@ fn e2e_transient_trader_backing_cannot_lower_the_twap_principal_floor() {
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(env.long_backing_ledger, false),
+        AccountMeta::new_readonly(env.short_backing_ledger, false),
     ];
+    let swapped_handoff = build_cross_backing_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+        &env.short_backing_ledger,
+        &env.long_backing_ledger,
+    );
+    let mut swapped_remaining = remaining.clone();
+    swapped_remaining.swap(8, 9);
+    let market_before_swapped = svm.get_account(&env.slab).unwrap();
+    let config_before_swapped = svm.get_account(&twap_cfg).unwrap();
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            2,
+            &swapped_handoff,
+            &swapped_remaining,
+        )
+        .is_err(),
+        "governance cannot substitute one canonical backing domain for the other",
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_swapped);
+    assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_swapped);
     squads_execute(
         &mut svm,
         &env.squads,
         &env.multisig,
         &env.dao,
         &payer,
-        2,
+        3,
         &handoff,
         &remaining,
     )
@@ -52385,13 +52456,15 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
     let twap_cfg = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
-    let handoff = build_subledger_handoff_to_twap_message(
+    let handoff = build_cross_backing_subledger_handoff_to_twap_message(
         &env.squads_vault,
         &env.pool,
         &env.slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
     );
     let handoff_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -52402,6 +52475,8 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(env.long_backing_ledger, false),
+        AccountMeta::new_readonly(env.short_backing_ledger, false),
     ];
     squads_execute(
         &mut svm,
