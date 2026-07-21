@@ -14362,3 +14362,208 @@ FIX: own-vault and live-insurance complete exits now reuse one exact principal/l
 Every predecessor position layout remains withdrawable through the exact wire. The change adds no state,
 account, signer, authority, recipient, token path, custody path, or admin surface; tokens were never redirectable
 under the vulnerable path.
+
+## Tick - controller resolution discarded committed funding (surface A/C, REAL LOF)
+
+Pinned Percolator's privileged `ResolveMarket` path resolved exposed assets without first advancing
+an already-active authenticated mark to the current slot. A bounded Meta governor could therefore
+resolve before a public crank and discard deterministic price and funding accrual that honest traders
+had already committed to by keeping positions open after mark activation. In the retained real-SBF
+LiteSVM regression, an independent oracle activates a 99 mark against a 100 effective price, balanced
+users hold equal long and short exposure, and the creator donates only lifecycle authority to the
+controller. Immediate controller resolution pays both users 100,000,000 atoms; the control path's one
+public crank records equal-and-opposite funding and pays 100,100,000 and 99,900,000. Governance thus
+erased a 100,000-atom claim from the honest funding receiver without controlling the oracle or either
+portfolio.
+
+FIX: before proxying privileged global resolution, the controller uses the pinned read-only accounting
+layout and Percolator's exact price/funding helpers to detect value-bearing accrual from active marks.
+It rejects until public crankers commit each deterministic segment, after which the same
+generation-bound resolution remains live. Pending never-activated marks, settled targets, unexposed
+assets, and manual-price assets remain immediately resolvable. The change adds no state, account,
+signer, authority, recipient, CPI, token path, custody path, or admin surface.
+
+A separate real-SBF LiteSVM liveness regression resolves the maximum current 5,834-asset, 10 MiB
+market shape through the controller in about 770,000 CU and enforces a 1,200,000-CU ceiling. The
+preflight therefore does not trade the funding-loss fix for a terminal lifecycle DoS at the supported
+account cap.
+
+## Tick - controller resolution discarded a pending authenticated price (surface A/C, REAL LOF)
+
+The first resolution guard intentionally ignored a mark whose publication slot was newer than the
+engine accrual cursor. Pinned Percolator's first public crank suppresses funding for that mark, but it
+can still advance the circuit-breaker-bounded effective price. A bounded Meta governor could resolve
+before that crank and terminally choose the older price even though an independent oracle had already
+authenticated the transition. In the retained real-SBF LiteSVM regression, independent users hold
+balanced exposure at 10,000 and an independent oracle publishes 20,000. Crank-first resolution moves
+the bounded price to 10,100 and pays 100,100,000 / 99,900,000 atoms; immediate controller resolution
+paid 100,000,000 to each side, erasing the long's 100,000-atom claim.
+
+FIX: the read-only resolve preflight now includes a pending authenticated mark exactly when its first
+ordinary crank can move the effective price. It still excludes pending zero-move funding because the
+pinned program does not accrue funding on the activation crank; after activation, the existing
+price-or-funding predicate applies. A public cranker commits the bounded step and governance retries
+the same generation-bound resolution. No state, account, signer, authority, recipient, CPI, token,
+custody, or admin surface is added.
+
+## Tick - admitted exposure exhausted sparse source capacity (surface C, REAL DOS)
+
+Pinned Percolator admitted a new position after an ordinary portfolio had accumulated positive claims
+in all 32 sparse source domains. The active-leg limit did not reserve a domain for that new position's
+first favorable settlement. After an honest authenticated mark moved from 100 to 101, the missing 33rd
+domain made permissionless crank, one-atom claim conversion, closing either live leg, and
+`RebalanceReduce` all fail and roll back. The accepted portfolio therefore had no bounded owner or
+keeper continuation; only privileged shutdown and forfeiture could recover it.
+
+The retained clean-room LiteSVM regression constructs all 32 domains through 64 signed trades and 32
+honest mark settlements across 16 assets. Against program
+`da64be639168b496833dd4c701607a94fcb06b6c` and engine
+`143e68c4917ed0400a27b952f036a5677047cd84`, it reaches the no-continuation assertion with SBF checksum
+`637f4fa15acc405c4351ea2c5e154d5324d62aae0cfa9505d96ca97e21b186d1`.
+
+FIX: program `cf69b40e095bf4ee6b750af56c68f1c3c05b9c0a` and engine
+`c1a058f3f6057838e78a6ada51509af336fd4ed6` reserve sparse source capacity before admitting new
+exposure. The same transaction now rejects atomically, the historical exposure remains closeable, and
+the owner withdraws all 1,000,000 units of original principal. The 32 positive claims deliberately
+remain unconverted so their separate maximum-source compute path is not conflated with admission
+liveness. The fixed SBF checksum is
+`15e43cb3939f365fdc7f5f3e3b4c9a6c0046db4306a48aa226af78da847b396d`. The pin adds no Meta account,
+signer, authority, recipient, CPI, custody, or collateral-moving surface.
+
+## Tick - stale signed partial insurance exit retired replacement capital (surface B, REAL DOS)
+
+Subledger's owner-signed partial insurance withdrawal committed only to its amount. A relayer could
+withhold a five-unit withdrawal signed against ten live Genesis units, let the owner land a distinct
+replacement five-unit withdrawal, and then submit the old transaction after deposits closed. The stale
+authorization consumed the five-unit remainder and permanently retired the one-per-owner position.
+Tokens still returned only to the owner, but the owner irrecoverably lost the replacement position's
+Genesis vote and reward opportunity after admission closed.
+
+Retained clean-room LiteSVM test commit `6378bbe` reproduces the public path against parent `4bfb7ed`
+with one valid blockhash and the real Subledger, Genesis Vote, Distribution, and pinned Percolator SBF
+binaries. The vulnerable Subledger checksum is
+`d42f1eca476d0956d37c15442f0220716276ebb3818ed8a502b7bd8d76f2aea2`; the pinned Percolator checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. A second retained probe restores
+both visible principal and last-deposit slot in one slot, proving those two witnesses alone are
+insufficient.
+
+FIX: active positions reuse their existing withdrawn-amount word as a monotonic action nonce. Every
+deposit, owner withdrawal, and vote-lock transition advances it once; partial, full, own-vault, and
+TWAP-forwarded owner exits commit to principal, last-deposit slot, and nonce. Permissionless terminal
+return still overwrites that word with the immutable principal-at-risk reward snapshot. The fixed
+Subledger and TWAP SBF checksums are
+`ec680da6320be1ff39e8d0de150ec32f2a37fc10265c3c96c3d039d007b7cf6f` and
+`1bbaf170d35a259f3a83dcf98ca4997ae5aca00953890b03491a215c5e78f85d`. No account layout, signer,
+authority, recipient, token path, custody path, or admin surface was added.
+
+## Tick - stale Genesis vote authorization crossed a position incarnation (surface B, REAL DOS)
+
+Current Genesis actions were bound only to the ballot nonce, and current configs also accepted the
+predecessor action-only retract while that nonce was zero. A relayer could obtain a retract before the
+canonical ballot existed, let the owner create and back the first ballot, then land the stale action
+after backing closed. The same ballot-only authorization remained live across a Subledger top-up.
+After the stale retract removed sole qualifying support, the immutable 100%-supply distribution had
+no winner and no admissible transaction could restore the vote. Tokens still remained owner-only;
+the loss was the depositor's irrecoverable Genesis vote and reward opportunity.
+
+The retained clean-room LiteSVM regressions sign action-only, nonce-only, and position-bound retracts
+before ballot creation, then prove the first vote makes every old authorization stale before backing
+closes. A second probe signs against a live five-unit ballot, adds a sixth unit in the final deposit
+slot under the same blockhash, and proves neither the retired ballot-only wire nor the stale current
+snapshot can remove the original five counted votes. The original action-only probe is mutation-sharp
+against parent `024800c`, whose vulnerable Genesis checksum is
+`6283fe343de44bd612f3b604c2b8424d8b27fee128caab278014ed357336aaeb`.
+
+FIX: both current back and retract actions now commit to the ballot nonce plus the Subledger
+position's exact principal, start slot, and monotonic action nonce. The first vote-lock transition,
+every top-up, and every owner withdrawal therefore invalidate an older authorization even when its
+principal and ballot nonce happen to match. Action-only retract remains exit-only for genuinely
+legacy config layouts, and existing current ballots remain owner-recoverable by reading their live
+position snapshot. The fixed Genesis checksum is
+`b070b8cef1cf2da2153d7a0f7736cecd2626b79b653bb7d2895fd2555c5c1e6c`; the pinned Percolator checksum
+is `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. All seven presigned-action
+lifecycle probes, every legacy Genesis ballot-generation recovery probe, all 28 Genesis
+unit/integration tests, and both affected full-chain lifecycle tests pass. No account, state, signer,
+authority, recipient, CPI, token path, custody path, or admin surface was added.
+
+## Tick - stale signed capital crystallize redistributed an exited backer's reward (surface D, REAL LOF)
+
+Residual capital crystallization was owner-gated but its instruction carried no position snapshot. A
+relayer could withhold a valid owner-signed crystallize while backing was live, let the owner exit through
+Subledger, then land the old transaction before reward freeze. Crystallize read the exited position as zero,
+removed the victim's points from the shared denominator, and let an equal co-staker claim the victim's fixed
+COIN allocation. Subledger still returned principal only to its owner; the vulnerable path could not redirect
+insurance or backing custody.
+
+The retained clean-room LiteSVM regression uses the real Residual and Subledger public APIs with one valid
+blockhash. Two independent owners deposit 100 backing units and crystallize 600 points each. Against Residual
+checksum `8fccaea80d570fbc7625afe2efc005f74bf76ece4bf5240b7a71e19a0453151d`, the victim's real full exit
+returns all 100 units, the held crystallize drops the denominator from 1,200 to 600, and the co-staker claims
+all 1,000,000 reward units. The backing vault retains the other owner's 100 units throughout.
+
+FIX: insurance/backing crystallize now commits to the position's exact principal, start slot, and monotonic
+action nonce. A full exit changes only the nonce, making that comparison mutation-sharp; top-ups, partial
+withdrawals, vote locks, and terminal return also invalidate predecessor authorizations. Portfolio-flow
+crystallize remains data-empty and permissionless. The fixed Residual checksum is
+`37d1ae59110e9b3bc4be54d4657d5e97b9ea40d06e40a19d759a3cc421da23ec`; pinned Subledger remains
+`ec680da6320be1ff39e8d0de150ec32f2a37fc10265c3c96c3d039d007b7cf6f`. All 110 Residual tests,
+the complete Genesis-to-buy/burn path, the market-to-45-day 50/50 buyback/burn lifecycle, and terminal-return
+capital crystallization pass. No account, state, signer, authority, recipient, CPI, token path, custody path,
+or admin surface was added.
+
+## Tick - backing earnings blocked final cross-backed principal exit (surface B, REAL DOS/LOF)
+
+Pinned Percolator rejects a backing-bucket principal withdrawal that would empty the bucket while
+`utilization_fee_earnings` remains nonzero. The cross-backed Genesis exit previously attempted the
+principal debit directly. Once ordinary market activity accrued backing earnings, a depositor's
+otherwise liquid final principal atom therefore depended on someone first configuring TWAP and
+routing protocol rewards. The clean-room LiteSVM regression reproduced the public owner path against
+the real pinned binary with no TWAP config and failed at the Percolator CPI with `Custom(14)`. The
+distinct permissionless absent-owner terminal wire had the same dependency. No tested path could
+redirect principal, but custody could remain unavailable for reasons unrelated to the owner's claim.
+
+FIX: every cross-backed owner exit now reads both exact live earnings counters and atomically sweeps
+them to the canonical clean pool ATA before any backing-principal debit. The payout preserves that
+ATA's complete starting balance and transfers exactly the owner's loss-adjusted claim. The fixed
+amountless reward route combines that escrow with any later live counters and still forwards the
+complete amount only through TWAP to a clean token account owned by the config-bound Squads vault.
+A caller-selected pool-owned holding is rejected before mutation. Retained LiteSVM probes cover the
+ordinary owner path without TWAP, the absent-owner terminal path, atomic noncanonical-account
+rejection, an escrow-plus-live-counter route while principal survives, and a second earnings tranche
+before final exit. All 97 direct Subledger/Percolator tests pass; the complete chain is 234 passing
+with only the separately tracked pinned Percolator source-capacity expected-red probe.
+
+The fixed Subledger SBF checksum is
+`2c315f147d09fb34f1046cbfe041bf63a39981d39c25a54bffda60ac40f2404d`; pinned Percolator remains
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`, and unchanged TWAP remains
+`e9a2aa0b1e8e76f4e0660bf848170eafaecb4513d84db92b6a6af94e0940f07f`. No account layout,
+instruction, signer, authority, recipient, DAO-controlled amount, or admin surface was added.
+
+## Tick - ownerless backing rounding reserve blocked terminal cleanup (surface B/C, REAL DOS/LOF)
+
+Cross-backed principal used the same non-appreciating share-floor rule as insurance, but the final
+exit withdrew only the owner's rounded claim. In the retained real-Percolator LiteSVM regression,
+Alice deposits 1,000,000 units, the insurance half is lost, and Bob recapitalizes with another
+1,000,000. Their fair exits pay 500,000 and 999,999 units. Against parent `ac36e88` and Subledger
+checksum `2c315f147d09fb34f1046cbfe041bf63a39981d39c25a54bffda60ac40f2404d`, the remaining whole atom
+stayed in Percolator backing after pool outstanding principal reached zero. The legacy whole-backing
+cleanup intentionally rejects cross-backed pools, while the fixed reward route moves only earnings
+and escrowed protocol value. No owner action or allowed public cleanup could remove that principal
+atom, so terminal market cleanup could remain blocked. The atom was protocol reserve rather than a
+user claim, and no tested path could redirect user principal.
+
+FIX: the final cross-backed owner action cannot retire while valid backing liens remain. Once they
+are externally released, it withdraws every fresh backing atom plus both exact earnings counters
+before completing the final claim. It transfers exactly the owner's loss-adjusted `owed` amount and
+leaves every excess atom in the canonical clean pool escrow for the existing fixed Squads-vault
+route. The same logic runs when the owner payout itself is zero, without issuing a zero-value token
+CPI. No principal-moving route, caller-selected amount, destination, signer, authority, instruction,
+account layout, or admin surface was added.
+
+The regression is mutation-sharp on the old binary and now proves both exact user payouts, the
+one-atom protocol escrow, a zero Percolator vault, zero outstanding principal, and empty long/short
+backing state. All 98 direct Subledger/Percolator tests pass; the complete chain is 234 passing with
+only the separately tracked pinned Percolator source-capacity expected-red probe. The fixed
+Subledger SBF checksum is
+`2a7cb5a40e7a487eca2ee80fe730bddd042f05578f91f2b7ee5df1707586592b`; pinned Percolator remains
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.

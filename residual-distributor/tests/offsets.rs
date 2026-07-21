@@ -183,6 +183,11 @@ fn subledger_position_offsets_match_the_real_subledger_layout() {
         "Position.principal (cross-pool base-unit points) offset"
     );
     assert_eq!(
+        rd::SUB_POS_ACTION_NONCE,
+        subledger_program::POS_ACTION_NONCE_OFF,
+        "Position.action_nonce (capital crystallize authorization) offset"
+    );
+    assert_eq!(
         rd::SUB_POS_WITHDRAWN_AMOUNT,
         subledger_program::POS_WITHDRAWN_AMOUNT_OFF,
         "Position terminal-return principal snapshot offset"

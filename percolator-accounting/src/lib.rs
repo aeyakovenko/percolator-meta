@@ -11,6 +11,8 @@ pub const HEADER_LEN: usize = 16;
 pub const WRAPPER_CONFIG_LEN: usize = 448;
 pub const ASSET_WRAPPER_LEN: usize = 512;
 pub const MARKET_GROUP_OFFSET: usize = HEADER_LEN + WRAPPER_CONFIG_LEN;
+pub const NEXT_MARKET_ID_OFFSET: usize =
+    MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, next_market_id);
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
@@ -57,8 +59,35 @@ pub enum ReadError {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackingDomainBalance {
+    /// Principal immediately withdrawable by the backing authority.
     pub principal_atoms: u128,
+    /// Principal currently liened to live market exposure but not yet lost.
+    pub valid_liened_principal_atoms: u128,
+    /// Principal already consumed by counterparty losses.
+    pub consumed_principal_atoms: u128,
+    /// Principal attached to an impaired lien.
+    pub impaired_principal_atoms: u128,
     pub earnings_atoms: u128,
+}
+
+impl BackingDomainBalance {
+    pub fn protected_principal_atoms(self) -> Result<u128, ReadError> {
+        self.principal_atoms
+            .checked_add(self.valid_liened_principal_atoms)
+            .ok_or(ReadError::InvalidAccounting)
+    }
+
+    pub fn has_any_state(self) -> bool {
+        self.principal_atoms != 0
+            || self.valid_liened_principal_atoms != 0
+            || self.consumed_principal_atoms != 0
+            || self.impaired_principal_atoms != 0
+            || self.earnings_atoms != 0
+    }
+}
+
+pub fn backing_domain_ledger_account_len() -> usize {
+    percolator_prog::state::backing_domain_ledger_account_len()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -513,6 +542,111 @@ pub fn market_is_live(data: &[u8]) -> Result<bool, ReadError> {
     Ok(mode == 0)
 }
 
+/// Returns true when resolving at `resolve_slot` would discard a deterministic
+/// price or funding segment from an authenticated mark.
+///
+/// A newly published mark is value-bearing when its first public crank can move
+/// the effective price. Funding remains excluded until that activation crank,
+/// matching pinned Percolator's anti-retroactivity rule. Once active, either a
+/// price move or nonzero two-sided funding must be accrued before resolution.
+pub fn resolve_would_skip_committed_accrual(
+    data: &[u8],
+    resolve_slot: u64,
+) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    let (configured, _) = market_slot_counts(data)?;
+    let field = |base: usize, offset: usize| {
+        base.checked_add(offset).ok_or(ReadError::Truncated)
+    };
+    let config = field(
+        MARKET_GROUP_OFFSET,
+        offset_of!(MarketGroupV16HeaderAccount, config),
+    )?;
+    let max_accrual_dt_slots = read_u64(
+        data,
+        field(
+            config,
+            offset_of!(V16ConfigAccount, max_accrual_dt_slots),
+        )?,
+    )?;
+    let max_abs_funding_e9_per_slot = read_u64(
+        data,
+        field(
+            config,
+            offset_of!(V16ConfigAccount, max_abs_funding_e9_per_slot),
+        )?,
+    )?;
+    let max_price_move_bps_per_slot = read_u64(
+        data,
+        field(
+            config,
+            offset_of!(V16ConfigAccount, max_price_move_bps_per_slot),
+        )?,
+    )?;
+
+    for asset_index in 0..configured {
+        let asset = asset_engine_offset(asset_index)?
+            .checked_add(offset_of!(EngineAssetSlotV16Account, asset))
+            .ok_or(ReadError::Truncated)?;
+        let oi_long = read_u128(
+            data,
+            field(asset, offset_of!(AssetStateV16Account, oi_eff_long_q))?,
+        )?;
+        let oi_short = read_u128(
+            data,
+            field(asset, offset_of!(AssetStateV16Account, oi_eff_short_q))?,
+        )?;
+        if oi_long == 0 && oi_short == 0 {
+            continue;
+        }
+
+        let slot_last = read_u64(
+            data,
+            field(asset, offset_of!(AssetStateV16Account, slot_last))?,
+        )?;
+        if slot_last >= resolve_slot {
+            continue;
+        }
+        let profile = percolator_prog::state::read_asset_oracle_profile(data, asset_index)
+            .map_err(|_| ReadError::InvalidAccounting)?;
+        if !percolator_prog::oracle_v16::profile_is_price_managed(&profile) {
+            continue;
+        }
+        let pending_mark = profile.mark_ewma_last_slot > slot_last;
+        let current = read_u64(
+            data,
+            field(asset, offset_of!(AssetStateV16Account, effective_price))?,
+        )?;
+        if profile.mark_ewma_e6 == current {
+            continue;
+        }
+        let dt = core::cmp::min(
+            resolve_slot
+                .checked_sub(slot_last)
+                .ok_or(ReadError::InvalidAccounting)?,
+            max_accrual_dt_slots,
+        );
+        let next = percolator_prog::oracle_v16::effective_price_from_target(
+            current,
+            profile.mark_ewma_e6,
+            max_price_move_bps_per_slot,
+            dt,
+            true,
+        );
+        let funding_rate = percolator_prog::policy_v16::premium_funding_rate_e9(
+            profile.mark_ewma_e6,
+            next,
+            max_abs_funding_e9_per_slot,
+        )
+        .ok_or(ReadError::InvalidAccounting)?;
+        let balanced = oi_long != 0 && oi_short != 0;
+        if next != current || (!pending_mark && balanced && funding_rate != 0) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Returns whether one pinned-v16 asset still has open position accounting or
 /// unresolved loss state. A positive live insurance withdrawal is unsafe while
 /// this is true because stale portfolios may not yet have realized their loss.
@@ -610,15 +744,30 @@ pub fn read_asset_backing_balances(
         let bucket = engine
             .checked_add(bucket_offset)
             .ok_or(ReadError::Truncated)?;
-        let principal_num = read_u128(
-            data,
-            bucket + offset_of!(BackingBucketV16Account, fresh_unliened_backing_num),
-        )?;
-        if principal_num % BOUND_SCALE != 0 {
-            return Err(ReadError::InvalidAccounting);
-        }
+        let read_principal = |field_offset: usize| -> Result<u128, ReadError> {
+            let numerator = read_u128(data, bucket + field_offset)?;
+            if numerator % BOUND_SCALE != 0 {
+                return Err(ReadError::InvalidAccounting);
+            }
+            Ok(numerator / BOUND_SCALE)
+        };
         Ok(BackingDomainBalance {
-            principal_atoms: principal_num / BOUND_SCALE,
+            principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                fresh_unliened_backing_num
+            ))?,
+            valid_liened_principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                valid_liened_backing_num
+            ))?,
+            consumed_principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                consumed_liened_backing_num
+            ))?,
+            impaired_principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                impaired_liened_backing_num
+            ))?,
             earnings_atoms: read_u128(
                 data,
                 bucket + offset_of!(BackingBucketV16Account, utilization_fee_earnings),
@@ -654,6 +803,13 @@ pub fn read_asset_market_id(data: &[u8], asset_index: usize) -> Result<u64, Read
             + offset_of!(EngineAssetSlotV16Account, asset)
             + offset_of!(percolator::AssetStateV16Account, market_id),
     )
+}
+
+/// Returns the market-wide generation cursor. Percolator advances this monotonic
+/// identifier whenever any asset slot is created or restarted.
+pub fn read_next_market_id(data: &[u8]) -> Result<u64, ReadError> {
+    validate_market(data)?;
+    read_u64(data, NEXT_MARKET_ID_OFFSET)
 }
 
 /// Returns the insurance withdrawal authority recorded in one pinned-v16 asset profile.
@@ -922,6 +1078,61 @@ mod tests {
         data
     }
 
+    fn market_with_committed_funding_segment() -> Vec<u8> {
+        let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
+        wrapper.marketauth = [1u8; 32];
+        wrapper.collateral_mint = [2u8; 32];
+        let mut config = percolator::V16Config::public_user_fund(1, 0, 10);
+        config.max_accrual_dt_slots = 1;
+        config.max_abs_funding_e9_per_slot = 10_000;
+        config.max_price_move_bps_per_slot = 1;
+        let mut data = vec![
+            0u8;
+            percolator_prog::state::market_account_len_for_capacity(1).unwrap()
+        ];
+        percolator_prog::state::init_market_account_zero_copy(
+            &mut data,
+            &wrapper,
+            config,
+            [3u8; 32],
+            100,
+            1,
+        )
+        .unwrap();
+
+        let asset = asset_engine_offset(0).unwrap()
+            + offset_of!(EngineAssetSlotV16Account, asset);
+        write_u64_at(
+            &mut data,
+            asset + offset_of!(AssetStateV16Account, slot_last),
+            2,
+        );
+        write_u64_at(
+            &mut data,
+            asset + offset_of!(AssetStateV16Account, effective_price),
+            100,
+        );
+        write_u128_at(
+            &mut data,
+            asset + offset_of!(AssetStateV16Account, oi_eff_long_q),
+            1,
+        );
+        write_u128_at(
+            &mut data,
+            asset + offset_of!(AssetStateV16Account, oi_eff_short_q),
+            1,
+        );
+        let mut profile = percolator_prog::state::read_asset_oracle_profile(&data, 0).unwrap();
+        profile.oracle_mode = percolator_prog::constants::ORACLE_MODE_AUTH_MARK;
+        profile.mark_ewma_e6 = 99;
+        profile.mark_ewma_last_slot = 2;
+        profile.mark_ewma_halflife_slots = 0;
+        profile.mark_min_fee = 0;
+        profile.oracle_target_price_e6 = 99;
+        percolator_prog::state::write_asset_oracle_profile(&mut data, 0, &profile).unwrap();
+        data
+    }
+
     #[test]
     fn stale_resolution_uses_the_authenticated_slot_and_exact_boundary() {
         assert_eq!(
@@ -954,6 +1165,85 @@ mod tests {
 
         let by_market = market_with_stale_slots(50, 100, 150);
         assert!(permissionless_resolution_matured(&by_market, 149).unwrap());
+    }
+
+    #[test]
+    fn resolve_preflight_rejects_value_bearing_authenticated_marks() {
+        let mut market = market_with_committed_funding_segment();
+        assert_eq!(resolve_would_skip_committed_accrual(&market, 3), Ok(true));
+
+        let asset = asset_engine_offset(0).unwrap()
+            + offset_of!(EngineAssetSlotV16Account, asset);
+        let long_offset = asset + offset_of!(AssetStateV16Account, oi_eff_long_q);
+        let short_offset = asset + offset_of!(AssetStateV16Account, oi_eff_short_q);
+        write_u128_at(&mut market, long_offset, 0);
+        write_u128_at(&mut market, short_offset, 0);
+        assert_eq!(
+            resolve_would_skip_committed_accrual(&market, 3),
+            Ok(false),
+            "an unexposed asset cannot lose position value during resolution"
+        );
+        write_u128_at(&mut market, long_offset, 1);
+        write_u128_at(&mut market, short_offset, 1);
+
+        let mut profile = percolator_prog::state::read_asset_oracle_profile(&market, 0).unwrap();
+        profile.mark_ewma_e6 = 100;
+        profile.oracle_target_price_e6 = 100;
+        percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
+        assert_eq!(
+            resolve_would_skip_committed_accrual(&market, 3),
+            Ok(false),
+            "a settled target cannot create a skipped price or funding segment"
+        );
+
+        profile.mark_ewma_e6 = 99;
+        profile.oracle_target_price_e6 = 99;
+        profile.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
+        percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
+        assert_eq!(
+            resolve_would_skip_committed_accrual(&market, 3),
+            Ok(false),
+            "manual-price assets have no authenticated mark to commit"
+        );
+
+        profile.oracle_mode = percolator_prog::constants::ORACLE_MODE_AUTH_MARK;
+        profile.mark_ewma_last_slot = 3;
+        percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
+        assert_eq!(
+            resolve_would_skip_committed_accrual(&market, 3),
+            Ok(false),
+            "a pending zero-move mark cannot accrue funding on its activation crank"
+        );
+
+        profile.mark_ewma_e6 = 20_000;
+        profile.oracle_target_price_e6 = 20_000;
+        percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, effective_price),
+            10_000,
+        );
+        assert_eq!(
+            resolve_would_skip_committed_accrual(&market, 3),
+            Ok(true),
+            "resolution cannot erase a pending mark with an executable bounded price step"
+        );
+
+        profile.mark_ewma_last_slot = 2;
+        profile.mark_ewma_e6 = 99;
+        profile.oracle_target_price_e6 = 99;
+        percolator_prog::state::write_asset_oracle_profile(&mut market, 0, &profile).unwrap();
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, effective_price),
+            100,
+        );
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, slot_last),
+            3,
+        );
+        assert_eq!(resolve_would_skip_committed_accrual(&market, 3), Ok(false));
     }
 
     #[test]
@@ -996,6 +1286,17 @@ mod tests {
             read_asset_market_id(&market, 1),
             Err(ReadError::InvalidAsset)
         );
+    }
+
+    #[test]
+    fn next_market_id_uses_the_pinned_market_header_offset() {
+        let mut market = market_with_insurance_capacity();
+        market[NEXT_MARKET_ID_OFFSET..NEXT_MARKET_ID_OFFSET + 8]
+            .copy_from_slice(&91u64.to_le_bytes());
+        assert_eq!(read_next_market_id(&market), Ok(91));
+
+        market[10] = KIND_PORTFOLIO;
+        assert_eq!(read_next_market_id(&market), Err(ReadError::InvalidHeader));
     }
 
     #[test]

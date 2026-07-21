@@ -182,6 +182,10 @@ const IX_RETURN_RESOLVED_PROTOCOL_INSURANCE: u8 = 19;
 const IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 20;
 // Timelocked, value-neutral restart for asset 0 while this program holds asset_admin.
 const IX_RESTART_ASSET0: u8 = 21;
+// Fixed ingress for Subledger-derived cross-backing earnings. The bound pool
+// signs and supplies the exact amount; this program fixes the recipient owner to
+// the config's Squads vault and never accepts backing principal directly.
+const IX_ACCEPT_CROSS_BACKING_EARNINGS: u8 = 22;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -600,6 +604,9 @@ pub fn process_instruction(
             process_return_resolved_asset0_backing(program_id, accounts, data)
         }
         IX_RESTART_ASSET0 => process_restart_asset0(program_id, accounts, data),
+        IX_ACCEPT_CROSS_BACKING_EARNINGS => {
+            process_accept_cross_backing_earnings(program_id, accounts, data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -1179,7 +1186,8 @@ fn process_accept_custody<'a>(
 //   subledger_program, owner(signer, optional), position(w, optional),
 //   owner_destination(w, optional), pool_holding(w, optional),
 //   percolator_vault(w, optional), vault_authority(optional), token_program(optional)]
-// data: owner exit = expected_principal(u64) | expected_start_slot(u64);
+// data: owner exit = expected_principal(u64) | expected_start_slot(u64) |
+//   expected_action_nonce(u64);
 //       no-owner governance/resolved return = empty
 //
 // This is the only recovery key transition exposed by the TWAP. It cannot select an
@@ -1202,48 +1210,37 @@ fn process_return_to_subledger(
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let subledger_program = next_account_info(iter)?;
-    let owner = iter.next();
-    let position = iter.next();
-    let owner_destination = iter.next();
-    let pool_holding = iter.next();
-    let percolator_vault = iter.next();
-    let vault_authority = iter.next();
-    let token_program = iter.next();
-    if iter.next().is_some() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let owner_exit = match (
-        owner,
-        position,
-        owner_destination,
-        pool_holding,
-        percolator_vault,
-        vault_authority,
-        token_program,
-    ) {
-        (None, None, None, None, None, None, None) => None,
-        (
-            Some(owner),
-            Some(position),
-            Some(owner_destination),
-            Some(pool_holding),
-            Some(percolator_vault),
-            Some(vault_authority),
-            Some(token_program),
-        ) => Some((
-            owner,
-            position,
-            owner_destination,
-            pool_holding,
-            percolator_vault,
-            vault_authority,
-            token_program,
-        )),
+    let owner_exit = match iter.as_slice() {
+        [] => None,
+        [owner, position, owner_destination, pool_holding, percolator_vault, vault_authority, token_program] => {
+            Some((
+                owner,
+                position,
+                owner_destination,
+                pool_holding,
+                percolator_vault,
+                vault_authority,
+                None,
+                token_program,
+            ))
+        }
+        [owner, position, owner_destination, pool_holding, percolator_vault, vault_authority, long_backing_ledger, short_backing_ledger, token_program] => {
+            Some((
+                owner,
+                position,
+                owner_destination,
+                pool_holding,
+                percolator_vault,
+                vault_authority,
+                Some([long_backing_ledger, short_backing_ledger]),
+                token_program,
+            ))
+        }
         _ => return Err(ProgramError::InvalidInstructionData),
     };
     let owner_exit_requested = owner_exit.is_some();
     let owner_exit_witness = if owner_exit_requested {
-        if data.len() != 16 {
+        if data.len() != 24 {
             return Err(ProgramError::InvalidInstructionData);
         }
         Some(data)
@@ -1334,6 +1331,7 @@ fn process_return_to_subledger(
                 pool_holding,
                 percolator_vault,
                 _,
+                backing_ledgers,
                 token_program,
             ) = owner_exit.ok_or(ProgramError::MissingRequiredSignature)?;
             if !owner.is_signer
@@ -1343,6 +1341,8 @@ fn process_return_to_subledger(
                 || !pool_holding.is_writable
                 || !percolator_vault.is_writable
                 || !config_account.is_writable
+                || backing_ledgers
+                    .is_some_and(|ledgers| ledgers.into_iter().any(|ledger| !ledger.is_writable))
             {
                 return Err(ProgramError::MissingRequiredSignature);
             }
@@ -1380,6 +1380,7 @@ fn process_return_to_subledger(
         pool_holding,
         percolator_vault,
         vault_authority,
+        backing_ledgers,
         token_program,
     )) = owner_exit
     {
@@ -1387,36 +1388,48 @@ fn process_return_to_subledger(
         withdraw_data.extend_from_slice(
             owner_exit_witness.ok_or(ProgramError::InvalidInstructionData)?,
         );
+        let mut withdraw_accounts = vec![
+            AccountMeta::new_readonly(*owner.key, true),
+            AccountMeta::new(*pool.key, false),
+            AccountMeta::new(*position.key, false),
+            AccountMeta::new(*owner_destination.key, false),
+            AccountMeta::new(*pool_holding.key, false),
+            AccountMeta::new(*market_slab.key, false),
+            AccountMeta::new(*percolator_vault.key, false),
+            AccountMeta::new_readonly(*vault_authority.key, false),
+        ];
+        let mut withdraw_infos = vec![
+            owner.clone(),
+            pool.clone(),
+            position.clone(),
+            owner_destination.clone(),
+            pool_holding.clone(),
+            market_slab.clone(),
+            percolator_vault.clone(),
+            vault_authority.clone(),
+        ];
+        if let Some(ledgers) = backing_ledgers {
+            for ledger in ledgers {
+                withdraw_accounts.push(AccountMeta::new(*ledger.key, false));
+                withdraw_infos.push(ledger.clone());
+            }
+        }
+        withdraw_accounts.extend_from_slice(&[
+            AccountMeta::new_readonly(*percolator_program.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
+        ]);
+        withdraw_infos.extend_from_slice(&[
+            percolator_program.clone(),
+            token_program.clone(),
+            subledger_program.clone(),
+        ]);
         invoke(
             &Instruction {
                 program_id: *subledger_program.key,
-                accounts: vec![
-                    AccountMeta::new_readonly(*owner.key, true),
-                    AccountMeta::new(*pool.key, false),
-                    AccountMeta::new(*position.key, false),
-                    AccountMeta::new(*owner_destination.key, false),
-                    AccountMeta::new(*pool_holding.key, false),
-                    AccountMeta::new(*market_slab.key, false),
-                    AccountMeta::new(*percolator_vault.key, false),
-                    AccountMeta::new_readonly(*vault_authority.key, false),
-                    AccountMeta::new_readonly(*percolator_program.key, false),
-                    AccountMeta::new_readonly(*token_program.key, false),
-                ],
+                accounts: withdraw_accounts,
                 data: withdraw_data,
             },
-            &[
-                owner.clone(),
-                pool.clone(),
-                position.clone(),
-                owner_destination.clone(),
-                pool_holding.clone(),
-                market_slab.clone(),
-                percolator_vault.clone(),
-                vault_authority.clone(),
-                percolator_program.clone(),
-                token_program.clone(),
-                subledger_program.clone(),
-            ],
+            &withdraw_infos,
         )?;
     }
     if owner_exit_requested {
@@ -1760,6 +1773,124 @@ fn process_return_resolved_asset0_backing(
         ],
         &[&auth_seeds],
     )
+}
+
+// accept_cross_backing_earnings accounts:
+// [pool(s), config, governance, market, pool_transit(w),
+//  governance_destination(w), percolator_program, token_program]
+// data: exact earnings amount (u64)
+//
+// Subledger derives the amount from its canonical pool escrow plus both live
+// backing-earnings counters and enters with its canonical pool PDA signer. This
+// fixed leg can empty only that escrow into a clean token account owned by the
+// config-bound Squads vault. It exposes no principal withdrawal or admin action.
+fn process_accept_cross_backing_earnings(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if data.len() != 8 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let amount = u64::from_le_bytes(data.try_into().unwrap());
+    if amount == 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    let iter = &mut accounts.iter();
+    let pool = next_account_info(iter)?;
+    let config_account = next_account_info(iter)?;
+    let governance = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let pool_transit = next_account_info(iter)?;
+    let governance_destination = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let token_program = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !pool_transit.is_writable
+        || !governance_destination.is_writable
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if !pool.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if pool.owner != &SUBLEDGER_PROGRAM_ID || config_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if *token_program.key != spl_token::ID
+        || !percolator_program.executable
+        || market_slab.owner != percolator_program.key
+    {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    if config_account.data_len() < CONFIG_SIZE
+        || config.market_0_domain != 0
+        || config.custody_mode != CUSTODY_MODE_POOL_BOUND
+        || config.custody_pool != *pool.key
+        || config.market_slab != *market_slab.key
+        || config.percolator_program != *percolator_program.key
+        || *governance.key != squads_default_vault(&config.squads_multisig)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if percolator_accounting::read_asset_backing_authority(
+        &market_slab.try_borrow_data()?,
+        0,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?
+        != pool.key.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if pool_transit.owner != &spl_token::ID
+        || governance_destination.owner != &spl_token::ID
+        || pool_transit.key == governance_destination.key
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let source = spl_token::state::Account::unpack(&pool_transit.try_borrow_data()?)?;
+    let destination =
+        spl_token::state::Account::unpack(&governance_destination.try_borrow_data()?)?;
+    if source.state != spl_token::state::AccountState::Initialized
+        || destination.state != spl_token::state::AccountState::Initialized
+        || source.owner != *pool.key
+        || destination.owner != *governance.key
+        || source.mint != destination.mint
+        || source.amount != amount
+        || source.delegate.is_some()
+        || source.delegated_amount != 0
+        || source.close_authority.is_some()
+        || source.is_native.is_some()
+        || destination.delegate.is_some()
+        || destination.delegated_amount != 0
+        || destination.close_authority.is_some()
+        || destination.is_native.is_some()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let destination_after = destination
+        .amount
+        .checked_add(amount)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    spl_transfer(
+        token_program,
+        pool_transit,
+        governance_destination,
+        pool,
+        amount,
+        None,
+    )?;
+    if spl_token::state::Account::unpack(&pool_transit.try_borrow_data()?)?.amount != 0
+        || spl_token::state::Account::unpack(&governance_destination.try_borrow_data()?)?.amount
+            != destination_after
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
 }
 
 // donate_insurance accounts: [donor(s), config, twap_authority,

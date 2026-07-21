@@ -9,6 +9,7 @@ use litesvm::LiteSVM;
 use solana_sdk::{
     account::Account,
     clock::Clock,
+    compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
     program_option::COption,
     program_pack::Pack,
@@ -1192,6 +1193,403 @@ fn maximum_real_subledger_position_claims_its_full_reward_without_mul_overflow_l
         "a sole staker receives the entire cohort; overflow must not strand COIN"
     );
     assert_eq!(token_amount(&svm, &reward_vault), 0);
+}
+
+// PUBLIC REWARD LoF: capital crystallization is owner-gated because lowering one frozen stake's
+// points also lowers the shared denominator and redistributes fixed COIN to its peers. That signer
+// gate must be bound to the exact Subledger position incarnation. Otherwise a sponsored transaction
+// signed while capital is live can be withheld until after the owner exits, then zero the victim's
+// points and let a co-staker capture the victim's reward. Every capital transition below uses the
+// real Subledger and Residual binaries; the exit returns only the victim's own backing principal.
+#[test]
+fn presigned_capital_crystallize_cannot_redistribute_an_exited_backers_reward() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    svm.add_program_from_file(subledger_program::id(), subledger_so())
+        .unwrap();
+
+    let payer = Keypair::new();
+    let dao = Keypair::new();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&victim.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    set_slot(&mut svm, 1);
+
+    // A real segregated backing pool with two equal, independently owned deposits.
+    let collateral_authority = Keypair::new();
+    let collateral_mint = create_mint(&mut svm, &payer, &collateral_authority.pubkey());
+    let asset_id = 78u64;
+    let no_market = Pubkey::default();
+    let policy = [1u8]; // with-surplus backing
+    let domain = [1u8]; // backing domain
+    let deposit_window = u64::MAX.to_le_bytes();
+    let deposit_start = 0u64.to_le_bytes();
+    let bootstrap_delay = 0u64.to_le_bytes();
+    let backing_pool = Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            collateral_mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            no_market.as_ref(),
+            no_market.as_ref(),
+            no_market.as_ref(),
+            &policy,
+            &domain,
+            &deposit_window,
+            &deposit_start,
+            &bootstrap_delay,
+        ],
+        &subledger_program::id(),
+    )
+    .0;
+    let backing_vault = create_token_account(&mut svm, &payer, &collateral_mint, &backing_pool);
+    let mut init_pool_data = vec![0u8];
+    init_pool_data.extend_from_slice(&asset_id.to_le_bytes());
+    init_pool_data.extend_from_slice(&[policy[0], domain[0]]);
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: subledger_program::id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(backing_pool, false),
+                AccountMeta::new_readonly(backing_vault, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: init_pool_data,
+        }],
+        &[],
+    )
+    .expect("initialize real backing pool");
+
+    let principal = 100u64;
+    let victim_collateral =
+        create_token_account(&mut svm, &payer, &collateral_mint, &victim.pubkey());
+    let attacker_collateral =
+        create_token_account(&mut svm, &payer, &collateral_mint, &attacker.pubkey());
+    mint_to(
+        &mut svm,
+        &payer,
+        &collateral_mint,
+        &collateral_authority,
+        &victim_collateral,
+        principal,
+    );
+    mint_to(
+        &mut svm,
+        &payer,
+        &collateral_mint,
+        &collateral_authority,
+        &attacker_collateral,
+        principal,
+    );
+    let victim_position = Pubkey::find_program_address(
+        &[
+            b"subledger_position",
+            backing_pool.as_ref(),
+            victim.pubkey().as_ref(),
+        ],
+        &subledger_program::id(),
+    )
+    .0;
+    let attacker_position = Pubkey::find_program_address(
+        &[
+            b"subledger_position",
+            backing_pool.as_ref(),
+            attacker.pubkey().as_ref(),
+        ],
+        &subledger_program::id(),
+    )
+    .0;
+    for (owner, owner_collateral, position) in [
+        (&victim, victim_collateral, victim_position),
+        (&attacker, attacker_collateral, attacker_position),
+    ] {
+        let mut deposit_data = vec![1u8];
+        deposit_data.extend_from_slice(&principal.to_le_bytes());
+        send(
+            &mut svm,
+            &payer,
+            &[Instruction {
+                program_id: subledger_program::id(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(backing_pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(owner_collateral, false),
+                    AccountMeta::new(backing_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                ],
+                data: deposit_data,
+            }],
+            &[owner],
+        )
+        .expect("deposit backing through real subledger");
+    }
+    assert_eq!(token_amount(&svm, &backing_vault), 2 * principal);
+
+    // Give the backing cohort the complete immutable reward supply.
+    let coin_authority = Keypair::new();
+    let coin_mint = create_mint(&mut svm, &payer, &coin_authority.pubkey());
+    let reward_supply = 1_000_000u64;
+    let epoch_id = 9_003u64;
+    let rd_config = reward_epoch_pda(&dao.pubkey(), &coin_mint, epoch_id);
+    let reward_vault = create_token_account(&mut svm, &payer, &coin_mint, &rd_config);
+    mint_to(
+        &mut svm,
+        &payer,
+        &coin_mint,
+        &coin_authority,
+        &reward_vault,
+        reward_supply,
+    );
+    revoke_mint(&mut svm, &payer, &coin_mint, &coin_authority);
+    let market = Pubkey::new_unique();
+    let stub_percolator = Pubkey::new_unique();
+    let emission_start = 10u64;
+    let emission_end = 100u64;
+    let finalize_window = 10u64;
+    send(
+        &mut svm,
+        &payer,
+        &[Instruction {
+            program_id: rd_id(),
+            accounts: reward_epoch_init_accounts(
+                payer.pubkey(),
+                dao.pubkey(),
+                coin_mint,
+                stub_percolator,
+                subledger_program::id(),
+                rd_config,
+                reward_vault,
+            ),
+            data: reward_epoch_init_data(
+                epoch_id,
+                emission_start,
+                emission_end,
+                reward_supply,
+                0,
+                10_000,
+                0,
+                0,
+                finalize_window,
+                0,
+                &[RewardEpochMarket {
+                    market,
+                    insurance_pool: Pubkey::default(),
+                    backing_pool,
+                }],
+            ),
+        }],
+        &[&dao],
+    )
+    .expect("initialize backing-only reward epoch");
+    let env = Env {
+        rd_config,
+        coin_mint,
+        vault: reward_vault,
+        mint_auth: Keypair::new(),
+        stub_sub: subledger_program::id(),
+        stub_perc: stub_percolator,
+        ins_pool: Pubkey::default(),
+        back_pool: backing_pool,
+        market,
+        supply: reward_supply,
+        emission_end,
+        finalize_window,
+    };
+
+    set_slot(&mut svm, emission_start);
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &victim,
+        &victim.pubkey(),
+        &victim_position,
+        COHORT_BACKING,
+    )
+    .expect("register victim backing");
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker.pubkey(),
+        &attacker_position,
+        COHORT_BACKING,
+    )
+    .expect("register attacker backing");
+    set_slot(&mut svm, 74); // age 64 => floor(log2(age)) = 6
+    crystallize(&mut svm, &payer, &env, &victim, &victim_position)
+        .expect("crystallize victim backing");
+    crystallize(&mut svm, &payer, &env, &attacker, &attacker_position)
+        .expect("crystallize attacker backing");
+    let victim_stake =
+        stake_pda_for_cohort(&env, &victim.pubkey(), &victim_position, COHORT_BACKING);
+    let attacker_stake =
+        stake_pda_for_cohort(&env, &attacker.pubkey(), &attacker_position, COHORT_BACKING);
+    let expected_points = 6u128 * principal as u128;
+    for stake in [victim_stake, attacker_stake] {
+        assert_eq!(
+            u128::from_le_bytes(
+                svm.get_account(&stake).unwrap().data[176..192]
+                    .try_into()
+                    .unwrap()
+            ),
+            expected_points,
+        );
+    }
+
+    // The victim signs a second exact crystallize through a relayer. Hold it while a distinct,
+    // equally owner-authorized full backing exit lands under the same still-valid blockhash.
+    svm.expire_blockhash();
+    let held_blockhash = svm.latest_blockhash();
+    let victim_position_before_exit = svm.get_account(&victim_position).unwrap();
+    let mut exact_crystallize_data = vec![2u8];
+    exact_crystallize_data.extend_from_slice(&victim_position_before_exit.data[72..80]);
+    exact_crystallize_data.extend_from_slice(&victim_position_before_exit.data[89..97]);
+    exact_crystallize_data.extend_from_slice(&victim_position_before_exit.data[80..88]);
+    let withheld_crystallize = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(victim.pubkey(), true),
+                    AccountMeta::new(rd_config, false),
+                    AccountMeta::new(victim_stake, false),
+                    AccountMeta::new_readonly(victim_position, false),
+                ],
+                data: exact_crystallize_data,
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    );
+    let withheld_predecessor_crystallize = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(victim.pubkey(), true),
+                    AccountMeta::new(rd_config, false),
+                    AccountMeta::new(victim_stake, false),
+                    AccountMeta::new_readonly(victim_position, false),
+                ],
+                data: vec![2u8],
+            },
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    );
+    let mut exit_data = vec![2u8];
+    exit_data.extend_from_slice(&victim_position_before_exit.data[72..80]);
+    exit_data.extend_from_slice(&victim_position_before_exit.data[89..97]);
+    exit_data.extend_from_slice(&victim_position_before_exit.data[80..88]);
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[Instruction {
+            program_id: subledger_program::id(),
+            accounts: vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(backing_pool, false),
+                AccountMeta::new(victim_position, false),
+                AccountMeta::new(victim_collateral, false),
+                AccountMeta::new(backing_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: exit_data,
+        }],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        held_blockhash,
+    ))
+    .expect("victim exits its backing position");
+    assert_eq!(token_amount(&svm, &victim_collateral), principal);
+    assert_eq!(token_amount(&svm, &backing_vault), principal);
+    assert_eq!(svm.get_account(&victim_position).unwrap().data[88], 1);
+
+    let stale_result = svm.send_transaction(withheld_crystallize);
+    if stale_result.is_ok() {
+        assert_eq!(
+            u128::from_le_bytes(
+                svm.get_account(&rd_config).unwrap().data[154..170]
+                    .try_into()
+                    .unwrap()
+            ),
+            expected_points,
+            "the stale owner signature removed the victim from the shared denominator",
+        );
+        set_slot(&mut svm, emission_end + finalize_window);
+        freeze(&mut svm, &payer, &env).expect("freeze exploited denominator");
+        let attacker_reward =
+            create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
+        claim(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &attacker_reward,
+            Some(&attacker_position),
+        )
+        .expect("attacker claims redistributed reward");
+        assert_eq!(
+            token_amount(&svm, &attacker_reward),
+            reward_supply,
+            "the co-staker extracted the exited victim's fixed reward",
+        );
+        assert_eq!(
+            token_amount(&svm, &victim_collateral),
+            principal,
+            "the exploit cannot redirect backing principal",
+        );
+        assert_eq!(token_amount(&svm, &backing_vault), principal);
+        panic!("a stale crystallize authorization redistributed an exited backer's reward");
+    }
+    assert!(
+        svm.send_transaction(withheld_predecessor_crystallize)
+            .is_err(),
+        "a current capital stake must reject the predecessor empty crystallize wire",
+    );
+
+    // Fixed path: the exact position witness went stale at exit, so the denominator stays at the
+    // two equal live-at-crystallization contributions and the attacker can claim only its half.
+    assert_eq!(
+        svm.get_account(&victim_stake).unwrap().data[176..192],
+        expected_points.to_le_bytes()
+    );
+    assert_eq!(
+        u128::from_le_bytes(
+            svm.get_account(&rd_config).unwrap().data[154..170]
+                .try_into()
+                .unwrap()
+        ),
+        2 * expected_points,
+    );
+    set_slot(&mut svm, emission_end + finalize_window);
+    freeze(&mut svm, &payer, &env).expect("freeze intact denominator");
+    let attacker_reward = create_token_account(&mut svm, &payer, &coin_mint, &attacker.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker_reward,
+        Some(&attacker_position),
+    )
+    .expect("attacker claims only its own share");
+    assert_eq!(token_amount(&svm, &attacker_reward), reward_supply / 2);
+    assert_eq!(token_amount(&svm, &reward_vault), reward_supply / 2);
+    assert_eq!(token_amount(&svm, &victim_collateral), principal);
+    assert_eq!(token_amount(&svm, &backing_vault), principal);
 }
 
 // Conservation PROBE: the cohort denominator must remain the exact sum of stake points. If a
@@ -3894,13 +4292,20 @@ fn crystallize_as(
             false,
         ));
     }
+    let mut data = vec![2u8];
+    if matches!(cohort, COHORT_INSURANCE | COHORT_BACKING) {
+        let position = svm.get_account(linked).expect("capital position");
+        data.extend_from_slice(&position.data[72..80]);
+        data.extend_from_slice(&position.data[89..97]);
+        data.extend_from_slice(&position.data[80..88]);
+    }
     send(
         svm,
         payer,
         &[Instruction {
             program_id: rd_id(),
             accounts,
-            data: vec![2u8],
+            data,
         }],
         &[cranker],
     )
@@ -3942,13 +4347,20 @@ fn crystallize_cohort(
             false,
         ));
     }
+    let mut data = vec![2u8];
+    if matches!(cohort, COHORT_INSURANCE | COHORT_BACKING) {
+        let position = svm.get_account(linked).expect("capital position");
+        data.extend_from_slice(&position.data[72..80]);
+        data.extend_from_slice(&position.data[89..97]);
+        data.extend_from_slice(&position.data[80..88]);
+    }
     send(
         svm,
         payer,
         &[Instruction {
             program_id: rd_id(),
             accounts,
-            data: vec![2u8],
+            data,
         }],
         &[cranker],
     )
