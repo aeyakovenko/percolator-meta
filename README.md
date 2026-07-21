@@ -530,10 +530,10 @@ cargo build-sbf --tools-version v1.52 --manifest-path genesis-vote/Cargo.toml
 cargo build-sbf --tools-version v1.52 --manifest-path residual-distributor/Cargo.toml
 cargo build-sbf --tools-version v1.52 --manifest-path twap-program/Cargo.toml
 
-# Green Meta smoke suite. The separately named expected-red probe below exercises
-# a pinned Percolator liveness bug tracked by percolator-prog PR #270.
-cargo test --workspace -- --skip e2e_source_capacity_is_reserved_before_new_exposure
+# Green Meta smoke suite, including the pinned source-capacity regression.
+cargo test --workspace
 
+# Optional focused source-capacity regression.
 cargo test -p twap-program --test chain \
   e2e_source_capacity_is_reserved_before_new_exposure -- --exact
 
