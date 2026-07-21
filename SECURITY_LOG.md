@@ -2,6 +2,27 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - controller-owned backing could leave before shutdown (surface A/C)
+
+The fixed shutdown-return instruction signed as the controller market authority. When the
+controller was also the recorded backing provider, pinned Percolator accepted that signature
+through its immediate local-provider branch instead of its delayed market-authority override. Any
+caller could therefore move live protocol backing into the governance-owned destination before
+shutdown, and no public instruction could restore the controller PDA's market capacity.
+
+The retained real-SBF LiteSVM regression creates a controller-owned secondary asset, opens and
+settles public long/short positions through an EWMA funding segment, and observes organically
+accrued backing. Before any shutdown action, its permissionless return now rejects with the slab,
+vault, backing role, and governance balance unchanged. After governance starts shutdown and the
+configured delay matures, the same return succeeds and restores the controller as provider.
+
+FIX: controller-owned backing cleanup temporarily rotates the asset's backing role to an
+asset-scoped instruction-only PDA. The withdrawal still signs as market authority, so Percolator's
+own recovery, empty-asset, and delay checks are mandatory; the role is restored atomically after
+the fixed return. External providers keep the existing wire and recipient binding. No reusable
+signer, caller-selected destination, custody account, amount, or governance withdrawal method was
+added.
+
 ## Tick - live insurance could exit before stale portfolios realized loss (surface B/C)
 
 Pinned Percolator allowed an asset-local live insurance withdrawal once the market-level mark had
