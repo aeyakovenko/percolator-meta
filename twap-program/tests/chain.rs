@@ -54805,3 +54805,645 @@ fn e2e_terminal_source_dust_payout_is_order_independent() {
     assert_eq!(attack.victim_withdrawn, 20_000_000_000);
     assert!(attack.vault_remaining <= 1);
 }
+
+// A no-observation refresh must account for pending marks on every active leg before its health
+// certificate can authorize more risk. Otherwise two attacker-owned portfolios can manufacture a
+// junior claim against capital that already belongs to an independent winner.
+#[test]
+fn e2e_no_observation_refresh_cannot_overleverage_a_later_active_leg() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const PRICE: u64 = 1_000_000;
+    const DEPOSIT: u64 = 100_000_000;
+    const VICTIM_SIZE_Q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    const SEED_SIZE_Q: i128 = percolator::POS_SCALE as i128;
+    const ATTACK_SIZE_Q: i128 = 952 * percolator::POS_SCALE as i128;
+
+    #[derive(Debug)]
+    struct Outcome {
+        omitted_refresh_succeeded: bool,
+        oversized_trade_succeeded: bool,
+        attacker_coalition: u128,
+        victim: u64,
+        epoch_pair: u128,
+        vault_remaining: u64,
+        total_paid: u128,
+    }
+
+    let run = |omit_later_observation: bool| {
+        let mut svm = LiteSVM::new().with_compute_budget(
+            solana_program_runtime::compute_budget::ComputeBudget {
+                compute_unit_limit: 1_400_000,
+                heap_size: 256 * 1024,
+                ..solana_program_runtime::compute_budget::ComputeBudget::default()
+            },
+        );
+        svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+        let payer = Keypair::new();
+        let admin = Keypair::new();
+        let honest_oracle = Keypair::new();
+        let attacker = Keypair::new();
+        let victim = Keypair::new();
+        let seed_counterparty = Keypair::new();
+        let attack_recipient = Keypair::new();
+        let epoch_long = Keypair::new();
+        let epoch_short = Keypair::new();
+        for signer in [
+            &payer,
+            &admin,
+            &honest_oracle,
+            &attacker,
+            &victim,
+            &seed_counterparty,
+            &attack_recipient,
+            &epoch_long,
+            &epoch_short,
+        ] {
+            svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+                .unwrap();
+        }
+        svm.set_sysvar(&Clock {
+            slot: 1,
+            unix_timestamp: 1,
+            ..Clock::default()
+        });
+
+        let mint_authority = Keypair::new();
+        let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+        let market = Pubkey::new_unique();
+        let market_len = percolator_prog::state::market_account_len_for_capacity(3).unwrap();
+        svm.set_account(
+            market,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0; market_len],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(collateral, false),
+                ],
+                PIx::InitMarket {
+                    max_portfolio_assets: 3,
+                    h_min: 0,
+                    h_max: 6_480_000,
+                    initial_price: PRICE,
+                    min_nonzero_mm_req: 599,
+                    min_nonzero_im_req: 600,
+                    maintenance_margin_bps: 500,
+                    initial_margin_bps: 500,
+                    max_trading_fee_bps: 10_000,
+                    trade_fee_base_bps: 0,
+                    liquidation_fee_bps: 5,
+                    liquidation_fee_cap: percolator::MAX_PROTOCOL_FEE_ABS,
+                    min_liquidation_abs: 0,
+                    max_price_move_bps_per_slot: 24,
+                    max_accrual_dt_slots: 20,
+                    max_abs_funding_e9_per_slot: 0,
+                    min_funding_lifetime_slots: 10_000_000,
+                    max_account_b_settlement_chunks: 1,
+                    max_bankrupt_close_chunks: 1,
+                    max_bankrupt_close_lifetime_slots: 100,
+                    public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                    maintenance_fee_per_slot: 0,
+                },
+            ),
+        )
+        .expect("initialize the three-asset public market");
+        for asset_index in 0..3u16 {
+            send(
+                &mut svm,
+                &[&payer, &admin],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(admin.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::ConfigureAuthMark {
+                        asset_index,
+                        now_slot: 1,
+                        initial_mark_e6: PRICE,
+                    },
+                ),
+            )
+            .expect("configure an authenticated mark");
+            send(
+                &mut svm,
+                &[&payer, &admin, &honest_oracle],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(admin.pubkey(), true),
+                        AccountMeta::new_readonly(honest_oracle.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::UpdateAssetAuthority {
+                        asset_index,
+                        kind: percolator_prog::processor::ASSET_AUTH_ORACLE,
+                        new_pubkey: honest_oracle.pubkey().to_bytes(),
+                    },
+                ),
+            )
+            .expect("separate the oracle authority from every trader");
+        }
+
+        let vault_authority = perc_vault_authority(&market, &perc_id());
+        let vault = canonical_insurance_vault(&vault_authority, &collateral);
+        set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+
+        let portfolios = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        let owners = [
+            &attacker,
+            &victim,
+            &seed_counterparty,
+            &attack_recipient,
+            &epoch_long,
+            &epoch_short,
+        ];
+        let portfolio_len =
+            percolator_prog::state::portfolio_account_len_for_market_slots(3).unwrap();
+        for (owner, portfolio) in owners.iter().zip(portfolios) {
+            svm.set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0; portfolio_len],
+                    owner: perc_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("initialize a public portfolio");
+            let source = Pubkey::new_unique();
+            set_token(&mut svm, &source, &collateral, &owner.pubkey(), DEPOSIT);
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit {
+                        amount: DEPOSIT as u128,
+                    },
+                ),
+            )
+            .expect("deposit real collateral");
+        }
+        let [attacker_pf, victim_pf, seed_pf, recipient_pf, epoch_long_pf, epoch_short_pf] =
+            portfolios;
+
+        let trade = |svm: &mut LiteSVM,
+                     long_owner: &Keypair,
+                     short_owner: &Keypair,
+                     long_pf: Pubkey,
+                     short_pf: Pubkey,
+                     asset_index: u16,
+                     size_q: i128| {
+            send(
+                svm,
+                &[&payer, long_owner, short_owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(long_owner.pubkey(), true),
+                        AccountMeta::new_readonly(short_owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(long_pf, false),
+                        AccountMeta::new(short_pf, false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index,
+                        size_q,
+                        exec_price: PRICE,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+        };
+        trade(
+            &mut svm,
+            &seed_counterparty,
+            &attacker,
+            seed_pf,
+            attacker_pf,
+            1,
+            SEED_SIZE_Q,
+        )
+        .expect("put asset 1 in the attacker's first active leg");
+        trade(
+            &mut svm,
+            &victim,
+            &attacker,
+            victim_pf,
+            attacker_pf,
+            0,
+            VICTIM_SIZE_Q,
+        )
+        .expect("the victim opens a fair long against the attacker");
+        trade(
+            &mut svm,
+            &epoch_long,
+            &epoch_short,
+            epoch_long_pf,
+            epoch_short_pf,
+            2,
+            SEED_SIZE_Q,
+        )
+        .expect("open an unrelated asset used only to advance the market epoch");
+
+        let attacker_state = percolator_prog::state::read_portfolio(
+            &svm.get_account(&attacker_pf).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            attacker_state.legs[0].try_to_runtime().unwrap().asset_index,
+            1,
+            "asset 1 must remain the first engine-selected leg"
+        );
+        assert_eq!(
+            attacker_state.legs[1].try_to_runtime().unwrap().asset_index,
+            0,
+            "the adverse asset must occupy a later active leg"
+        );
+
+        svm.set_sysvar(&Clock {
+            slot: 2,
+            unix_timestamp: 2,
+            ..Clock::default()
+        });
+        for (asset_index, mark) in [(0u16, 1_500_000u64), (2u16, 1_010_000u64)] {
+            send(
+                &mut svm,
+                &[&payer, &honest_oracle],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(honest_oracle.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::PushAuthMark {
+                        asset_index,
+                        now_slot: 2,
+                        mark_e6: mark,
+                    },
+                ),
+            )
+            .expect("the independent oracle stages a mark");
+        }
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(epoch_long_pf, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: 2,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 2,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("unrelated public progress advances the global oracle epoch");
+        let (_, pending_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            pending_group.assets[0].effective_price, PRICE,
+            "the victim's authenticated gain is still pending"
+        );
+
+        let observations = if omit_later_observation {
+            vec![]
+        } else {
+            vec![percolator_prog::ix::CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 0,
+            }]
+        };
+        let crank_attacker = |svm: &mut LiteSVM, observations| {
+            send(
+                svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(attacker_pf, false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: 2,
+                        observations,
+                    },
+                ),
+            )
+        };
+        let market_before_refresh = svm.get_account(&market).unwrap();
+        let attacker_before_refresh = svm.get_account(&attacker_pf).unwrap();
+        let refresh = crank_attacker(&mut svm, observations);
+        let omitted_refresh_succeeded = omit_later_observation && refresh.is_ok();
+        if let Err(err) = refresh {
+            assert!(
+                omit_later_observation,
+                "the fully observed control refresh failed: {err}"
+            );
+            assert_eq!(
+                svm.get_account(&market).unwrap(),
+                market_before_refresh,
+                "rejected omitted-observation refresh must be market-atomic"
+            );
+            assert_eq!(
+                svm.get_account(&attacker_pf).unwrap(),
+                attacker_before_refresh,
+                "rejected omitted-observation refresh must be portfolio-atomic"
+            );
+            crank_attacker(
+                &mut svm,
+                vec![percolator_prog::ix::CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            )
+            .expect("the bounded fully observed fallback refreshes the attacker");
+        }
+
+        let oversized_trade_succeeded = trade(
+            &mut svm,
+            &attack_recipient,
+            &attacker,
+            recipient_pf,
+            attacker_pf,
+            1,
+            ATTACK_SIZE_Q,
+        )
+        .is_ok();
+
+        svm.set_sysvar(&Clock {
+            slot: 3,
+            unix_timestamp: 3,
+            ..Clock::default()
+        });
+        if omit_later_observation && oversized_trade_succeeded {
+            send(
+                &mut svm,
+                &[&payer, &honest_oracle],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(honest_oracle.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::PushAuthMark {
+                        asset_index: 1,
+                        now_slot: 3,
+                        mark_e6: 1_100_000,
+                    },
+                ),
+            )
+            .expect("the independent oracle later moves the oversized position");
+        }
+        let target_asset1 = if omit_later_observation && oversized_trade_succeeded {
+            1_100_000
+        } else {
+            PRICE
+        };
+        for segment in 1..=24u64 {
+            let (_, before_group) = percolator_prog::state::read_market(
+                &svm.get_account(&market).unwrap().data,
+            )
+            .unwrap();
+            let mut observations = Vec::new();
+            if before_group.assets[0].effective_price != 1_500_000 {
+                observations.push(percolator_prog::ix::CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                });
+            }
+            if before_group.assets[1].effective_price != target_asset1 {
+                observations.push(percolator_prog::ix::CrankObservationHint {
+                    asset_index: 1,
+                    oracle_accounts: 0,
+                });
+            }
+            if observations.is_empty() {
+                break;
+            }
+            let slot = 3 + 20 * segment;
+            svm.set_sysvar(&Clock {
+                slot,
+                unix_timestamp: slot as i64,
+                ..Clock::default()
+            });
+            let progress = send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(victim_pf, false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: slot,
+                        observations,
+                    },
+                ),
+            );
+            if let Err(err) = progress {
+                panic!(
+                    "bounded terminal crank failed: omit={omit_later_observation}, segment={segment}, asset0={}, asset1={}, target1={target_asset1}, err={err}",
+                    before_group.assets[0].effective_price,
+                    before_group.assets[1].effective_price,
+                );
+            }
+            let (_, group) = percolator_prog::state::read_market(
+                &svm.get_account(&market).unwrap().data,
+            )
+            .unwrap();
+            if group.assets[0].effective_price == 1_500_000
+                && group.assets[1].effective_price == target_asset1
+            {
+                break;
+            }
+        }
+        let (_, terminal_group) = percolator_prog::state::read_market(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(terminal_group.assets[0].effective_price, 1_500_000);
+        assert_eq!(terminal_group.assets[1].effective_price, target_asset1);
+
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ResolveMarket,
+            ),
+        )
+        .expect("the honest market authority resolves after committed marks");
+
+        let destinations = [
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        ];
+        for (owner, destination) in owners.iter().zip(destinations) {
+            set_token(
+                &mut svm,
+                &destination,
+                &collateral,
+                &owner.pubkey(),
+                0,
+            );
+        }
+        for _ in 0..32 {
+            let mut all_terminal = true;
+            for ((owner, portfolio), destination) in
+                owners.iter().zip(portfolios).zip(destinations)
+            {
+                let state = percolator_prog::state::read_portfolio(
+                    &svm.get_account(&portfolio).unwrap().data,
+                )
+                .unwrap();
+                if state.capital.get() == 0
+                    && state.pnl.get() == 0
+                    && percolator::active_bitmap_is_empty(
+                        state.active_bitmap.map(percolator::V16PodU64::get),
+                    )
+                {
+                    continue;
+                }
+                all_terminal = false;
+                send(
+                    &mut svm,
+                    &[&payer],
+                    pix(
+                        vec![
+                            AccountMeta::new_readonly(owner.pubkey(), false),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio, false),
+                            AccountMeta::new(destination, false),
+                            AccountMeta::new(vault, false),
+                            AccountMeta::new_readonly(vault_authority, false),
+                            AccountMeta::new_readonly(spl_token::ID, false),
+                        ],
+                        PIx::CloseResolved {
+                            fee_rate_per_slot: 0,
+                        },
+                    ),
+                )
+                .expect("permissionless terminal settlement must remain live");
+            }
+            if all_terminal {
+                break;
+            }
+        }
+
+        let mut payouts = [0u64; 6];
+        for (index, (portfolio, destination)) in
+            portfolios.into_iter().zip(destinations).enumerate()
+        {
+            let state = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio).unwrap().data,
+            )
+            .unwrap();
+            assert_eq!(
+                state.capital.get(),
+                0,
+                "portfolio {index} terminal capital must be paid"
+            );
+            assert_eq!(
+                state.pnl.get(),
+                0,
+                "portfolio {index} terminal PnL must be finalized"
+            );
+            assert!(percolator::active_bitmap_is_empty(
+                state.active_bitmap.map(percolator::V16PodU64::get)
+            ));
+            payouts[index] = token_amount(&svm, &destination);
+        }
+
+        let vault_remaining = token_amount(&svm, &vault);
+        let total_paid = payouts.iter().copied().map(u128::from).sum::<u128>();
+        assert_eq!(
+            total_paid + u128::from(vault_remaining),
+            6 * u128::from(DEPOSIT),
+            "terminal payouts conserve every deposited atom"
+        );
+        Outcome {
+            omitted_refresh_succeeded,
+            oversized_trade_succeeded,
+            attacker_coalition: u128::from(payouts[0])
+                + u128::from(payouts[2])
+                + u128::from(payouts[3]),
+            victim: payouts[1],
+            epoch_pair: u128::from(payouts[4]) + u128::from(payouts[5]),
+            vault_remaining,
+            total_paid,
+        }
+    };
+
+    let control = run(false);
+    let attack = run(true);
+    assert!(
+        !control.oversized_trade_succeeded,
+        "committing the adverse mark must reject the oversized trade: {control:?}"
+    );
+    assert_eq!(
+        control.epoch_pair, attack.epoch_pair,
+        "unrelated epoch-advancing users must not fund either ordering"
+    );
+    assert_eq!(control.total_paid, attack.total_paid);
+    assert_eq!(control.vault_remaining, attack.vault_remaining);
+    assert!(
+        !attack.omitted_refresh_succeeded
+            && !attack.oversized_trade_succeeded
+            && attack.attacker_coalition <= control.attacker_coalition
+            && attack.victim >= control.victim,
+        "omitted later-leg work let the attacker coalition divert the victim's payout: control={control:?}, attack={attack:?}"
+    );
+}
