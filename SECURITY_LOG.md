@@ -14621,3 +14621,33 @@ Percolator and Subledger SBF binaries, the retained-principal Subledger-to-TWAP 
 Subledger/Percolator LiteSVM tests, and the complete 235-test runnable chain from Genesis through
 distribution, TWAP handoff, buyback/burn rounds, claims, and principal recovery. The separately
 tracked pinned-Percolator source-capacity expected-red probe remains filtered.
+
+## Tick - terminal governance close could destroy a staged Genesis exit (surface A/B, ADMIN DOS/LOF)
+
+A public trader can materialize transient backing in the initially empty domain before a one-unit
+Genesis deposit. The compatible insurance atom enters Percolator while the backing atom is correctly
+staged in the canonical Subledger pool ATA. After TWAP handoff, governance resolution, and complete
+public trader settlement, Percolator reports an empty resolved market even though Subledger still owes
+that staged atom. Against parent `095c75307d8d04dd41d92f02d9da7983460c551b`, the old terminal
+controller path trusted only Percolator's `CloseSlab`: Squads could delete the immutable market account
+and permanently remove the account needed to authenticate the owner's later withdrawal. The atom was
+not redirected and a governance signature was required, so this is an admin-triggered permanent loss
+of access, not a permissionless attacker drain.
+
+FIX: terminal close now reads asset 0's current custody roles. Controller-owned custody keeps its
+existing account shape. Canonical pool-bound TWAP and direct Subledger custody must provide exact
+read-only state bindings and pass Subledger's `AssertNoPrincipal` CPI before the slab can close. A
+canonical poolless TWAP config proves that no pool exists without adding a Subledger liveness
+dependency. The validator accepts supported historical market-bound pool layouts as well as current
+bootstrap and cross-backed pools, while current donation validation remains strict.
+
+The retained full-chain LiteSVM regression uses the real Percolator, Subledger, Genesis,
+Distribution, TWAP, controller, and Squads programs. It proves the old no-proof close is rejected, a
+canonical proof cannot close while the staged atom is owed, permissionless TWAP return restores
+Subledger custody, the owner withdraws exactly one atom, and direct Subledger proof then permits final
+close. All 12 controller unit tests and the complete 236-test runnable chain pass; only the separately
+tracked pinned-Percolator source-capacity expected-red probe is filtered. The fixed controller SBF
+checksum is `da618a25857381910099bfcc20a4a3d97702e1a180a2e69296da6b9c4576fdf2`.
+No account layout, signer, authority, amount, destination, transfer, withdrawal path, or new value
+surface was added; terminal close gained only conditional read-only proof accounts and a no-principal
+CPI.
