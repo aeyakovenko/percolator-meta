@@ -15352,6 +15352,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
             AccountMeta::new_readonly(cleanup_pool, false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: vec![5u8], // IX_CLOSE_MARKET_AND_RECLAIM
     };
@@ -17962,6 +17963,7 @@ fn e2e_controller_terminal_cleanup_requires_and_reclaims_secondary_collateral() 
             AccountMeta::new_readonly(pool, false),
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ];
         if include_secondary {
             accounts.extend_from_slice(&[
