@@ -8184,6 +8184,7 @@ fn build_controller_close_and_reclaim_with_custody_message(
     governance_destination: &Pubkey,
     custody_state: &Pubkey,
     custody_pool: &Pubkey,
+    custody_holding: &Pubkey,
 ) -> Vec<u8> {
     let mut m = Vec::new();
     let retired_market = retired_market_pda(market, &perc_id());
@@ -8191,7 +8192,7 @@ fn build_controller_close_and_reclaim_with_custody_message(
     m.push(1); // governance signer
     m.push(1); // governance receives the reclaimed lamports
     m.push(6); // controller, market, vault, token destinations, and retirement marker
-    m.push(if direct_subledger_custody { 14 } else { 15 });
+    m.push(if direct_subledger_custody { 15 } else { 16 });
     for key in [
         governance,
         controller,
@@ -8212,17 +8213,18 @@ fn build_controller_close_and_reclaim_with_custody_message(
         m.extend_from_slice(custody_pool.as_ref());
     }
     m.extend_from_slice(sub_id().as_ref());
+    m.extend_from_slice(custody_holding.as_ref());
     m.extend_from_slice(controller_id().as_ref());
     m.push(1);
-    m.push(if direct_subledger_custody { 13 } else { 14 }); // market-controller program
-    m.push(14);
+    m.push(if direct_subledger_custody { 14 } else { 15 }); // market-controller program
+    m.push(15);
     for index in [0u8, 1, 2, 7, 3, 4, 5, 8, 9, 10, 6] {
         m.push(index);
     }
     if direct_subledger_custody {
-        m.extend_from_slice(&[11, 10, 12]);
+        m.extend_from_slice(&[11, 10, 12, 13]);
     } else {
-        m.extend_from_slice(&[11, 12, 13]);
+        m.extend_from_slice(&[11, 12, 13, 14]);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
     m.push(5); // IX_CLOSE_MARKET_AND_RECLAIM
@@ -8266,8 +8268,8 @@ fn build_controller_close_and_reclaim_with_poolless_twap_message(
     }
     m.push(1);
     m.push(12); // market-controller program
-    m.push(14);
-    for index in [0u8, 1, 2, 7, 3, 4, 5, 8, 9, 10, 6, 11, 10, 10] {
+    m.push(15);
+    for index in [0u8, 1, 2, 7, 3, 4, 5, 8, 9, 10, 6, 11, 10, 10, 10] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -17197,6 +17199,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &governance_destination,
         &pool,
         &system_program::ID,
+        &holding,
     );
     let close_remaining = vec![
         AccountMeta::new(squads_vault, false),
@@ -17212,6 +17215,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -17675,6 +17679,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &governance_destination,
         &pool,
         &system_program::ID,
+        &pool_holding,
     );
     let pool_close_remaining = vec![
         AccountMeta::new(squads_vault, false),
@@ -17690,6 +17695,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool_holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     assert!(
@@ -17748,6 +17754,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &governance_destination,
         &twap_config,
         &pool,
+        &pool_holding,
     );
     let twap_close_remaining = vec![
         AccountMeta::new(squads_vault, false),
@@ -17764,6 +17771,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         AccountMeta::new_readonly(twap_config, false),
         AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool_holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -54601,6 +54609,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &governance_destination,
         &env.pool,
         &system_program::ID,
+        &pool_holding,
     );
     let fallback_close_remaining = vec![
         AccountMeta::new(env.squads_vault, false),
@@ -54616,6 +54625,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(env.pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool_holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -57226,6 +57236,7 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         &governance_destination,
         &twap_cfg,
         &env.pool,
+        &pool_holding,
     );
     let attested_close_remaining = vec![
         AccountMeta::new(env.squads_vault, false),
@@ -57242,6 +57253,7 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(env.pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool_holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     assert!(
@@ -57323,6 +57335,7 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         &governance_destination,
         &env.pool,
         &system_program::ID,
+        &pool_holding,
     );
     let final_close_remaining = vec![
         AccountMeta::new(env.squads_vault, false),
@@ -57338,6 +57351,7 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(env.pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool_holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -57909,6 +57923,7 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         &governance_destination,
         &env.pool,
         &system_program::ID,
+        &pool_holding,
     );
     let close_remaining = vec![
         AccountMeta::new(env.squads_vault, false),
@@ -57924,8 +57939,31 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         AccountMeta::new_readonly(system_program::ID, false),
         AccountMeta::new_readonly(env.pool, false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(pool_holding, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
+    let decoy_pool_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &decoy_pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let forged_close = build_controller_close_and_reclaim_with_custody_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &env.perc_vault,
+        &vault_authority,
+        &controller_transit,
+        &governance_destination,
+        &env.pool,
+        &system_program::ID,
+        &decoy_pool_holding,
+    );
+    let mut forged_close_remaining = close_remaining.clone();
+    forged_close_remaining[13] = AccountMeta::new_readonly(decoy_pool_holding, false);
     let market_before_surplus_route = svm.get_account(&env.slab).unwrap();
     let (_, terminal_group) = percolator_prog::state::read_market(
         &svm.get_account(&env.slab).unwrap().data,
@@ -57950,6 +57988,20 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
             &env.dao,
             &payer,
             8,
+            &forged_close,
+            &forged_close_remaining,
+        )
+        .is_err(),
+        "an empty pool-owned decoy cannot substitute for the canonical funded escrow",
+    );
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            9,
             &close,
             &close_remaining,
         )
@@ -57987,7 +58039,7 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         &env.multisig,
         &env.dao,
         &payer,
-        9,
+        10,
         &close,
         &close_remaining,
     )
