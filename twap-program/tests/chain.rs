@@ -49486,6 +49486,7 @@ enum OrganicRewardCleanup {
     None,
     BeforeCrystallize,
     PostEmissionLoss,
+    LateFinalizeAfterRecovery,
     LegacyPreIdPortfolioCleanup,
     OwnerReinitializeBeforeCrystallize,
     OwnerCloseAfterRecovery,
@@ -49509,6 +49510,9 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     let owner_reinitialize_before_crystallize =
         cleanup == OrganicRewardCleanup::OwnerReinitializeBeforeCrystallize;
     let legacy_pre_id_cleanup = cleanup == OrganicRewardCleanup::LegacyPreIdPortfolioCleanup;
+    let late_finalize_after_recovery =
+        cleanup == OrganicRewardCleanup::LateFinalizeAfterRecovery;
+    let recovery_after_crystallize = owner_close_after_recovery || late_finalize_after_recovery;
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -49542,7 +49546,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     // Real InitMarket (the percolator-test path): 5% margins so a leveraged long can be driven
     // underwater, and a FULL b-settlement chunk (public_b_chunk_atoms = MAX_VAULT_TVL) so one crank
     // realizes the whole marked loss into pnl (make_live_market's 100% margins + 1-atom chunks can't).
-    let market_slots = if owner_close_after_recovery { 2 } else { 1 };
+    let market_slots = if recovery_after_crystallize { 2 } else { 1 };
     let mlen = percolator_prog::state::market_account_len_for_capacity(market_slots).unwrap();
     svm.set_account(
         market,
@@ -49739,7 +49743,12 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     // ---- residual-distributor: sole trader cohort, or sole LP cohort for the rematerialization case ----
     let coin_auth = Keypair::new();
     let coin_mint = create_real_mint(&mut svm, &payer, &coin_auth.pubkey());
-    let rd_config = Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0;
+    let reward_epoch_id = 50_001u64;
+    let rd_config = if late_finalize_after_recovery {
+        rd_epoch_config_pda(&coin_auth.pubkey(), &coin_mint, reward_epoch_id)
+    } else {
+        Pubkey::find_program_address(&[b"rd_config", coin_mint.as_ref()], &rd_id()).0
+    };
     let dist_config = dist_config_pda_e2e(&coin_mint, &rd_config);
     let supply = 1_000_000u64;
     let rd_vault = Pubkey::new_unique();
@@ -49762,24 +49771,43 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         bh,
     ))
     .expect("fund coin vault");
-    let mut ri = vec![0u8];
-    ri.extend_from_slice(&supply.to_le_bytes());
-    ri.extend_from_slice(&500u64.to_le_bytes());
-    ri.extend_from_slice(&0u16.to_le_bytes());
-    ri.extend_from_slice(&0u16.to_le_bytes());
-    ri.extend_from_slice(
-        &(if public_rematerialize_lp { 10_000u16 } else { 0u16 }).to_le_bytes(),
-    ); // LP 100% for the rematerialization probe; otherwise trader gets the remainder.
-    ri.extend_from_slice(&100u64.to_le_bytes());
-    ri.extend_from_slice(Pubkey::default().as_ref());
-    ri.extend_from_slice(Pubkey::default().as_ref());
-    ri.extend_from_slice(market.as_ref());
-    ri.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
-    ri.extend_from_slice(&0u16.to_le_bytes()); // portfolio-flow claim fee disabled for exact trader-cohort assertion
-    svm.expire_blockhash();
-    let bh = svm.latest_blockhash();
-    svm.send_transaction(Transaction::new_signed_with_payer(
-        &[Instruction {
+    let rd_init = if late_finalize_after_recovery {
+        rd_epoch_init_ix(
+            &payer.pubkey(),
+            &coin_auth.pubkey(),
+            &coin_mint,
+            &perc_id(),
+            &sub_id(),
+            &rd_config,
+            &rd_vault,
+            reward_epoch_id,
+            100,
+            500,
+            supply,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            &[(market, Pubkey::default(), Pubkey::default())],
+        )
+    } else {
+        let mut ri = vec![0u8];
+        ri.extend_from_slice(&supply.to_le_bytes());
+        ri.extend_from_slice(&500u64.to_le_bytes());
+        ri.extend_from_slice(&0u16.to_le_bytes());
+        ri.extend_from_slice(&0u16.to_le_bytes());
+        ri.extend_from_slice(
+            &(if public_rematerialize_lp { 10_000u16 } else { 0u16 }).to_le_bytes(),
+        ); // LP 100% for the rematerialization probe; otherwise trader gets the remainder.
+        ri.extend_from_slice(&100u64.to_le_bytes());
+        ri.extend_from_slice(Pubkey::default().as_ref());
+        ri.extend_from_slice(Pubkey::default().as_ref());
+        ri.extend_from_slice(market.as_ref());
+        ri.extend_from_slice(&[0u8]); // extra market allow-list count (0 = single market)
+        ri.extend_from_slice(&0u16.to_le_bytes()); // portfolio-flow claim fee disabled for exact trader-cohort assertion
+        Instruction {
             program_id: rd_id(),
             accounts: vec![
                 AccountMeta::new(payer.pubkey(), true),
@@ -49793,7 +49821,12 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
                 AccountMeta::new_readonly(coin_auth.pubkey(), true),
             ],
             data: ri,
-        }],
+        }
+    };
+    svm.expire_blockhash();
+    let bh = svm.latest_blockhash();
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[rd_init],
         Some(&payer.pubkey()),
         &[&payer, &coin_auth],
         bh,
@@ -50156,7 +50189,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         crystallized > 0,
         "the settled loss organically bumped crystallized_loss (got {crystallized})"
     );
-    if !maintenance_fee_cleanup && !owner_close_after_recovery {
+    if !maintenance_fee_cleanup && !recovery_after_crystallize {
         send(
             &mut svm,
             &[&winner, &loser],
@@ -50243,11 +50276,18 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         .expect("crystallize");
     }
 
-    if owner_close_after_recovery {
+    if recovery_after_crystallize {
         // Spend the frozen trader-loss budget through the pinned program's ordinary public trade
         // path on an independent active asset. The loss-bearing asset's domain barrier remains
         // intact; the same counterparty supplies new margin on asset 1, so Percolator transfers the
         // residual credit and closes this trader's live reward cap.
+        if late_finalize_after_recovery {
+            svm.set_sysvar(&Clock {
+                slot: 600,
+                unix_timestamp: 600,
+                ..Clock::default()
+            });
+        }
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -50276,6 +50316,44 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             spent, crystallized,
             "the public recovery consumes the full frozen loss, so a live claim is capped to zero"
         );
+        if late_finalize_after_recovery {
+            let config_before = svm.get_account(&rd_config).unwrap();
+            let stake_before = svm.get_account(&t_stake).unwrap();
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            let late_crystallize = svm.send_transaction(Transaction::new_signed_with_payer(
+                &[crystallize_ix()],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ));
+            assert!(
+                late_crystallize.is_err(),
+                "a public crystallize cannot change the denominator in the first freeze-eligible slot"
+            );
+            assert_eq!(svm.get_account(&rd_config).unwrap(), config_before);
+            assert_eq!(svm.get_account(&t_stake).unwrap(), stake_before);
+
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                &[Instruction {
+                    program_id: rd_id(),
+                    accounts: vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new(rd_config, false),
+                        AccountMeta::new_readonly(coin_mint, false),
+                        AccountMeta::new(rd_vault, false),
+                    ],
+                    data: vec![4u8],
+                }],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .expect("permissionless freeze remains live at the exact cutoff");
+            return;
+        }
         if public_rematerialize_lp {
             let received = read_portfolio_residual_received(&svm, &winner_pf);
             assert_eq!(
@@ -51069,6 +51147,13 @@ fn e2e_reward_registration_rejects_public_maintenance_close_risk() {
 fn e2e_legacy_reward_end_excludes_post_period_real_trade_loss() {
     run_organic_pnl_loss_real_trade_feeds_reward_cohort(
         OrganicRewardCleanup::PostEmissionLoss,
+    );
+}
+
+#[test]
+fn e2e_late_public_trader_crystallize_cannot_race_freeze_after_real_recovery() {
+    run_organic_pnl_loss_real_trade_feeds_reward_cohort(
+        OrganicRewardCleanup::LateFinalizeAfterRecovery,
     );
 }
 

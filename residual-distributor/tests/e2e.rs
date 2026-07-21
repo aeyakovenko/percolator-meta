@@ -3688,7 +3688,7 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     let env = setup(&mut svm, &payer, supply); // no fee -> isolate the time-weight
 
     let r = 9_000u128; // IDENTICAL net residual for both stakers
-                       // EARLY: register at slot 100 (residual-empty), manufacture R only at slot 10_000 -> tenure 9_900, log2=13.
+                       // EARLY: register at slot 100 (residual-empty), manufacture R only at slot 1_900 -> tenure 1_800, log2=10.
     let early = Keypair::new();
     let early_pf = Pubkey::new_unique();
     set_slot(&mut svm, 100);
@@ -3711,10 +3711,10 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
         COHORT_TRADER,
     )
     .expect("reg early");
-    // LATE: register at slot 9_000 -> crystallize at 10_000 gives tenure 1_000, log2=9 (same R).
+    // LATE: register at slot 900 -> crystallize at 1_900 gives tenure 1_000, log2=9 (same R).
     let late = Keypair::new();
     let late_pf = Pubkey::new_unique();
-    set_slot(&mut svm, 9_000);
+    set_slot(&mut svm, 900);
     set_portfolio(
         &mut svm,
         &late_pf,
@@ -3736,7 +3736,7 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     .expect("reg late");
 
     // Both manufacture the SAME loss at the SAME slot, then crystallize together.
-    set_slot(&mut svm, 10_000);
+    set_slot(&mut svm, 1_900);
     set_portfolio(
         &mut svm,
         &early_pf,
@@ -3765,20 +3765,20 @@ fn time_weight_rewards_registration_tenure_not_residual_age_early_over_captures(
     claim(&mut svm, &payer, &env, &early, &early_ata, None).expect("early claim");
     claim(&mut svm, &payer, &env, &late, &late_ata, None).expect("late claim");
 
-    // points: early = 13*9_000 = 117_000, late = 9*9_000 = 81_000; denom = 198_000; cohort = 400_000.
+    // points: early = 10*9_000 = 90_000, late = 9*9_000 = 81_000; denom = 171_000; cohort = 400_000.
     let early_paid = token_amount(&svm, &early_ata);
     let late_paid = token_amount(&svm, &late_ata);
     assert_eq!(
         early_paid,
-        400_000u64 * 117_000 / 198_000,
-        "early registrant captures the log2(9_900)=13 multiplier"
+        400_000u64 * 90_000 / 171_000,
+        "early registrant captures the log2(1_800)=10 multiplier"
     );
     assert_eq!(
         late_paid,
-        400_000u64 * 81_000 / 198_000,
+        400_000u64 * 81_000 / 171_000,
         "late registrant only gets log2(1_000)=9 on the SAME residual"
     );
-    // The pin: SAME residual, different registration -> early over-captures (~59% vs ~41%). The weight rewards
+    // The pin: SAME residual, different registration -> early over-captures (~53% vs ~47%). The weight rewards
     // stake-tenure, not how long the loss was held; the bound is the cost to manufacture R, not the multiplier.
     assert!(
         early_paid > late_paid,
@@ -5722,7 +5722,7 @@ fn funding_payer_points_are_accumulator_delta_without_age_multiplier() {
     )
     .expect("register early funding payer");
 
-    set_slot(&mut svm, 9_000);
+    set_slot(&mut svm, 900);
     set_portfolio_funding(
         &mut svm,
         &late_pf,
@@ -5745,7 +5745,7 @@ fn funding_payer_points_are_accumulator_delta_without_age_multiplier() {
     )
     .expect("register late funding payer");
 
-    set_slot(&mut svm, 10_000);
+    set_slot(&mut svm, 1_000);
     set_portfolio_funding(
         &mut svm,
         &early_pf,
@@ -5850,8 +5850,8 @@ fn funding_payer_100_case_no_age_replay_and_claim_redirect_sweep() {
         let late_pf = Pubkey::new_unique();
         let receiver_pf = Pubkey::new_unique();
         let start_slot = 100 + case_idx as u64;
-        let late_slot = start_slot + 500 + ((case_idx as u64 * 13) % 3_000);
-        let final_slot = late_slot + 1 + ((case_idx as u64 * 29) % 6_000);
+        let late_slot = start_slot + 500 + ((case_idx as u64 * 13) % 500);
+        let final_slot = late_slot + 1 + ((case_idx as u64 * 29) % 600);
 
         let early_baseline_long = ((case_idx as u128 * 17) % 2_000) + 3;
         let early_baseline_short = ((case_idx as u128 * 19) % 2_000) + 5;
@@ -9116,6 +9116,217 @@ fn finalize_window_removes_recovered_trader_loss_without_admitting_fresh_loss() 
         h_got, 1_000_000,
         "stale recovered-loss points cannot lock an honest trader's cohort share"
     );
+}
+
+// PUBLIC REWARD LOF: the first freeze-eligible slot must be freeze-only. Otherwise a competing
+// trader can wait for another stake's loss to be spent after the published finalize window, remove
+// that stake from the frozen denominator with one permissionless crystallize, and immediately
+// freeze a 100% share for itself. Claim's live cap should leave the recovered half in the vault,
+// not redistribute it after the cutoff.
+#[test]
+fn finalize_cutoff_rejects_late_trader_redistribution_before_freeze() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup_trader_reward_epoch(&mut svm, &payer, 1_000_000);
+    set_slot(&mut svm, 100);
+
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    let victim_pf = Pubkey::new_unique();
+    let attacker_pf = Pubkey::new_unique();
+    for (owner, portfolio) in [(&victim, victim_pf), (&attacker, attacker_pf)] {
+        set_portfolio_full(
+            &mut svm,
+            &portfolio,
+            &env.stub_perc,
+            &env.market,
+            &owner.pubkey(),
+            0,
+            0,
+            0,
+        );
+        register(
+            &mut svm,
+            &payer,
+            &env,
+            owner,
+            &owner.pubkey(),
+            &portfolio,
+            COHORT_TRADER,
+        )
+        .expect("register trader");
+    }
+
+    set_slot(&mut svm, 1_124);
+    for (owner, portfolio) in [(&victim, victim_pf), (&attacker, attacker_pf)] {
+        set_portfolio_full(
+            &mut svm,
+            &portfolio,
+            &env.stub_perc,
+            &env.market,
+            &owner.pubkey(),
+            0,
+            6_000,
+            0,
+        );
+        crystallize(&mut svm, &payer, &env, owner, &portfolio)
+            .expect("crystallize equal in-period loss");
+    }
+
+    let victim_stake =
+        stake_pda_for_cohort(&env, &victim.pubkey(), &victim_pf, COHORT_TRADER);
+    let attacker_stake =
+        stake_pda_for_cohort(&env, &attacker.pubkey(), &attacker_pf, COHORT_TRADER);
+    let stake_points = |svm: &LiteSVM, stake: &Pubkey| {
+        u128::from_le_bytes(
+            svm.get_account(stake).unwrap().data[176..192]
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(
+        stake_points(&svm, &victim_stake),
+        stake_points(&svm, &attacker_stake),
+        "the attack starts from equal frozen-eligible shares"
+    );
+
+    let freeze_cutoff = env.emission_end + env.finalize_window;
+    set_slot(&mut svm, freeze_cutoff);
+    set_portfolio_full(
+        &mut svm,
+        &victim_pf,
+        &env.stub_perc,
+        &env.market,
+        &victim.pubkey(),
+        0,
+        6_000,
+        6_000,
+    );
+    let config_before = svm.get_account(&env.rd_config).unwrap();
+    let stake_before = svm.get_account(&victim_stake).unwrap();
+    assert!(
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &attacker,
+            &victim.pubkey(),
+            &victim_pf,
+        )
+        .is_err(),
+        "the first freeze-eligible slot cannot admit a denominator-changing crystallize"
+    );
+    assert_eq!(svm.get_account(&env.rd_config).unwrap(), config_before);
+    assert_eq!(svm.get_account(&victim_stake).unwrap(), stake_before);
+
+    freeze(&mut svm, &payer, &env).expect("freeze remains live at the exact cutoff");
+    let victim_ata = create_token_account(&mut svm, &payer, &env.coin_mint, &victim.pubkey());
+    let attacker_ata =
+        create_token_account(&mut svm, &payer, &env.coin_mint, &attacker.pubkey());
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &attacker,
+        &attacker_ata,
+        None,
+    )
+    .expect("attacker claims only its frozen half");
+    claim(
+        &mut svm,
+        &payer,
+        &env,
+        &victim,
+        &victim_ata,
+        None,
+    )
+    .expect("victim's recovered loss is live-capped");
+    assert_eq!(token_amount(&svm, &attacker_ata), 500_000);
+    assert_eq!(token_amount(&svm, &victim_ata), 0);
+    assert_eq!(
+        token_amount(&svm, &env.vault),
+        500_000,
+        "the capped share stays in the vault instead of being redistributed after cutoff"
+    );
+}
+
+#[test]
+fn legacy_finalize_cutoff_also_rejects_a_late_trader_refresh() {
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    let env = setup(&mut svm, &payer, 1_000_000);
+    let owner = Keypair::new();
+    let cranker = Keypair::new();
+    let portfolio = Pubkey::new_unique();
+
+    set_slot(&mut svm, 100);
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        0,
+        0,
+    );
+    register(
+        &mut svm,
+        &payer,
+        &env,
+        &owner,
+        &owner.pubkey(),
+        &portfolio,
+        COHORT_TRADER,
+    )
+    .expect("register legacy trader");
+    set_slot(&mut svm, 1_124);
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        6_000,
+        0,
+    );
+    crystallize(&mut svm, &payer, &env, &owner, &portfolio)
+        .expect("crystallize legacy points inside the window");
+
+    set_slot(&mut svm, env.emission_end + env.finalize_window);
+    set_portfolio_full(
+        &mut svm,
+        &portfolio,
+        &env.stub_perc,
+        &env.market,
+        &owner.pubkey(),
+        0,
+        6_000,
+        6_000,
+    );
+    let config_before = svm.get_account(&env.rd_config).unwrap();
+    let stake = stake_pda_for_cohort(&env, &owner.pubkey(), &portfolio, COHORT_TRADER);
+    let stake_before = svm.get_account(&stake).unwrap();
+    assert!(
+        crystallize_as(
+            &mut svm,
+            &payer,
+            &env,
+            &cranker,
+            &owner.pubkey(),
+            &portfolio,
+        )
+        .is_err(),
+        "predecessor configs share the same freeze-only cutoff"
+    );
+    assert_eq!(svm.get_account(&env.rd_config).unwrap(), config_before);
+    assert_eq!(svm.get_account(&stake).unwrap(), stake_before);
+    freeze(&mut svm, &payer, &env).expect("legacy freeze remains live at the cutoff");
 }
 
 #[test]

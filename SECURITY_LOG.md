@@ -2,6 +2,28 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - late trader crystallize raced freeze and redistributed fixed COIN (surface D, REAL LOF)
+
+The reward epoch's first freeze-eligible slot still admitted permissionless trader crystallization.
+An attacker could wait until another trader's previously crystallized loss was spent after the
+published finalize window, reduce that victim's points, and freeze immediately afterward. Because
+the reduction happened before the denominator snapshot, the remaining stakes received the victim's
+fixed cohort share instead of leaving the victim's live-capped amount in the reward vault. Legacy
+configs admitted the same race for every cohort until a cranker happened to freeze.
+
+The retained Residual SBF LiteSVM regression begins with two equal trader stakes, consumes one
+stake's loss at the exact cutoff, and proves the other owner remains limited to 50% rather than
+turning the denominator reduction into a 100% claim. A second mutation-sharp chain probe uses the
+pinned Percolator SBF to create an organic loss through real trades, crystallizes it, consumes it
+through the public recovery trade at the exact cutoff, and then attempts the late public refresh.
+Changing only the inclusive cutoff comparison makes that real-chain probe fail.
+
+FIX: `crystallize` rejects at or after immutable `emission_end + finalize_window` for both legacy
+and continuous reward configs, while permissionless `freeze` remains live at the exact same slot.
+No account, signer, authority, recipient, token route, collateral path, Subledger state, or admin
+surface was added. The vulnerable path could redistribute fixed COIN rewards but could not touch
+insurance, backing, or portfolio principal.
+
 ## Tick - live insurance could exit before stale portfolios realized loss (surface B/C)
 
 Pinned Percolator allowed an asset-local live insurance withdrawal once the market-level mark had
