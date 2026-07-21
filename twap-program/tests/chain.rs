@@ -7006,6 +7006,8 @@ fn poolless_twap_protocol_insurance_recovers_after_public_resolution() {
     .expect("unaffiliated stale resolver ends the pool-less market");
 
     let twap_transit = canonical_insurance_vault(&env.twap_authority, &env.collateral_mint);
+    // ADMIN LOF: after all user and Percolator balances clear, the slab must remain
+    // live until the segregated pool escrow takes its only canonical route to TWAP.
     let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
@@ -57821,4 +57823,176 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         0,
         "the successful exit retires the complete owner-bound claim"
     );
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("zero-principal pool returns protocol-insurance custody to TWAP");
+    let protocol_insurance = u64::try_from(read_asset0_insurance(&svm, &env.slab)).unwrap();
+    assert!(protocol_insurance > 0);
+    let twap_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &twap_transit,
+        &env.collateral_mint,
+        &twap_authority,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_resolved_protocol_insurance_ix(
+            &twap_cfg,
+            &twap_authority,
+            &env.pool,
+            &env.slab,
+            &twap_transit,
+            &governance_destination,
+            &env.perc_vault,
+            &vault_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("permissionless terminal recovery drains protocol insurance");
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), 0);
+    assert_eq!(token_amount(&svm, &governance_destination), protocol_insurance);
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker returns zero-value custody to the canonical pool");
+
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &controller, 1),
+    )
+    .expect("public transfer materializes the stateless controller PDA");
+    let controller_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    let close = build_controller_close_and_reclaim_with_custody_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &env.perc_vault,
+        &vault_authority,
+        &controller_transit,
+        &governance_destination,
+        &env.pool,
+        &system_program::ID,
+    );
+    let close_remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(controller, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(env.perc_vault, false),
+        AccountMeta::new(controller_transit, false),
+        AccountMeta::new(governance_destination, false),
+        AccountMeta::new(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let market_before_surplus_route = svm.get_account(&env.slab).unwrap();
+    let (_, terminal_group) = percolator_prog::state::read_market(
+        &svm.get_account(&env.slab).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            terminal_group.vault,
+            terminal_group.insurance,
+            terminal_group.c_tot,
+            terminal_group.materialized_portfolio_count,
+            token_amount(&svm, &env.perc_vault),
+        ),
+        (0, 0, 0, 0, 0),
+        "only the segregated pool escrow remains before terminal close",
+    );
+    assert!(
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            8,
+            &close,
+            &close_remaining,
+        )
+        .is_err(),
+        "governance cannot delete the slab while segregated protocol surplus still needs it",
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_surplus_route);
+    assert_eq!(token_amount(&svm, &pool_holding), protocol_surplus);
+    send(
+        &mut svm,
+        &[&payer],
+        subledger_route_cross_backing_earnings_ix(
+            &env.pool,
+            &env.squads_vault,
+            &env.slab,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            &perc_id(),
+            &twap_cfg,
+            &governance_destination,
+        ),
+    )
+    .expect("terminal close must not destroy the only route for segregated protocol surplus");
+    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
+        protocol_insurance.checked_add(protocol_surplus).unwrap(),
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        9,
+        &close,
+        &close_remaining,
+    )
+    .expect("routing the final protocol surplus unblocks terminal close");
+    assert!(svm
+        .get_account(&env.slab)
+        .map_or(true, |account| account.lamports == 0));
 }
