@@ -2399,6 +2399,113 @@ fn cross_backing_split_exit_cannot_shift_an_impaired_codepositors_protection() {
     );
 }
 
+#[test]
+fn bootstrap_unlock_cannot_expire_genesis_backing_before_provider_exit() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_cross_backing_genesis_pool();
+
+    let principal = 400_000_000u64;
+    let (depositor, depositor_ata) = new_depositor(&mut env, principal);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(&depositor, &depositor_ata, &pool_holding, principal)
+        .expect("fund Genesis insurance and backing");
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                // The deployed program authenticates this against Clock, so even
+                // the oracle cannot force the non-expiring sentinel to mature.
+                now_slot: u64::MAX,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the independent authenticated mark");
+
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let (long, long_portfolio, short, short_portfolio) =
+        open_public_pair(&mut env, 1_000_000_000_000, 100, 100_000_000);
+    let mut slot = 100;
+    advance_public_mark(&mut env, &oracle, observer_portfolio, &mut slot, 101, 4);
+    public_percolator_crank(&mut env, long_portfolio, slot, false)
+        .expect("settle the solvent winner and create its source lien");
+    public_percolator_crank(&mut env, short_portfolio, slot, false)
+        .expect("settle the solvent loser");
+    let winner = percolator_prog::state::read_portfolio(
+        &env.svm.get_account(&long_portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(winner.pnl.get() > 0);
+    assert!(
+        winner
+            .source_domains
+            .into_iter()
+            .any(|source| source.source_claim_bound_num.get() != 0),
+        "the live winner has a genuine claim against Genesis backing",
+    );
+
+    assert!(
+        env.cross_backing_withdraw(
+            &depositor,
+            &depositor_ata,
+            &pool_holding,
+            principal,
+        )
+        .is_err(),
+        "live market exposure prevents the provider from escaping before unlock",
+    );
+    assert_eq!(env.pool_outstanding(), principal);
+
+    env.warp_slot(env.bootstrap_end_slot());
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve at the configured Genesis unlock boundary");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&observer, observer_portfolio),
+            (&long, long_portfolio),
+            (&short, short_portfolio),
+        ],
+    );
+    env.cross_backing_withdraw(
+        &depositor,
+        &depositor_ata,
+        &pool_holding,
+        principal,
+    )
+    .expect("the provider exits after market risk clears");
+
+    assert_eq!(env.token_amount(&depositor_ata), principal);
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
+    assert_eq!(env.token_amount(&pool_holding), 0);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
