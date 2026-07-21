@@ -115,6 +115,37 @@ fn insurance_pool_pda_with_schedule(
     .0
 }
 
+fn cross_backing_pool_pda_with_schedule(
+    mint: &Pubkey,
+    coin_mint: &Pubkey,
+    slab: &Pubkey,
+    policy: u8,
+    deposit_window_slots: u64,
+    deposit_start_slot: u64,
+    bootstrap_delay_slots: u64,
+) -> Pubkey {
+    let policy_seed = [policy];
+    let domain_seed = [DOMAIN_INSURANCE];
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            mint.as_ref(),
+            &ASSET_ID.to_le_bytes(),
+            slab.as_ref(),
+            perc_id().as_ref(),
+            coin_mint.as_ref(),
+            &policy_seed,
+            &domain_seed,
+            &deposit_window_slots.to_le_bytes(),
+            &deposit_start_slot.to_le_bytes(),
+            &bootstrap_delay_slots.to_le_bytes(),
+            b"cross-backing",
+        ],
+        &sub_id(),
+    )
+    .0
+}
+
 fn legacy_master_insurance_pool_pda(
     mint: &Pubkey,
     slab: &Pubkey,
@@ -130,6 +161,18 @@ fn legacy_master_insurance_pool_pda(
         ],
         &sub_id(),
     )
+}
+
+fn cross_backing_ledger_pda(pool: &Pubkey, domain: u16) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"subledger_backing_ledger",
+            pool.as_ref(),
+            &domain.to_le_bytes(),
+        ],
+        &sub_id(),
+    )
+    .0
 }
 
 struct Env {
@@ -154,6 +197,16 @@ struct Env {
 impl Env {
     fn new() -> Self {
         Self::new_for_policy(POLICY_PRINCIPAL)
+    }
+
+    fn new_cross_backing() -> Self {
+        Self::new_for_policy_with_bootstrap_schedule_and_cross_backing(
+            POLICY_PRINCIPAL,
+            DEFAULT_GENESIS_DEPOSIT_WINDOW_SLOTS,
+            DEFAULT_GENESIS_DEPOSIT_START_SLOT,
+            DEFAULT_GENESIS_BOOTSTRAP_DELAY_SLOTS,
+            true,
+        )
     }
 
     fn new_for_policy(pool_policy: u8) -> Self {
@@ -188,6 +241,22 @@ impl Env {
         bootstrap_start_slot: u64,
         bootstrap_delay_slots: u64,
     ) -> Self {
+        Self::new_for_policy_with_bootstrap_schedule_and_cross_backing(
+            pool_policy,
+            deposit_window_slots,
+            bootstrap_start_slot,
+            bootstrap_delay_slots,
+            false,
+        )
+    }
+
+    fn new_for_policy_with_bootstrap_schedule_and_cross_backing(
+        pool_policy: u8,
+        deposit_window_slots: u64,
+        bootstrap_start_slot: u64,
+        bootstrap_delay_slots: u64,
+        cross_backing: bool,
+    ) -> Self {
         let mut svm = LiteSVM::new().with_compute_budget(ComputeBudget {
             compute_unit_limit: 1_400_000,
             heap_size: 256 * 1024,
@@ -213,15 +282,27 @@ impl Env {
         // bound to (mint, asset_id, market_slab, percolator_program, coin_mint,
         // policy, domain, deposit_window_slots, bootstrap_start_slot,
         // bootstrap_delay_slots).
-        let pool = insurance_pool_pda_with_schedule(
-            &mint,
-            &coin_mint,
-            &slab,
-            pool_policy,
-            deposit_window_slots,
-            bootstrap_start_slot,
-            bootstrap_delay_slots,
-        );
+        let pool = if cross_backing {
+            cross_backing_pool_pda_with_schedule(
+                &mint,
+                &coin_mint,
+                &slab,
+                pool_policy,
+                deposit_window_slots,
+                bootstrap_start_slot,
+                bootstrap_delay_slots,
+            )
+        } else {
+            insurance_pool_pda_with_schedule(
+                &mint,
+                &coin_mint,
+                &slab,
+                pool_policy,
+                deposit_window_slots,
+                bootstrap_start_slot,
+                bootstrap_delay_slots,
+            )
+        };
 
         // Build the real Live market-0 slab with marketauth = pool PDA and the
         // deposits-only principal-recovery insurance policy.
@@ -382,6 +463,99 @@ impl Env {
             data,
         };
         self.send(&[ix], &[]).expect("init insurance pool");
+    }
+
+    fn init_cross_backing_genesis_pool(&mut self) {
+        let mut data = vec![14u8]; // IX_INIT_CROSS_BACKING_GENESIS_POOL
+        data.extend_from_slice(&ASSET_ID.to_le_bytes());
+        data.push(POLICY_PRINCIPAL);
+        data.extend_from_slice(&self.deposit_window_slots.to_le_bytes());
+        data.extend_from_slice(&self.bootstrap_start_slot.to_le_bytes());
+        data.extend_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
+        let ix = Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(self.payer.pubkey(), true),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new_readonly(self.perc_vault, false),
+                AccountMeta::new_readonly(self.slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(self.gv_config_pda(), false),
+                AccountMeta::new_readonly(self.coin_mint, false),
+                AccountMeta::new(cross_backing_ledger_pda(&self.pool, 0), false),
+                AccountMeta::new(cross_backing_ledger_pda(&self.pool, 1), false),
+            ],
+            data,
+        };
+        self.send(&[ix], &[])
+            .expect("init cross-backing genesis pool");
+    }
+
+    fn cross_backing_deposit(
+        &mut self,
+        owner: &Keypair,
+        owner_ata: &Pubkey,
+        holding: &Pubkey,
+        amount: u64,
+    ) -> Result<(), String> {
+        let mut data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+        data.extend_from_slice(&amount.to_le_bytes());
+        let ix = Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new(self.position_pda(&owner.pubkey()), false),
+                AccountMeta::new(*owner_ata, false),
+                AccountMeta::new(*holding, false),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(self.perc_vault, false),
+                AccountMeta::new(cross_backing_ledger_pda(&self.pool, 0), false),
+                AccountMeta::new(cross_backing_ledger_pda(&self.pool, 1), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data,
+        };
+        self.send(&[ix], &[owner])
+    }
+
+    fn cross_backing_withdraw(
+        &mut self,
+        owner: &Keypair,
+        owner_ata: &Pubkey,
+        holding: &Pubkey,
+        amount: u64,
+    ) -> Result<(), String> {
+        let (expected_principal, expected_start_slot, _) = self.read_position(&owner.pubkey());
+        let expected_action_nonce = self.position_action_nonce(&owner.pubkey());
+        let mut data = vec![5u8]; // IX_INSURANCE_WITHDRAW
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&expected_principal.to_le_bytes());
+        data.extend_from_slice(&expected_start_slot.to_le_bytes());
+        data.extend_from_slice(&expected_action_nonce.to_le_bytes());
+        let ix = Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new(self.position_pda(&owner.pubkey()), false),
+                AccountMeta::new(*owner_ata, false),
+                AccountMeta::new(*holding, false),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(self.perc_vault, false),
+                AccountMeta::new_readonly(self.vault_authority, false),
+                AccountMeta::new(cross_backing_ledger_pda(&self.pool, 0), false),
+                AccountMeta::new(cross_backing_ledger_pda(&self.pool, 1), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data,
+        };
+        self.send(&[ix], &[owner])
     }
 
     fn insurance_deposit(
@@ -1149,6 +1323,98 @@ fn create_percolator_portfolio(env: &mut Env, owner: &Keypair, capital: u64) -> 
     portfolio
 }
 
+fn close_resolved_portfolios(env: &mut Env, portfolios: &[(&Keypair, Pubkey)]) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let payer = clone_kp(&env.payer);
+    let payouts: Vec<_> = portfolios
+        .iter()
+        .map(|(owner, portfolio)| {
+            let destination =
+                create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
+            (*owner, *portfolio, destination)
+        })
+        .collect();
+
+    // A winner's haircut rate is terminal only after every winner has converted its
+    // unreceipted bound into a receipt. Round-robin the public lifecycle so one early
+    // winner cannot block all later winners from making that market-wide progress.
+    for _ in 0..512 {
+        let mut open = 0usize;
+        for (owner, portfolio, destination) in &payouts {
+            if env
+                .svm
+                .get_account(portfolio)
+                .map_or(true, |account| account.lamports == 0)
+            {
+                continue;
+            }
+            open += 1;
+            let _ = env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(*portfolio, false),
+                        AccountMeta::new(*destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(env.vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    data: PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    }
+                    .encode(),
+                }],
+                &[owner],
+            );
+            let _ = env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(*portfolio, false),
+                        AccountMeta::new(*destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(env.vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    data: PIx::ClaimResolvedPayoutTopup.encode(),
+                }],
+                &[owner],
+            );
+            let _ = env.send(
+                &[Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(*portfolio, false),
+                    ],
+                    data: PIx::ClosePortfolio.encode(),
+                }],
+                &[owner],
+            );
+        }
+        if open == 0 {
+            return;
+        }
+    }
+
+    let open: Vec<_> = payouts
+        .iter()
+        .filter_map(|(owner, portfolio, _)| {
+            env.svm
+                .get_account(portfolio)
+                .filter(|account| account.lamports != 0)
+                .map(|_| (owner.pubkey(), *portfolio))
+        })
+        .collect();
+    panic!("resolved public portfolios remain withdrawal gates: {open:?}");
+}
+
 fn public_percolator_crank(
     env: &mut Env,
     portfolio: Pubkey,
@@ -1808,6 +2074,129 @@ fn deposit_into_real_percolator_insurance_records_position() {
     assert_eq!(start_slot, 100, "start_slot = clock at deposit");
     assert!(!withdrawn);
     assert_eq!(env.pool_outstanding(), amount);
+}
+
+#[test]
+fn legacy_genesis_pool_cannot_squat_cross_backing_genesis_address() {
+    let mut env = Env::new();
+    env.init_insurance_pool();
+
+    let cross_pool = cross_backing_pool_pda_with_schedule(
+        &env.mint,
+        &env.coin_mint,
+        &env.slab,
+        POLICY_PRINCIPAL,
+        env.deposit_window_slots,
+        env.bootstrap_start_slot,
+        env.bootstrap_delay_slots,
+    );
+    assert_ne!(env.pool, cross_pool);
+    let cross_vote_authority = gv_config_pda_for_schedule(
+        &env.coin_mint,
+        &cross_pool,
+        env.bootstrap_delay_slots,
+        env.bootstrap_start_slot,
+    );
+    let mut data = vec![14u8]; // IX_INIT_CROSS_BACKING_GENESIS_POOL
+    data.extend_from_slice(&ASSET_ID.to_le_bytes());
+    data.push(POLICY_PRINCIPAL);
+    data.extend_from_slice(&env.deposit_window_slots.to_le_bytes());
+    data.extend_from_slice(&env.bootstrap_start_slot.to_le_bytes());
+    data.extend_from_slice(&env.bootstrap_delay_slots.to_le_bytes());
+    let ix = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(cross_pool, false),
+            AccountMeta::new_readonly(env.perc_vault, false),
+            AccountMeta::new_readonly(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(cross_vote_authority, false),
+            AccountMeta::new_readonly(env.coin_mint, false),
+            AccountMeta::new(cross_backing_ledger_pda(&cross_pool, 0), false),
+            AccountMeta::new(cross_backing_ledger_pda(&cross_pool, 1), false),
+        ],
+        data,
+    };
+    env.send(&[ix], &[])
+        .expect("cross-backed genesis init remains available after legacy init");
+
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 272);
+    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 273);
+}
+
+#[test]
+fn genesis_cross_backing_splits_globally_and_returns_only_owner_principal() {
+    let mut env = Env::new_cross_backing();
+    env.init_cross_backing_genesis_pool();
+
+    let (alice, alice_ata) = new_depositor(&mut env, 1);
+    let (bob, bob_ata) = new_depositor(&mut env, 1);
+    let pool = env.pool;
+    let alice_holding = create_holding(&mut env, &pool);
+    let bob_holding = create_holding(&mut env, &pool);
+
+    env.cross_backing_deposit(&alice, &alice_ata, &alice_holding, 1)
+        .expect("alice deposits one base unit");
+    env.cross_backing_deposit(&bob, &bob_ata, &bob_holding, 1)
+        .expect("bob deposits one base unit");
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let insurance = percolator_accounting::read_asset_insurance_remaining(&market.data, 0)
+        .expect("asset-0 insurance");
+    let backing = percolator_accounting::read_asset_backing_balances(&market.data, 0)
+        .expect("asset-0 backing");
+    assert_eq!(insurance, 1, "half of aggregate genesis capital is insurance");
+    assert_eq!(
+        backing
+            .iter()
+            .map(|domain| domain.principal_atoms)
+            .sum::<u128>(),
+        1,
+        "half of aggregate genesis capital is market-risk backing"
+    );
+    assert_eq!(env.pool_outstanding(), 2, "each base unit remains one vote");
+    assert_eq!(env.token_amount(&env.perc_vault), 2, "all capital stays in Percolator custody");
+
+    let mut ledger_principal = 0u128;
+    for domain in 0..2u16 {
+        let ledger_account = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .expect("canonical backing ledger");
+        assert_eq!(ledger_account.owner, perc_id());
+        if percolator_prog::state::is_initialized(&ledger_account.data) {
+            let ledger = percolator_prog::state::read_backing_domain_ledger(&ledger_account.data)
+                .expect("initialized backing ledger");
+            assert_eq!(ledger.market_group, env.slab.to_bytes());
+            assert_eq!(ledger.authority, env.pool.to_bytes());
+            assert_eq!(ledger.domain, domain);
+            ledger_principal += ledger.total_principal_atoms;
+        } else {
+            assert!(ledger_account.data.iter().all(|byte| *byte == 0));
+        }
+    }
+    assert_eq!(ledger_principal, 1);
+
+    env.cross_backing_withdraw(&alice, &alice_ata, &alice_holding, 1)
+        .expect("alice recovers only her base unit");
+    env.cross_backing_withdraw(&bob, &bob_ata, &bob_holding, 1)
+        .expect("bob recovers only his base unit");
+    assert_eq!(env.token_amount(&alice_ata), 1);
+    assert_eq!(env.token_amount(&bob_ata), 1);
+    assert_eq!(env.pool_outstanding(), 0);
+    let market = env.svm.get_account(&env.slab).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(&market.data, 0).unwrap(),
+        0
+    );
+    assert!(percolator_accounting::read_asset_backing_balances(&market.data, 0)
+        .unwrap()
+        .iter()
+        .all(|domain| domain.principal_atoms == 0));
+    assert_eq!(env.token_amount(&env.perc_vault), 0);
 }
 
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
@@ -3218,54 +3607,11 @@ fn stale_generation_partial_exit_cannot_replay_as_a_historical_position() {
     )
     .expect("the authenticated authority resolves the completed public loss epoch");
     loss_portfolios.push((observer, observer_portfolio));
-    for (owner, portfolio) in loss_portfolios {
-        let payer = clone_kp(&env.payer);
-        let destination = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
-        let mut last_resolved = None;
-        let mut last_close = None;
-        for _ in 0..512 {
-            last_resolved = Some(env.send(
-                &[Instruction {
-                    program_id: perc_id(),
-                    accounts: vec![
-                        AccountMeta::new_readonly(owner.pubkey(), true),
-                        AccountMeta::new(env.slab, false),
-                        AccountMeta::new(portfolio, false),
-                        AccountMeta::new(destination, false),
-                        AccountMeta::new(env.perc_vault, false),
-                        AccountMeta::new_readonly(env.vault_authority, false),
-                        AccountMeta::new_readonly(spl_token::ID, false),
-                    ],
-                    data: PIx::CloseResolved {
-                        fee_rate_per_slot: 0,
-                    }
-                    .encode(),
-                }],
-                &[&owner],
-            ));
-            last_close = Some(env.send(
-                &[Instruction {
-                    program_id: perc_id(),
-                    accounts: vec![
-                        AccountMeta::new_readonly(owner.pubkey(), true),
-                        AccountMeta::new(env.slab, false),
-                        AccountMeta::new(portfolio, false),
-                    ],
-                    data: PIx::ClosePortfolio.encode(),
-                }],
-                &[&owner],
-            ));
-            if last_close.as_ref().is_some_and(Result::is_ok) {
-                break;
-            }
-        }
-        assert!(
-            env.svm
-                .get_account(&portfolio)
-                .map_or(true, |account| account.lamports == 0),
-            "resolved public portfolio must not remain a withdrawal gate: close_resolved={last_resolved:?}, close={last_close:?}",
-        );
-    }
+    let loss_portfolio_refs: Vec<_> = loss_portfolios
+        .iter()
+        .map(|(owner, portfolio)| (owner, *portfolio))
+        .collect();
+    close_resolved_portfolios(&mut env, &loss_portfolio_refs);
     assert_ne!(
         env.position_share_generation(&impaired_owner.pubkey()),
         env.pool_share_generation(),
@@ -3791,49 +4137,10 @@ fn impaired_exit_order_cannot_transfer_rounding_value_to_the_last_depositor() {
         &[&oracle],
     )
     .expect("resolve the publicly impaired market");
-    for (owner, portfolio) in [(&long, long_portfolio), (&short, short_portfolio)] {
-        let payer = clone_kp(&env.payer);
-        let destination = create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey());
-        let mut last_resolved = None;
-        let mut last_close = None;
-        for _ in 0..512 {
-            last_resolved = Some(env.send(
-                &[Instruction {
-                    program_id: perc_id(),
-                    accounts: vec![
-                        AccountMeta::new_readonly(owner.pubkey(), true),
-                        AccountMeta::new(env.slab, false),
-                        AccountMeta::new(portfolio, false),
-                        AccountMeta::new(destination, false),
-                        AccountMeta::new(env.perc_vault, false),
-                        AccountMeta::new_readonly(env.vault_authority, false),
-                        AccountMeta::new_readonly(spl_token::ID, false),
-                    ],
-                    data: PIx::CloseResolved { fee_rate_per_slot: 0 }.encode(),
-                }],
-                &[owner],
-            ));
-            last_close = Some(env.send(
-                &[Instruction {
-                    program_id: perc_id(),
-                    accounts: vec![
-                        AccountMeta::new_readonly(owner.pubkey(), true),
-                        AccountMeta::new(env.slab, false),
-                        AccountMeta::new(portfolio, false),
-                    ],
-                    data: PIx::ClosePortfolio.encode(),
-                }],
-                &[owner],
-            ));
-            if last_close.as_ref().is_some_and(Result::is_ok) {
-                break;
-            }
-        }
-        assert!(
-            env.svm.get_account(&portfolio).map_or(true, |account| account.lamports == 0),
-            "resolved public portfolio must not remain a withdrawal gate: close_resolved={last_resolved:?}, close={last_close:?}",
-        );
-    }
+    close_resolved_portfolios(
+        &mut env,
+        &[(&long, long_portfolio), (&short, short_portfolio)],
+    );
 
     // The victim exits first. Their fractional claim rounds down, but the aggregate rounding atom
     // must become protocol reserve rather than increasing the attacker's later exchange rate.

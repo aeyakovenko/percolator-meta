@@ -138,6 +138,19 @@ fn modeled_subledger_position(
     data
 }
 
+fn capital_crystallize_data(svm: &LiteSVM, position: &Pubkey) -> Vec<u8> {
+    let position = svm.get_account(position).expect("capital position");
+    let mut data = vec![2u8];
+    for offset in [
+        residual_distributor::SUB_POS_PRINCIPAL,
+        residual_distributor::SUB_POS_START_SLOT,
+        residual_distributor::SUB_POS_ACTION_NONCE,
+    ] {
+        data.extend_from_slice(&position.data[offset..offset + 8]);
+    }
+    data
+}
+
 #[test]
 fn rational_miner_farms_the_deterministic_distributor_across_uncontrolled_markets() {
     let mut svm = LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -772,9 +785,10 @@ fn full_economy_100_traders_10_assets_distribution_report() {
     for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
         for (o, pos, _a) in parts {
             let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, cohort);
+            let crystallize_data = capital_crystallize_data(&svm, pos);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
-            ], data: vec![2u8] }], &[o]).expect("crystallize capital");
+            ], data: crystallize_data }], &[o]).expect("crystallize capital");
         }
     }
 
@@ -1091,9 +1105,10 @@ fn cross_margin_100_traders_10_assets_distribution_report() {
     for (cohort, parts) in [(0u8, &ins_parts), (1u8, &back_parts)] {
         for (o, pos, _a) in parts {
             let stake = rd_stake_pda(&rd_config, &o.pubkey(), pos, cohort);
+            let crystallize_data = capital_crystallize_data(&svm, pos);
             tx(&mut svm, &[Instruction { program_id: rd_id(), accounts: vec![
                 AccountMeta::new(o.pubkey(), true), AccountMeta::new(rd_config, false), AccountMeta::new(stake, false), AccountMeta::new_readonly(*pos, false),
-            ], data: vec![2u8] }], &[o]).expect("crystallize capital");
+            ], data: crystallize_data }], &[o]).expect("crystallize capital");
         }
     }
     svm.set_sysvar(&Clock { slot: 2_101, unix_timestamp: 2_101, ..Default::default() });

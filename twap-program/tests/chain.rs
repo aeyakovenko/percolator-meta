@@ -7730,9 +7730,52 @@ fn sub_pool_pda(
     )
     .0
 }
+
+fn sub_cross_backing_pool_pda(
+    collateral_mint: &Pubkey,
+    asset_id: u64,
+    slab: &Pubkey,
+    perc: &Pubkey,
+    coin_mint: &Pubkey,
+    policy: u8,
+    domain: u8,
+) -> Pubkey {
+    let policy = [policy];
+    let domain = [domain];
+    Pubkey::find_program_address(
+        &[
+            b"subledger_pool",
+            collateral_mint.as_ref(),
+            &asset_id.to_le_bytes(),
+            slab.as_ref(),
+            perc.as_ref(),
+            coin_mint.as_ref(),
+            &policy,
+            &domain,
+            &TEST_GENESIS_DEPOSIT_WINDOW_SLOTS.to_le_bytes(),
+            &TEST_BOOTSTRAP_START_SLOT.to_le_bytes(),
+            &TEST_BOOTSTRAP_DELAY_SLOTS.to_le_bytes(),
+            b"cross-backing",
+        ],
+        &sub_id(),
+    )
+    .0
+}
 fn sub_position_pda(pool: &Pubkey, owner: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
         &[b"subledger_position", pool.as_ref(), owner.as_ref()],
+        &sub_id(),
+    )
+    .0
+}
+
+fn sub_cross_backing_ledger_pda(pool: &Pubkey, domain: u16) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"subledger_backing_ledger",
+            pool.as_ref(),
+            &domain.to_le_bytes(),
+        ],
         &sub_id(),
     )
     .0
@@ -8272,6 +8315,41 @@ fn subledger_return_resolved_asset0_backing_ix(
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
         data: vec![9u8], // IX_RETURN_RESOLVED_ASSET0_BACKING
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn subledger_route_cross_backing_earnings_ix(
+    pool: &Pubkey,
+    governance: &Pubkey,
+    market: &Pubkey,
+    pool_transit: &Pubkey,
+    vault: &Pubkey,
+    vault_authority: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+    percolator_program: &Pubkey,
+    twap_config: &Pubkey,
+    governance_destination: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(*pool, false),
+            AccountMeta::new_readonly(*twap_config, false),
+            AccountMeta::new_readonly(*governance, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*pool_transit, false),
+            AccountMeta::new(*governance_destination, false),
+            AccountMeta::new(*vault, false),
+            AccountMeta::new_readonly(*vault_authority, false),
+            AccountMeta::new(*long_backing_ledger, false),
+            AccountMeta::new(*short_backing_ledger, false),
+            AccountMeta::new_readonly(*percolator_program, false),
+            AccountMeta::new_readonly(twap_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![15u8], // IX_ROUTE_CROSS_BACKING_EARNINGS
     }
 }
 
@@ -21824,6 +21902,8 @@ struct GenesisEnv {
     collateral_mint: Pubkey,
     coin_mint: Pubkey,
     pool: Pubkey,
+    long_backing_ledger: Pubkey,
+    short_backing_ledger: Pubkey,
     gv_config: Pubkey,
     dist_config: Pubkey,
     dist_vault: Pubkey,
@@ -21831,13 +21911,26 @@ struct GenesisEnv {
     mint_auth: Keypair,
 }
 fn setup_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
-    setup_genesis_with_policy(svm, payer, POLICY_PRINCIPAL)
+    setup_genesis_with_policy_and_backing(svm, payer, POLICY_PRINCIPAL, false)
+}
+
+fn setup_cross_backing_genesis(svm: &mut LiteSVM, payer: &Keypair) -> GenesisEnv {
+    setup_genesis_with_policy_and_backing(svm, payer, POLICY_PRINCIPAL, true)
 }
 
 fn setup_genesis_with_policy(
     svm: &mut LiteSVM,
     payer: &Keypair,
     pool_policy: u8,
+) -> GenesisEnv {
+    setup_genesis_with_policy_and_backing(svm, payer, pool_policy, false)
+}
+
+fn setup_genesis_with_policy_and_backing(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    pool_policy: u8,
+    cross_backing: bool,
 ) -> GenesisEnv {
     let squads = squads_id();
     let treasury = install_squads(svm, &squads, &payer.pubkey());
@@ -21891,34 +21984,55 @@ fn setup_genesis_with_policy(
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    let pool = sub_pool_pda(
-        &collateral_mint,
-        0,
-        &slab,
-        &perc_id(),
-        &coin_mint,
-        pool_policy,
-        DOMAIN_INSURANCE,
-    );
+    let pool = if cross_backing {
+        sub_cross_backing_pool_pda(
+            &collateral_mint,
+            0,
+            &slab,
+            &perc_id(),
+            &coin_mint,
+            pool_policy,
+            DOMAIN_INSURANCE,
+        )
+    } else {
+        sub_pool_pda(
+            &collateral_mint,
+            0,
+            &slab,
+            &perc_id(),
+            &coin_mint,
+            pool_policy,
+            DOMAIN_INSURANCE,
+        )
+    };
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
-    let mut dp = vec![3u8];
+    let long_backing_ledger = sub_cross_backing_ledger_pda(&pool, 0);
+    let short_backing_ledger = sub_cross_backing_ledger_pda(&pool, 1);
+    let mut dp = vec![if cross_backing { 14u8 } else { 3u8 }];
     dp.extend_from_slice(&0u64.to_le_bytes());
     dp.push(pool_policy);
     append_test_genesis_schedule(&mut dp);
+    let mut init_accounts = vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new_readonly(collateral_mint, false),
+        AccountMeta::new(pool, false),
+        AccountMeta::new_readonly(perc_vault, false),
+        AccountMeta::new_readonly(slab, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(gv_config, false),
+        AccountMeta::new_readonly(coin_mint, false),
+    ];
+    if cross_backing {
+        init_accounts.extend_from_slice(&[
+            AccountMeta::new(long_backing_ledger, false),
+            AccountMeta::new(short_backing_ledger, false),
+        ]);
+    }
     let init_pool = Instruction {
         program_id: sub_id(),
-        accounts: vec![
-            AccountMeta::new(payer.pubkey(), true),
-            AccountMeta::new_readonly(collateral_mint, false),
-            AccountMeta::new(pool, false),
-            AccountMeta::new_readonly(perc_vault, false),
-            AccountMeta::new_readonly(slab, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(system_program::ID, false),
-            AccountMeta::new_readonly(gv_config, false),
-            AccountMeta::new_readonly(coin_mint, false),
-        ],
+        accounts: init_accounts,
         data: dp,
     };
     let bh = svm.latest_blockhash();
@@ -22031,6 +22145,8 @@ fn setup_genesis_with_policy(
         collateral_mint,
         coin_mint,
         pool,
+        long_backing_ledger,
+        short_backing_ledger,
         gv_config,
         dist_config,
         dist_vault,
@@ -30732,7 +30848,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
 
-    let pool = sub_pool_pda(
+    let pool = sub_cross_backing_pool_pda(
         &collateral_mint,
         0,
         &slab,
@@ -30741,11 +30857,14 @@ fn e2e_full_genesis_to_buy_burn() {
         POLICY_PRINCIPAL,
         DOMAIN_INSURANCE,
     );
+    let long_genesis_backing_ledger = sub_cross_backing_ledger_pda(&pool, 0);
+    let short_genesis_backing_ledger = sub_cross_backing_ledger_pda(&pool, 1);
     let gv_config = gv_config_pda_e2e(&coin_mint, &pool);
     let dist_config = dist_config_pda_e2e(&coin_mint, &gv_config);
 
-    // subledger insurance pool (vote_authority = gv config PDA, per finding R).
-    let mut d = vec![3u8];
+    // Owner-bound genesis pool: one vote per base unit and a pool-wide 50/50
+    // insurance/backing split against the real Percolator market.
+    let mut d = vec![14u8];
     d.extend_from_slice(&0u64.to_le_bytes());
     d.push(0); // POLICY_PRINCIPAL (genesis risk capital exits at nominal principal when healthy)
     append_test_genesis_schedule(&mut d);
@@ -30761,6 +30880,8 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new_readonly(system_program::ID, false),
             AccountMeta::new_readonly(gv_config, false),
             AccountMeta::new_readonly(coin_mint, false),
+            AccountMeta::new(long_genesis_backing_ledger, false),
+            AccountMeta::new(short_genesis_backing_ledger, false),
         ],
         data: d,
     };
@@ -30865,6 +30986,8 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new(holding, false),
             AccountMeta::new(slab, false),
             AccountMeta::new(perc_vault, false),
+            AccountMeta::new(long_genesis_backing_ledger, false),
+            AccountMeta::new(short_genesis_backing_ledger, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(system_program::ID, false),
@@ -30883,7 +31006,28 @@ fn e2e_full_genesis_to_buy_burn() {
     assert_eq!(
         token_amount(&svm, &perc_vault),
         surplus + principal,
-        "insurance = surplus + principal"
+        "all genesis capital stays in the canonical Percolator vault"
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        u128::from(surplus + principal / 2),
+        "exactly half the genesis principal is insurance",
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>(),
+        u128::from(principal / 2),
+        "exactly half the genesis principal is cross backing",
     );
 
     // --- Distribution setup: fund + freeze a fixed-supply COIN ---
@@ -31389,9 +31533,11 @@ fn e2e_full_genesis_to_buy_burn() {
     )
     .expect("rotate operator to twap");
 
-    // DAO sets the surplus floor = the reserved depositor principal (finding O fix). Until
-    // this, the twap's reserved_floor is u128::MAX and pull_surplus pulls nothing.
-    let floor_msg = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    // Cross backing protects half the principal outside TWAP custody. The imported
+    // insurance floor therefore protects the complementary half, not the full bond.
+    let insurance_floor = principal / 2;
+    let floor_msg =
+        build_set_reserved_floor_message(&squads_vault, &twap_cfg, insurance_floor as u128);
     let floor_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -31407,7 +31553,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &floor_msg,
         &floor_remaining,
     )
-    .expect("set surplus floor = reserved principal");
+    .expect("confirm the imported genesis insurance floor");
 
     // Keep the real market actionable across the 45-day warp. Oracle pushes are
     // externally cranked through the same timelocked Squads vault used in production.
@@ -31905,8 +32051,21 @@ fn e2e_full_genesis_to_buy_burn() {
     );
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
+        (insurance_floor + 100_000) as u128,
+        "the retained insurance surplus ratchets above the insurance half"
+    );
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg)
+            + percolator_accounting::read_asset_backing_balances(
+                &svm.get_account(&slab).unwrap().data,
+                0,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|balance| balance.protected_principal_atoms().unwrap())
+            .sum::<u128>(),
         (principal + 100_000) as u128,
-        "the retained surplus ratchets above depositor principal"
+        "insurance and backing retain the full genesis principal plus surplus"
     );
 
     send(
@@ -32114,8 +32273,8 @@ fn e2e_full_genesis_to_buy_burn() {
     );
 
     // Complete the advertised lifecycle: return custody to the canonical pool, retract the sealed
-    // ballot, and recover the genesis deposit. Insurance is still healthy (1.1M >= 1M outstanding),
-    // so TWAP's protocol-surplus auction must not turn into a depositor-principal haircut.
+    // ballot, and recover the genesis deposit. Combined insurance plus backing is
+    // still healthy, so the auction cannot turn into a principal haircut.
     let return_message = build_return_to_subledger_message(
         &squads_vault,
         &pool,
@@ -32180,6 +32339,8 @@ fn e2e_full_genesis_to_buy_burn() {
             AccountMeta::new(slab, false),
             AccountMeta::new(perc_vault, false),
             AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(long_genesis_backing_ledger, false),
+            AccountMeta::new(short_genesis_backing_ledger, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
@@ -32203,6 +32364,16 @@ fn e2e_full_genesis_to_buy_burn() {
         token_amount(&svm, &perc_vault),
         surplus - 400_000,
         "the retained protocol insurance remains after principal recovery"
+    );
+    assert!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|balance| balance.principal_atoms == 0),
+        "the same owner exit returns all genesis cross backing",
     );
     let mut backing_exit_data = vec![2u8]; // IX_WITHDRAW
     backing_exit_data.extend_from_slice(&subledger_full_exit_witness(&svm, &backing_position));
@@ -51104,6 +51275,590 @@ fn e2e_same_key_reinitialization_cannot_revive_consumed_trader_reward() {
 fn e2e_public_same_key_rematerialization_cannot_strand_frozen_lp_reward() {
     run_organic_pnl_loss_real_trade_feeds_reward_cohort(
         OrganicRewardCleanup::PublicRematerializeLpAfterClose,
+    );
+}
+
+// EXTERNAL-BACKING CAPTURE: a cross-backed genesis pool needs the backing role,
+// but it may take that role only from an empty backing state. Otherwise the pool
+// could become the withdrawal authority for principal supplied by somebody else.
+// The rejection precedes every role rotation, so the attempted handoff is atomic.
+#[test]
+fn e2e_cross_backing_pool_cannot_capture_external_principal() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let external_provider = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    svm.airdrop(&external_provider.pubkey(), 1_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let collateral_mint = Pubkey::new_unique();
+    let coin_mint = Pubkey::new_unique();
+    let slab = Pubkey::new_unique();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: make_live_market(
+                &slab,
+                &collateral_mint,
+                &external_provider.pubkey(),
+                1,
+            ),
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let provider_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &provider_source,
+        &collateral_mint,
+        &external_provider.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&payer, &external_provider],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(external_provider.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(provider_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: PIx::TopUpBackingBucket {
+                domain: 0,
+                amount: 1,
+                expiry_slot: 1_200,
+            }
+            .encode(),
+        },
+    )
+    .expect("external provider funds backing before genesis custody");
+
+    let pool = sub_cross_backing_pool_pda(
+        &collateral_mint,
+        0,
+        &slab,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let long_backing_ledger = sub_cross_backing_ledger_pda(&pool, 0);
+    let short_backing_ledger = sub_cross_backing_ledger_pda(&pool, 1);
+    let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut init_data = vec![14u8]; // IX_INIT_CROSS_BACKING_GENESIS_POOL
+    init_data.extend_from_slice(&0u64.to_le_bytes());
+    init_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut init_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(percolator_vault, false),
+                AccountMeta::new_readonly(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_authority, false),
+                AccountMeta::new_readonly(coin_mint, false),
+                AccountMeta::new(long_backing_ledger, false),
+                AccountMeta::new(short_backing_ledger, false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("initialize the cross-backed genesis pool");
+
+    let market_before = svm.get_account(&slab).unwrap();
+    let vault_before = svm.get_account(&percolator_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &external_provider],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(external_provider.pubkey(), true),
+                    AccountMeta::new_readonly(pool, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![7u8], // IX_ACCEPT_OPERATOR
+            },
+        )
+        .is_err(),
+        "genesis custody cannot capture an external provider's live backing"
+    );
+    assert_eq!(svm.get_account(&slab).unwrap(), market_before);
+    assert_eq!(svm.get_account(&percolator_vault).unwrap(), vault_before);
+    assert_eq!(token_amount(&svm, &provider_source), 0);
+    let market_data = &svm.get_account(&slab).unwrap().data;
+    for authority in [
+        percolator_accounting::read_asset_admin(market_data, 0).unwrap(),
+        percolator_accounting::read_asset_insurance_authority(market_data, 0).unwrap(),
+        percolator_accounting::read_asset_insurance_operator(market_data, 0).unwrap(),
+        percolator_accounting::read_asset_backing_authority(market_data, 0).unwrap(),
+    ] {
+        assert_eq!(authority, external_provider.pubkey().to_bytes());
+    }
+}
+
+// CROSS-BACKING CUSTODY: terminal cleanup must not move principal while even one
+// owner claim survives. Once the owner has recovered exactly their deposit, the
+// same fixed path may route only unowned backing earnings to the bound Squads vault.
+#[test]
+fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_cross_backing_genesis(&mut svm, &payer);
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let principal = 4u64;
+    let depositor_ata = Pubkey::new_unique();
+    let pool_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &depositor_ata,
+        &env.collateral_mint,
+        &depositor.pubkey(),
+        principal,
+    );
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &depositor.pubkey());
+    let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    deposit_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new(env.long_backing_ledger, false),
+                AccountMeta::new(env.short_backing_ledger, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("owner deposits four base units across insurance and backing");
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &env.slab, 0),
+        (principal / 2) as u128,
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>(),
+        (principal / 2) as u128,
+    );
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize the pool-bound TWAP config");
+    let twap_cfg = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+    let handoff = build_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("pool hands only its insurance half to TWAP custody");
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), principal as u128 / 2);
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &twap_cfg,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("Squads donates lifecycle control while custody remains constrained");
+
+    // Model the exact state emitted by Percolator's separately covered backing-fee
+    // path, then exercise every withdrawal through the pinned SBF binary.
+    let long_backing_earnings = 1u64;
+    let short_backing_earnings = 2u64;
+    let backing_earnings = long_backing_earnings + short_backing_earnings;
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &vault_authority,
+        principal + backing_earnings,
+    );
+    let mut market_with_earnings = svm.get_account(&env.slab).unwrap();
+    {
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut market_with_earnings.data).unwrap();
+        group.header.vault =
+            percolator::V16PodU128::new(group.header.vault.get() + backing_earnings as u128);
+        group.header.backing_provider_earnings_total = percolator::V16PodU128::new(
+            group.header.backing_provider_earnings_total.get() + backing_earnings as u128,
+        );
+        group.markets[0].engine.backing_long.utilization_fee_earnings =
+            percolator::V16PodU128::new(long_backing_earnings as u128);
+        group.markets[0].engine.backing_short.utilization_fee_earnings =
+            percolator::V16PodU128::new(short_backing_earnings as u128);
+        group
+            .validate_shape()
+            .expect("the injected backing-earnings fixture remains engine-valid");
+    }
+    svm.set_account(env.slab, market_with_earnings).unwrap();
+
+    let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
+    let resolve = build_controller_generation_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &[],
+        &resolve_witness,
+        &PIx::ResolveMarket.encode(),
+    );
+    let resolve_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(resolve_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        4,
+        &resolve,
+        &resolve_remaining,
+    )
+    .expect("governance resolves the empty market through the controller");
+    let pool_transit = Pubkey::new_unique();
+    let controller_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &pool_transit,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &controller_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        ),
+    )
+    .expect("any cranker returns resolved custody for the surviving owner claim");
+    let legacy_cleanup = subledger_return_resolved_asset0_backing_ix(
+        &env.pool,
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &pool_transit,
+        &controller_transit,
+        &env.perc_vault,
+        &vault_authority,
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
+        &perc_id(),
+    );
+    let market_before_early_cleanup = svm.get_account(&env.slab).unwrap();
+    let vault_before_early_cleanup = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], legacy_cleanup).is_err(),
+        "public terminal cleanup cannot move backing while an owner claim survives"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_early_cleanup);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_early_cleanup);
+    assert_eq!(token_amount(&svm, &pool_transit), 0);
+
+    let governance_destination = Pubkey::new_unique();
+    let attacker = Keypair::new();
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &env.collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    let route_earnings = |destination: &Pubkey| {
+        subledger_route_cross_backing_earnings_ix(
+            &env.pool,
+            &env.squads_vault,
+            &env.slab,
+            &pool_transit,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            &perc_id(),
+            &twap_cfg,
+            destination,
+        )
+    };
+    let market_before_domain_swap = svm.get_account(&env.slab).unwrap();
+    let vault_before_domain_swap = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            subledger_route_cross_backing_earnings_ix(
+                &env.pool,
+                &env.squads_vault,
+                &env.slab,
+                &pool_transit,
+                &env.perc_vault,
+                &vault_authority,
+                &env.short_backing_ledger,
+                &env.long_backing_ledger,
+                &perc_id(),
+                &twap_cfg,
+                &governance_destination,
+            ),
+        )
+        .is_err(),
+        "a caller cannot substitute one backing domain's ledger for the other"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_domain_swap);
+    assert_eq!(
+        svm.get_account(&env.perc_vault).unwrap(),
+        vault_before_domain_swap
+    );
+    assert_eq!(token_amount(&svm, &pool_transit), 0);
+
+    let market_before_redirect = svm.get_account(&env.slab).unwrap();
+    let vault_before_redirect = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(&mut svm, &[&payer], route_earnings(&attacker_destination)).is_err(),
+        "a caller cannot redirect backing earnings away from bound governance"
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_redirect);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_redirect);
+    assert_eq!(token_amount(&svm, &pool_transit), 0);
+    assert_eq!(token_amount(&svm, &attacker_destination), 0);
+    send(
+        &mut svm,
+        &[&payer],
+        route_earnings(&governance_destination),
+    )
+    .expect("any cranker routes only backing earnings to bound governance");
+    assert_eq!(token_amount(&svm, &governance_destination), backing_earnings);
+    assert_eq!(token_amount(&svm, &pool_transit), 0);
+
+    let owner_withdraw = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(depositor.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(depositor_ata, false),
+            AccountMeta::new(pool_holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new(env.long_backing_ledger, false),
+            AccountMeta::new(env.short_backing_ledger, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: subledger_insurance_withdraw_data(&svm, &position, principal, 0),
+    };
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        owner_withdraw,
+    )
+    .expect("owner receives both principal halves after resolved custody returns");
+    assert_eq!(token_amount(&svm, &depositor_ata), principal);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.earnings_atoms)
+        .sum::<u128>(),
+        0,
+        "backing earnings never enlarge the owner's principal-only claim",
+    );
+
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("futarchy kickstarts constrained post-genesis custody");
+    assert_eq!(token_amount(&svm, &depositor_ata), principal);
+    assert_eq!(token_amount(&svm, &governance_destination), backing_earnings);
+    assert_eq!(token_amount(&svm, &pool_transit), 0);
+    assert_eq!(token_amount(&svm, &env.perc_vault), 0);
+    assert!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|balance| !balance.has_any_state()),
+        "terminal cleanup leaves no backing principal, liens, losses, or earnings",
     );
 }
 

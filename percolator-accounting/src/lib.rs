@@ -59,8 +59,35 @@ pub enum ReadError {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackingDomainBalance {
+    /// Principal immediately withdrawable by the backing authority.
     pub principal_atoms: u128,
+    /// Principal currently liened to live market exposure but not yet lost.
+    pub valid_liened_principal_atoms: u128,
+    /// Principal already consumed by counterparty losses.
+    pub consumed_principal_atoms: u128,
+    /// Principal attached to an impaired lien.
+    pub impaired_principal_atoms: u128,
     pub earnings_atoms: u128,
+}
+
+impl BackingDomainBalance {
+    pub fn protected_principal_atoms(self) -> Result<u128, ReadError> {
+        self.principal_atoms
+            .checked_add(self.valid_liened_principal_atoms)
+            .ok_or(ReadError::InvalidAccounting)
+    }
+
+    pub fn has_any_state(self) -> bool {
+        self.principal_atoms != 0
+            || self.valid_liened_principal_atoms != 0
+            || self.consumed_principal_atoms != 0
+            || self.impaired_principal_atoms != 0
+            || self.earnings_atoms != 0
+    }
+}
+
+pub fn backing_domain_ledger_account_len() -> usize {
+    percolator_prog::state::backing_domain_ledger_account_len()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -717,15 +744,30 @@ pub fn read_asset_backing_balances(
         let bucket = engine
             .checked_add(bucket_offset)
             .ok_or(ReadError::Truncated)?;
-        let principal_num = read_u128(
-            data,
-            bucket + offset_of!(BackingBucketV16Account, fresh_unliened_backing_num),
-        )?;
-        if principal_num % BOUND_SCALE != 0 {
-            return Err(ReadError::InvalidAccounting);
-        }
+        let read_principal = |field_offset: usize| -> Result<u128, ReadError> {
+            let numerator = read_u128(data, bucket + field_offset)?;
+            if numerator % BOUND_SCALE != 0 {
+                return Err(ReadError::InvalidAccounting);
+            }
+            Ok(numerator / BOUND_SCALE)
+        };
         Ok(BackingDomainBalance {
-            principal_atoms: principal_num / BOUND_SCALE,
+            principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                fresh_unliened_backing_num
+            ))?,
+            valid_liened_principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                valid_liened_backing_num
+            ))?,
+            consumed_principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                consumed_liened_backing_num
+            ))?,
+            impaired_principal_atoms: read_principal(offset_of!(
+                BackingBucketV16Account,
+                impaired_liened_backing_num
+            ))?,
             earnings_atoms: read_u128(
                 data,
                 bucket + offset_of!(BackingBucketV16Account, utilization_fee_earnings),
