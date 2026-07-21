@@ -2585,7 +2585,8 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
     install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
     env.init_cross_backing_genesis_pool();
 
-    let principal = 4u64;
+    let principal = 4_000u64;
+    let trader_capital = 1_000_000u64;
     let (old_owner, old_ata) = new_depositor(&mut env, principal);
     let pool_holding = create_canonical_pool_holding(&mut env);
     env.cross_backing_deposit(&old_owner, &old_ata, &pool_holding, principal)
@@ -2613,7 +2614,7 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
         &mut env,
         percolator::POS_SCALE as i128,
         100,
-        1_000,
+        trader_capital,
     );
     let mut slot = 100;
     advance_public_mark(
@@ -2621,23 +2622,53 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
         &oracle,
         observer_portfolio,
         &mut slot,
-        1_102,
+        1_002_100,
         300,
     );
     liquidate_stale_public_loser(&mut env, short_portfolio, slot);
     clear_stale_public_winner_with_backing(&mut env, &long, long_portfolio, slot);
 
-    let transient_backing = percolator_accounting::read_asset_backing_balances(
+    let transient_balances = percolator_accounting::read_asset_backing_balances(
         &env.svm.get_account(&env.slab).unwrap().data,
         0,
     )
-    .unwrap()
-    .into_iter()
-    .map(|balance| balance.protected_principal_atoms().unwrap())
-    .sum::<u128>();
+    .unwrap();
+    let transient_sources = percolator_accounting::read_asset_backing_source_credits(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    let transient_backing = transient_balances
+        .into_iter()
+        .map(|balance| balance.protected_principal_atoms().unwrap())
+        .sum::<u128>();
     assert!(
         transient_backing > u128::from(principal),
         "the public loss must materialize non-provider trader backing",
+    );
+    let ledger_principals = [0u16, 1u16].map(|domain| {
+        let account = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .unwrap();
+        percolator_prog::state::read_backing_domain_ledger(&account.data)
+            .unwrap()
+            .total_principal_atoms
+    });
+    let provider_backing = transient_balances
+        .into_iter()
+        .zip(ledger_principals)
+        .zip(transient_sources)
+        .map(|((balance, principal), source)| {
+            balance
+                .provider_protected_principal_atoms(principal, source)
+                .unwrap()
+        })
+        .sum::<u128>();
+    assert_eq!(
+        asset_insurance_remaining(&env, 0) + provider_backing,
+        u128::from(principal / 2),
+        "provider-ledger pricing observes the complete pre-deposit impairment: balances={transient_balances:?}, principals={ledger_principals:?}",
     );
 
     let (fresh_owner, fresh_ata) = new_depositor(&mut env, principal);
@@ -2677,7 +2708,43 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
             .sum::<u128>(),
         )
         .unwrap();
-    assert_eq!(protected_after_cleanup, 6);
+    assert_eq!(protected_after_cleanup, 3 * u128::from(principal) / 2);
+    let cleanup_balances = percolator_accounting::read_asset_backing_balances(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    let cleanup_ledger_principals = [0u16, 1u16].map(|domain| {
+        let account = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .unwrap();
+        percolator_prog::state::read_backing_domain_ledger(&account.data)
+            .unwrap()
+            .total_principal_atoms
+    });
+    let cleanup_sources = percolator_accounting::read_asset_backing_source_credits(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert!(cleanup_sources
+        .iter()
+        .all(|source| source.exact_positive_claim_num == 0));
+    let cleanup_provider_backing = cleanup_balances
+        .into_iter()
+        .zip(cleanup_ledger_principals)
+        .zip(cleanup_sources)
+        .map(|((balance, principal), source)| {
+            balance
+                .provider_protected_principal_atoms(principal, source)
+                .unwrap()
+        })
+        .sum::<u128>();
+    assert_eq!(
+        asset_insurance_remaining(&env, 0) + cleanup_provider_backing,
+        protected_after_cleanup,
+    );
 
     let old_before = env.token_amount(&old_ata);
     let fresh_before = env.token_amount(&fresh_ata);
@@ -2685,11 +2752,14 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
         .expect("old owner realizes only the pre-deposit market loss");
     env.cross_backing_withdraw(&fresh_owner, &fresh_ata, &pool_holding, principal)
         .expect("fresh owner exits after taking no additional market risk");
-    assert_eq!(env.token_amount(&old_ata) - old_before, 2);
     assert_eq!(
-        env.token_amount(&fresh_ata) - fresh_before,
-        principal,
-        "the old generation cannot capture any of the fresh deposit",
+        env.token_amount(&old_ata) - old_before,
+        principal / 2,
+        "the old generation realizes its pre-deposit market loss",
+    );
+    assert!(
+        env.token_amount(&fresh_ata) - fresh_before >= principal - 1,
+        "the old generation cannot capture more than the documented rounding atom",
     );
 }
 
