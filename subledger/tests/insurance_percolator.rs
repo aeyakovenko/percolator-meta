@@ -3457,6 +3457,164 @@ fn cross_backing_one_atom_sybil_churn_cannot_erode_an_incumbent() {
     }
 }
 
+// PUBLIC NON-CAPTURE PROBE: settling a real bankrupt trade temporarily turns
+// trader capital into fresh counterparty backing beyond provider-ledger principal.
+// Resolving the trader portfolios must remove that transient value before the
+// genesis owner exits, so the owner receives only surviving protection.
+#[test]
+fn public_trader_backing_cannot_inflate_final_cross_backer_exit() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_cross_backing_genesis_pool();
+
+    let low_entry = 100u64;
+    let first_terminal = 1_102u64;
+    let trader_capital = 1_000u64;
+    let principal = 4u64;
+    let (depositor, depositor_ata) = new_depositor(&mut env, principal);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(&depositor, &depositor_ata, &pool_holding, principal)
+        .expect("fund both canonical protection classes");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let position_q = percolator::POS_SCALE as i128;
+    let mut slot = 100;
+    let (low_long, low_long_portfolio, low_short, low_short_portfolio) =
+        open_public_pair(&mut env, position_q, low_entry, trader_capital);
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        first_terminal,
+        300,
+    );
+    liquidate_stale_public_loser(&mut env, low_short_portfolio, slot);
+    clear_stale_public_winner_with_backing(&mut env, &low_long, low_long_portfolio, slot);
+
+    let backing = percolator_accounting::read_asset_backing_balances(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    let withdrawable_backing = backing
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>();
+    let ledger_principal = (0..2u16)
+        .map(|domain| {
+            let account = env
+                .svm
+                .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+                .unwrap();
+            percolator_prog::state::read_backing_domain_ledger(&account.data)
+                .unwrap()
+                .total_principal_atoms
+        })
+        .sum::<u128>();
+    assert!(
+        withdrawable_backing > ledger_principal,
+        "the public settlement must create ownerless backing beyond provider principal",
+    );
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve after the public positions are cleared");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&observer, observer_portfolio),
+            (&low_long, low_long_portfolio),
+            (&low_short, low_short_portfolio),
+        ],
+    );
+
+    let backing_after_close = percolator_accounting::read_asset_backing_balances(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    let protected_after_close = asset_insurance_remaining(&env, 0)
+        .checked_add(
+            backing_after_close
+                .into_iter()
+                .map(|balance| balance.protected_principal_atoms().unwrap())
+                .sum::<u128>(),
+        )
+        .unwrap();
+    assert_eq!(
+        protected_after_close,
+        u128::from(principal / 2),
+        "transient trader backing must not recapitalize the genesis owner",
+    );
+    assert!(
+        backing_after_close
+            .iter()
+            .any(|balance| balance.consumed_principal_atoms != 0),
+        "the real trade must consume canonical backing",
+    );
+    let owner_before_exit = env.token_amount(&depositor_ata);
+    let vault_before_exit = env.token_amount(&env.perc_vault);
+    let escrow_before_exit = env.token_amount(&pool_holding);
+    let expected_payout = principal / 2;
+    let custody_before_exit = owner_before_exit
+        .checked_add(vault_before_exit)
+        .unwrap()
+        .checked_add(escrow_before_exit)
+        .unwrap();
+
+    env.cross_backing_withdraw(
+        &depositor,
+        &depositor_ata,
+        &pool_holding,
+        principal,
+    )
+    .expect("the genesis owner realizes the public market loss");
+    assert_eq!(env.token_amount(&depositor_ata), expected_payout);
+    assert_eq!(env.pool_outstanding(), 0);
+    let protocol_after_exit = env
+        .token_amount(&env.perc_vault)
+        .checked_add(env.token_amount(&pool_holding))
+        .unwrap();
+    assert_eq!(
+        expected_payout.checked_add(protocol_after_exit).unwrap(),
+        custody_before_exit,
+        "owner payout and segregated protocol custody conserve every remaining atom",
+    );
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
