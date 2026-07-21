@@ -54805,3 +54805,418 @@ fn e2e_terminal_source_dust_payout_is_order_independent() {
     assert_eq!(attack.victim_withdrawn, 20_000_000_000);
     assert!(attack.vault_remaining <= 1);
 }
+
+#[derive(Debug)]
+struct FundingSegmentCadenceOutcome {
+    effective_price: u64,
+    f_long_num: i128,
+    f_short_num: i128,
+    attacker_equity: i128,
+    victim_equity: i128,
+    attacker_funding_paid: u128,
+    victim_funding_received: u128,
+    attacker_payout: u64,
+    victim_payout: u64,
+}
+
+fn run_public_funding_segment_cadence(fragmented: bool) -> FundingSegmentCadenceOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INITIAL_PRICE: u64 = 100_000;
+    const TARGET_PRICE: u64 = 200_000;
+    const DEPOSIT: u64 = 1_000_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = Keypair::new();
+    for signer in [&payer, &admin, &attacker, &victim] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 0,
+        unix_timestamp: 0,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_key = market.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_key,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the public market");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: INITIAL_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 1,
+                max_accrual_dt_slots: 20,
+                max_abs_funding_e9_per_slot: 9_000,
+                min_funding_lifetime_slots: 20,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize the public market");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 0,
+                initial_mark_e6: INITIAL_PRICE,
+            },
+        ),
+    )
+    .expect("configure the authenticated mark");
+
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let attacker_portfolio = Keypair::new();
+    let victim_portfolio = Keypair::new();
+    let driver_portfolio = Keypair::new();
+    for (owner, portfolio, deposit) in [
+        (&attacker, &attacker_portfolio, true),
+        (&victim, &victim_portfolio, true),
+        (&attacker, &driver_portfolio, false),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate a public portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a public portfolio");
+        if deposit {
+            let source = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &source,
+                &collateral_mint,
+                &owner.pubkey(),
+                DEPOSIT,
+            );
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(market_key, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit {
+                        amount: DEPOSIT as u128,
+                    },
+                ),
+            )
+            .expect("deposit trader collateral");
+        }
+    }
+
+    send(
+        &mut svm,
+        &[&payer, &attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: percolator::POS_SCALE as i128,
+                exec_price: INITIAL_PRICE,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("open the balanced long and short");
+
+    let set_slot = |svm: &mut LiteSVM, slot: u64| {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+    };
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&attacker],
+            pix(
+                vec![
+                    AccountMeta::new(attacker.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+
+    set_slot(&mut svm, 1);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 1,
+                mark_e6: TARGET_PRICE,
+            },
+        ),
+    )
+    .expect("publish the funding premium");
+    crank(&mut svm, driver_portfolio.pubkey(), 1).expect("stage the target consistently");
+
+    if fragmented {
+        for slot in 2..=11 {
+            set_slot(&mut svm, slot);
+            crank(&mut svm, driver_portfolio.pubkey(), slot)
+                .expect("attacker fragments the funding interval");
+        }
+    } else {
+        set_slot(&mut svm, 11);
+        crank(&mut svm, driver_portfolio.pubkey(), 11)
+            .expect("honest keeper accrues the complete funding interval");
+    }
+    let final_effective_price = read_asset0_effective_price(&svm, &market_key);
+    assert_eq!(final_effective_price, 100_110);
+
+    for portfolio in [attacker_portfolio.pubkey(), victim_portfolio.pubkey()] {
+        for _ in 0..4 {
+            crank(&mut svm, portfolio, 11).expect("settle each trader at the final index");
+        }
+    }
+
+    send(
+        &mut svm,
+        &[&payer, &attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -(percolator::POS_SCALE as i128),
+                exec_price: final_effective_price,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("both traders close at the common final price");
+    for portfolio in [attacker_portfolio.pubkey(), victim_portfolio.pubkey()] {
+        for _ in 0..4 {
+            crank(&mut svm, portfolio, 11).expect("finish public account settlement");
+        }
+    }
+
+    let (_, group) =
+        percolator_prog::state::read_market(&svm.get_account(&market_key).unwrap().data).unwrap();
+    let attacker_state = percolator_prog::state::read_portfolio(
+        &svm.get_account(&attacker_portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    let victim_state = percolator_prog::state::read_portfolio(
+        &svm.get_account(&victim_portfolio.pubkey()).unwrap().data,
+    )
+    .unwrap();
+    let equity = |capital: u128, pnl: i128| i128::try_from(capital).unwrap() + pnl;
+    let attacker_equity = equity(attacker_state.capital.get(), attacker_state.pnl.get());
+    let victim_equity = equity(victim_state.capital.get(), victim_state.pnl.get());
+    let attacker_funding_paid =
+        read_portfolio_funding_long_paid(&svm, &attacker_portfolio.pubkey());
+    let victim_funding_received =
+        read_portfolio_funding_short_received(&svm, &victim_portfolio.pubkey());
+
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ResolveMarket,
+        ),
+    )
+    .expect("resolve the fully closed public market");
+    let attacker_destination = Pubkey::new_unique();
+    let victim_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &victim_destination,
+        &collateral_mint,
+        &victim.pubkey(),
+        0,
+    );
+    for (owner, portfolio, destination) in [
+        (&attacker, attacker_portfolio.pubkey(), attacker_destination),
+        (&victim, victim_portfolio.pubkey(), victim_destination),
+    ] {
+        for _ in 0..8 {
+            send(
+                &mut svm,
+                &[&attacker],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), false),
+                        AccountMeta::new(market_key, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    },
+                ),
+            )
+            .expect("permissionless terminal payout makes bounded progress");
+            if token_amount(&svm, &destination) != 0 {
+                break;
+            }
+        }
+        assert_ne!(
+            token_amount(&svm, &destination),
+            0,
+            "terminal payout must reach each trader"
+        );
+    }
+
+    FundingSegmentCadenceOutcome {
+        effective_price: final_effective_price,
+        f_long_num: group.assets[0].f_long_num,
+        f_short_num: group.assets[0].f_short_num,
+        attacker_equity,
+        victim_equity,
+        attacker_funding_paid,
+        victim_funding_received,
+        attacker_payout: token_amount(&svm, &attacker_destination),
+        victim_payout: token_amount(&svm, &victim_destination),
+    }
+}
+
+// PUBLIC LOF: a funding payer must not choose the amount it owes by splitting one authenticated
+// oracle interval into smaller permissionless cranks. Both paths traverse the same slots, target,
+// terminal effective price, open interest, and final close; only the attacker's crank cadence differs.
+#[test]
+fn e2e_permissionless_crank_cadence_cannot_erase_funding_obligations() {
+    let delayed = run_public_funding_segment_cadence(false);
+    let fragmented = run_public_funding_segment_cadence(true);
+
+    assert_eq!(delayed.effective_price, 100_110);
+    assert_eq!(fragmented.effective_price, delayed.effective_price);
+    assert!(
+        delayed.attacker_funding_paid > 0 && delayed.victim_funding_received > 0,
+        "the delayed control must create a real payer-to-receiver obligation: {delayed:?}"
+    );
+    assert!(delayed.f_long_num < 0 && delayed.f_short_num > 0);
+    assert!(
+        fragmented.attacker_equity == delayed.attacker_equity
+            && fragmented.victim_equity == delayed.victim_equity
+            && fragmented.attacker_funding_paid == delayed.attacker_funding_paid
+            && fragmented.victim_funding_received == delayed.victim_funding_received
+            && fragmented.attacker_payout == delayed.attacker_payout
+            && fragmented.victim_payout == delayed.victim_payout,
+        "an unprivileged payer changed final user value solely through public crank cadence: delayed={delayed:?}, fragmented={fragmented:?}"
+    );
+}
