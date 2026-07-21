@@ -2280,16 +2280,24 @@ fn genesis_cross_backing_splits_globally_and_returns_only_owner_principal() {
     assert_eq!(env.token_amount(&env.perc_vault), 0);
 }
 
-// PUBLIC DOS: a one-atom first deposit lands entirely in insurance, leaving both
-// deterministic backing ledgers blank. A foreign market authority must not be
-// able to bind either ledger through Percolator's public first-write path and
-// permanently block the funded owner's otherwise-valid principal withdrawal.
+// PUBLIC DOS: a one-atom first deposit lands entirely in insurance and would
+// otherwise leave both deterministic backing ledgers blank. A foreign market
+// authority must not be able to bind either ledger through Percolator's public
+// first-write path and block the funded owner's valid principal withdrawal.
 #[test]
 fn foreign_market_cannot_claim_a_funded_cross_backing_pools_blank_ledger() {
     use percolator_prog::ix::Instruction as PIx;
 
     let mut env = Env::new_cross_backing();
     env.init_cross_backing_genesis_pool();
+    for domain in 0..2u16 {
+        let ledger = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .unwrap();
+        assert_eq!(ledger.owner, sub_id(), "blank ledger remains quarantined");
+        assert!(ledger.data.iter().all(|byte| *byte == 0));
+    }
 
     let (victim, victim_ata) = new_depositor(&mut env, 1);
     let pool_holding = create_canonical_pool_holding(&mut env);
@@ -2298,6 +2306,18 @@ fn foreign_market_cannot_claim_a_funded_cross_backing_pools_blank_ledger() {
     assert_eq!(env.pool_outstanding(), 1);
     assert_eq!(env.token_amount(&victim_ata), 0);
     assert_eq!(env.token_amount(&env.perc_vault), 1);
+    for domain in 0..2u16 {
+        let ledger = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .unwrap();
+        assert_eq!(ledger.owner, perc_id());
+        let ledger = percolator_prog::state::read_backing_domain_ledger(&ledger.data)
+            .expect("first valid deposit binds both ledgers");
+        assert_eq!(ledger.market_group, env.slab.to_bytes());
+        assert_eq!(ledger.authority, env.pool.to_bytes());
+        assert_eq!(ledger.domain, domain);
+    }
 
     let attacker = Keypair::new();
     let attacker_market = Keypair::new();
@@ -2922,11 +2942,10 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
     );
 }
 
-// PUBLIC DOS: one Genesis atom initializes only the short backing bucket. A
-// trader loss can then materialize source backing in the empty long bucket with
-// Percolator's short fallback expiry. Later Genesis principal must still be able
-// to initialize its canonical long backing without inheriting or conflicting
-// with that trader-selected expiry.
+// PUBLIC DOS: one Genesis atom funds only the short backing bucket. A trader
+// loss can then materialize source backing in the empty long bucket with
+// Percolator's short fallback expiry. The pre-bound, zero-principal long ledger
+// must not inherit that expiry or block later Genesis backing.
 #[test]
 fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     use percolator_prog::ix::Instruction as PIx;
@@ -2987,8 +3006,13 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
         .svm
         .get_account(&cross_backing_ledger_pda(&env.pool, 0))
         .unwrap();
-    assert!(
-        !percolator_prog::state::is_initialized(&long_ledger.data),
+    let long_ledger = percolator_prog::state::read_backing_domain_ledger(&long_ledger.data)
+        .expect("both canonical ledgers are bound by the first valid deposit");
+    assert_eq!(long_ledger.market_group, env.slab.to_bytes());
+    assert_eq!(long_ledger.authority, env.pool.to_bytes());
+    assert_eq!(long_ledger.domain, 0);
+    assert_eq!(
+        long_ledger.total_principal_atoms, 0,
         "the long bucket contains only trader source backing",
     );
 
