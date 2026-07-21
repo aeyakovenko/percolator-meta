@@ -2763,6 +2763,89 @@ fn transient_trader_backing_cannot_recapitalize_an_old_generation() {
     );
 }
 
+// PUBLIC DOS: one Genesis atom initializes only the short backing bucket. A
+// trader loss can then materialize source backing in the empty long bucket with
+// Percolator's short fallback expiry. Later Genesis principal must still be able
+// to initialize its canonical long backing without inheriting or conflicting
+// with that trader-selected expiry.
+#[test]
+fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_cross_backing_genesis_pool();
+    let pool_holding = create_canonical_pool_holding(&mut env);
+
+    let (first, first_ata) = new_depositor(&mut env, 1);
+    env.cross_backing_deposit(&first, &first_ata, &pool_holding, 1)
+        .expect("the first voter initializes one aggregate backing atom");
+    let first_backing = percolator_accounting::read_asset_backing_balances(
+        &env.svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(first_backing.map(|balance| balance.principal_atoms), [0, 1]);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the independent authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let (_long, long_portfolio, short, short_portfolio) =
+        open_public_pair(&mut env, 100_000_000_000, 100, 1_000_000);
+    let mut slot = 100;
+    advance_public_mark(&mut env, &oracle, observer_portfolio, &mut slot, 89, 10);
+    liquidate_stale_public_loser(&mut env, long_portfolio, slot);
+    clear_stale_public_winner_with_backing(&mut env, &short, short_portfolio, slot);
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let transient_backing =
+        percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+    let transient_sources =
+        percolator_accounting::read_asset_backing_source_credits(&market.data, 0).unwrap();
+    assert!(transient_backing[0].protected_principal_atoms().unwrap() > 0);
+    assert!(transient_sources[0].exact_positive_claim_num > 0);
+    let long_ledger = env
+        .svm
+        .get_account(&cross_backing_ledger_pda(&env.pool, 0))
+        .unwrap();
+    assert!(
+        !percolator_prog::state::is_initialized(&long_ledger.data),
+        "the long bucket contains only trader source backing",
+    );
+
+    let (second, second_ata) = new_depositor(&mut env, 1);
+    env.cross_backing_deposit(&second, &second_ata, &pool_holding, 1)
+        .expect("the next aggregate atom funds insurance");
+    let (third, third_ata) = new_depositor(&mut env, 1);
+    env.cross_backing_deposit(&third, &third_ata, &pool_holding, 1)
+        .expect("trader source expiry cannot veto later Genesis backing");
+
+    assert_eq!(env.pool_outstanding(), 3);
+    assert_eq!(env.token_amount(&first_ata), 0);
+    assert_eq!(env.token_amount(&second_ata), 0);
+    assert_eq!(env.token_amount(&third_ata), 0);
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
