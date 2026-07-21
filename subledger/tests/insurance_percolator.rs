@@ -2303,6 +2303,102 @@ fn cross_backing_rounding_reserve_cannot_remain_ownerless_in_percolator() {
     );
 }
 
+// A partial exiter can choose the nominal tranche boundaries that feed the
+// insurance/backing allocation. Per-call floors must not let that choice shift
+// an impaired co-depositor's claim or leave live backing after the final sweep.
+#[test]
+fn cross_backing_split_exit_cannot_shift_an_impaired_codepositors_protection() {
+    let run = |split_exit: bool| {
+        let mut env = Env::new_cross_backing();
+        env.init_cross_backing_genesis_pool();
+
+        let amount = 1_000_000u64;
+        let (alice, alice_ata) = new_depositor(&mut env, amount);
+        let (bob, bob_ata) = new_depositor(&mut env, amount);
+        let pool_holding = create_canonical_pool_holding(&mut env);
+        env.cross_backing_deposit(&alice, &alice_ata, &pool_holding, amount)
+            .expect("Alice deposits into both protection classes");
+        env.cross_backing_deposit(&bob, &bob_ata, &pool_holding, amount)
+            .expect("Bob deposits into both protection classes");
+
+        impair_market(&mut env, 1);
+        let backing = percolator_accounting::read_asset_backing_balances(
+            &env.svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>();
+        assert_eq!(backing, u128::from(amount));
+        let protected = backing + 1;
+        let mut impaired_market = env.svm.get_account(&env.slab).unwrap();
+        {
+            let (_, group) =
+                percolator_prog::state::market_view_mut(&mut impaired_market.data).unwrap();
+            group.header.vault = percolator::V16PodU128::new(protected);
+            group
+                .validate_shape()
+                .expect("one-class impairment plus live backing remains valid");
+        }
+        env.svm.set_account(env.slab, impaired_market).unwrap();
+        env.svm
+            .set_account(
+                env.perc_vault,
+                Account {
+                    lamports: 1_000_000,
+                    data: token_account_data(
+                        &env.mint,
+                        &env.vault_authority,
+                        protected as u64,
+                    ),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+
+        if split_exit {
+            for chunk in [400_000u64, 300_000, 300_000] {
+                env.cross_backing_withdraw(
+                    &alice,
+                    &alice_ata,
+                    &pool_holding,
+                    chunk,
+                )
+                .expect("Alice's bounded partial exit remains live");
+            }
+        } else {
+            env.cross_backing_withdraw(
+                &alice,
+                &alice_ata,
+                &pool_holding,
+                amount,
+            )
+            .expect("Alice's control exit remains live");
+        }
+        env.cross_backing_withdraw(&bob, &bob_ata, &pool_holding, amount)
+            .expect("Bob exits after Alice");
+
+        (
+            env.token_amount(&alice_ata),
+            env.token_amount(&bob_ata),
+            env.token_amount(&env.perc_vault),
+            env.token_amount(&pool_holding),
+            env.pool_outstanding(),
+        )
+    };
+
+    let control = run(false);
+    let split = run(true);
+    assert_eq!(control, (500_000, 500_000, 0, 1, 0));
+    assert_eq!(
+        split, control,
+        "uneven partial exits cannot change either payout or reserve custody",
+    );
+}
+
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
 // market-binding PDA seeds. A program upgrade must preserve its existing owners'
 // exit path, but must not reopen that pre-window genesis pool to new deposits.
