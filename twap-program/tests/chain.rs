@@ -52281,13 +52281,15 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
     let twap_config = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_config.as_ref()], &twap_id()).0;
-    let handoff = build_subledger_handoff_to_twap_message(
+    let handoff = build_cross_backing_subledger_handoff_to_twap_message(
         &env.squads_vault,
         &env.pool,
         &env.slab,
         &twap_config,
         &twap_authority,
         &perc_id(),
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
     );
     let handoff_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -52298,6 +52300,8 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(env.long_backing_ledger, false),
+        AccountMeta::new_readonly(env.short_backing_ledger, false),
     ];
     squads_execute(
         &mut svm,
@@ -52349,6 +52353,8 @@ fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
             AccountMeta::new_readonly(twap_authority, false),
             AccountMeta::new(env.slab, false),
             AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(env.long_backing_ledger, false),
+            AccountMeta::new_readonly(env.short_backing_ledger, false),
             AccountMeta::new_readonly(twap_id(), false),
         ],
         data: vec![8u8], // IX_HANDOFF_TO_TWAP
