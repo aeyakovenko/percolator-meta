@@ -14595,3 +14595,29 @@ expected-red probe filtered. The fixed Subledger SBF checksum is
 `72f895d34461cf2a799d23f645ce64f70a2b09ac19dec149e9bc1cc4327f8ad0`; pinned Percolator remains
 `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`. No account layout,
 instruction, signer, authority, recipient, destination, custody path, or admin surface was added.
+
+## Tick - transient source expiry blocked later Genesis backing (surface B/C, REAL DOS)
+
+The first one-unit Genesis deposit initializes only one backing domain. A public balanced trade and
+authenticated mark move can then materialize trader-source backing in the other domain. Percolator
+assigns that fresh source bucket its short fallback expiry and rejects a later provider top-up whose
+Genesis expiry differs. The retained real-binary LiteSVM regression deposits one unit, creates and
+clears the public loss pair, deposits the insurance atom, and proves the next one-unit deposit failed
+atomically with `EngineLockActive`. This blocks permissionless deposits during the configured window
+on an otherwise live, initialized pool.
+
+FIX: current cross-backed pools append two domain-specific pending-backing counters. A deposit reads
+the pinned Percolator bucket status and expiry; compatible principal enters Percolator, while only an
+incompatible domain's amount remains in the canonical pool ATA. Pending atoms participate in share
+pricing and TWAP floor calculation, and owner exits debit them before canonical backing. The fixed
+Subledger-to-TWAP earnings message commits to the exact retained principal, so both programs verify
+that governance receives all routeable escrow and live backing earnings while the protected remainder
+stays in pool custody. Historical 273-byte cross-backed pools remain exit-capable but cannot accept
+new deposits under an untracked layout. No instruction, administrator, caller-selected amount, or
+recipient was added.
+
+Focused verification covers the public loss and all three one-unit refunds through the pinned
+Percolator and Subledger SBF binaries, the retained-principal Subledger-to-TWAP CPI, all 102 direct
+Subledger/Percolator LiteSVM tests, and the complete 235-test runnable chain from Genesis through
+distribution, TWAP handoff, buyback/burn rounds, claims, and principal recovery. The separately
+tracked pinned-Percolator source-capacity expected-red probe remains filtered.

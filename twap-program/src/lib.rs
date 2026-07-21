@@ -1778,21 +1778,28 @@ fn process_return_resolved_asset0_backing(
 // accept_cross_backing_earnings accounts:
 // [pool(s), config, governance, market, pool_transit(w),
 //  governance_destination(w), percolator_program, token_program]
-// data: exact earnings amount (u64)
+// data: exact earnings amount (u64), optional retained principal (u64)
 //
 // Subledger derives the amount from its canonical pool escrow plus both live
 // backing-earnings counters and enters with its canonical pool PDA signer. This
-// fixed leg can empty only that escrow into a clean token account owned by the
-// config-bound Squads vault. It exposes no principal withdrawal or admin action.
+// fixed leg can move only that amount into a clean token account owned by the
+// config-bound Squads vault. Current Subledger pools also attest any staged
+// owner principal that must remain in the source escrow. It exposes no principal
+// withdrawal or admin action.
 fn process_accept_cross_backing_earnings(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 8 {
+    if data.len() != 8 && data.len() != 16 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let amount = u64::from_le_bytes(data.try_into().unwrap());
+    let amount = u64::from_le_bytes(data[..8].try_into().unwrap());
+    let retained_principal = if data.len() == 16 {
+        u64::from_le_bytes(data[8..16].try_into().unwrap())
+    } else {
+        0
+    };
     if amount == 0 {
         return Err(ProgramError::InvalidArgument);
     }
@@ -1854,12 +1861,15 @@ fn process_accept_cross_backing_earnings(
     let source = spl_token::state::Account::unpack(&pool_transit.try_borrow_data()?)?;
     let destination =
         spl_token::state::Account::unpack(&governance_destination.try_borrow_data()?)?;
+    let source_before = amount
+        .checked_add(retained_principal)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
     if source.state != spl_token::state::AccountState::Initialized
         || destination.state != spl_token::state::AccountState::Initialized
         || source.owner != *pool.key
         || destination.owner != *governance.key
         || source.mint != destination.mint
-        || source.amount != amount
+        || source.amount != source_before
         || source.delegate.is_some()
         || source.delegated_amount != 0
         || source.close_authority.is_some()
@@ -1884,7 +1894,8 @@ fn process_accept_cross_backing_earnings(
         amount,
         None,
     )?;
-    if spl_token::state::Account::unpack(&pool_transit.try_borrow_data()?)?.amount != 0
+    if spl_token::state::Account::unpack(&pool_transit.try_borrow_data()?)?.amount
+        != retained_principal
         || spl_token::state::Account::unpack(&governance_destination.try_borrow_data()?)?.amount
             != destination_after
     {
