@@ -2993,7 +2993,7 @@ fn process_accept_market_authority<'a>(
 // donate_insurance accounts:
 // [donor(s), governance, controller_pda, market(w), donor_source(w),
 //  controller_holding(w), percolator_vault(w), percolator_program, token_program]
-// data: amount (u64)
+// data: amount (u64) || expected_market_id (u64)
 //
 // Permissionless and inbound-only. This lets a new market receive bootstrap
 // surplus before custody moves to the genesis pool without exposing TopUpInsurance
@@ -3003,11 +3003,12 @@ fn process_donate_insurance<'a>(
     accounts: &'a [AccountInfo<'a>],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 8 {
+    if data.len() != 16 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let amount = u64::from_le_bytes(data.try_into().unwrap());
-    if amount == 0 {
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let expected_market_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    if amount == 0 || expected_market_id == 0 {
         return Err(ProgramError::InvalidArgument);
     }
     let iter = &mut accounts.iter();
@@ -3036,7 +3037,10 @@ fn process_donate_insurance<'a>(
     {
         let market_data = market.try_borrow_data()?;
         let controller_key = controller.key.to_bytes();
-        if percolator_accounting::read_market_authority(&market_data)
+        if percolator_accounting::read_asset_market_id(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != expected_market_id
+            || percolator_accounting::read_market_authority(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
             != controller_key
             || percolator_accounting::read_asset_insurance_authority(&market_data, 0)

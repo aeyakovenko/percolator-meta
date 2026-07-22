@@ -694,6 +694,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         &twap_authority,
         0,
     );
+    let donation_market_id = read_asset0_market_id(&svm, &market);
     send(
         &mut svm,
         &[&payer, &donor],
@@ -703,6 +704,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
             &donor_source,
             &donation_holding,
             1,
+            donation_market_id,
         ),
     )
     .expect("a public donor adds one post-loss fee-surplus atom");
@@ -4162,6 +4164,7 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
     let mut donation_data = vec![4u8]; // IX_DONATE_INSURANCE
     donation_data.extend_from_slice(&insurance_amount.to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &market).to_le_bytes());
     send(
         &mut svm,
         &[&payer],
@@ -4509,6 +4512,7 @@ fn e2e_presigned_controller_insurance_donation_cannot_cross_asset0_restart() {
             &controller_holding,
             &percolator_vault,
             amount,
+            old_market_id,
         )],
         Some(&donor.pubkey()),
         &[&donor],
@@ -4701,6 +4705,7 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
     );
     let mut donation_data = vec![4u8]; // IX_DONATE_INSURANCE
     donation_data.extend_from_slice(&insurance_amount.to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &market.pubkey()).to_le_bytes());
     send(
         &mut svm,
         &[&payer],
@@ -8784,9 +8789,11 @@ fn controller_donate_insurance_ix(
     controller_holding: &Pubkey,
     percolator_vault: &Pubkey,
     amount: u64,
+    expected_market_id: u64,
 ) -> Instruction {
     let mut data = vec![4u8];
     data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&expected_market_id.to_le_bytes());
     Instruction {
         program_id: controller_id(),
         accounts: vec![
@@ -11200,6 +11207,7 @@ fn e2e_presigned_twap_insurance_donation_cannot_cross_asset0_restart() {
             &donor_source,
             &donation_holding,
             amount,
+            old_market_id,
         )],
         Some(&payer.pubkey()),
         &[&payer, &donor],
@@ -12632,6 +12640,7 @@ fn assert_controller_donation_rejects_delegated_role(delegated_kind: u8) {
         &controller_holding,
         &percolator_vault,
         amount,
+        read_asset0_market_id(&svm, &slab),
     );
     if send(&mut svm, &[&payer, &donor], donation).is_ok() {
         if delegated_kind == 0 {
@@ -13795,6 +13804,7 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
         &donor.pubkey(),
         1,
     );
+    let donation_market_id = read_asset0_market_id(&svm, &slab);
     send(
         &mut svm,
         &[&payer, &donor],
@@ -13807,6 +13817,7 @@ fn assert_public_stale_resolution_cannot_strand_controller_owned_asset0_insuranc
             &controller_holding,
             &percolator_vault,
             1,
+            donation_market_id,
         ),
     )
     .expect("public donor funds controller-owned asset-0 insurance");
@@ -20105,6 +20116,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     );
     let mut donation_data = vec![17u8];
     donation_data.extend_from_slice(&fee_surplus.to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &slab).to_le_bytes());
     let donation = Instruction {
         program_id: twap_id(),
         accounts: vec![
@@ -21308,6 +21320,7 @@ fn setup_handoff_with_mint_mode(
     );
     let mut donation_data = vec![17u8];
     donation_data.extend_from_slice(&(principal + surplus).to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(svm, &slab).to_le_bytes());
     send(
         svm,
         &[&donor],
@@ -30187,9 +30200,11 @@ fn donate_insurance_ix(
     donor_source: &Pubkey,
     holding: &Pubkey,
     amount: u64,
+    expected_market_id: u64,
 ) -> Instruction {
     let mut data = vec![17u8];
     data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&expected_market_id.to_le_bytes());
     Instruction {
         program_id: twap_id(),
         accounts: vec![
@@ -42147,10 +42162,18 @@ fn e2e_ratchet_pulls_fresh_surplus_across_rounds() {
         &donor.pubkey(),
         500_000,
     );
+    let donation_market_id = read_asset0_market_id(&svm, &env.slab);
     send(
         &mut svm,
         &[&donor],
-        donate_insurance_ix(&donor.pubkey(), &env, &src, &bk.holding, 500_000),
+        donate_insurance_ix(
+            &donor.pubkey(),
+            &env,
+            &src,
+            &bk.holding,
+            500_000,
+            donation_market_id,
+        ),
     )
     .expect("inject fresh surplus");
     assert_eq!(
@@ -42352,10 +42375,18 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         &donor.pubkey(),
         2,
     );
+    let donation_market_id = read_asset0_market_id(&svm, &env.slab);
     send(
         &mut svm,
         &[&donor],
-        donate_insurance_ix(&donor.pubkey(), &env, &donor_source, &bk.holding, 2),
+        donate_insurance_ix(
+            &donor.pubkey(),
+            &env,
+            &donor_source,
+            &bk.holding,
+            2,
+            donation_market_id,
+        ),
     )
     .expect("restore the floor and inject the next round's one-atom surplus");
 
@@ -42443,11 +42474,19 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         &donor.pubkey(),
         2,
     );
+    let donation_market_id = read_asset0_market_id(&svm, &env.slab);
     for round in 0..2 {
         send(
             &mut svm,
             &[&donor],
-            donate_insurance_ix(&donor.pubkey(), &env, &route_source, &bk.holding, 1),
+            donate_insurance_ix(
+                &donor.pubkey(),
+                &env,
+                &route_source,
+                &bk.holding,
+                1,
+                donation_market_id,
+            ),
         )
         .expect("inject one atom for route apportionment");
         let round_end = {
@@ -48706,6 +48745,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     );
     let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
     donation_data.extend_from_slice(&surplus.to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &slab).to_le_bytes());
     let vault_before_surplus = token_amount(&svm, &perc_vault);
     send(
         &mut svm,
@@ -51889,6 +51929,9 @@ fn read_asset0_insurance(svm: &LiteSVM, market: &Pubkey) -> u128 {
     let (_, group) = percolator_prog::state::read_market(&data).unwrap();
     group.insurance
 }
+fn read_asset0_market_id(svm: &LiteSVM, market: &Pubkey) -> u64 {
+    percolator_accounting::read_asset_market_id(&svm.get_account(market).unwrap().data, 0).unwrap()
+}
 fn read_asset_insurance_remaining(svm: &LiteSVM, market: &Pubkey, asset_index: usize) -> u128 {
     let data = svm.get_account(market).unwrap().data;
     let (_, group) = percolator_prog::state::read_market(&data).unwrap();
@@ -54762,6 +54805,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
         );
         let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
         donation_data.extend_from_slice(&donation.to_le_bytes());
+        donation_data.extend_from_slice(&read_asset0_market_id(&svm, &env.slab).to_le_bytes());
         send(
             &mut svm,
             &[&payer, &donor],
@@ -57039,6 +57083,7 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     );
     let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
     donation_data.extend_from_slice(&round_surplus.to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &env.slab).to_le_bytes());
     send(
         &mut svm,
         &[&payer, &donor],

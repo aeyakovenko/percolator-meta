@@ -274,7 +274,9 @@ slot-only wire remains valid only for predecessor books that are exit-only under
    markets and set fee splits. Retained insurance surplus and routed backing earnings are protocol
    value, never a DAO claim on depositor principal. Inbound-only donation instructions fund
    Percolator without giving governance an insurance key and reject unless every asset-0 insurance
-   withdrawal/rotation role is already the constrained controller.
+   withdrawal/rotation role is already the constrained controller. Controller and TWAP donations
+   also commit to asset 0's current monotonic market ID, so a donor signature cannot cross an
+   in-place restart into a replacement market generation.
 7. **Handoff.** If capital remains for continuous operation, Squads authorizes the fixed
    principal-pool-to-TWAP transition. The transition records the exact pool identity and live
    insurance complement in the TWAP floor, capped by live insurance, and checkpoints the selected

@@ -1984,7 +1984,7 @@ fn process_accept_cross_backing_earnings(
 // donate_insurance accounts: [donor(s), config, twap_authority,
 //   donor_source(w), twap_holding(w), market_slab(w), percolator_vault(w),
 //   percolator_program, token_program]
-// data: amount (u64)
+// data: amount (u64) || expected_market_id (u64)
 //
 // This replaces the unsafe pattern of leaving insurance_authority on governance.
 // It can only move donor-owned collateral inward: donor -> a TWAP-owned holding ->
@@ -1994,11 +1994,12 @@ fn process_donate_insurance(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 8 {
+    if data.len() != 16 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let amount = u64::from_le_bytes(data.try_into().unwrap());
-    if amount == 0 {
+    let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let expected_market_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    if amount == 0 || expected_market_id == 0 {
         return Err(ProgramError::InvalidArgument);
     }
     let iter = &mut accounts.iter();
@@ -2023,9 +2024,16 @@ fn process_donate_insurance(
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
     if *market_slab.key != config.market_slab
+        || market_slab.owner != percolator_program.key
         || *percolator_program.key != config.percolator_program
         || !percolator_program.executable
     {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let current_market_id =
+        percolator_accounting::read_asset_market_id(&market_slab.try_borrow_data()?, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+    if current_market_id != expected_market_id {
         return Err(ProgramError::InvalidAccountData);
     }
     let auth_bump = [config.authority_bump];
