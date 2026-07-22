@@ -73,9 +73,12 @@ const POOL_SIZE_WINDOW: usize = 256;
 const POOL_SIZE_START: usize = 264;
 const POOL_SIZE: usize = 272;
 const POOL_SIZE_CROSS_BACKING_V1: usize = 273;
-const POOL_SIZE_CROSS_BACKING: usize = 289;
+const POOL_SIZE_CROSS_BACKING_V2: usize = 289;
+const POOL_SIZE_CROSS_BACKING: usize = 321;
 const POOL_CROSS_BACKING_OFF: usize = 272;
 const POOL_PENDING_BACKING_OFF: usize = 273;
+const POOL_SHARE_RATE_NUMERATOR_OFF: usize = 289;
+const POOL_SHARE_RATE_DENOMINATOR_OFF: usize = 305;
 const POSITION_SIZE_BASE: usize = 96;
 const POSITION_SIZE_TENURE: usize = 104;
 const POSITION_SIZE: usize = 120;
@@ -329,12 +332,11 @@ struct Pool {
     /// Authority allowed to toggle a position's vote-lock (the genesis-vote config
     /// PDA). `Pubkey::default()` disables vote-locking (own-vault pools).
     vote_authority: Pubkey,
-    /// Total pricing shares (POLICY_WITH_SURPLUS). A deposit mints
-    /// `amount * total_shares / insurance_balance` shares (1:1 for the first); a
-    /// withdraw redeems `shares * insurance_balance / total_shares`. Floor remainders
-    /// leave unowned reserve shares here so an exiting holder cannot transfer that
-    /// value to whoever exits last. Principal pools reset at zero principal;
-    /// empty with-surplus epochs normalize reserve pricing for later deposits.
+    /// Total pricing shares. Legacy layouts price deposits and withdrawals from
+    /// the live balance and leave floor remainders as unowned reserve shares.
+    /// Current cross-backed pools burn the owner's exact shares against the
+    /// loss-only rational rate below, so exit order cannot move those remainders
+    /// into another owner's claim.
     total_shares: u128,
     /// Distributed COIN mint whose genesis-vote config may lock this pool's positions.
     /// Own-vault pools store Pubkey::default().
@@ -359,6 +361,12 @@ struct Pool {
     /// trader-source capital fixed a conflicting bucket expiry. These atoms stay
     /// in the canonical pool ATA and remain owner principal, segregated by domain.
     pending_backing: [u64; 2],
+    /// Exact owner-claim value per share for current cross-backed principal
+    /// pools. External protection losses may lower this rational accumulator;
+    /// deposits and exits never change it, so one position's floor remainder
+    /// cannot move another position's claim.
+    share_rate_numerator: u128,
+    share_rate_denominator: u128,
 }
 
 impl Pool {
@@ -444,7 +452,7 @@ impl Pool {
                 OWN_VAULT_BOOTSTRAP_DELAY_SLOTS
             },
             cross_backing,
-            pending_backing: if data.len() >= POOL_SIZE_CROSS_BACKING {
+            pending_backing: if data.len() >= POOL_SIZE_CROSS_BACKING_V2 {
                 [
                     u64::from_le_bytes(
                         data[POOL_PENDING_BACKING_OFF..POOL_PENDING_BACKING_OFF + 8]
@@ -459,6 +467,24 @@ impl Pool {
                 ]
             } else {
                 [0, 0]
+            },
+            share_rate_numerator: if data.len() >= POOL_SIZE_CROSS_BACKING {
+                u128::from_le_bytes(
+                    data[POOL_SHARE_RATE_NUMERATOR_OFF..POOL_SHARE_RATE_NUMERATOR_OFF + 16]
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
+            },
+            share_rate_denominator: if data.len() >= POOL_SIZE_CROSS_BACKING {
+                u128::from_le_bytes(
+                    data[POOL_SHARE_RATE_DENOMINATOR_OFF..POOL_SHARE_RATE_DENOMINATOR_OFF + 16]
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
             },
         })
     }
@@ -510,12 +536,20 @@ impl Pool {
         } else if self.cross_backing {
             return Err(ProgramError::InvalidAccountData);
         }
-        if data.len() >= POOL_SIZE_CROSS_BACKING {
+        if data.len() >= POOL_SIZE_CROSS_BACKING_V2 {
             data[POOL_PENDING_BACKING_OFF..POOL_PENDING_BACKING_OFF + 8]
                 .copy_from_slice(&self.pending_backing[0].to_le_bytes());
             data[POOL_PENDING_BACKING_OFF + 8..POOL_PENDING_BACKING_OFF + 16]
                 .copy_from_slice(&self.pending_backing[1].to_le_bytes());
         } else if self.pending_backing != [0, 0] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data.len() >= POOL_SIZE_CROSS_BACKING {
+            data[POOL_SHARE_RATE_NUMERATOR_OFF..POOL_SHARE_RATE_NUMERATOR_OFF + 16]
+                .copy_from_slice(&self.share_rate_numerator.to_le_bytes());
+            data[POOL_SHARE_RATE_DENOMINATOR_OFF..POOL_SHARE_RATE_DENOMINATOR_OFF + 16]
+                .copy_from_slice(&self.share_rate_denominator.to_le_bytes());
+        } else if self.share_rate_numerator != 0 || self.share_rate_denominator != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
@@ -1173,6 +1207,29 @@ fn begin_fully_impaired_recapitalization(pool: &mut Pool, priced_balance: u64) -
     Ok(())
 }
 
+fn begin_fully_impaired_indexed_recapitalization(pool: &mut Pool) -> ProgramResult {
+    if pool.share_rate_numerator != 0 || pool.total_shares == 0 {
+        if pool.total_shares == 0 {
+            pool.share_rate_numerator = 1;
+            pool.share_rate_denominator = VIRTUAL_SHARES;
+        }
+        return Ok(());
+    }
+    if pool.outstanding_principal != 0 {
+        let (reset_generation, _) = share_generation_parts(pool.share_generation)?;
+        pool.share_generation = encode_share_generation(
+            reset_generation
+                .checked_add(1)
+                .ok_or(ProgramError::ArithmeticOverflow)?,
+            0,
+        )?;
+    }
+    pool.total_shares = 0;
+    pool.share_rate_numerator = 1;
+    pool.share_rate_denominator = VIRTUAL_SHARES;
+    Ok(())
+}
+
 fn rescale_insurance_shares(pool: &mut Pool) -> ProgramResult {
     let (reset_generation, scale_epoch) = share_generation_parts(pool.share_generation)?;
     // Pool totals round up while each lazily touched position rounds down. This keeps the sum of
@@ -1188,6 +1245,148 @@ fn rescale_insurance_shares(pool: &mut Pool) -> ProgramResult {
             .checked_add(1)
             .ok_or(ProgramError::ArithmeticOverflow)?,
     )?;
+    Ok(())
+}
+
+fn uses_indexed_cross_backing(pool: &Pool, pool_data_len: usize) -> bool {
+    pool.cross_backing && pool_data_len >= POOL_SIZE_CROSS_BACKING
+}
+
+fn redeem_indexed_shares(
+    shares: u128,
+    share_rate_numerator: u128,
+    share_rate_denominator: u128,
+) -> Result<u64, ProgramError> {
+    let value = wide_mul_div_floor(shares, share_rate_numerator, share_rate_denominator)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+}
+
+fn wide_product(left: u128, right: u128) -> Result<(u128, u128), ProgramError> {
+    const LIMB_MASK: u128 = u64::MAX as u128;
+    let left_low = left & LIMB_MASK;
+    let left_high = left >> 64;
+    let right_low = right & LIMB_MASK;
+    let right_high = right >> 64;
+
+    let low_product = left_low * right_low;
+    let low_word = low_product & LIMB_MASK;
+    let middle = left_high
+        .checked_mul(right_low)
+        .and_then(|value| value.checked_add(low_product >> 64))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let middle_low = middle & LIMB_MASK;
+    let middle_high = middle >> 64;
+    let upper_middle = left_low
+        .checked_mul(right_high)
+        .and_then(|value| value.checked_add(middle_low))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let low = (upper_middle << 64) | low_word;
+    let high = left_high
+        .checked_mul(right_high)
+        .and_then(|value| value.checked_add(middle_high))
+        .and_then(|value| value.checked_add(upper_middle >> 64))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    Ok((high, low))
+}
+
+fn compare_fractions(
+    left_numerator: u128,
+    left_denominator: u128,
+    right_numerator: u128,
+    right_denominator: u128,
+) -> Result<core::cmp::Ordering, ProgramError> {
+    if left_denominator == 0 || right_denominator == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(wide_product(left_numerator, right_denominator)?
+        .cmp(&wide_product(right_numerator, left_denominator)?))
+}
+
+/// Current cross-backed pools use a loss-only share-rate accumulator. Physical
+/// protection above the aggregate indexed claim is protocol value and cannot
+/// raise the rate; a real market loss lowers it before the next user action.
+/// Exact share burns and floor-priced mints make the live-balance candidate at
+/// least the stored rate after any user exit or deposit, respectively.
+fn sync_indexed_share_rate(pool: &mut Pool, protected_balance: u64) -> ProgramResult {
+    if pool.total_shares == 0 || pool.share_rate_numerator == 0 {
+        return Ok(());
+    }
+    if pool.share_rate_denominator == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if protected_balance == 0 {
+        pool.share_rate_numerator = 0;
+        pool.share_rate_denominator = 1;
+        return Ok(());
+    }
+    let candidate_numerator = (protected_balance as u128)
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let candidate_denominator = pool
+        .total_shares
+        .checked_add(insurance_virtual_shares(pool.share_generation)?)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if compare_fractions(
+        candidate_numerator,
+        candidate_denominator,
+        pool.share_rate_numerator,
+        pool.share_rate_denominator,
+    )? == core::cmp::Ordering::Less
+    {
+        pool.share_rate_numerator = candidate_numerator;
+        pool.share_rate_denominator = candidate_denominator;
+    }
+    Ok(())
+}
+
+fn mint_indexed_shares_with_capacity(
+    pool: &mut Pool,
+    amount: u64,
+) -> Result<u128, ProgramError> {
+    if pool.share_rate_numerator == 0 || pool.share_rate_denominator == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let shares = wide_mul_div_floor(
+        amount as u128,
+        pool.share_rate_denominator,
+        pool.share_rate_numerator,
+    )
+    .ok_or(ProgramError::ArithmeticOverflow)?;
+    let virtual_shares = insurance_virtual_shares(pool.share_generation)?;
+    // Never rescale live owner shares to admit a deposit: any lazy integer
+    // rescale can erase an independent holder's whole-atom claim. Capacity
+    // failure is detected before the user's token transfer and leaves all
+    // existing custody and withdrawal paths unchanged.
+    if shares == 0
+        || pool
+            .total_shares
+            .checked_add(shares)
+            .and_then(|total| total.checked_add(virtual_shares))
+            .is_none()
+    {
+        return Err(ProgramError::ArithmeticOverflow);
+    }
+    Ok(shares)
+}
+
+fn require_bounded_indexed_rounding(
+    amount: u64,
+    shares_minted: u128,
+    share_rate_numerator: u128,
+    share_rate_denominator: u128,
+) -> ProgramResult {
+    let immediate_value = redeem_indexed_shares(
+        shares_minted,
+        share_rate_numerator,
+        share_rate_denominator,
+    )?;
+    if immediate_value == 0
+        || immediate_value > amount
+        || amount.saturating_sub(immediate_value) > 1
+    {
+        return Err(ProgramError::InvalidArgument);
+    }
     Ok(())
 }
 
@@ -1683,6 +1882,8 @@ fn process_init_pool(
         bootstrap_delay_slots: OWN_VAULT_BOOTSTRAP_DELAY_SLOTS,
         cross_backing: false,
         pending_backing: [0, 0],
+        share_rate_numerator: 0,
+        share_rate_denominator: 0,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2428,6 +2629,8 @@ fn process_init_insurance_pool(
         bootstrap_delay_slots,
         cross_backing,
         pending_backing: [0, 0],
+        share_rate_numerator: u128::from(cross_backing),
+        share_rate_denominator: if cross_backing { VIRTUAL_SHARES } else { 0 },
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2597,24 +2800,40 @@ fn process_insurance_deposit(
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let protected_before = u64::try_from(protected_before)
         .map_err(|_| ProgramError::ArithmeticOverflow)?;
+    let indexed_cross_backing = uses_indexed_cross_backing(&pool, pool_account.data_len());
+    if indexed_cross_backing {
+        sync_indexed_share_rate(&mut pool, protected_before)?;
+    }
     let priced_balance_before = if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(protected_before, pool.outstanding_principal)
     } else {
         protected_before
     };
-    begin_fully_impaired_recapitalization(&mut pool, priced_balance_before)?;
-    let (shares_minted, virtual_shares) =
-        mint_insurance_shares_with_capacity(&mut pool, amount, priced_balance_before)?;
-    // Inflation/rounding guard (finding HB): a large surplus can make deposits mint zero or very
-    // few shares. Reject before transfer unless their immediate value is within one atom of the
-    // deposit, so public donations cannot turn entry rounding into material principal loss.
-    require_bounded_share_rounding_with_virtual_offset(
-        amount,
-        shares_minted,
-        pool.total_shares,
-        priced_balance_before,
-        virtual_shares,
-    )?;
+    let shares_minted = if indexed_cross_backing {
+        begin_fully_impaired_indexed_recapitalization(&mut pool)?;
+        let shares = mint_indexed_shares_with_capacity(&mut pool, amount)?;
+        require_bounded_indexed_rounding(
+            amount,
+            shares,
+            pool.share_rate_numerator,
+            pool.share_rate_denominator,
+        )?;
+        shares
+    } else {
+        begin_fully_impaired_recapitalization(&mut pool, priced_balance_before)?;
+        let (shares, virtual_shares) =
+            mint_insurance_shares_with_capacity(&mut pool, amount, priced_balance_before)?;
+        // Inflation/rounding guard (finding HB): a large surplus can make deposits mint zero or
+        // very few shares. Reject before transfer unless their immediate value is within one atom.
+        require_bounded_share_rounding_with_virtual_offset(
+            amount,
+            shares,
+            pool.total_shares,
+            priced_balance_before,
+            virtual_shares,
+        )?;
+        shares
+    };
     let outstanding_after = pool
         .outstanding_principal
         .checked_add(amount)
@@ -3200,6 +3419,13 @@ fn process_insurance_withdraw_impl(
         .checked_add(backing)
         .and_then(|value| u64::try_from(value).ok())
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    let indexed_cross_backing = uses_indexed_cross_backing(&pool, pool_account.data_len());
+    if indexed_cross_backing {
+        // Observe any market loss before touching this position's lazy share
+        // generation. Deposits and prior exits can only leave physical surplus,
+        // so this accumulator never rises from another owner's action.
+        sync_indexed_share_rate(&mut pool, protected_balance)?;
+    }
     let priced_balance = if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(protected_balance, pool.outstanding_principal)
     } else {
@@ -3228,6 +3454,15 @@ fn process_insurance_withdraw_impl(
     };
     let owed = if !shares_are_current {
         0
+    } else if indexed_cross_backing && share_accounting {
+        core::cmp::min(
+            amount,
+            redeem_indexed_shares(
+                shares_to_retire,
+                pool.share_rate_numerator,
+                pool.share_rate_denominator,
+            )?,
+        )
     } else if pool.policy == POLICY_WITH_SURPLUS && share_accounting {
         redeem_shares_with_virtual_offset(
             shares_to_retire,
@@ -3381,6 +3616,11 @@ fn process_insurance_withdraw_impl(
     };
     let pool_shares_to_burn = if shares_to_retire == 0 {
         0
+    } else if indexed_cross_backing {
+        // Retire exactly the withdrawing position's indexed shares. Its floored
+        // token remainder stays protocol-owned in custody without entering any
+        // surviving position's denominator or claim.
+        shares_to_retire
     } else {
         rate_safe_pool_share_burn_with_virtual_offset(
             shares_to_retire,
@@ -3665,10 +3905,10 @@ fn process_insurance_withdraw_impl(
     pool.pending_backing = pending_backing_after;
     pool.outstanding_principal = outstanding_after;
     position.principal -= amount;
-    // The position retires its nominal shares. The pool burns only the rate-safe
-    // subset; the difference is unowned reserve that keeps floor dust out of a
-    // later holder's redemption. Empty principal pools reset for terminal custody;
-    // with-surplus pools normalize reserve pricing for future deposit epochs.
+    // The position retires its nominal shares. Historical pools burn only the
+    // rate-safe subset and retain the difference as unowned reserve. Current
+    // cross-backed pools burn the exact indexed amount while their rational rate
+    // remains fixed. Empty principal pools reset for terminal custody.
     if shares_are_current {
         position.shares = position
             .shares
@@ -3687,6 +3927,10 @@ fn process_insurance_withdraw_impl(
     if outstanding_after == 0 {
         let (reset_generation, _) = share_generation_parts(pool.share_generation)?;
         pool.share_generation = encode_share_generation(reset_generation, 0)?;
+        if indexed_cross_backing {
+            pool.share_rate_numerator = 1;
+            pool.share_rate_denominator = VIRTUAL_SHARES;
+        }
     }
     // Historical telemetry must not become a custody gate. A position can cycle
     // the finite token supply enough times for cumulative withdrawals to exceed
@@ -4961,6 +5205,231 @@ mod tests {
     }
 
     #[test]
+    fn indexed_principal_split_exits_preserve_surviving_claims() {
+        #[derive(Clone, Copy, Debug)]
+        struct ExitState {
+            protected: u64,
+            outstanding: u64,
+            total_shares: u128,
+            share_rate_numerator: u128,
+            share_rate_denominator: u128,
+            attacker_principal: u64,
+            attacker_shares: u128,
+            victim_principal: u64,
+            victim_shares: u128,
+        }
+
+        fn exit(mut state: ExitState, attacker: bool, amount: u64) -> (ExitState, u64) {
+            let (principal, shares) = if attacker {
+                (state.attacker_principal, state.attacker_shares)
+            } else {
+                (state.victim_principal, state.victim_shares)
+            };
+            let shares_retired = if amount == principal {
+                shares
+            } else {
+                wide_mul_div_floor(shares, amount as u128, principal as u128).unwrap()
+            };
+            let paid = core::cmp::min(
+                amount,
+                redeem_indexed_shares(
+                    shares_retired,
+                    state.share_rate_numerator,
+                    state.share_rate_denominator,
+                )
+                .unwrap(),
+            );
+            let outstanding_after = state.outstanding - amount;
+            let protected_after = state.protected - paid;
+            state.total_shares -= shares_retired;
+            state.protected = protected_after;
+            state.outstanding = outstanding_after;
+            if attacker {
+                state.attacker_principal -= amount;
+                state.attacker_shares -= shares_retired;
+            } else {
+                state.victim_principal -= amount;
+                state.victim_shares -= shares_retired;
+            }
+            if outstanding_after == 0 {
+                state.attacker_shares = 0;
+                state.victim_shares = 0;
+            }
+            assert!(
+                state.total_shares >= state.attacker_shares + state.victim_shares,
+                "an exit burned surviving owned shares: {state:?}",
+            );
+            (state, paid)
+        }
+
+        for attacker_principal in 1u64..=16 {
+            for victim_principal in 1u64..=16 {
+                let outstanding = attacker_principal + victim_principal;
+                for protected in 0..=outstanding {
+                    let mut pool = historical_pool_fixture();
+                    pool.cross_backing = true;
+                    pool.policy = POLICY_PRINCIPAL;
+                    pool.domain = DOMAIN_INSURANCE;
+                    pool.outstanding_principal = outstanding;
+                    pool.total_shares = u128::from(outstanding) * VIRTUAL_SHARES;
+                    pool.share_rate_numerator = 1;
+                    pool.share_rate_denominator = VIRTUAL_SHARES;
+                    sync_indexed_share_rate(&mut pool, protected).unwrap();
+                    let initial = ExitState {
+                        protected,
+                        outstanding,
+                        total_shares: pool.total_shares,
+                        share_rate_numerator: pool.share_rate_numerator,
+                        share_rate_denominator: pool.share_rate_denominator,
+                        attacker_principal,
+                        attacker_shares: u128::from(attacker_principal) * VIRTUAL_SHARES,
+                        victim_principal,
+                        victim_shares: u128::from(victim_principal) * VIRTUAL_SHARES,
+                    };
+                    let initial_attacker_claim = core::cmp::min(
+                        attacker_principal,
+                        redeem_indexed_shares(
+                            initial.attacker_shares,
+                            initial.share_rate_numerator,
+                            initial.share_rate_denominator,
+                        )
+                        .unwrap(),
+                    );
+                    let initial_victim_claim = core::cmp::min(
+                        victim_principal,
+                        redeem_indexed_shares(
+                            initial.victim_shares,
+                            initial.share_rate_numerator,
+                            initial.share_rate_denominator,
+                        )
+                        .unwrap(),
+                    );
+                    let (control, control_attacker_paid) =
+                        exit(initial, true, attacker_principal);
+                    let (_, control_victim_paid) = exit(control, false, victim_principal);
+                    assert!(control_attacker_paid <= initial_attacker_claim);
+                    assert!(control_victim_paid >= initial_victim_claim);
+
+                    for chunk in 1..=attacker_principal {
+                        let mut split = initial;
+                        let mut split_attacker_paid = 0u64;
+                        while split.attacker_principal != 0 {
+                            let amount = core::cmp::min(chunk, split.attacker_principal);
+                            let (next, paid) = exit(split, true, amount);
+                            split = next;
+                            split_attacker_paid += paid;
+                        }
+                        let (_, split_victim_paid) = exit(split, false, victim_principal);
+                        assert!(
+                            split_attacker_paid <= initial_attacker_claim,
+                            "splitter exceeded its pre-sequence claim: initial={initial:?}, chunk={chunk}, claim={initial_attacker_claim}, split={split_attacker_paid}",
+                        );
+                        assert!(
+                            split_victim_paid >= initial_victim_claim,
+                            "splitter reduced victim below its pre-sequence claim: initial={initial:?}, chunk={chunk}, claim={initial_victim_claim}, split={split_victim_paid}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_rate_moves_only_for_external_loss() {
+        let mut pool = historical_pool_fixture();
+        pool.cross_backing = true;
+        pool.policy = POLICY_PRINCIPAL;
+        pool.domain = DOMAIN_INSURANCE;
+        pool.outstanding_principal = 28;
+        pool.total_shares = 28 * VIRTUAL_SHARES;
+        pool.share_rate_numerator = 1;
+        pool.share_rate_denominator = VIRTUAL_SHARES;
+
+        sync_indexed_share_rate(&mut pool, 26).unwrap();
+        let impaired_rate = (pool.share_rate_numerator, pool.share_rate_denominator);
+        assert_eq!(
+            compare_fractions(impaired_rate.0, impaired_rate.1, 1, VIRTUAL_SHARES).unwrap(),
+            core::cmp::Ordering::Less,
+        );
+        assert_eq!(
+            redeem_indexed_shares(14 * VIRTUAL_SHARES, impaired_rate.0, impaired_rate.1).unwrap(),
+            13,
+        );
+
+        sync_indexed_share_rate(&mut pool, 28).unwrap();
+        assert_eq!(
+            (pool.share_rate_numerator, pool.share_rate_denominator),
+            impaired_rate,
+            "surplus cannot raise claims",
+        );
+
+        pool.total_shares -= 14 * VIRTUAL_SHARES;
+        sync_indexed_share_rate(&mut pool, 13).unwrap();
+        assert_eq!(
+            (pool.share_rate_numerator, pool.share_rate_denominator),
+            impaired_rate,
+            "an exit cannot lower claims",
+        );
+        assert_eq!(
+            redeem_indexed_shares(
+                14 * VIRTUAL_SHARES,
+                pool.share_rate_numerator,
+                pool.share_rate_denominator,
+            )
+            .unwrap(),
+            13,
+        );
+
+        let mut exact_threshold = historical_pool_fixture();
+        exact_threshold.cross_backing = true;
+        exact_threshold.policy = POLICY_PRINCIPAL;
+        exact_threshold.domain = DOMAIN_INSURANCE;
+        exact_threshold.outstanding_principal = 5;
+        exact_threshold.total_shares = 5 * VIRTUAL_SHARES;
+        exact_threshold.share_rate_numerator = 1;
+        exact_threshold.share_rate_denominator = VIRTUAL_SHARES;
+        sync_indexed_share_rate(&mut exact_threshold, 1).unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                3 * VIRTUAL_SHARES,
+                exact_threshold.share_rate_numerator,
+                exact_threshold.share_rate_denominator,
+            )
+            .unwrap(),
+            1,
+            "the exact rational rate cannot round an existing whole-atom claim away",
+        );
+    }
+
+    #[test]
+    fn fraction_comparison_is_exact_without_cross_product_overflow() {
+        for left_numerator in 0u128..=32 {
+            for left_denominator in 1u128..=32 {
+                for right_numerator in 0u128..=32 {
+                    for right_denominator in 1u128..=32 {
+                        assert_eq!(
+                            compare_fractions(
+                                left_numerator,
+                                left_denominator,
+                                right_numerator,
+                                right_denominator,
+                            )
+                            .unwrap(),
+                            (left_numerator * right_denominator)
+                                .cmp(&(right_numerator * left_denominator)),
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            compare_fractions(u128::MAX, u128::MAX - 1, u128::MAX - 1, u128::MAX)
+                .unwrap(),
+            core::cmp::Ordering::Greater,
+        );
+    }
+
+    #[test]
     fn empty_with_surplus_epoch_normalizes_reserve_for_minimum_reentry() {
         let reserve_balance = 2u64;
         let reserve_shares = pool_total_shares_after_exit(
@@ -5010,6 +5479,8 @@ mod tests {
             bootstrap_delay_slots: 30_000,
             cross_backing: false,
             pending_backing: [0, 0],
+            share_rate_numerator: 0,
+            share_rate_denominator: 0,
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf).unwrap();
@@ -5127,6 +5598,8 @@ mod tests {
             bootstrap_delay_slots: 1_000,
             cross_backing: false,
             pending_backing: [0, 0],
+            share_rate_numerator: 0,
+            share_rate_denominator: 0,
         }
     }
 
@@ -5157,6 +5630,8 @@ mod tests {
         pool.domain = DOMAIN_INSURANCE;
         pool.cross_backing = true;
         pool.pending_backing = [3, 5];
+        pool.share_rate_numerator = 1;
+        pool.share_rate_denominator = VIRTUAL_SHARES;
 
         let mut current = [0u8; POOL_SIZE_CROSS_BACKING];
         pool.serialize(&mut current).unwrap();
@@ -5164,6 +5639,18 @@ mod tests {
         let decoded = Pool::deserialize(&current).unwrap();
         assert!(decoded.cross_backing);
         assert_eq!(decoded.pending_backing, [3, 5]);
+        assert_eq!(decoded.share_rate_numerator, 1);
+        assert_eq!(decoded.share_rate_denominator, VIRTUAL_SHARES);
+
+        pool.share_rate_numerator = 0;
+        pool.share_rate_denominator = 0;
+        let mut predecessor_v2 = [0u8; POOL_SIZE_CROSS_BACKING_V2];
+        pool.serialize(&mut predecessor_v2).unwrap();
+        let decoded_predecessor_v2 = Pool::deserialize(&predecessor_v2).unwrap();
+        assert!(decoded_predecessor_v2.cross_backing);
+        assert_eq!(decoded_predecessor_v2.pending_backing, [3, 5]);
+        assert_eq!(decoded_predecessor_v2.share_rate_numerator, 0);
+        assert_eq!(decoded_predecessor_v2.share_rate_denominator, 0);
 
         pool.pending_backing = [0, 0];
         let mut predecessor = [0u8; POOL_SIZE_CROSS_BACKING_V1];
@@ -5171,6 +5658,8 @@ mod tests {
         let decoded_predecessor = Pool::deserialize(&predecessor).unwrap();
         assert!(decoded_predecessor.cross_backing);
         assert_eq!(decoded_predecessor.pending_backing, [0, 0]);
+        assert_eq!(decoded_predecessor.share_rate_numerator, 0);
+        assert_eq!(decoded_predecessor.share_rate_denominator, 0);
 
         let mut legacy = [0u8; POOL_SIZE];
         assert!(
@@ -5198,6 +5687,9 @@ mod tests {
             POOL_SIZE_WINDOW,
             POOL_SIZE_START,
             POOL_SIZE,
+            POOL_SIZE_CROSS_BACKING_V1,
+            POOL_SIZE_CROSS_BACKING_V2,
+            POOL_SIZE_CROSS_BACKING,
         ] {
             let mut data = vec![0u8; size];
             pool.serialize(&mut data).unwrap();
@@ -5355,6 +5847,16 @@ mod tests {
                 &crate::id(),
                 &cross_key,
                 POOL_SIZE_CROSS_BACKING,
+                &cross,
+            )
+            .unwrap(),
+            PoolSeedVersion::CrossBacking,
+        );
+        assert_eq!(
+            pool_seed_version(
+                &crate::id(),
+                &cross_key,
+                POOL_SIZE_CROSS_BACKING_V2,
                 &cross,
             )
             .unwrap(),

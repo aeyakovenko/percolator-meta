@@ -2207,7 +2207,7 @@ fn legacy_genesis_pool_cannot_squat_cross_backing_genesis_address() {
         .expect("cross-backed genesis init remains available after legacy init");
 
     assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 272);
-    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 289);
+    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 321);
 }
 
 #[test]
@@ -2640,6 +2640,509 @@ fn cross_backing_split_exit_cannot_shift_an_impaired_codepositors_protection() {
     );
 }
 
+// PUBLIC LOF: every small partial exit independently rounds position shares,
+// the aggregate insurance/backing tranche, and each long/short domain debit. A
+// splitter must never collect more than the position's pre-exit whole-claim value
+// or reduce an independent depositor's claim after a public Percolator loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublicSplitExitOutcome {
+    attacker_payout: u128,
+    victim_payout: u128,
+    attacker_whole_claim: u128,
+    victim_whole_claim: u128,
+    protected: u128,
+}
+
+fn run_public_cross_backing_repeated_split_exit(
+    attacker_principals: &[u64],
+    victim_principal: u64,
+    target_mark: u64,
+    partial_exit_chunks: Option<&[u64]>,
+) -> PublicSplitExitOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    env.svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_cross_backing_genesis_pool();
+
+    let mut attackers = Vec::with_capacity(attacker_principals.len());
+    for principal in attacker_principals {
+        let (owner, owner_ata) = new_depositor(&mut env, *principal);
+        attackers.push((owner, owner_ata, *principal));
+    }
+    let (victim, victim_ata) = new_depositor(&mut env, victim_principal);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    for (owner, owner_ata, principal) in &attackers {
+        env.cross_backing_deposit(owner, owner_ata, &pool_holding, *principal)
+            .expect("attacker funds aggregate protection");
+    }
+    env.cross_backing_deposit(
+        &victim,
+        &victim_ata,
+        &pool_holding,
+        victim_principal,
+    )
+    .expect("victim funds aggregate protection");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the authenticated mark");
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
+    let short_portfolio = create_percolator_portfolio(&mut env, &short, 200);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: percolator::POS_SCALE as i128,
+                exec_price: 100,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open the public loss pair");
+
+    let mut slot = 100;
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        long_portfolio,
+        &mut slot,
+        target_mark,
+        300,
+    );
+    liquidate_stale_public_loser(&mut env, short_portfolio, slot);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve the publicly impaired market");
+    close_resolved_portfolios(
+        &mut env,
+        &[(&long, long_portfolio), (&short, short_portfolio)],
+    );
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let backing_balances =
+        percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+    let backing_sources =
+        percolator_accounting::read_asset_backing_source_credits(&market.data, 0).unwrap();
+    let ledger_principals = [0u16, 1u16].map(|domain| {
+        let ledger = env
+            .svm
+            .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+            .unwrap();
+        percolator_prog::state::read_backing_domain_ledger(&ledger.data)
+            .unwrap()
+            .total_principal_atoms
+    });
+    let protected_backing = backing_balances
+        .into_iter()
+        .zip(backing_sources)
+        .zip(ledger_principals)
+        .map(|((balance, source), principal)| {
+            balance
+                .provider_protected_principal_atoms(principal, source)
+                .unwrap()
+        })
+        .sum::<u128>();
+    let protected = asset_insurance_remaining(&env, 0) + protected_backing;
+    let attacker_principal = attacker_principals.iter().sum::<u64>();
+    let deposited = u128::from(attacker_principal) + u128::from(victim_principal);
+    assert!(
+        protected < deposited,
+        "the public trade must impair the owner pool: insurance={}, protected_backing={protected_backing}, balances={backing_balances:?}, sources={backing_sources:?}, ledgers={ledger_principals:?}",
+        asset_insurance_remaining(&env, 0),
+    );
+
+    let attacker_shares = attackers
+        .iter()
+        .map(|(owner, _, _)| env.position_shares(&owner.pubkey()))
+        .sum::<u128>();
+    let victim_shares = env.position_shares(&victim.pubkey());
+    let total_shares = env.pool_total_shares();
+    let whole_claim = attacker_shares * (protected + 1) / (total_shares + 1_000_000);
+    let victim_whole_claim = victim_shares * (protected + 1) / (total_shares + 1_000_000);
+    if let Some(exit_chunks) = partial_exit_chunks {
+        assert_eq!(attackers.len(), 1);
+        assert_eq!(exit_chunks.iter().sum::<u64>(), attacker_principal);
+        let (attacker, attacker_ata, _) = &attackers[0];
+        for amount in exit_chunks {
+            env.cross_backing_withdraw(
+                attacker,
+                attacker_ata,
+                &pool_holding,
+                *amount,
+            )
+            .expect("the public split exit remains live");
+        }
+    } else {
+        for (attacker, attacker_ata, principal) in &attackers {
+            env.cross_backing_withdraw(
+                attacker,
+                attacker_ata,
+                &pool_holding,
+                *principal,
+            )
+            .expect("each public attacker identity exits once");
+        }
+    }
+    let attacker_payout = attackers
+        .iter()
+        .map(|(_, owner_ata, _)| u128::from(env.token_amount(owner_ata)))
+        .sum::<u128>();
+    assert!(
+        attacker_payout <= whole_claim,
+        "split exits collected {attacker_payout}, above the pre-attack whole claim {whole_claim}",
+    );
+
+    env.cross_backing_withdraw(
+        &victim,
+        &victim_ata,
+        &pool_holding,
+        victim_principal,
+    )
+    .expect("the co-depositor retains a bounded exit");
+    let victim_payout = u128::from(env.token_amount(&victim_ata));
+    assert_eq!(env.pool_outstanding(), 0);
+    PublicSplitExitOutcome {
+        attacker_payout,
+        victim_payout,
+        attacker_whole_claim: whole_claim,
+        victim_whole_claim,
+        protected,
+    }
+}
+
+#[test]
+fn public_cross_backing_repeated_split_exit_cannot_drain_a_codepositor() {
+    let control =
+        run_public_cross_backing_repeated_split_exit(&[12], 2, 303, Some(&[12]));
+    let split = run_public_cross_backing_repeated_split_exit(
+        &[12],
+        2,
+        303,
+        Some(&[3, 3, 3, 3]),
+    );
+    assert_eq!(
+        control,
+        PublicSplitExitOutcome {
+            attacker_payout: 7,
+            victim_payout: 1,
+            attacker_whole_claim: 7,
+            victim_whole_claim: 1,
+            protected: 8,
+        },
+    );
+    assert!(
+        split.attacker_payout <= control.attacker_payout,
+        "splitting must not increase the attacker's payout",
+    );
+    assert!(
+        split.victim_payout >= control.victim_payout,
+        "four public three-atom exits reduce the independent victim from {} to {}",
+        control.victim_payout,
+        split.victim_payout,
+    );
+}
+
+#[test]
+fn public_zero_payout_partial_exits_cannot_grief_a_codepositor() {
+    let control =
+        run_public_cross_backing_repeated_split_exit(&[14], 14, 301, Some(&[14]));
+    let dust =
+        run_public_cross_backing_repeated_split_exit(&[14], 14, 301, Some(&[1; 14]));
+    assert_eq!(
+        (control.attacker_payout, control.victim_payout, control.protected),
+        (13, 13, 26),
+    );
+    assert_eq!(dust.attacker_payout, 0);
+    assert!(
+        dust.victim_payout >= dust.victim_whole_claim,
+        "fourteen public zero-payout exits reduced the victim from {} to {}",
+        dust.victim_whole_claim,
+        dust.victim_payout,
+    );
+}
+
+#[test]
+fn public_zero_payout_identity_splitting_cannot_grief_a_codepositor() {
+    let split_identities =
+        run_public_cross_backing_repeated_split_exit(&[1; 14], 14, 301, None);
+    assert_eq!(split_identities.attacker_payout, 0);
+    assert!(
+        split_identities.victim_payout >= split_identities.victim_whole_claim,
+        "fourteen public one-unit identities reduced the victim from {} to {}",
+        split_identities.victim_whole_claim,
+        split_identities.victim_payout,
+    );
+}
+
+#[test]
+fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new_cross_backing();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_cross_backing_genesis_pool();
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 321);
+
+    let high_entry = 200u64;
+    let side_protection = 2_000_000u64;
+    let high_capital = 98_000_000u64;
+    let impaired_principal = side_protection.checked_mul(2).unwrap();
+    let (impaired_owner, impaired_ata) = new_depositor(&mut env, impaired_principal);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    env.cross_backing_deposit(
+        &impaired_owner,
+        &impaired_ata,
+        &pool_holding,
+        impaired_principal,
+    )
+    .expect("fund both cross-backing loss domains");
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let position_q = 1_000_000_000_000i128;
+    let pnl_atoms_per_price = position_q.unsigned_abs() / percolator::POS_SCALE;
+    let low_capital = 10_000_000u64;
+    assert_eq!(
+        (u128::from(side_protection) + u128::from(low_capital)) % pnl_atoms_per_price,
+        0,
+    );
+
+    let (low_long, low_long_portfolio, low_short, low_short_portfolio) =
+        open_public_pair(&mut env, position_q, 100, low_capital);
+    let high_target = 100u64
+        .checked_add(
+            u64::try_from(
+                (u128::from(side_protection) + u128::from(low_capital))
+                    / pnl_atoms_per_price,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let mut slot = 100;
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        high_target,
+        300,
+    );
+    liquidate_stale_public_loser(&mut env, low_short_portfolio, slot);
+    clear_stale_public_winner_with_backing(&mut env, &low_long, low_long_portfolio, slot);
+
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        high_entry,
+        100,
+    );
+    let (high_long, high_long_portfolio, high_short, high_short_portfolio) =
+        open_public_pair(&mut env, position_q, high_entry, high_capital);
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        100,
+        400,
+    );
+    liquidate_stale_public_loser(&mut env, high_long_portfolio, slot);
+    clear_stale_public_winner_with_backing(&mut env, &high_short, high_short_portfolio, slot);
+
+    let protected = {
+        let market = env.svm.get_account(&env.slab).unwrap();
+        let balances =
+            percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+        let sources =
+            percolator_accounting::read_asset_backing_source_credits(&market.data, 0).unwrap();
+        let ledgers = [0u16, 1u16].map(|domain| {
+            let ledger = env
+                .svm
+                .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+                .unwrap();
+            percolator_prog::state::read_backing_domain_ledger(&ledger.data)
+                .unwrap()
+                .total_principal_atoms
+        });
+        asset_insurance_remaining(&env, 0)
+            + balances
+                .into_iter()
+                .zip(sources)
+                .zip(ledgers)
+                .map(|((balance, source), principal)| {
+                    balance
+                        .provider_protected_principal_atoms(principal, source)
+                        .unwrap()
+                })
+                .sum::<u128>()
+    };
+    assert_eq!(protected, 0, "both owner-protection domains are fully impaired");
+
+    let recapitalization = 1_000_000u64;
+    let payer = clone_kp(&env.payer);
+    let mint_authority = clone_kp(&env.mint_auth);
+    let mint = env.mint;
+    mint_to(
+        &mut env.svm,
+        &payer,
+        &mint,
+        &mint_authority,
+        &impaired_ata,
+        recapitalization,
+    );
+    env.cross_backing_deposit(
+        &impaired_owner,
+        &impaired_ata,
+        &pool_holding,
+        recapitalization,
+    )
+    .expect("the impaired owner adds fresh capital to its stale position PDA");
+    let (fresh_owner, fresh_ata) = new_depositor(&mut env, recapitalization);
+    env.cross_backing_deposit(
+        &fresh_owner,
+        &fresh_ata,
+        &pool_holding,
+        recapitalization,
+    )
+    .expect("fresh owner recapitalizes the fully impaired pool");
+    let recapitalized_pool = env.svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        u128::from_le_bytes(recapitalized_pool[289..305].try_into().unwrap()),
+        1,
+    );
+    assert_eq!(
+        u128::from_le_bytes(recapitalized_pool[305..321].try_into().unwrap()),
+        1_000_000,
+    );
+    assert_eq!(
+        env.position_share_generation(&impaired_owner.pubkey()),
+        env.pool_share_generation(),
+    );
+    assert_eq!(
+        env.position_share_generation(&fresh_owner.pubkey()),
+        env.pool_share_generation(),
+    );
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve after both public loss sides are cleared");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&observer, observer_portfolio),
+            (&low_long, low_long_portfolio),
+            (&low_short, low_short_portfolio),
+            (&high_long, high_long_portfolio),
+            (&high_short, high_short_portfolio),
+        ],
+    );
+
+    env.cross_backing_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &pool_holding,
+        impaired_principal,
+    )
+    .expect("the mixed position retires stale nominal principal pro rata");
+    assert_eq!(
+        env.token_amount(&impaired_ata),
+        800_000,
+        "withdrawing stale nominal principal cannot claim all mixed fresh shares",
+    );
+    env.cross_backing_withdraw(
+        &fresh_owner,
+        &fresh_ata,
+        &pool_holding,
+        recapitalization,
+    )
+    .expect("the independent current generation retains every recapitalization atom");
+    assert_eq!(env.token_amount(&fresh_ata), recapitalization);
+    env.cross_backing_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &pool_holding,
+        recapitalization,
+    )
+    .expect("the mixed position collects only its remaining fresh share value");
+    assert_eq!(env.token_amount(&impaired_ata), recapitalization);
+    assert_eq!(env.pool_outstanding(), 0);
+}
+
 #[test]
 fn bootstrap_unlock_cannot_expire_genesis_backing_before_provider_exit() {
     use percolator_prog::ix::Instruction as PIx;
@@ -3029,7 +3532,7 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     assert_eq!(env.token_amount(&third_ata), 0);
 
     let pool_data = env.svm.get_account(&env.pool).unwrap().data;
-    assert_eq!(pool_data.len(), 289, "current cross-backed pool layout");
+    assert_eq!(pool_data.len(), 321, "current cross-backed pool layout");
     assert_eq!(
         [
             u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
@@ -3207,6 +3710,260 @@ fn bilateral_transient_sources_cannot_block_genesis_backing_or_refunds() {
     }
     assert_eq!(env.pool_outstanding(), 0);
     assert_eq!(env.token_amount(&pool_holding), 0);
+}
+
+// REGRESSION PROBE: a trader-source expiry can keep part of Genesis backing
+// staged in the pool ATA. A later public loss must still fix one pool-wide share
+// rate: dust-splitting one impaired position cannot consume staged principal,
+// reduce an independent owner's claim, or strand that owner's bounded exit.
+#[test]
+fn staged_backing_survives_an_indexed_haircut_and_dust_split_exit() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Outcome {
+        splitter_payout: u64,
+        victim_payout: u64,
+        victim_whole_claim: u128,
+        protected_before_exits: u128,
+        final_protocol_value: u128,
+    }
+
+    let run = |split_exit: bool| {
+        let mut env = Env::new_cross_backing();
+        let oracle = Keypair::new();
+        let observer = Keypair::new();
+        for owner in [&oracle, &observer] {
+            env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        }
+        install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+        env.init_cross_backing_genesis_pool();
+        let pool_holding = create_canonical_pool_holding(&mut env);
+
+        // Seed only the short provider bucket, then publicly materialize a long
+        // trader-source bucket whose finite expiry rejects Genesis' u64::MAX top-up.
+        let (seed_owner, seed_ata) = new_depositor(&mut env, 1);
+        env.cross_backing_deposit(&seed_owner, &seed_ata, &pool_holding, 1)
+            .expect("seed the short provider bucket");
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: 100,
+                    initial_mark_e6: 100,
+                }
+                .encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("configure the independent authenticated mark");
+        let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+        let (source_long, source_long_portfolio, source_short, source_short_portfolio) =
+            open_public_pair(&mut env, 100_000_000_000, 100, 1_000_000);
+        let mut slot = 100;
+        advance_public_mark(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            89,
+            10,
+        );
+        liquidate_stale_public_loser(&mut env, source_long_portfolio, slot);
+        clear_stale_public_winner_with_backing(
+            &mut env,
+            &source_short,
+            source_short_portfolio,
+            slot,
+        );
+
+        let (splitter, splitter_ata) = new_depositor(&mut env, 14);
+        let (victim, victim_ata) = new_depositor(&mut env, 14);
+        env.cross_backing_deposit(&splitter, &splitter_ata, &pool_holding, 14)
+            .expect("splitter deposits after the public expiry mismatch");
+        env.cross_backing_deposit(&victim, &victim_ata, &pool_holding, 14)
+            .expect("victim deposits after the public expiry mismatch");
+
+        let staged_before_loss = {
+            let pool = env.svm.get_account(&env.pool).unwrap();
+            [
+                u64::from_le_bytes(pool.data[273..281].try_into().unwrap()),
+                u64::from_le_bytes(pool.data[281..289].try_into().unwrap()),
+            ]
+        };
+        assert_eq!(staged_before_loss, [7, 0]);
+        assert_eq!(env.token_amount(&pool_holding), 7);
+        assert_eq!(env.pool_outstanding(), 29);
+
+        // The second public pair crosses its own margin. This is the real market
+        // loss that must lower the indexed owner-claim rate.
+        let (loss_long, loss_long_portfolio, loss_short, loss_short_portfolio) =
+            open_public_pair(
+                &mut env,
+                percolator::POS_SCALE as i128,
+                89,
+                600,
+            );
+        advance_public_mark(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            691,
+            300,
+        );
+        liquidate_stale_public_loser(&mut env, loss_short_portfolio, slot);
+        clear_stale_public_winner_with_backing(
+            &mut env,
+            &loss_long,
+            loss_long_portfolio,
+            slot,
+        );
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ResolveMarket.encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("resolve after the indexed public loss");
+        close_resolved_portfolios(
+            &mut env,
+            &[
+                (&observer, observer_portfolio),
+                (&source_long, source_long_portfolio),
+                (&source_short, source_short_portfolio),
+                (&loss_long, loss_long_portfolio),
+                (&loss_short, loss_short_portfolio),
+            ],
+        );
+
+        let market = env.svm.get_account(&env.slab).unwrap();
+        let backing_balances =
+            percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+        let backing_sources =
+            percolator_accounting::read_asset_backing_source_credits(&market.data, 0).unwrap();
+        let ledger_principals = [0u16, 1u16].map(|domain| {
+            let ledger = env
+                .svm
+                .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+                .unwrap();
+            percolator_prog::state::read_backing_domain_ledger(&ledger.data)
+                .unwrap()
+                .total_principal_atoms
+        });
+        let provider_backing = backing_balances
+            .into_iter()
+            .zip(backing_sources)
+            .zip(ledger_principals)
+            .map(|((balance, source), principal)| {
+                balance
+                    .provider_protected_principal_atoms(principal, source)
+                    .unwrap()
+            })
+            .sum::<u128>();
+        let pool_before_exits = env.svm.get_account(&env.pool).unwrap();
+        let staged_before_exits = [
+            u64::from_le_bytes(pool_before_exits.data[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_before_exits.data[281..289].try_into().unwrap()),
+        ];
+        assert_eq!(staged_before_exits, staged_before_loss);
+        let protected_before_exits = asset_insurance_remaining(&env, 0)
+            + provider_backing
+            + staged_before_exits.into_iter().map(u128::from).sum::<u128>();
+        assert!(
+            protected_before_exits < 29,
+            "the second public pair must impair owner protection: insurance={}, provider_backing={provider_backing}, staged={staged_before_exits:?}",
+            asset_insurance_remaining(&env, 0),
+        );
+
+        let victim_shares = env.position_shares(&victim.pubkey());
+        let total_shares = env.pool_total_shares();
+        let victim_whole_claim = victim_shares * (protected_before_exits + 1)
+            / (total_shares + 1_000_000);
+
+        env.cross_backing_withdraw(&seed_owner, &seed_ata, &pool_holding, 1)
+            .expect("the zero-value seed claim fixes the exact loss rate");
+        assert_eq!(env.token_amount(&seed_ata), 0);
+
+        if split_exit {
+            for _ in 0..14 {
+                env.cross_backing_withdraw(&splitter, &splitter_ata, &pool_holding, 1)
+                    .expect("each dust split remains a bounded public exit");
+            }
+        } else {
+            env.cross_backing_withdraw(&splitter, &splitter_ata, &pool_holding, 14)
+                .expect("the lump-sum control exit remains live");
+        }
+        env.cross_backing_withdraw(&victim, &victim_ata, &pool_holding, 14)
+            .expect("the independent owner retains a bounded exit");
+
+        let final_pool = env.svm.get_account(&env.pool).unwrap();
+        assert_eq!(
+            [
+                u64::from_le_bytes(final_pool.data[273..281].try_into().unwrap()),
+                u64::from_le_bytes(final_pool.data[281..289].try_into().unwrap()),
+            ],
+            [0, 0],
+        );
+        assert_eq!(env.pool_outstanding(), 0);
+
+        let splitter_payout = env.token_amount(&splitter_ata);
+        let victim_payout = env.token_amount(&victim_ata);
+        let final_protocol_value = u128::from(env.token_amount(&env.perc_vault))
+            + u128::from(env.token_amount(&pool_holding));
+        let owner_payouts = u128::from(splitter_payout) + u128::from(victim_payout);
+        assert!(
+            owner_payouts <= protected_before_exits,
+            "owners cannot claim non-provider trader-source value",
+        );
+        assert!(
+            final_protocol_value >= protected_before_exits - owner_payouts,
+            "every unpaid protected atom remains in protocol custody",
+        );
+
+        Outcome {
+            splitter_payout,
+            victim_payout,
+            victim_whole_claim,
+            protected_before_exits,
+            final_protocol_value,
+        }
+    };
+
+    let control = run(false);
+    let split = run(true);
+    assert_eq!(control.protected_before_exits, 25);
+    assert_eq!(control.victim_whole_claim, 12);
+    assert_eq!(control.splitter_payout, 12);
+    assert_eq!(control.victim_payout, 12);
+    assert_eq!(split.splitter_payout, 0);
+    assert_eq!(control.protected_before_exits, split.protected_before_exits);
+    assert!(split.splitter_payout <= control.splitter_payout);
+    assert_eq!(
+        split.victim_payout, control.victim_payout,
+        "dust exits cannot transfer staged backing or indexed value away from the victim",
+    );
+    assert!(
+        u128::from(split.victim_payout) >= split.victim_whole_claim,
+        "the victim receives {}/{} indexed atoms",
+        split.victim_payout,
+        split.victim_whole_claim,
+    );
+    assert!(
+        split.final_protocol_value >= control.final_protocol_value,
+        "splitter forfeitures remain protocol value instead of leaving custody",
+    );
 }
 
 // UPGRADE LOF PROBE: the original deployed pool was 208 bytes and used only the
