@@ -26345,6 +26345,315 @@ fn e2e_approved_old_generation_resolve_cannot_shutdown_reused_market_key() {
     );
 }
 
+// PUBLIC LIVE-MARKET DOS: accepting an externally created market used to bind only the
+// slab key and outgoing authority. Percolator permits a raw authority to close a slab and
+// initialize a new generation at the same key, so a withheld donation signed for generation A
+// could execute against a funded generation B. The stale transfer leaves B under the old
+// controller even though neither B's users nor its creator authorized that handoff.
+#[test]
+fn e2e_presigned_market_donation_cannot_capture_reused_live_slab() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const DEPOSIT: u64 = 1_000_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let victim = Keypair::new();
+    let counterparty = Keypair::new();
+    for signer in [&payer, &creator, &victim, &counterparty] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Pubkey::new_unique();
+    init_creator_owned_market(
+        &mut svm,
+        &payer,
+        &creator,
+        &collateral_mint,
+        &market,
+    );
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let creator_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &creator_destination,
+        &collateral_mint,
+        &creator.pubkey(),
+        0,
+    );
+
+    // The old governance key is intentionally unavailable after A closes. The creator
+    // authorized donating A to it, not any future market that happens to reuse A's key.
+    let old_governance = Pubkey::new_unique();
+    let controller = controller_pda(&old_governance, &market, &perc_id());
+    let donation = Instruction {
+        program_id: controller_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(old_governance, false),
+            AccountMeta::new_readonly(creator.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+        ],
+        data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+    };
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let stale_donation = Transaction::new_signed_with_payer(
+        &[donation],
+        Some(&payer.pubkey()),
+        &[&payer, &creator],
+        shared_blockhash,
+    );
+
+    // Generation A resolves and closes through the real pinned Percolator binary while the
+    // already-signed donation remains within the same recent-blockhash lifetime.
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &creator],
+        shared_blockhash,
+    ))
+    .expect("generation A resolves");
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(creator_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseSlab,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &creator],
+        shared_blockhash,
+    ))
+    .expect("generation A closes without entering Meta governance");
+    assert!(
+        svm.get_account(&market)
+            .is_none_or(|account| account.lamports == 0),
+        "generation A is gone"
+    );
+
+    // Reinitialize B at the same public slab key, then put independent user collateral and
+    // balanced open interest into it before the stale donation is submitted.
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: 1,
+                maintenance_fee_per_slot: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &creator],
+        shared_blockhash,
+    ))
+    .expect("generation B initializes at the same slab key");
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let victim_portfolio = Keypair::new();
+    let counterparty_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&victim, &victim_portfolio),
+        (&counterparty, &counterparty_portfolio),
+    ] {
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, portfolio],
+            shared_blockhash,
+        ))
+        .expect("allocate generation-B portfolio");
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, owner],
+            shared_blockhash,
+        ))
+        .expect("initialize generation-B portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            DEPOSIT,
+        );
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: DEPOSIT as u128,
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, owner],
+            shared_blockhash,
+        ))
+        .expect("fund generation-B portfolio");
+    }
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new_readonly(counterparty.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(counterparty_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: (percolator::POS_SCALE / 10) as i128,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &victim, &counterparty],
+        shared_blockhash,
+    ))
+    .expect("generation B has independent collateral and open interest");
+
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let replay = svm.send_transaction(stale_donation);
+    if replay.is_ok() {
+        assert_eq!(
+            percolator_accounting::read_market_authority(
+                &svm.get_account(&market).unwrap().data,
+            )
+            .unwrap(),
+            controller.to_bytes(),
+            "the generation-A signature captured generation B"
+        );
+        assert!(
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                &[pix(
+                    vec![
+                        AccountMeta::new_readonly(creator.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::ResolveMarket,
+                )],
+                Some(&payer.pubkey()),
+                &[&payer, &creator],
+                shared_blockhash,
+            ))
+            .is_err(),
+            "B's real creator no longer has a bounded admin resolution path"
+        );
+        panic!("a stale market donation captured a funded replacement generation");
+    }
+
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_replay,
+        "rejecting stale donation is byte-atomic"
+    );
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                1_399_999,
+            ),
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ResolveMarket,
+            ),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &creator],
+        shared_blockhash,
+    ))
+    .expect("generation B retains its creator-authorized resolution path");
+}
+
 // ATTACK PROBE (voting with NO capital at all): a voter must have a real subledger position
 // (capital at risk) to vote. An account that never deposited has no position account, so the gv
 // `vote` cannot read or owner-check it and rejects. Governance power requires live principal.
