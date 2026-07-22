@@ -59963,6 +59963,54 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
     )
     .expect("governance isolates funding settlement from configured trade fees");
 
+    warp_to(&mut svm, 1001);
+    let premium = build_push_ewma_mark_message(
+        &env.squads_vault,
+        &env.slab,
+        &perc_id(),
+        1001,
+        2_000_000,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        4,
+        &premium,
+        &oracle_remaining,
+    )
+    .expect("the external oracle publishes a funding premium");
+
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &twap_cfg,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("futarchy donates lifecycle control before public portfolio admission");
+
     let long = Keypair::new();
     let short = Keypair::new();
     for owner in [&long, &short] {
@@ -59994,25 +60042,6 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
     )
     .expect("public traders open a balanced funding pair");
 
-    warp_to(&mut svm, 1001);
-    let premium = build_push_ewma_mark_message(
-        &env.squads_vault,
-        &env.slab,
-        &perc_id(),
-        1001,
-        2_000_000,
-    );
-    squads_execute(
-        &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        4,
-        &premium,
-        &oracle_remaining,
-    )
-    .expect("the external oracle publishes a funding premium");
     for slot in [1001u64, 1002, 1003] {
         warp_to(&mut svm, slot);
         for _ in 0..8 {
@@ -60082,34 +60111,6 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         backing_after_funding > initial_backing,
         "public funding settlement must create organic backing surplus: before={initial_backing}, after={backing_after_funding}"
     );
-
-    let donate_market = build_controller_accept_market_authority_message(
-        &env.squads_vault,
-        &controller,
-        &env.slab,
-        &perc_id(),
-        &twap_cfg,
-    );
-    let donate_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        5,
-        &donate_market,
-        &donate_remaining,
-    )
-    .expect("futarchy donates only lifecycle control after public settlement");
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
     let resolve = build_controller_generation_proxy_message(
