@@ -10474,6 +10474,25 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         )
         .expect("configure authenticated marks");
 
+        let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+                ],
+                data: vec![3u8],
+            },
+        )
+        .expect("donate bounded lifecycle authority before public portfolio admission");
+
         let vault_authority = perc_vault_authority(&market, &perc_id());
         let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
         set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
@@ -10600,25 +10619,6 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         if activate_mark {
             crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
         }
-
-        let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
-        send(
-            &mut svm,
-            &[&payer, &creator],
-            Instruction {
-                program_id: controller_id(),
-                accounts: vec![
-                    AccountMeta::new_readonly(governance.pubkey(), false),
-                    AccountMeta::new_readonly(creator.pubkey(), true),
-                    AccountMeta::new_readonly(controller, false),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new_readonly(perc_id(), false),
-                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
-                ],
-                data: vec![3u8],
-            },
-        )
-        .expect("donate bounded lifecycle authority to the controller");
 
         clock.slot = resolve_slot;
         clock.unix_timestamp = resolve_slot as i64;
@@ -15578,9 +15578,9 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
     assert_eq!(token_amount(&svm, &provider_destination), 0);
     assert_eq!(token_amount(&svm, &controller_transit), 0);
 
-    // Move asset-admin custody through the same owner-bound pool used by genesis.
-    // Backing remains externally attributed, while the pool becomes the only PDA
-    // that can authorize the fixed post-resolution cleanup.
+    // Initialize the canonical current pool whose prefix supplies the deployed
+    // predecessor fixture below. Current first grants reject pre-existing backing;
+    // the historical account path remains recoverable after an upgrade.
     let coin_mint = Pubkey::new_unique();
     let pool = sub_pool_pda(
         &collateral_mint,
@@ -15612,20 +15612,6 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
         data: pool_data,
     };
     send(&mut svm, &[&payer], init_pool).expect("initialize the canonical genesis pool");
-    let grant_pool = Instruction {
-        program_id: controller_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(governance.pubkey(), true),
-            AccountMeta::new_readonly(controller, false),
-            AccountMeta::new_readonly(pool, false),
-            AccountMeta::new(slab, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(sub_id(), false),
-        ],
-        data: vec![2u8], // IX_GRANT_GENESIS_POOL
-    };
-    send(&mut svm, &[&payer, &governance], grant_pool)
-        .expect("controller hands asset-admin custody to the owner-bound pool");
     assert_eq!(
         percolator_accounting::read_asset_backing_authority(
             &svm.get_account(&slab).unwrap().data,
@@ -15633,7 +15619,7 @@ fn e2e_resolved_asset0_backing_is_returned_only_to_its_recorded_provider() {
         )
         .unwrap(),
         creator.pubkey().to_bytes(),
-        "custody handoff cannot absorb the external backing provider"
+        "market donation cannot absorb the external backing provider"
     );
 
     // Compatibility probe: deployed predecessor pools could carry a nonzero metadata
@@ -29939,8 +29925,13 @@ fn warp_to_first_pool_deposit_slot(svm: &mut LiteSVM, pool: &Pubkey) {
         .get_account(pool)
         .expect("genesis pool must exist")
         .data;
+    let grant_slot_offset = match data.len() {
+        329 => 321,
+        size if size >= 361 => 353,
+        size => panic!("pool layout {size} has no custody grant slot"),
+    };
     let slot = u64::from_le_bytes(
-        data[321..329]
+        data[grant_slot_offset..grant_slot_offset + 8]
             .try_into()
             .expect("current pool stores its custody grant slot"),
     );
@@ -34150,6 +34141,7 @@ fn e2e_full_genesis_to_buy_burn() {
     );
     let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
     donation_data.extend_from_slice(&surplus.to_le_bytes());
+    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &slab).to_le_bytes());
     send(
         &mut svm,
         &[&payer],
@@ -49759,9 +49751,11 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
 
     let payer = Keypair::new();
     let admin = Keypair::new();
+    let oracle = Keypair::new();
     let governance = Keypair::new();
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
     svm.airdrop(&governance.pubkey(), 1_000_000_000).unwrap();
     svm.set_sysvar(&Clock {
         slot: 100,
@@ -49891,10 +49885,27 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     .expect("public attacker initializes a second live market");
     send(
         &mut svm,
-        &[&payer, &admin],
+        &[&payer, &admin, &oracle],
         pix(
             vec![
-                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("separate the oracle from lifecycle authority");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new(oracle.pubkey(), true),
                 AccountMeta::new(market_key, false),
             ],
             PIx::ConfigureEwmaMark {
@@ -49922,6 +49933,25 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         ),
     )
     .expect("configure public stale resolution");
+
+    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
+            ],
+            data: vec![3u8],
+        },
+    )
+    .expect("creator donates lifecycle authority before public portfolio admission");
 
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -50118,10 +50148,10 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
     svm.set_sysvar(&clock);
     send(
         &mut svm,
-        &[&payer, &admin],
+        &[&payer, &oracle],
         pix(
             vec![
-                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(oracle.pubkey(), true),
                 AccountMeta::new(market_key, false),
             ],
             PIx::PushEwmaMark {
@@ -50183,59 +50213,7 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         "flattening preserves the monotonic paid counter"
     );
 
-    // Conservative funding rounding can leave protocol insurance owned by the outgoing creator.
-    // Return that value before donation, as the controller requires, without touching either trader.
-    let outgoing_insurance = read_asset0_insurance(&svm, &market_key);
-    if outgoing_insurance > 0 {
-        let admin_collateral =
-            canonical_insurance_vault(&admin.pubkey(), &collateral_mint);
-        set_token(
-            &mut svm,
-            &admin_collateral,
-            &collateral_mint,
-            &admin.pubkey(),
-            0,
-        );
-        send(
-            &mut svm,
-            &[&payer, &admin],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(admin.pubkey(), true),
-                    AccountMeta::new(market_key, false),
-                    AccountMeta::new(admin_collateral, false),
-                    AccountMeta::new(percolator_vault, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                PIx::WithdrawInsuranceAsset {
-                    asset_index: 0,
-                    amount: outgoing_insurance,
-                },
-            ),
-        )
-        .expect("outgoing creator returns funding-rounding insurance before donation");
-    }
-
-    // Donate lifecycle authority, then let unaffiliated callers resolve, pay, and empty the long.
-    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
-    send(
-        &mut svm,
-        &[&payer, &admin],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(governance.pubkey(), false),
-                AccountMeta::new_readonly(admin.pubkey(), true),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market_key, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
-            ],
-            data: vec![3u8],
-        },
-    )
-    .expect("creator donates lifecycle authority to the controller");
+    // Let unaffiliated callers resolve, pay, and empty the market through the controller.
     clock.slot = 110;
     clock.unix_timestamp = 110;
     svm.set_sysvar(&clock);
@@ -50439,6 +50417,59 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         },
     )
     .expect("public cleanup archives and retires the remaining short");
+
+    let protocol_insurance = read_asset0_insurance(&svm, &market_key);
+    if protocol_insurance > 0 {
+        let insurance_destination = Pubkey::new_unique();
+        let insurance_transit = Pubkey::new_unique();
+        let insurance_ledger = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &insurance_destination,
+            &collateral_mint,
+            &governance.pubkey(),
+            0,
+        );
+        set_token(
+            &mut svm,
+            &insurance_transit,
+            &collateral_mint,
+            &controller,
+            0,
+        );
+        svm.set_account(
+            insurance_ledger,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; percolator_prog::state::insurance_ledger_account_len()],
+                owner: perc_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer],
+            controller_return_resolved_asset_insurance_ix(
+                &governance.pubkey(),
+                &controller,
+                &market_key,
+                &insurance_destination,
+                &insurance_transit,
+                &percolator_vault,
+                &vault_authority,
+                &insurance_ledger,
+                &perc_id(),
+                0,
+            ),
+        )
+        .expect("public terminal path returns controller-owned protocol insurance");
+        assert_eq!(
+            token_amount(&svm, &insurance_destination),
+            u64::try_from(protocol_insurance).unwrap(),
+        );
+    }
 
     // Funding settlement left two provider-owned backing atoms. Return them through the fixed,
     // amountless controller path before CloseSlab; no protocol or DAO account may absorb them.
@@ -52387,6 +52418,8 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
     let admin = Keypair::new();
     svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    let oracle = Keypair::new();
+    svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
     let governance = Keypair::new();
     svm.airdrop(&governance.pubkey(), 1_000_000_000)
         .unwrap();
@@ -52396,8 +52429,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         ..Clock::default()
     });
 
-    // ---- live percolator market (direct-write, the proven `make_live_market` path; admin is the
-    //      marketauth so it drives the manual oracle via ConfigureAuthMark) ----
+    // ---- live Percolator market with an oracle independent from lifecycle authority ----
     let mint_auth = Keypair::new();
     let collateral = create_real_mint(&mut svm, &payer, &mint_auth.pubkey());
     let market = Pubkey::new_unique();
@@ -52460,13 +52492,30 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         bh,
     ))
     .expect("init market");
+    send(
+        &mut svm,
+        &[&payer, &admin, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("separate the oracle from lifecycle authority");
     let auth_mark = |svm: &mut LiteSVM, mark: u64, slot: u64| {
         svm.expire_blockhash();
         let bh = svm.latest_blockhash();
         svm.send_transaction(Transaction::new_signed_with_payer(
             &[pix(
                 vec![
-                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(oracle.pubkey(), true),
                     AccountMeta::new(market, false),
                 ],
                 PIx::ConfigureAuthMark {
@@ -52476,7 +52525,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
                 },
             )],
             Some(&payer.pubkey()),
-            &[&payer, &admin],
+            &[&payer, &oracle],
             bh,
         ))
     };
@@ -52519,6 +52568,100 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             funded_group.source_backing_buckets[0].fresh_unliened_backing_num,
             percolator::BOUND_SCALE,
         );
+    }
+
+    if owner_close_after_recovery {
+        send(
+            &mut svm,
+            &[&admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetLifecycle {
+                    action: 2,
+                    asset_index: 1,
+                    now_slot: init_slot,
+                    initial_price: 0,
+                    insurance_authority: [0u8; 32],
+                    insurance_operator: [0u8; 32],
+                    backing_bucket_authority: [0u8; 32],
+                    oracle_authority: [0u8; 32],
+                },
+            ),
+        )
+        .expect("creator retires the empty secondary asset before donation");
+    }
+
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: vec![3u8],
+        },
+    )
+    .expect("creator donates lifecycle authority before public portfolio admission");
+
+    if owner_close_after_recovery {
+        let activation_slot = init_slot + 1;
+        svm.set_sysvar(&Clock {
+            slot: activation_slot,
+            unix_timestamp: activation_slot as i64,
+            ..Clock::default()
+        });
+        let secondary_generation = percolator_accounting::read_asset_market_id(
+            &svm.get_account(&market).unwrap().data,
+            1,
+        )
+        .expect("retired secondary asset keeps its generation");
+        let generation_witness =
+            market_controller_program::asset_generation_witness_address(
+                &market,
+                1,
+                secondary_generation,
+            )
+            .0;
+        let mut activate_data = vec![0u8]; // IX_PROXY_ADMIN
+        activate_data.extend_from_slice(
+            &PIx::UpdateAssetLifecycle {
+                action: 0,
+                asset_index: 1,
+                now_slot: activation_slot,
+                initial_price,
+                insurance_authority: controller.to_bytes(),
+                insurance_operator: controller.to_bytes(),
+                backing_bucket_authority: controller.to_bytes(),
+                oracle_authority: oracle.pubkey().to_bytes(),
+            }
+            .encode(),
+        );
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(generation_witness, false),
+                ],
+                data: activate_data,
+            },
+        )
+        .expect("controller activates the independent recovery asset");
     }
 
     // ---- two portfolios: `loser` (a real trader who will take an organic loss) + `winner` counterparty ----
@@ -52969,7 +53112,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     svm.send_transaction(Transaction::new_signed_with_payer(
         &[pix(
             vec![
-                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(oracle.pubkey(), true),
                 AccountMeta::new(market, false),
             ],
             PIx::PushAuthMark {
@@ -52979,7 +53122,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             },
         )],
         Some(&payer.pubkey()),
-        &[&payer, &admin],
+        &[&payer, &oracle],
         bh,
     ))
     .expect("oracle drops against the long");
@@ -53515,10 +53658,10 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         });
         send(
             &mut svm,
-            &[&admin],
+            &[&oracle],
             pix(
                 vec![
-                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(oracle.pubkey(), true),
                     AccountMeta::new(market, false),
                 ],
                 PIx::PushAuthMark {
@@ -53539,7 +53682,6 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         );
     }
 
-    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
     if owner_close_after_recovery {
         assert!(
             svm.get_account(&reward_archive).is_none(),
@@ -53578,25 +53720,8 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         assert_eq!(dusted_witness.owner, perc_id());
     } else {
         // A portfolio's historical loss counters are the trader claim's live-cap
-        // witness. Hand the market to the real controller, resolve it, and fully pay
-        // the trader so its Percolator account is otherwise safe to dematerialize.
-        send(
-            &mut svm,
-            &[&admin],
-            Instruction {
-                program_id: controller_id(),
-                accounts: vec![
-                    AccountMeta::new_readonly(governance.pubkey(), false),
-                    AccountMeta::new_readonly(admin.pubkey(), true),
-                    AccountMeta::new_readonly(controller, false),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new_readonly(perc_id(), false),
-                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
-                ],
-                data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
-            },
-        )
-        .expect("creator donates the live market to the fixed controller");
+        // witness. Resolve through the controller and fully pay the trader so its
+        // Percolator account is otherwise safe to dematerialize.
         let mut resolve_data = vec![0u8]; // IX_PROXY_ADMIN
         resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
         let resolve_witness = controller_market_generation_witness(&svm, &market);
@@ -55286,6 +55411,7 @@ fn run_ordinary_twap_public_loss_exit(opening_fee_bps: u64) -> OrdinaryTwapLossO
         &oracle.pubkey(),
         10_000,
     );
+    warp_to_first_pool_deposit_slot(&mut svm, &env.pool);
 
     let owner = Keypair::new();
     svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
@@ -55331,6 +55457,7 @@ fn run_ordinary_twap_public_loss_exit(opening_fee_bps: u64) -> OrdinaryTwapLossO
     )
     .expect("the independent owner funds ordinary principal-only insurance");
 
+    let auth_mark_slot = svm.get_sysvar::<Clock>().slot;
     send(
         &mut svm,
         &[&payer, &oracle],
@@ -55341,7 +55468,7 @@ fn run_ordinary_twap_public_loss_exit(opening_fee_bps: u64) -> OrdinaryTwapLossO
             ],
             PIx::ConfigureAuthMark {
                 asset_index: 0,
-                now_slot: 100,
+                now_slot: auth_mark_slot,
                 initial_mark_e6: 100,
             },
         ),
@@ -55465,7 +55592,7 @@ fn run_ordinary_twap_public_loss_exit(opening_fee_bps: u64) -> OrdinaryTwapLossO
     .expect("public traders open the fee-controlled loss pair under TWAP custody");
 
     let target_mark = 301u64;
-    let mut slot = 101u64;
+    let mut slot = auth_mark_slot.checked_add(1).unwrap();
     warp_to(&mut svm, slot);
     send(
         &mut svm,
@@ -60438,7 +60565,37 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     let oracle = Keypair::new();
     install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
 
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &env.pool,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("donate lifecycle control before public portfolio admission");
+
     let actors = materialize_public_transient_backing(&mut svm, &payer, &env, &oracle);
+    warp_to_first_pool_deposit_slot(&mut svm, &env.pool);
 
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
@@ -60538,41 +60695,12 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         &env.multisig,
         &env.dao,
         &payer,
-        2,
+        3,
         &handoff,
         &handoff_remaining,
     )
     .expect("handoff preserves the staged unit outside TWAP custody");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 0);
-
-    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
-    let donate_market = build_controller_accept_market_authority_message(
-        &env.squads_vault,
-        &controller,
-        &env.slab,
-        &perc_id(),
-        &twap_cfg,
-    );
-    let donate_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        3,
-        &donate_market,
-        &donate_remaining,
-    )
-    .expect("donate lifecycle control while TWAP retains constrained custody");
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
     let resolve = build_controller_generation_proxy_message(
