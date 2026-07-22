@@ -2945,6 +2945,145 @@ fn public_zero_payout_identity_splitting_cannot_grief_a_codepositor() {
     );
 }
 
+// PUBLIC LOF PROBE: principal-only insurance owners bear venue losses but do not own trade fees.
+// Generate the same bankruptcy with and without opening fees; fees may increase protocol reserve,
+// but they must not restore an already-incurred owner claim.
+#[test]
+fn public_trade_fees_cannot_erase_an_ordinary_principal_pool_loss() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Outcome {
+        owner_payout: u64,
+        insurance_spent: u128,
+        protected_before_exit: u128,
+        protocol_reserve: u128,
+    }
+
+    let run = |opening_fee_bps: u64| {
+        let mut env = Env::new();
+        let oracle = Keypair::new();
+        env.svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+        install_public_loss_fixture(&mut env, &oracle.pubkey());
+        env.init_insurance_pool();
+
+        let principal = 29u64;
+        let (owner, owner_ata) = new_depositor(&mut env, principal);
+        let pool = env.pool;
+        let holding = create_holding(&mut env, &pool);
+        env.insurance_deposit(&owner, &owner_ata, &holding, principal)
+            .expect("the independent owner funds principal-only insurance");
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: 100,
+                    initial_mark_e6: 100,
+                }
+                .encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("configure the authenticated public-loss mark");
+
+        let long = Keypair::new();
+        let short = Keypair::new();
+        for trader in [&long, &short] {
+            env.svm.airdrop(&trader.pubkey(), 1_000_000_000).unwrap();
+        }
+        let opening_fee = 100u64
+            .checked_mul(opening_fee_bps)
+            .and_then(|product| product.checked_add(9_999))
+            .map(|product| product / 10_000)
+            .unwrap();
+        let long_portfolio = create_percolator_portfolio(&mut env, &long, 1_000_000);
+        let short_portfolio =
+            create_percolator_portfolio(&mut env, &short, 200 + opening_fee);
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new(long.pubkey(), true),
+                    AccountMeta::new(short.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(long_portfolio, false),
+                    AccountMeta::new(short_portfolio, false),
+                ],
+                data: PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: percolator::POS_SCALE as i128,
+                    exec_price: 100,
+                    fee_bps: opening_fee_bps,
+                }
+                .encode(),
+            }],
+            &[&long, &short],
+        )
+        .expect("public users open the fee-controlled loss pair");
+
+        let mut slot = 100u64;
+        advance_public_mark(
+            &mut env,
+            &oracle,
+            long_portfolio,
+            &mut slot,
+            301,
+            300,
+        );
+        liquidate_stale_public_loser(&mut env, short_portfolio, slot);
+        clear_stale_public_winner(&mut env, &long, long_portfolio, slot);
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ResolveMarket.encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("resolve after bounded public loss cleanup");
+        close_resolved_portfolios(
+            &mut env,
+            &[(&long, long_portfolio), (&short, short_portfolio)],
+        );
+
+        let market = env.svm.get_account(&env.slab).unwrap();
+        let insurance_spent = percolator_accounting::read_asset_insurance_spent(&market.data, 0)
+            .unwrap()
+            .into_iter()
+            .sum::<u128>();
+        let protected_before_exit = asset_insurance_remaining(&env, 0);
+        env.insurance_withdraw(&owner, &owner_ata, &holding, &owner, principal)
+            .expect("the owner realizes the loss-adjusted principal claim");
+        Outcome {
+            owner_payout: env.token_amount(&owner_ata),
+            insurance_spent,
+            protected_before_exit,
+            protocol_reserve: asset_insurance_remaining(&env, 0),
+        }
+    };
+
+    let control = run(0);
+    let with_fees = run(100);
+    assert!(control.insurance_spent > 0);
+    assert_eq!(with_fees.insurance_spent, control.insurance_spent);
+    assert!(with_fees.protected_before_exit > control.protected_before_exit);
+    assert_eq!(
+        with_fees.owner_payout, control.owner_payout,
+        "protocol trade fees cannot erase the independent owner's venue loss",
+    );
+    assert!(with_fees.protocol_reserve > control.protocol_reserve);
+}
+
 #[test]
 fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() {
     use percolator_prog::ix::Instruction as PIx;
