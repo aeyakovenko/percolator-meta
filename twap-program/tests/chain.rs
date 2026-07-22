@@ -10016,7 +10016,7 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
 }
 
 #[test]
-fn probe_controller_resolve_cannot_skip_committed_funding() {
+fn probe_controller_terminal_transitions_cannot_skip_committed_accrual() {
     use percolator_prog::ix::Instruction as PIx;
 
     #[derive(Clone, Copy)]
@@ -10025,15 +10025,22 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         PendingPrice,
     }
 
+    #[derive(Clone, Copy)]
+    enum Transition {
+        Resolve,
+        Shutdown,
+    }
+
     #[derive(Debug)]
     struct Outcome {
+        transition_rejected: bool,
         f_long_num: i128,
         f_short_num: i128,
         long_payout: u64,
         short_payout: u64,
     }
 
-    fn run(segment: Segment, crank_before_resolve: bool) -> Outcome {
+    fn run(segment: Segment, transition: Transition, crank_before_transition: bool) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
         const DEPOSIT: u128 = 100_000_000;
@@ -10146,6 +10153,22 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         .expect("initialize the public funding market");
         send(
             &mut svm,
+            &[&payer, &creator],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigurePermissionlessResolve {
+                    stale_slots: 1_000,
+                    force_close_delay_slots: 1,
+                },
+            ),
+        )
+        .expect("configure the bounded public force-close delay");
+
+        send(
+            &mut svm,
             &[&payer, &creator, &oracle],
             pix(
                 vec![
@@ -10177,6 +10200,25 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             ),
         )
         .expect("configure authenticated marks");
+
+        let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+                ],
+                data: vec![3u8],
+            },
+        )
+        .expect("donate bounded lifecycle authority before public capital is admitted");
 
         let vault_authority = perc_vault_authority(&market, &perc_id());
         let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -10305,35 +10347,45 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
         }
 
-        let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
-        send(
-            &mut svm,
-            &[&payer, &creator],
-            Instruction {
-                program_id: controller_id(),
-                accounts: vec![
-                    AccountMeta::new_readonly(governance.pubkey(), false),
-                    AccountMeta::new_readonly(creator.pubkey(), true),
-                    AccountMeta::new_readonly(controller, false),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new_readonly(perc_id(), false),
-                    AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
-                ],
-                data: vec![3u8],
-            },
-        )
-        .expect("donate bounded lifecycle authority to the controller");
-
         clock.slot = resolve_slot;
         clock.unix_timestamp = resolve_slot as i64;
         svm.set_sysvar(&clock);
-        if crank_before_resolve {
+        if crank_before_transition {
             crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
         }
-        let resolve = |svm: &LiteSVM| {
-            let witness = controller_market_generation_witness(svm, &market);
+        let transition_ix = |svm: &LiteSVM, transition: Transition| {
+            let (raw, witness) = match transition {
+                Transition::Resolve => (
+                    PIx::ResolveMarket.encode(),
+                    controller_market_generation_witness(svm, &market),
+                ),
+                Transition::Shutdown => {
+                    let market_id = percolator_accounting::read_asset_market_id(
+                        &svm.get_account(&market).unwrap().data,
+                        0,
+                    )
+                    .unwrap();
+                    (
+                        PIx::UpdateAssetLifecycle {
+                            action: 3,
+                            asset_index: 0,
+                            now_slot: resolve_slot,
+                            initial_price: 0,
+                            insurance_authority: [0u8; 32],
+                            insurance_operator: [0u8; 32],
+                            backing_bucket_authority: [0u8; 32],
+                            oracle_authority: [0u8; 32],
+                        }
+                        .encode(),
+                        market_controller_program::asset_generation_witness_address(
+                            &market, 0, market_id,
+                        )
+                        .0,
+                    )
+                }
+            };
             let mut data = vec![0u8];
-            data.extend_from_slice(&PIx::ResolveMarket.encode());
+            data.extend_from_slice(&raw);
             Instruction {
                 program_id: controller_id(),
                 accounts: vec![
@@ -10346,15 +10398,58 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 data,
             }
         };
-        let first_resolve_ix = resolve(&svm);
-        let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
-        if crank_before_resolve {
-            first_resolve.expect("settled controller resolve remains live");
-        } else if first_resolve.is_err() {
+        let market_before_transition = svm.get_account(&market).unwrap();
+        let first_transition_ix = transition_ix(&svm, transition);
+        let first_transition = send(
+            &mut svm,
+            &[&payer, &governance],
+            first_transition_ix,
+        );
+        let transition_rejected = first_transition.is_err();
+        if crank_before_transition {
+            first_transition.expect("settled controller transition remains live");
+        } else if transition_rejected {
+            assert_eq!(
+                svm.get_account(&market).unwrap(),
+                market_before_transition,
+                "the rejected terminal transition is byte-atomic"
+            );
             crank(&mut svm, resolve_slot).expect("public crank catches up committed value");
-            let retry_resolve_ix = resolve(&svm);
-            send(&mut svm, &[&payer, &governance], retry_resolve_ix)
-                .expect("controller resolve succeeds after bounded catch-up");
+            let retry_transition_ix = transition_ix(&svm, transition);
+            send(
+                &mut svm,
+                &[&payer, &governance],
+                retry_transition_ix,
+            )
+            .expect("controller transition succeeds after bounded catch-up");
+        }
+
+        if matches!(transition, Transition::Shutdown) {
+            let force_close_slot = resolve_slot + 1;
+            clock.slot = force_close_slot;
+            clock.unix_timestamp = force_close_slot as i64;
+            svm.set_sysvar(&clock);
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(long_portfolio.pubkey(), false),
+                        AccountMeta::new(short_portfolio.pubkey(), false),
+                    ],
+                    PIx::ForceCloseAbandonedAsset {
+                        asset_index: 0,
+                        now_slot: force_close_slot,
+                        close_q: size_q.unsigned_abs(),
+                    },
+                ),
+            )
+            .expect("public force-close clears the shutdown asset after its bounded delay");
+            let resolve_ix = transition_ix(&svm, Transition::Resolve);
+            send(&mut svm, &[&payer, &governance], resolve_ix)
+                .expect("governance resolves after the public force-close");
         }
 
         let resolved = percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
@@ -10363,7 +10458,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
                 vec![
-                    AccountMeta::new_readonly(owner, false),
+                    AccountMeta::new_readonly(owner, true),
                     AccountMeta::new(market, false),
                     AccountMeta::new(portfolio, false),
                     AccountMeta::new(destination, false),
@@ -10394,7 +10489,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         );
         send(
             &mut svm,
-            &[&payer],
+            &[&payer, &short_owner],
             close(
                 short_owner.pubkey(),
                 short_portfolio.pubkey(),
@@ -10404,7 +10499,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         .expect("funding loser closes first");
         send(
             &mut svm,
-            &[&payer],
+            &[&payer, &long_owner],
             close(
                 long_owner.pubkey(),
                 long_portfolio.pubkey(),
@@ -10413,6 +10508,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         )
         .expect("funding winner collects released value");
         Outcome {
+            transition_rejected,
             f_long_num: resolved.assets[0].f_long_num,
             f_short_num: resolved.assets[0].f_short_num,
             long_payout: token_amount(&svm, &long_destination),
@@ -10420,16 +10516,37 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         }
     }
 
-    let control = run(Segment::ActiveFunding, true);
-    let attack = run(Segment::ActiveFunding, false);
+    let control = run(Segment::ActiveFunding, Transition::Resolve, true);
+    let attack = run(Segment::ActiveFunding, Transition::Resolve, false);
+    assert!(!control.transition_rejected && attack.transition_rejected);
     assert!(control.f_long_num > 0 && control.f_short_num < 0);
     assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
     assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
     assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
     assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
 
-    let control = run(Segment::PendingPrice, true);
-    let attack = run(Segment::PendingPrice, false);
+    let control = run(Segment::PendingPrice, Transition::Resolve, true);
+    let attack = run(Segment::PendingPrice, Transition::Resolve, false);
+    assert!(!control.transition_rejected && attack.transition_rejected);
+    assert_eq!(control.f_long_num, 0);
+    assert_eq!(control.f_short_num, 0);
+    assert!(control.long_payout > 100_000_000, "{control:?}");
+    assert!(control.short_payout < 100_000_000, "{control:?}");
+    assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
+    assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+
+    let control = run(Segment::ActiveFunding, Transition::Shutdown, true);
+    let attack = run(Segment::ActiveFunding, Transition::Shutdown, false);
+    assert!(!control.transition_rejected && attack.transition_rejected);
+    assert!(control.f_long_num > 0 && control.f_short_num < 0);
+    assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
+    assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
+    assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
+    assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+
+    let control = run(Segment::PendingPrice, Transition::Shutdown, true);
+    let attack = run(Segment::PendingPrice, Transition::Shutdown, false);
+    assert!(!control.transition_rejected && attack.transition_rejected);
     assert_eq!(control.f_long_num, 0);
     assert_eq!(control.f_short_num, 0);
     assert!(control.long_payout > 100_000_000, "{control:?}");
