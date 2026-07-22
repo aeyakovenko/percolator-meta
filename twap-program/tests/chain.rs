@@ -53838,6 +53838,8 @@ fn e2e_transient_trader_backing_cannot_lower_the_twap_principal_floor() {
 fn run_cross_backing_haircut_and_protocol_donation(
     handoff_before_loss: bool,
     predecessor_config_size: Option<usize>,
+    opening_fee_bps: u64,
+    direct_exit_before_handoff: bool,
 ) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -54099,8 +54101,18 @@ fn run_cross_backing_haircut_and_protocol_donation(
     }
     let long_portfolio =
         create_cross_backing_loss_portfolio(&mut svm, &payer, &env, &long, 1_000_000);
-    let short_portfolio =
-        create_cross_backing_loss_portfolio(&mut svm, &payer, &env, &short, 200);
+    let opening_fee = 100u64
+        .checked_mul(opening_fee_bps)
+        .and_then(|product| product.checked_add(9_999))
+        .map(|product| product / 10_000)
+        .unwrap();
+    let short_portfolio = create_cross_backing_loss_portfolio(
+        &mut svm,
+        &payer,
+        &env,
+        &short,
+        200 + opening_fee,
+    );
     send(
         &mut svm,
         &[&payer, &long, &short],
@@ -54116,7 +54128,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
                 asset_index: 0,
                 size_q: percolator::POS_SCALE as i128,
                 exec_price: 100,
-                fee_bps: 0,
+                fee_bps: opening_fee_bps,
             },
         ),
     )
@@ -54240,7 +54252,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
         .expect("any cranker finalizes the public loss side");
     }
 
-    if !handoff_before_loss {
+    if !handoff_before_loss && !direct_exit_before_handoff {
         squads_execute(
             &mut svm,
             &env.squads,
@@ -54255,7 +54267,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
         assert_eq!(
             read_reserved_floor(&svm, &twap_cfg),
             (principal - 1) as u128,
-            "the first handoff cannot checkpoint away a pre-custody insurance loss",
+            "the first handoff cannot expose loss-adjusted owner insurance",
         );
     }
 
@@ -54284,13 +54296,15 @@ fn run_cross_backing_haircut_and_protocol_donation(
                 })
                 .sum::<u128>()
     };
-    assert_eq!(
-        protected_balance(&svm),
-        27,
-        "the public trade consumes two of the owners' 29 protection atoms",
-    );
+    let protected_after_public_loss = protected_balance(&svm);
+    if opening_fee_bps == 0 {
+        assert_eq!(
+            protected_after_public_loss, 27,
+            "the public trade consumes two of the owners' 29 protection atoms",
+        );
+    }
 
-    let donation = if predecessor_config_size.is_some() {
+    let donation = if predecessor_config_size.is_some() || direct_exit_before_handoff {
         0
     } else {
         10u64
@@ -54337,7 +54351,10 @@ fn run_cross_backing_haircut_and_protocol_donation(
         )
         .expect("a public donor adds protocol insurance before Subledger observes the loss");
     }
-    assert_eq!(protected_balance(&svm), 27 + donation as u128);
+    assert_eq!(
+        protected_balance(&svm),
+        protected_after_public_loss + donation as u128,
+    );
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
     let resolve = build_controller_generation_proxy_message(
@@ -54363,7 +54380,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
         &env.multisig,
         &env.dao,
         &payer,
-        4,
+        if direct_exit_before_handoff { 3 } else { 4 },
         &resolve,
         &resolve_remaining,
     )
@@ -54451,14 +54468,21 @@ fn run_cross_backing_haircut_and_protocol_donation(
         .unwrap(),
     );
 
-    assert_eq!(
-        protected_balance(&svm),
-        27 + donation as u128,
-        "terminal trader settlement cannot consume the later protocol donation",
-    );
+    if opening_fee_bps == 0 {
+        assert_eq!(
+            protected_balance(&svm),
+            protected_after_public_loss + donation as u128,
+            "terminal trader settlement cannot consume the later protocol donation",
+        );
+    }
 
-    let owner_withdraw =
-        |svm: &LiteSVM, owner: &Keypair, position: Pubkey, destination: Pubkey| Instruction {
+    let owner_withdraw = |svm: &LiteSVM,
+                          owner: &Keypair,
+                          position: Pubkey,
+                          destination: Pubkey,
+                          amount: u64|
+     -> Instruction {
+        Instruction {
             program_id: sub_id(),
             accounts: vec![
                 AccountMeta::new(owner.pubkey(), true),
@@ -54477,8 +54501,44 @@ fn run_cross_backing_haircut_and_protocol_donation(
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            data: subledger_insurance_withdraw_data(svm, &position, principal, 0),
-        };
+            data: subledger_insurance_withdraw_data(svm, &position, amount, 0),
+        }
+    };
+    if direct_exit_before_handoff {
+        let direct_exit = owner_withdraw(
+            &svm,
+            &sync_owner,
+            sync_position,
+            sync_destination,
+            1,
+        );
+        send(
+            &mut svm,
+            &[&payer, &sync_owner],
+            direct_exit,
+        )
+        .expect("the one-unit owner exits directly after terminal trader cleanup");
+        assert_eq!(
+            token_amount(&svm, &sync_destination),
+            0,
+            "trade fees cannot restore an already-incurred owner loss before TWAP custody",
+        );
+        for ((owner, position), destination) in owners
+            .iter()
+            .zip(positions)
+            .zip(destinations)
+        {
+            let exit = owner_withdraw(&svm, owner, position, destination, principal);
+            send(&mut svm, &[&payer, owner], exit)
+                .expect("each remaining owner completes the direct loss-adjusted exit");
+            assert_eq!(
+                token_amount(&svm, &destination),
+                13,
+                "the spent-counter cap cannot over-haircut an independent owner",
+            );
+        }
+        return;
+    }
     let public_return = twap_return_cross_backing_to_subledger_ix(
         &env.squads_vault,
         &env.pool,
@@ -54532,6 +54592,19 @@ fn run_cross_backing_haircut_and_protocol_donation(
     send(&mut svm, &[&payer], public_return.clone())
         .expect("any cranker returns resolved custody to the owner-bound pool");
 
+    let recovered_pool = svm.get_account(&env.pool).unwrap().data;
+    let recovered_shares =
+        u128::from_le_bytes(recovered_pool[192..208].try_into().unwrap());
+    let recovered_rate_numerator =
+        u128::from_le_bytes(recovered_pool[289..305].try_into().unwrap());
+    let recovered_rate_denominator =
+        u128::from_le_bytes(recovered_pool[305..321].try_into().unwrap());
+    assert_eq!(
+        recovered_shares * recovered_rate_numerator / recovered_rate_denominator,
+        u128::from(2 * principal - 1),
+        "protocol fees cannot hide either the insurance or canonical backing loss",
+    );
+
     let sync_exit = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -54558,31 +54631,36 @@ fn run_cross_backing_haircut_and_protocol_donation(
         "later protocol insurance cannot erase an already-incurred backing loss",
     );
     let indexed_pool = svm.get_account(&env.pool).unwrap().data;
+    let owner_rate = indexed_pool[289..321].to_vec();
+    let owner_rate_numerator =
+        u128::from_le_bytes(indexed_pool[289..305].try_into().unwrap());
+    let owner_rate_denominator =
+        u128::from_le_bytes(indexed_pool[305..321].try_into().unwrap());
     assert_eq!(
-        u128::from_le_bytes(indexed_pool[289..305].try_into().unwrap()),
-        28,
-    );
-    assert_eq!(
-        u128::from_le_bytes(indexed_pool[305..321].try_into().unwrap()),
-        30_000_000,
+        u128::from(principal) * 1_000_000 * owner_rate_numerator / owner_rate_denominator,
+        13,
+        "the recovered rational rate fixes each independent owner's loss-adjusted claim",
     );
     assert_eq!(
         u64::from_le_bytes(indexed_pool[80..88].try_into().unwrap()),
         2 * principal,
     );
 
-    let first_exit = owner_withdraw(&svm, &owners[0], positions[0], destinations[0]);
+    let first_exit = owner_withdraw(
+        &svm,
+        &owners[0],
+        positions[0],
+        destinations[0],
+        principal,
+    );
     send(&mut svm, &[&payer, &owners[0]], first_exit)
         .expect("the first owner realizes the indexed public-loss haircut");
     assert_eq!(token_amount(&svm, &destinations[0]), 13);
     let indexed_pool = svm.get_account(&env.pool).unwrap().data;
     assert_eq!(
-        u128::from_le_bytes(indexed_pool[289..305].try_into().unwrap()),
-        28,
-    );
-    assert_eq!(
-        u128::from_le_bytes(indexed_pool[305..321].try_into().unwrap()),
-        30_000_000,
+        indexed_pool[289..321],
+        owner_rate,
+        "one owner's exit cannot change the surviving owner's rational rate",
     );
 
     squads_execute(
@@ -54599,12 +54677,19 @@ fn run_cross_backing_haircut_and_protocol_donation(
     let rate_before_second_exit = svm.get_account(&env.pool).unwrap().data[289..321].to_vec();
     assert_eq!(
         rate_before_second_exit,
-        [28u128.to_le_bytes(), 30_000_000u128.to_le_bytes()].concat(),
+        owner_rate,
+        "re-handoff cannot change the surviving owner's rational rate",
     );
 
     send(&mut svm, &[&payer], public_return)
         .expect("any cranker returns custody for the remaining owner");
-    let second_exit = owner_withdraw(&svm, &owners[1], positions[1], destinations[1]);
+    let second_exit = owner_withdraw(
+        &svm,
+        &owners[1],
+        positions[1],
+        destinations[1],
+        principal,
+    );
     send(&mut svm, &[&payer, &owners[1]], second_exit)
         .expect("the second owner exits through the same bounded public return path");
     assert_eq!(
@@ -54630,10 +54715,11 @@ fn run_cross_backing_haircut_and_protocol_donation(
         ),
         0,
     );
+    let protocol_trade_fees = u128::from(opening_fee) * 2;
     assert_eq!(
         protected_balance(&svm),
-        donation as u128 + 1,
-        "after both owner claims exit, only the donation and ownerless floor atom remain",
+        donation as u128 + protocol_trade_fees + 1,
+        "after every owner exits, only protocol value and the ownerless floor atom remain",
     );
 
     squads_execute(
@@ -54657,22 +54743,32 @@ fn run_cross_backing_haircut_and_protocol_donation(
 
 #[test]
 fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(true, None);
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false);
 }
 
 #[test]
 fn e2e_cross_backing_haircut_before_twap_handoff_survives_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(false, None);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false);
+}
+
+#[test]
+fn e2e_pre_handoff_trade_fees_cannot_erase_a_cross_backing_owner_loss() {
+    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false);
+}
+
+#[test]
+fn e2e_pre_handoff_trade_fees_cannot_restore_a_direct_owner_exit() {
+    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true);
 }
 
 #[test]
 fn e2e_predecessor_cross_backing_config_can_finish_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(272));
+    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false);
 }
 
 #[test]
 fn e2e_legacy_custody_config_can_finish_cross_backing_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(264));
+    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false);
 }
 
 // PUBLIC LOF: Percolator cannot empty a backing bucket while utilization earnings

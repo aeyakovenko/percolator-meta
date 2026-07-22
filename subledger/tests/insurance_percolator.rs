@@ -2234,8 +2234,8 @@ fn legacy_genesis_pool_cannot_squat_cross_backing_genesis_address() {
     env.send(&[ix], &[])
         .expect("cross-backed genesis init remains available after legacy init");
 
-    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 329);
-    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 329);
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 361);
+    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 361);
 }
 
 #[test]
@@ -2957,7 +2957,7 @@ fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() 
     }
     install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
     env.init_cross_backing_genesis_pool();
-    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 329);
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 361);
 
     let high_entry = 200u64;
     let side_protection = 2_000_000u64;
@@ -3560,7 +3560,7 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     assert_eq!(env.token_amount(&third_ata), 0);
 
     let pool_data = env.svm.get_account(&env.pool).unwrap().data;
-    assert_eq!(pool_data.len(), 329, "current cross-backed pool layout");
+    assert_eq!(pool_data.len(), 361, "current cross-backed pool layout");
     assert_eq!(
         [
             u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
