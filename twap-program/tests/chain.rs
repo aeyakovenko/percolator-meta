@@ -26654,6 +26654,353 @@ fn e2e_presigned_market_donation_cannot_capture_reused_live_slab() {
     .expect("generation B retains its creator-authorized resolution path");
 }
 
+// PUBLIC DOS: a zero-principal Subledger pool survives a raw Percolator slab close. A second
+// copy of the asset-admin grant signed for generation A must not execute after the same slab key
+// is reused: otherwise it revokes a generation-B provider's only insurance withdrawal authority.
+#[test]
+fn e2e_presigned_empty_pool_grant_cannot_capture_funded_replacement_slab() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const PRINCIPAL: u64 = 1;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let replacement_provider = Keypair::new();
+    for signer in [&payer, &admin, &replacement_provider] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate generation-A market");
+    let market = market.pubkey();
+    let init_market = || {
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: 1,
+                maintenance_fee_per_slot: 0,
+            },
+        )
+    };
+    send(&mut svm, &[&payer, &admin], init_market()).expect("initialize generation A");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral,
+        &vault_authority,
+        0,
+    );
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral,
+        0,
+        &market,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8];
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut pool_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(percolator_vault, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_authority, false),
+                AccountMeta::new_readonly(coin_mint, false),
+            ],
+            data: pool_data,
+        },
+    )
+    .expect("initialize generation-A pool");
+
+    let accept_pool = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(admin.pubkey(), true),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![7u8],
+    };
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let stale_accept = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                1_399_999,
+            ),
+            accept_pool.clone(),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &admin],
+        shared_blockhash,
+    );
+    let submit =
+        |svm: &mut LiteSVM, instructions: &[Instruction], signers: &[&Keypair]| {
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                instructions,
+                Some(&payer.pubkey()),
+                signers,
+                shared_blockhash,
+            ))
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
+        };
+    submit(&mut svm, &[accept_pool], &[&payer, &admin])
+        .expect("generation A grants custody to its empty pool");
+
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        )],
+        &[&payer, &admin],
+    )
+    .expect("resolve empty generation A");
+    let admin_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &admin_destination,
+        &collateral,
+        &admin.pubkey(),
+        0,
+    );
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(admin_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseSlab,
+        )],
+        &[&payer, &admin],
+    )
+    .expect("close empty generation A");
+
+    submit(
+        &mut svm,
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(
+                1_399_998,
+            ),
+            init_market(),
+        ],
+        &[&payer, &admin],
+    )
+    .expect("initialize generation B at the same slab key");
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral,
+        &vault_authority,
+        0,
+    );
+    for kind in [1u8, 2] {
+        submit(
+            &mut svm,
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new_readonly(replacement_provider.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: replacement_provider.pubkey().to_bytes(),
+                },
+            )],
+            &[&payer, &admin, &replacement_provider],
+        )
+        .expect("bind generation-B insurance to its provider");
+    }
+
+    let replacement_source = Pubkey::new_unique();
+    let replacement_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &replacement_source,
+        &collateral,
+        &replacement_provider.pubkey(),
+        PRINCIPAL,
+    );
+    set_token(
+        &mut svm,
+        &replacement_destination,
+        &collateral,
+        &replacement_provider.pubkey(),
+        0,
+    );
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(replacement_provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(replacement_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpInsuranceDomain {
+                domain: 0,
+                amount: PRINCIPAL as u128,
+            },
+        )],
+        &[&payer, &replacement_provider],
+    )
+    .expect("independent provider funds generation B");
+
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let replay = svm.send_transaction(stale_accept);
+    if replay.is_ok() {
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_operator(
+                &svm.get_account(&market).unwrap().data,
+                0,
+            )
+            .unwrap(),
+            pool.to_bytes(),
+            "the generation-A grant captured generation-B insurance",
+        );
+        assert!(
+            submit(
+                &mut svm,
+                &[pix(
+                    vec![
+                        AccountMeta::new_readonly(replacement_provider.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(replacement_destination, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::WithdrawInsuranceAsset {
+                        asset_index: 0,
+                        amount: PRINCIPAL as u128,
+                    },
+                )],
+                &[&payer, &replacement_provider],
+            )
+            .is_err(),
+            "the replacement provider must demonstrate the captured withdrawal path",
+        );
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+        panic!("a stale pool grant locked a funded replacement provider out of its deposit");
+    }
+
+    let replay_error = format!("{:?}", replay.unwrap_err().err);
+    assert!(
+        replay_error.contains("InstructionError(1, InvalidAccountData)"),
+        "the fixed Subledger guard must reject before CPI, not via blockhash expiry: {replay_error}",
+    );
+    assert_eq!(
+        svm.get_account(&market).unwrap(),
+        market_before_replay,
+        "rejecting the stale grant is byte-atomic",
+    );
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(replacement_provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(replacement_destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: PRINCIPAL as u128,
+            },
+        )],
+        &[&payer, &replacement_provider],
+    )
+    .expect("generation-B provider retains its ordinary withdrawal path");
+    assert_eq!(token_amount(&svm, &replacement_destination), PRINCIPAL);
+}
+
 // ATTACK PROBE (voting with NO capital at all): a voter must have a real subledger position
 // (capital at risk) to vote. An account that never deposited has no position account, so the gv
 // `vote` cannot read or owner-check it and rejects. Governance power requires live principal.

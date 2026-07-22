@@ -633,6 +633,21 @@ pub fn market_is_live_before_portfolio_admission(data: &[u8]) -> Result<bool, Re
     Ok(mode == 0 && c_tot == 0 && portfolios == 0)
 }
 
+/// Returns true only while an asset-0 custody pool can receive its first grant:
+/// the market is live, no portfolio has been admitted, and no insurance or
+/// backing provider value is already attributed to asset 0.
+pub fn asset0_custody_can_be_first_granted(data: &[u8]) -> Result<bool, ReadError> {
+    if !market_is_live_before_portfolio_admission(data)? {
+        return Ok(false);
+    }
+    if read_asset_insurance_balance(data, 0)?.remaining_atoms != 0 {
+        return Ok(false);
+    }
+    Ok(read_asset_backing_balances(data, 0)?
+        .into_iter()
+        .all(|balance| !balance.has_any_state()))
+}
+
 /// Returns true only after Percolator has resolved the market and every materialized
 /// portfolio/capital balance has exited. Value-moving CPIs repeat these checks; this
 /// view prevents a fixed authority transition from running before its first CPI.
@@ -1375,6 +1390,31 @@ mod tests {
             market_is_live_before_portfolio_admission(&market),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn first_asset0_custody_grant_rejects_existing_provider_value() {
+        let mut market = market_with_insurance_capacity();
+        assert_eq!(asset0_custody_can_be_first_granted(&market), Ok(false));
+
+        let header = MARKET_GROUP_OFFSET;
+        write_u128_at(&mut market, INSURANCE_OFFSET, 0);
+        write_u128_at(
+            &mut market,
+            header + offset_of!(MarketGroupV16HeaderAccount, vault),
+            0,
+        );
+        assert_eq!(asset0_custody_can_be_first_granted(&market), Ok(true));
+
+        let engine = asset_engine_offset(0).unwrap();
+        write_u128_at(
+            &mut market,
+            engine
+                + offset_of!(EngineAssetSlotV16Account, backing_long)
+                + offset_of!(BackingBucketV16Account, fresh_unliened_backing_num),
+            BOUND_SCALE,
+        );
+        assert_eq!(asset0_custody_can_be_first_granted(&market), Ok(false));
     }
 
     #[test]

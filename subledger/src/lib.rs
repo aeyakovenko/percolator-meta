@@ -239,6 +239,9 @@ const BACKING_LEDGER_SEED: &[u8] = b"subledger_backing_ledger";
 const CROSS_BACKING_POOL_SEED: &[u8] = b"cross-backing";
 const TWAP_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("TwapBuyBurn11111111111111111111111111111111");
+const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
+const TWAP_CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
+const TWAP_CUSTODY_CONFIG_MIN_SIZE: usize = 264;
 const TWAP_IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
 const TWAP_IX_ACCEPT_CROSS_BACKING_EARNINGS: u8 = 22;
 const CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
@@ -3773,7 +3776,38 @@ fn process_set_vote_lock(
     Ok(())
 }
 
-// accept_operator accounts: [asset_admin(signer), pool, market_slab(w), percolator_program]
+fn validate_twap_recovery_grant(
+    asset_admin: &AccountInfo,
+    twap_config: &AccountInfo,
+    pool_account: &AccountInfo,
+    market_slab: &AccountInfo,
+    percolator_program: &AccountInfo,
+) -> ProgramResult {
+    if twap_config.owner != &TWAP_PROGRAM_ID {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let expected_authority = Pubkey::find_program_address(
+        &[TWAP_AUTHORITY_SEED, twap_config.key.as_ref()],
+        &TWAP_PROGRAM_ID,
+    )
+    .0;
+    if *asset_admin.key != expected_authority {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let config_data = twap_config.try_borrow_data()?;
+    if config_data.len() < TWAP_CUSTODY_CONFIG_MIN_SIZE
+        || config_data[..8] != TWAP_CONFIG_DISC
+        || config_data[40..72] != market_slab.key.to_bytes()
+        || config_data[72..104] != percolator_program.key.to_bytes()
+        || config_data[225..257] != pool_account.key.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+// accept_operator accounts: [asset_admin(signer), pool, market_slab(w), percolator_program,
+//   twap_config(optional; required after any user/provider value is admitted)]
 // data: none
 //
 // The incoming pool PDA co-signs every rotation. Asset-admin moves LAST, after the
@@ -3794,6 +3828,10 @@ fn process_accept_operator(
     let pool_account = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
+    let twap_config = iter.next();
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
     if !asset_admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -3809,6 +3847,21 @@ fn process_accept_operator(
         return Err(ProgramError::InvalidAccountData);
     }
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
+    let first_grant = percolator_accounting::asset0_custody_can_be_first_granted(
+        &market_slab.try_borrow_data()?,
+    )
+    .map_err(|_| ProgramError::InvalidAccountData)?;
+    if let Some(twap_config) = twap_config {
+        validate_twap_recovery_grant(
+            asset_admin,
+            twap_config,
+            pool_account,
+            market_slab,
+            percolator_program,
+        )?;
+    } else if !first_grant {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let rotate_backing = if pool.cross_backing {
         let market_data = market_slab.try_borrow_data()?;
         let authority = percolator_accounting::read_asset_backing_authority(&market_data, 0)
