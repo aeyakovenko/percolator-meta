@@ -522,6 +522,7 @@ fn assert_constrained_custody_cleared<'a>(
     custody_state: &AccountInfo<'a>,
     custody_pool_or_system: &AccountInfo<'a>,
     subledger_program_or_system: &AccountInfo<'a>,
+    custody_holding_or_system: &AccountInfo<'a>,
     asset_admin: [u8; 32],
     insurance_authority: [u8; 32],
     insurance_operator: [u8; 32],
@@ -547,6 +548,9 @@ fn assert_constrained_custody_cleared<'a>(
                     && *subledger_program_or_system.key
                         == solana_program::system_program::ID =>
             {
+                if *custody_holding_or_system.key != solana_program::system_program::ID {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 return Ok(())
             }
             _ => return Err(ProgramError::InvalidAccountData),
@@ -576,10 +580,17 @@ fn assert_constrained_custody_cleared<'a>(
     invoke(
         &Instruction {
             program_id: *subledger_program_or_system.key,
-            accounts: vec![AccountMeta::new_readonly(*claim_pool.key, false)],
+            accounts: vec![
+                AccountMeta::new_readonly(*claim_pool.key, false),
+                AccountMeta::new_readonly(*custody_holding_or_system.key, false),
+            ],
             data: vec![SUBLEDGER_IX_ASSERT_NO_PRINCIPAL],
         },
-        &[claim_pool.clone(), subledger_program_or_system.clone()],
+        &[
+            claim_pool.clone(),
+            custody_holding_or_system.clone(),
+            subledger_program_or_system.clone(),
+        ],
     )
 }
 
@@ -2386,7 +2397,8 @@ fn process_close_resolved_portfolio<'a>(
 // [governance(s,w), controller(w), market(w), vault_authority,
 //  primary_vault(w), controller_primary_transit(w), governance_primary_dest(w),
 //  percolator_program, token_program, system_program, retired_market_marker(w),
-//  custody_state, custody_pool_or_system, subledger_program_or_system
+//  custody_state, custody_pool_or_system, subledger_program_or_system,
+//  custody_holding_or_system
 //    (required only when canonical Subledger/TWAP state owns asset_admin),
 //  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w)]
 //
@@ -2429,6 +2441,7 @@ fn process_close_market_and_reclaim<'a>(
             None
         } else {
             Some((
+                next_account_info(iter)?,
                 next_account_info(iter)?,
                 next_account_info(iter)?,
                 next_account_info(iter)?,
@@ -2486,6 +2499,7 @@ fn process_close_market_and_reclaim<'a>(
         custody_state,
         custody_pool_or_system,
         subledger_program_or_system,
+        custody_holding_or_system,
         asset_admin,
         insurance_authority,
         insurance_operator,
@@ -2498,6 +2512,7 @@ fn process_close_market_and_reclaim<'a>(
             custody_state,
             custody_pool_or_system,
             subledger_program_or_system,
+            custody_holding_or_system,
             asset_admin,
             insurance_authority,
             insurance_operator,

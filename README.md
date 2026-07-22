@@ -367,9 +367,12 @@ and bounded asset lifecycle, approved oracle configuration, bounded fee policy, 
 empty-slab cleanup. `DrainOnly` is excluded because it blocks replacement liquidity without starting
 the force-close clock; governance uses explicit shutdown so every position has a bounded public exit.
 Raw `CloseSlab` is not proxied: the dedicated cleanup forwards its mandatory controller
-destinations atomically. The proxy excludes deposits, withdrawals, swaps, portfolio operations,
-authority rotation, and backing-bucket movement. External backing providers retain their own
-asset-local withdrawal path; governance only sets the fee split that sends the configured share
+destinations atomically. When canonical Subledger or pool-bound TWAP custody is active, cleanup also
+requires Subledger's read-only proof that owner claims and the canonical protocol-earnings escrow are
+empty, so closing the slab cannot destroy the surplus route. The proxy excludes deposits, withdrawals,
+swaps, portfolio operations, authority rotation, and backing-bucket movement.
+External backing providers retain their own asset-local withdrawal path; governance only sets the fee
+split that sends the configured share
 into insurance. Secondary activation may independently select backing and oracle providers, but its
 insurance authority and operator remain the constrained controller so governance cannot install a
 raw withdrawal key.

@@ -4210,11 +4210,13 @@ fn process_handoff_to_twap(
     )
 }
 
-// assert_no_principal accounts: [pool]
+// assert_no_principal accounts: [pool, optional holding_or_system]
 // data: none
 //
 // This read-only CPI keeps the terminal owner-claim check in the program that
-// owns the subledger layout. It moves no value and grants no authority.
+// owns the subledger layout. When a holding account is supplied, it also proves
+// that holding is valid for the pool and empty; current cross-backed layouts bind
+// it to the canonical protocol escrow. It moves no value and grants no authority.
 fn process_assert_no_principal(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -4225,6 +4227,7 @@ fn process_assert_no_principal(
     }
     let iter = &mut accounts.iter();
     let pool_account = next_account_info(iter)?;
+    let holding = iter.next();
     if iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -4235,6 +4238,18 @@ fn process_assert_no_principal(
     validate_pool_pda(program_id, pool_account, &pool)?;
     if !pool.is_insurance() || !pool.owner_claims_cleared() {
         return Err(ProgramError::InvalidAccountData);
+    }
+    match holding {
+        Some(system)
+            if !pool.cross_backing
+                && *system.key == solana_program::system_program::ID =>
+        {}
+        Some(holding) => {
+            if validate_insurance_holding(pool_account, &pool, holding)? != 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        None => {}
     }
     Ok(())
 }
