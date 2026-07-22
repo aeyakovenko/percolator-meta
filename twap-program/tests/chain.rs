@@ -8757,6 +8757,43 @@ fn build_return_to_subledger_message(
     m
 }
 
+fn build_cross_backing_return_to_subledger_message(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(0); // num_writable_signers
+    m.push(2); // market_slab, pool
+    m.push(10); // account_keys count
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market_slab.as_ref()); // 1 writable
+    m.extend_from_slice(pool.as_ref()); // 2 writable
+    m.extend_from_slice(twap_config.as_ref()); // 3
+    m.extend_from_slice(twap_authority.as_ref()); // 4
+    m.extend_from_slice(percolator_program.as_ref()); // 5
+    m.extend_from_slice(sub_id().as_ref()); // 6
+    m.extend_from_slice(long_backing_ledger.as_ref()); // 7
+    m.extend_from_slice(short_backing_ledger.as_ref()); // 8
+    m.extend_from_slice(twap_id().as_ref()); // 9 program id
+    m.push(1); // instructions count
+    m.push(9); // program_id_index -> twap
+    m.push(9); // account_indexes count
+    for index in [0u8, 3, 4, 2, 1, 5, 6, 7, 8] {
+        m.push(index);
+    }
+    m.extend_from_slice(&1u16.to_le_bytes());
+    m.push(16); // IX_RETURN_TO_SUBLEDGER
+    m.push(0); // address_table_lookups
+    m
+}
+
 fn twap_return_to_subledger_ix(
     squads_vault: &Pubkey,
     pool: &Pubkey,
@@ -34438,13 +34475,15 @@ fn e2e_full_genesis_to_buy_burn() {
     // Complete the advertised lifecycle: return custody to the canonical pool, retract the sealed
     // ballot, and recover the genesis deposit. Combined insurance plus backing is
     // still healthy, so the auction cannot turn into a principal haircut.
-    let return_message = build_return_to_subledger_message(
+    let return_message = build_cross_backing_return_to_subledger_message(
         &squads_vault,
         &pool,
         &slab,
         &twap_cfg,
         &twap_authority,
         &perc_id(),
+        &long_genesis_backing_ledger,
+        &short_genesis_backing_ledger,
     );
     let return_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -34454,6 +34493,8 @@ fn e2e_full_genesis_to_buy_burn() {
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(long_genesis_backing_ledger, false),
+        AccountMeta::new_readonly(short_genesis_backing_ledger, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
     squads_execute(
