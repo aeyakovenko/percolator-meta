@@ -3045,6 +3045,24 @@ fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() 
     assert_eq!(protected, 0, "both owner-protection domains are fully impaired");
 
     let recapitalization = 1_000_000u64;
+    let payer = clone_kp(&env.payer);
+    let mint_authority = clone_kp(&env.mint_auth);
+    let mint = env.mint;
+    mint_to(
+        &mut env.svm,
+        &payer,
+        &mint,
+        &mint_authority,
+        &impaired_ata,
+        recapitalization,
+    );
+    env.cross_backing_deposit(
+        &impaired_owner,
+        &impaired_ata,
+        &pool_holding,
+        recapitalization,
+    )
+    .expect("the impaired owner adds fresh capital to its stale position PDA");
     let (fresh_owner, fresh_ata) = new_depositor(&mut env, recapitalization);
     env.cross_backing_deposit(
         &fresh_owner,
@@ -3062,7 +3080,7 @@ fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() 
         u128::from_le_bytes(recapitalized_pool[305..321].try_into().unwrap()),
         1_000_000,
     );
-    assert_ne!(
+    assert_eq!(
         env.position_share_generation(&impaired_owner.pubkey()),
         env.pool_share_generation(),
     );
@@ -3100,16 +3118,28 @@ fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() 
         &pool_holding,
         impaired_principal,
     )
-    .expect("fully impaired generation retires without touching fresh capital");
-    assert_eq!(env.token_amount(&impaired_ata), 0);
+    .expect("the mixed position retires stale nominal principal pro rata");
+    assert_eq!(
+        env.token_amount(&impaired_ata),
+        800_000,
+        "withdrawing stale nominal principal cannot claim all mixed fresh shares",
+    );
     env.cross_backing_withdraw(
         &fresh_owner,
         &fresh_ata,
         &pool_holding,
         recapitalization,
     )
-    .expect("current generation retains every recapitalization atom");
+    .expect("the independent current generation retains every recapitalization atom");
     assert_eq!(env.token_amount(&fresh_ata), recapitalization);
+    env.cross_backing_withdraw(
+        &impaired_owner,
+        &impaired_ata,
+        &pool_holding,
+        recapitalization,
+    )
+    .expect("the mixed position collects only its remaining fresh share value");
+    assert_eq!(env.token_amount(&impaired_ata), recapitalization);
     assert_eq!(env.pool_outstanding(), 0);
 }
 
