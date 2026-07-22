@@ -27018,8 +27018,7 @@ fn e2e_presigned_empty_pool_grant_cannot_capture_funded_replacement_slab() {
 // PUBLIC LOF PROBE: the Subledger pool survives a raw slab close, but its deposit wire does not
 // identify the market incarnation. A deposit signed while generation A owns the slab must not land
 // after the empty pool is freshly granted to generation B, where a different oracle can consume it.
-#[test]
-fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
+fn run_presigned_genesis_deposit_market_replay(grant_generation_a: bool) {
     use percolator_prog::ix::Instruction as PIx;
 
     const VICTIM_PRINCIPAL: u64 = 14;
@@ -27161,13 +27160,15 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
         ],
         data: vec![7u8],
     };
-    send(&mut svm, &[&payer, &attacker], accept_pool())
-        .expect("generation A grants custody to its empty pool");
-    assert_eq!(
-        svm.get_account(&pool).unwrap().data[272],
-        2,
-        "the first grant permanently seals this pool to generation A",
-    );
+    if grant_generation_a {
+        send(&mut svm, &[&payer, &attacker], accept_pool())
+            .expect("generation A grants custody to its empty pool");
+        assert_eq!(
+            svm.get_account(&pool).unwrap().data[272],
+            2,
+            "the first grant permanently seals this pool to generation A",
+        );
+    }
 
     let victim_source = Pubkey::new_unique();
     let victim_destination = Pubkey::new_unique();
@@ -27208,12 +27209,29 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
     };
     svm.expire_blockhash();
     let retained_blockhash = svm.latest_blockhash();
+    let stale_instructions = if grant_generation_a {
+        vec![deposit]
+    } else {
+        vec![accept_pool(), deposit]
+    };
+    let stale_signers = if grant_generation_a {
+        vec![&payer, &victim]
+    } else {
+        vec![&payer, &attacker, &victim]
+    };
     let stale_deposit = Transaction::new_signed_with_payer(
-        &[deposit],
+        &stale_instructions,
         Some(&payer.pubkey()),
-        &[&payer, &victim],
+        &stale_signers,
         retained_blockhash,
     );
+    if !grant_generation_a {
+        assert!(
+            svm.simulate_transaction(stale_deposit.clone().into())
+                .is_ok(),
+            "the atomic first grant plus deposit is valid against generation A",
+        );
+    }
     let submit = |svm: &mut LiteSVM, instructions: &[Instruction], signers: &[&Keypair]| {
         svm.send_transaction(Transaction::new_signed_with_payer(
             instructions,
@@ -27299,28 +27317,30 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
         &[&payer, &attacker],
     )
     .expect("generation-B creator configures its oracle");
-    let market_before_regrant = svm.get_account(&market).unwrap();
-    let pool_before_regrant = svm.get_account(&pool).unwrap();
-    let regrant = submit(
-        &mut svm,
-        &[
-            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(3),
-            accept_pool(),
-        ],
-        &[&payer, &attacker],
-    );
-    if regrant.is_err() {
-        assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
-        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
-        let source_before_replay = svm.get_account(&victim_source).unwrap();
-        assert!(
-            svm.send_transaction(stale_deposit).is_err(),
-            "an ungranted replacement market cannot admit the stale deposit",
+    if grant_generation_a {
+        let market_before_regrant = svm.get_account(&market).unwrap();
+        let pool_before_regrant = svm.get_account(&pool).unwrap();
+        let regrant = submit(
+            &mut svm,
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(3),
+                accept_pool(),
+            ],
+            &[&payer, &attacker],
         );
-        assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
-        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
-        assert_eq!(svm.get_account(&victim_source).unwrap(), source_before_replay);
-        return;
+        if regrant.is_err() {
+            assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
+            assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
+            let source_before_replay = svm.get_account(&victim_source).unwrap();
+            assert!(
+                svm.send_transaction(stale_deposit).is_err(),
+                "an ungranted replacement market cannot admit the stale deposit",
+            );
+            assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
+            assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
+            assert_eq!(svm.get_account(&victim_source).unwrap(), source_before_replay);
+            return;
+        }
     }
 
     let market_before_replay = svm.get_account(&market).unwrap();
@@ -27614,6 +27634,16 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
     panic!(
         "generation-A consent landed in generation B: victim recovered {recovered}/{VICTIM_PRINCIPAL}"
     );
+}
+
+#[test]
+fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
+    run_presigned_genesis_deposit_market_replay(true);
+}
+
+#[test]
+fn probe_presigned_pregrant_deposit_cannot_cross_raw_market_generations() {
+    run_presigned_genesis_deposit_market_replay(false);
 }
 
 // ATTACK PROBE (voting with NO capital at all): a voter must have a real subledger position
