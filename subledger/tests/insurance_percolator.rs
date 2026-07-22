@@ -1326,6 +1326,24 @@ fn install_public_loss_fixture_with_margin(
     env.svm.set_account(env.slab, account).unwrap();
 }
 
+fn install_public_funding_loss_fixture(
+    env: &mut Env,
+    oracle_authority: &Pubkey,
+    margin_bps: u64,
+) {
+    install_public_loss_fixture_with_margin(env, oracle_authority, margin_bps);
+    let mut account = env.svm.get_account(&env.slab).unwrap();
+    {
+        let (_, group) = percolator_prog::state::market_view_mut(&mut account.data).unwrap();
+        group.header.config.max_abs_funding_e9_per_slot =
+            percolator::V16PodU64::new(10_000);
+        group.header.config.max_price_move_bps_per_slot =
+            percolator::V16PodU64::new(9_000);
+        group.validate_shape().unwrap();
+    }
+    env.svm.set_account(env.slab, account).unwrap();
+}
+
 fn create_percolator_portfolio(env: &mut Env, owner: &Keypair, capital: u64) -> Pubkey {
     let portfolio = Pubkey::new_unique();
     env.svm
@@ -1606,6 +1624,46 @@ fn open_public_pair_with_fee(
         &[&long, &short],
     )
     .expect("open balanced public position");
+    (long, long_portfolio, short, short_portfolio)
+}
+
+fn open_public_pair_with_capitals(
+    env: &mut Env,
+    position_q: i128,
+    price: u64,
+    long_capital: u64,
+    short_capital: u64,
+) -> (Keypair, Pubkey, Keypair, Pubkey) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&long, &short] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let long_portfolio = create_percolator_portfolio(env, &long, long_capital);
+    let short_portfolio = create_percolator_portfolio(env, &short, short_capital);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: position_q,
+                exec_price: price,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open asymmetric-capital public position");
     (long, long_portfolio, short, short_portfolio)
 }
 
@@ -3009,6 +3067,291 @@ fn public_zero_payout_identity_splitting_cannot_grief_a_codepositor() {
         "fourteen public one-unit identities reduced the victim from {} to {}",
         split_identities.victim_whole_claim,
         split_identities.victim_payout,
+    );
+}
+
+// PUBLIC LOF PROBE: protocol funding surplus can refill backing after an owner
+// loss without restoring the loss-only share rate. A zero-value public exit must
+// not let a later zero-value exit checkpoint that recovery so its subsequent
+// consumption charges the same backing atom to an independent owner twice.
+#[test]
+fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Outcome {
+        victim_payout: u64,
+        backing_after_first_loss: u128,
+        backing_after_recovery: u128,
+        backing_after_second_loss: u128,
+    }
+
+    let run = |sync_recovery_before_second_loss: bool| {
+        let mut env = Env::new_cross_backing();
+        let oracle = Keypair::new();
+        let observer = Keypair::new();
+        for owner in [&oracle, &observer] {
+            env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        }
+        install_public_funding_loss_fixture(&mut env, &oracle.pubkey(), 10_000);
+        env.init_cross_backing_genesis_pool();
+
+        let victim_principal = 31u64;
+        let (victim, victim_ata) = new_depositor(&mut env, victim_principal);
+        let (first_sync, first_sync_ata) = new_depositor(&mut env, 1);
+        let (recovery_sync, recovery_sync_ata) = new_depositor(&mut env, 1);
+        let pool_holding = create_canonical_pool_holding(&mut env);
+        for (owner, destination, amount) in [
+            (&victim, &victim_ata, victim_principal),
+            (&first_sync, &first_sync_ata, 1),
+            (&recovery_sync, &recovery_sync_ata, 1),
+        ] {
+            env.cross_backing_deposit(owner, destination, &pool_holding, amount)
+                .expect("owner deposits into the public cross-backed pool");
+        }
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: 100,
+                    initial_mark_e6: 100,
+                }
+                .encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("configure the authenticated funding mark");
+        let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+        let mut slot = 100u64;
+
+        let (first_long, first_long_portfolio, first_short, first_short_portfolio) =
+            open_public_pair_with_capitals(
+                &mut env,
+                percolator::POS_SCALE as i128,
+                100,
+                1_000_000,
+                200,
+            );
+        advance_public_mark(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            303,
+            300,
+        );
+        liquidate_stale_public_loser(&mut env, first_short_portfolio, slot);
+        clear_stale_public_winner_with_backing(
+            &mut env,
+            &first_long,
+            first_long_portfolio,
+            slot,
+        );
+
+        let backing_protection = |env: &Env| {
+            let market = env.svm.get_account(&env.slab).unwrap();
+            let balances =
+                percolator_accounting::read_asset_backing_balances(&market.data, 0).unwrap();
+            let sources =
+                percolator_accounting::read_asset_backing_source_credits(&market.data, 0)
+                    .unwrap();
+            let principals = [0u16, 1u16].map(|domain| {
+                let ledger = env
+                    .svm
+                    .get_account(&cross_backing_ledger_pda(&env.pool, domain))
+                    .unwrap();
+                percolator_prog::state::read_backing_domain_ledger(&ledger.data)
+                    .unwrap()
+                    .total_principal_atoms
+            });
+            let provider_backing = balances
+                .into_iter()
+                .zip(sources)
+                .zip(principals)
+                .map(|((balance, source), principal)| {
+                    balance
+                        .provider_protected_principal_atoms(principal, source)
+                        .unwrap()
+                })
+                .sum::<u128>();
+            let pool = env.svm.get_account(&env.pool).unwrap();
+            let pending = u64::from_le_bytes(pool.data[273..281].try_into().unwrap())
+                .checked_add(u64::from_le_bytes(
+                    pool.data[281..289].try_into().unwrap(),
+                ))
+                .unwrap();
+            provider_backing + u128::from(pending)
+        };
+        let backing_after_first_loss = backing_protection(&env);
+        assert!(backing_after_first_loss < 15);
+        env.cross_backing_withdraw(&first_sync, &first_sync_ata, &pool_holding, 1)
+            .expect("zero-value exit records the first real owner loss");
+        assert_eq!(env.token_amount(&first_sync_ata), 0);
+        if !sync_recovery_before_second_loss {
+            env.cross_backing_withdraw(
+                &recovery_sync,
+                &recovery_sync_ata,
+                &pool_holding,
+                1,
+            )
+            .expect("control checkpoints only the first-loss backing low");
+            assert_eq!(env.token_amount(&recovery_sync_ata), 0);
+        }
+
+        let funding_size_q = (percolator::POS_SCALE / 10) as i128;
+        let (funding_long, funding_long_portfolio, funding_short, funding_short_portfolio) =
+            open_public_pair(&mut env, funding_size_q, 303, 1_000_000);
+        advance_public_mark(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            1_000_000,
+            300,
+        );
+        for portfolio in [funding_long_portfolio, funding_short_portfolio] {
+            for _ in 0..64 {
+                public_percolator_crank(&mut env, portfolio, slot, true)
+                    .expect("public funding settlement makes bounded progress");
+            }
+        }
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new(funding_long.pubkey(), true),
+                    AccountMeta::new(funding_short.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(funding_long_portfolio, false),
+                    AccountMeta::new(funding_short_portfolio, false),
+                ],
+                data: PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: -funding_size_q,
+                    exec_price: effective_price(&env),
+                    fee_bps: 0,
+                }
+                .encode(),
+            }],
+            &[&funding_long, &funding_short],
+        )
+        .expect("the fully collateralized funding pair flattens");
+        for portfolio in [funding_long_portfolio, funding_short_portfolio] {
+            for _ in 0..8 {
+                public_percolator_crank(&mut env, portfolio, slot, false)
+                    .expect("flat funding portfolio settles");
+            }
+        }
+        let backing_after_recovery = backing_protection(&env);
+        assert!(
+            backing_after_recovery > backing_after_first_loss,
+            "organic funding must refill at least one previously lost backing atom: first={backing_after_first_loss}, recovery={backing_after_recovery}",
+        );
+
+        if sync_recovery_before_second_loss {
+            env.cross_backing_withdraw(
+                &recovery_sync,
+                &recovery_sync_ata,
+                &pool_holding,
+                1,
+            )
+            .expect("attacker checkpoints the protocol-funded recovery");
+            assert_eq!(env.token_amount(&recovery_sync_ata), 0);
+        }
+
+        let (second_long, second_long_portfolio, second_short, second_short_portfolio) =
+            open_public_pair_with_capitals(
+                &mut env,
+                (percolator::POS_SCALE / 10) as i128,
+                1_000_000,
+                1_000_000,
+                100_000,
+            );
+        advance_public_mark(
+            &mut env,
+            &oracle,
+            observer_portfolio,
+            &mut slot,
+            2_000_010,
+            300,
+        );
+        liquidate_stale_public_loser(&mut env, second_short_portfolio, slot);
+        clear_stale_public_winner_with_backing(
+            &mut env,
+            &second_long,
+            second_long_portfolio,
+            slot,
+        );
+        let backing_after_second_loss = backing_protection(&env);
+        assert!(
+            backing_after_second_loss >= backing_after_first_loss,
+            "the second loss must consume only intervening protocol-funded recovery: first={backing_after_first_loss}, second={backing_after_second_loss}",
+        );
+
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                ],
+                data: PIx::ResolveMarket.encode(),
+            }],
+            &[&oracle],
+        )
+        .expect("resolve after both bounded loss epochs");
+        close_resolved_portfolios(
+            &mut env,
+            &[
+                (&observer, observer_portfolio),
+                (&first_long, first_long_portfolio),
+                (&first_short, first_short_portfolio),
+                (&funding_long, funding_long_portfolio),
+                (&funding_short, funding_short_portfolio),
+                (&second_long, second_long_portfolio),
+                (&second_short, second_short_portfolio),
+            ],
+        );
+
+        env.cross_backing_withdraw(
+            &victim,
+            &victim_ata,
+            &pool_holding,
+            victim_principal,
+        )
+        .expect("independent victim retains a bounded terminal exit");
+
+        Outcome {
+            victim_payout: env.token_amount(&victim_ata),
+            backing_after_first_loss,
+            backing_after_recovery,
+            backing_after_second_loss,
+        }
+    };
+
+    let control = run(false);
+    let checkpointed_recovery = run(true);
+    assert_eq!(
+        checkpointed_recovery.backing_after_first_loss,
+        control.backing_after_first_loss,
+    );
+    assert_eq!(
+        checkpointed_recovery.backing_after_recovery,
+        control.backing_after_recovery,
+    );
+    assert_eq!(
+        checkpointed_recovery.backing_after_second_loss,
+        control.backing_after_second_loss,
+    );
+    assert_eq!(
+        checkpointed_recovery.victim_payout, control.victim_payout,
+        "a zero-value checkpoint cannot charge protocol recovery to the victim twice",
     );
 }
 
