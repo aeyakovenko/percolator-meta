@@ -612,6 +612,27 @@ pub fn all_secondary_assets_retired(data: &[u8]) -> Result<bool, ReadError> {
     Ok(free == secondary_slots)
 }
 
+/// Returns true only while the market is live and no portfolio or user capital
+/// has been materialized. Authority handoffs use this view so a signature for a
+/// closed slab generation cannot capture a funded replacement generation.
+pub fn market_is_live_before_portfolio_admission(data: &[u8]) -> Result<bool, ReadError> {
+    validate_market(data)?;
+    let header = MARKET_GROUP_OFFSET;
+    let mode = data
+        .get(header + offset_of!(MarketGroupV16HeaderAccount, mode))
+        .copied()
+        .ok_or(ReadError::Truncated)?;
+    let c_tot = read_u128(
+        data,
+        header + offset_of!(MarketGroupV16HeaderAccount, c_tot),
+    )?;
+    let portfolios = read_u64(
+        data,
+        header + offset_of!(MarketGroupV16HeaderAccount, materialized_portfolio_count),
+    )?;
+    Ok(mode == 0 && c_tot == 0 && portfolios == 0)
+}
+
 /// Returns true only after Percolator has resolved the market and every materialized
 /// portfolio/capital balance has exited. Value-moving CPIs repeat these checks; this
 /// view prevents a fixed authority transition from running before its first CPI.
@@ -1308,6 +1329,52 @@ mod tests {
         profile.oracle_target_price_e6 = 99;
         percolator_prog::state::write_asset_oracle_profile(&mut data, 0, &profile).unwrap();
         data
+    }
+
+    #[test]
+    fn authority_handoff_view_closes_after_any_portfolio_admission() {
+        let mut market = market_with_insurance_capacity();
+        assert_eq!(
+            market_is_live_before_portfolio_admission(&market),
+            Ok(true)
+        );
+
+        let header = MARKET_GROUP_OFFSET;
+        write_u128_at(
+            &mut market,
+            header + offset_of!(MarketGroupV16HeaderAccount, c_tot),
+            1,
+        );
+        assert_eq!(
+            market_is_live_before_portfolio_admission(&market),
+            Ok(false)
+        );
+
+        write_u128_at(
+            &mut market,
+            header + offset_of!(MarketGroupV16HeaderAccount, c_tot),
+            0,
+        );
+        write_u64_at(
+            &mut market,
+            header + offset_of!(MarketGroupV16HeaderAccount, materialized_portfolio_count),
+            1,
+        );
+        assert_eq!(
+            market_is_live_before_portfolio_admission(&market),
+            Ok(false)
+        );
+
+        write_u64_at(
+            &mut market,
+            header + offset_of!(MarketGroupV16HeaderAccount, materialized_portfolio_count),
+            0,
+        );
+        market[header + offset_of!(MarketGroupV16HeaderAccount, mode)] = 1;
+        assert_eq!(
+            market_is_live_before_portfolio_admission(&market),
+            Ok(false)
+        );
     }
 
     #[test]

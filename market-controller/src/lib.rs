@@ -2811,6 +2811,9 @@ fn process_grant_genesis_pool<'a>(
 // the handoff. Funded asset-0 insurance owned by the outgoing raw key must exit before
 // donation; otherwise that key could withdraw its principal after handoff yet retain a
 // perpetual claim on later trade fees. Preserve only the recorded backing provider.
+// The market must still be live and have no materialized portfolio or user capital;
+// otherwise a withheld signature from a directly closed slab generation could capture
+// a funded replacement initialized at the same public key.
 // asset_admin must migrate to this controller unless canonical current-layout
 // Subledger/TWAP state proves that its constrained PDA already owns admin and both
 // insurance roles.
@@ -2855,6 +2858,8 @@ fn process_accept_market_authority<'a>(
         let market_data = market.try_borrow_data()?;
         if !percolator_accounting::all_secondary_assets_retired(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
+            || !percolator_accounting::market_is_live_before_portfolio_admission(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
             || percolator_accounting::read_permissionless_market_init_fee(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?
                 != 0
