@@ -54176,80 +54176,6 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
         "the public trade consumes two of the owners' 29 protection atoms",
     );
 
-    let mut sync_exit = twap_return_to_subledger_ix(
-        &env.squads_vault,
-        &env.pool,
-        &env.slab,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-    );
-    sync_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
-    sync_exit.accounts[3] = AccountMeta::new(env.pool, false);
-    sync_exit
-        .accounts
-        .push(AccountMeta::new_readonly(sync_owner.pubkey(), true));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new(sync_position, false));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new(sync_destination, false));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new(pool_holding, false));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new(env.perc_vault, false));
-    sync_exit.accounts.push(AccountMeta::new_readonly(
-        perc_vault_authority(&env.slab, &perc_id()),
-        false,
-    ));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new(env.long_backing_ledger, false));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new(env.short_backing_ledger, false));
-    sync_exit
-        .accounts
-        .push(AccountMeta::new_readonly(spl_token::ID, false));
-    bind_subledger_full_exit_witness(&svm, &mut sync_exit, &sync_position);
-    send(&mut svm, &[&payer, &sync_owner], sync_exit)
-        .expect("the zero-value owner fixes the loss rate and atomically returns custody");
-    assert_eq!(token_amount(&svm, &sync_destination), 0);
-    let indexed_pool = svm.get_account(&env.pool).unwrap().data;
-    assert_eq!(
-        u128::from_le_bytes(indexed_pool[289..305].try_into().unwrap()),
-        28,
-    );
-    assert_eq!(
-        u128::from_le_bytes(indexed_pool[305..321].try_into().unwrap()),
-        30_000_000,
-    );
-    assert_eq!(
-        u64::from_le_bytes(indexed_pool[80..88].try_into().unwrap()),
-        2 * principal,
-    );
-
-    let permissionless_rehandoff = Instruction {
-        program_id: sub_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(env.squads_vault, false),
-            AccountMeta::new_readonly(env.pool, false),
-            AccountMeta::new(twap_cfg, false),
-            AccountMeta::new_readonly(twap_authority, false),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(env.long_backing_ledger, false),
-            AccountMeta::new_readonly(env.short_backing_ledger, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ],
-        data: vec![8u8], // IX_HANDOFF_TO_TWAP
-    };
-    send(&mut svm, &[&payer], permissionless_rehandoff)
-        .expect("any cranker restores TWAP after the zero-value owner exits");
-
     let donation = 10u64;
     let donor = Keypair::new();
     svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
@@ -54290,7 +54216,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
             data: donation_data,
         },
     )
-    .expect("a public donor adds protocol insurance after the indexed loss");
+    .expect("a public donor adds protocol insurance before Subledger observes the loss");
     assert_eq!(protected_balance(&svm), 27 + donation as u128);
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
@@ -54443,6 +54369,45 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
     );
     send(&mut svm, &[&payer], public_return.clone())
         .expect("any cranker returns resolved custody to the owner-bound pool");
+
+    let sync_exit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(sync_owner.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(sync_position, false),
+            AccountMeta::new(sync_destination, false),
+            AccountMeta::new(pool_holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new(env.long_backing_ledger, false),
+            AccountMeta::new(env.short_backing_ledger, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: subledger_insurance_withdraw_data(&svm, &sync_position, 1, 0),
+    };
+    send(&mut svm, &[&payer, &sync_owner], sync_exit)
+        .expect("the one-unit owner realizes the complete pre-donation loss");
+    assert_eq!(
+        token_amount(&svm, &sync_destination),
+        0,
+        "later protocol insurance cannot erase an already-incurred backing loss",
+    );
+    let indexed_pool = svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        u128::from_le_bytes(indexed_pool[289..305].try_into().unwrap()),
+        28,
+    );
+    assert_eq!(
+        u128::from_le_bytes(indexed_pool[305..321].try_into().unwrap()),
+        30_000_000,
+    );
+    assert_eq!(
+        u64::from_le_bytes(indexed_pool[80..88].try_into().unwrap()),
+        2 * principal,
+    );
 
     let first_exit = owner_withdraw(&svm, &owners[0], positions[0], destinations[0]);
     send(&mut svm, &[&payer, &owners[0]], first_exit)
