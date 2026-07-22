@@ -10817,6 +10817,216 @@ fn e2e_standing_auction_bid_across_asset0_restart_conserves_value() {
     assert_eq!(token_amount(&svm, &bk.settlement_usd), 0);
 }
 
+// PUBLIC LOF: DonateInsurance binds only the slab key. A donor can sign while asset generation A
+// is active, then an untrusted relayer can withhold the transaction across a normal in-place asset
+// restart and spend the donor's collateral on generation B, which the donor never authorized.
+#[test]
+fn e2e_presigned_twap_insurance_donation_cannot_cross_asset0_restart() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_handoff(&mut svm, &payer);
+
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &env.twap_cfg,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &donate_market,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(env.twap_cfg, false),
+            AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ],
+    )
+    .expect("donate lifecycle authority before the normal restart");
+
+    let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+    let old_market_id = percolator_accounting::read_asset_market_id(
+        &svm.get_account(&env.slab).unwrap().data,
+        0,
+    )
+    .unwrap();
+    let shutdown = build_controller_proxy_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: 0,
+            now_slot: shutdown_slot,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    let restart_slot = shutdown_slot + 1;
+    let restart = build_twap_restart_asset0_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+        restart_slot,
+        1_000_001,
+        old_market_id,
+    );
+    let controller_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    let restart_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(env.twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+
+    for (index, message) in [(6u64, &shutdown), (7u64, &restart)] {
+        let transaction = transaction_pda(&env.squads, &env.multisig, index);
+        let proposal = proposal_pda(&env.squads, &env.multisig, index);
+        for instruction in [
+            vault_transaction_create_ix(
+                &env.squads,
+                &env.multisig,
+                &transaction,
+                &env.dao.pubkey(),
+                message,
+            ),
+            proposal_create_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+                index,
+            ),
+            proposal_approve_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+            ),
+        ] {
+            send(&mut svm, &[&env.dao], instruction)
+                .expect("pre-approve the normal asset lifecycle action");
+        }
+    }
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar::<Clock>(&clock);
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    let amount = 123u64;
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        amount,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let stale_donation = Transaction::new_signed_with_payer(
+        &[donate_insurance_ix(
+            &donor.pubkey(),
+            &env,
+            &donor_source,
+            &donation_holding,
+            amount,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &donor],
+        shared_blockhash,
+    );
+    let lifecycle_execute = |index: u64, remaining: &[AccountMeta]| {
+        Transaction::new_signed_with_payer(
+            &[vault_transaction_execute_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal_pda(&env.squads, &env.multisig, index),
+                &transaction_pda(&env.squads, &env.multisig, index),
+                &env.dao.pubkey(),
+                remaining,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &env.dao],
+            shared_blockhash,
+        )
+    };
+    svm.send_transaction(lifecycle_execute(6, &controller_remaining))
+        .expect("normally shut down generation A");
+    svm.warp_to_slot(restart_slot);
+    svm.send_transaction(lifecycle_execute(7, &restart_remaining))
+        .expect("normally restart asset 0 as generation B");
+    assert!(
+        percolator_accounting::read_asset_market_id(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+            > old_market_id,
+    );
+
+    let insurance_before = read_asset0_insurance(&svm, &env.slab);
+    let market_before = svm.get_account(&env.slab).unwrap();
+    let replay = svm.send_transaction(stale_donation);
+    if replay.is_ok() {
+        assert_eq!(token_amount(&svm, &donor_source), 0);
+        assert_eq!(
+            read_asset0_insurance(&svm, &env.slab),
+            insurance_before + amount as u128,
+        );
+        panic!("a generation-A signature donated the victim's collateral to generation B");
+    }
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before);
+}
+
 // PUBLIC VALUE LEAK: donating marketauth must neither absorb creator-funded insurance nor leave
 // its fee operator behind after the principal exits. The creator exits through Percolator first;
 // the unchanged donation can then migrate empty custody to the controller and genesis pool.
