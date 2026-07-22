@@ -506,11 +506,19 @@ impl Env {
         };
         self.send(&[ix], &[&market_admin])
             .expect("grant market custody to insurance pool");
+        let grant_slot = self.svm.get_sysvar::<Clock>().slot;
+        let pool_data = self.svm.get_account(&self.pool).unwrap().data;
         assert_eq!(
-            self.svm.get_account(&self.pool).unwrap().data[272] & 2,
+            pool_data[272] & 2,
             2,
             "the production first-grant path seals the pool generation",
         );
+        assert_eq!(
+            u64::from_le_bytes(pool_data[321..329].try_into().unwrap()),
+            grant_slot + 1,
+            "the pool records its first custody grant slot plus one",
+        );
+        self.warp_slot(grant_slot + 1);
     }
 
     fn cross_backing_deposit(
@@ -2174,7 +2182,7 @@ fn deposit_into_real_percolator_insurance_records_position() {
     // Position records principal + a nonzero start_slot; outstanding tracked.
     let (principal, start_slot, withdrawn) = env.read_position(&alice.pubkey());
     assert_eq!(principal, amount);
-    assert_eq!(start_slot, 100, "start_slot = clock at deposit");
+    assert_eq!(start_slot, 101, "start_slot = first slot after custody grant");
     assert!(!withdrawn);
     assert_eq!(env.pool_outstanding(), amount);
 }
@@ -2226,8 +2234,8 @@ fn legacy_genesis_pool_cannot_squat_cross_backing_genesis_address() {
     env.send(&[ix], &[])
         .expect("cross-backed genesis init remains available after legacy init");
 
-    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 273);
-    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 321);
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 329);
+    assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 329);
 }
 
 #[test]
@@ -2949,7 +2957,7 @@ fn public_full_cross_backing_impairment_cannot_capture_fresh_recapitalization() 
     }
     install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
     env.init_cross_backing_genesis_pool();
-    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 321);
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 329);
 
     let high_entry = 200u64;
     let side_protection = 2_000_000u64;
@@ -3552,7 +3560,7 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     assert_eq!(env.token_amount(&third_ata), 0);
 
     let pool_data = env.svm.get_account(&env.pool).unwrap().data;
-    assert_eq!(pool_data.len(), 321, "current cross-backed pool layout");
+    assert_eq!(pool_data.len(), 329, "current cross-backed pool layout");
     assert_eq!(
         [
             u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
@@ -4158,11 +4166,11 @@ fn a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_reward_tenure()
     let h1 = create_holding(&mut env, &pool);
     let h2 = create_holding(&mut env, &pool);
 
-    // (1) Dust deposit at slot 100 -> banks start_slot = 100.
+    // (1) Dust deposit in the first valid post-grant slot -> banks start_slot = 101.
     env.insurance_deposit(&alice, &alice_ata, &h1, 1).expect("dust deposit");
     let (p1, s1, _) = env.read_position(&alice.pubkey());
     assert_eq!(p1, 1, "1 atom of principal");
-    assert_eq!(s1, 100, "dust deposit dates the position to slot 100");
+    assert_eq!(s1, 101, "dust deposit dates the position to slot 101");
 
     // (2) Warp ahead (within the market's oracle-freshness window), then TOP UP the real capital. The reset
     // moves start_slot to the top-up slot.
@@ -4170,7 +4178,7 @@ fn a_top_up_deposit_resets_start_slot_late_capital_cannot_borrow_reward_tenure()
     env.insurance_deposit(&alice, &alice_ata, &h2, 1_999_999).expect("top-up");
     let (p2, s2, _) = env.read_position(&alice.pubkey());
     assert_eq!(p2, 2_000_000, "principal accumulates across both deposits");
-    assert_eq!(s2, 1124, "start_slot RESET to the top-up slot — the 1_999_999 cannot claim slot-100 tenure");
+    assert_eq!(s2, 1124, "start_slot RESET to the top-up slot — the 1_999_999 cannot claim slot-101 tenure");
     assert!(s2 > s1, "the tenure clock moved forward on the top-up; the dust-banked early slot is gone");
     // The whole 2M is now dated to slot 1124 for capital-reward accounting.
 }
@@ -7351,8 +7359,8 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     let bob_snapshot = env.read_position(&bob.pubkey());
     let alice_action_nonce = env.position_action_nonce(&alice.pubkey());
     let bob_action_nonce = env.position_action_nonce(&bob.pubkey());
-    assert_eq!(alice_snapshot, (1, start, false));
-    assert_eq!(bob_snapshot, (5, start, false));
+    assert_eq!(alice_snapshot, (1, start + 1, false));
+    assert_eq!(bob_snapshot, (5, start + 1, false));
 
     env.warp_slot(start + deposit_window - 1);
     env.svm.expire_blockhash();
@@ -7601,7 +7609,7 @@ fn presigned_partial_withdraw_cannot_retire_the_remainder_after_deposits_close()
         .expect("alice deposits ten vote units");
     let initial_snapshot = env.read_position(&alice.pubkey());
     let initial_action_nonce = env.position_action_nonce(&alice.pubkey());
-    assert_eq!(initial_snapshot, (10, start, false));
+    assert_eq!(initial_snapshot, (10, start + 1, false));
 
     env.warp_slot(start + deposit_window - 1);
     env.svm.expire_blockhash();
@@ -7654,13 +7662,13 @@ fn presigned_partial_withdraw_cannot_retire_the_remainder_after_deposits_close()
     env.svm
         .send_transaction(replacement)
         .expect("the replacement five-unit withdrawal lands");
-    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start + 1, false));
     assert_eq!(env.token_amount(&alice_ata), 5);
 
     env.warp_slot(start + deposit_window);
     let stale_result = env.svm.send_transaction(withheld);
     if stale_result.is_ok() {
-        assert_eq!(env.read_position(&alice.pubkey()), (0, start, true));
+        assert_eq!(env.read_position(&alice.pubkey()), (0, start + 1, true));
         assert_eq!(env.token_amount(&alice_ata), 10);
         assert!(
             gv_vote(&mut env, &ve, &alice, &gv_proposal, 1).is_err(),
@@ -7669,7 +7677,7 @@ fn presigned_partial_withdraw_cannot_retire_the_remainder_after_deposits_close()
         panic!("one partial-withdraw authorization retired the replacement remainder");
     }
 
-    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start + 1, false));
     assert_eq!(env.token_amount(&alice_ata), 5);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
         .expect("rejecting the stale withdrawal preserves five vote units");
@@ -7694,7 +7702,7 @@ fn same_slot_round_trip_cannot_restore_a_stale_withdrawal_snapshot() {
         .expect("initial same-slot deposit");
     let initial_snapshot = env.read_position(&alice.pubkey());
     let initial_action_nonce = env.position_action_nonce(&alice.pubkey());
-    assert_eq!(initial_snapshot, (10, start, false));
+    assert_eq!(initial_snapshot, (10, start + 1, false));
 
     let withdraw_accounts = vec![
         AccountMeta::new(alice.pubkey(), true),
@@ -7777,7 +7785,7 @@ fn same_slot_round_trip_cannot_restore_a_stale_withdrawal_snapshot() {
 
     env.insurance_withdraw(&alice, &alice_ata, &holding, &alice, 5)
         .expect("a fresh nonce-bound partial withdrawal remains live");
-    assert_eq!(env.read_position(&alice.pubkey()), (5, start, false));
+    assert_eq!(env.read_position(&alice.pubkey()), (5, start + 1, false));
     assert_eq!(env.token_amount(&alice_ata), 15);
 }
 
@@ -8394,10 +8402,10 @@ fn a_same_slot_vote_counts_exact_principal_and_locks_it() {
     );
 }
 
-// SLOT-ZERO LIVENESS: slot 0 is a valid configured bootstrap start and deposit slot. Genesis
-// must read principal directly rather than treating the zero timestamp as an unfunded sentinel.
+// FIRST-POST-GRANT-SLOT LIVENESS: a grant at slot 0 records a nonzero sentinel and deposits
+// open at slot 1. Genesis must accept that earliest valid deposit without an extra delay.
 #[test]
-fn a_slot_zero_deposit_can_vote_immediately() {
+fn a_first_post_grant_slot_deposit_can_vote_immediately() {
     let mut env = Env::new();
     env.warp_slot(0);
     env.init_insurance_pool();
@@ -8408,22 +8416,22 @@ fn a_slot_zero_deposit_can_vote_immediately() {
     let pool = env.pool;
     let holding = create_holding(&mut env, &pool);
     env.insurance_deposit(&alice, &alice_ata, &holding, amount)
-        .expect("slot-zero deposit through real Percolator");
+        .expect("first post-grant-slot deposit through real Percolator");
     assert_eq!(
         env.read_position(&alice.pubkey()),
-        (amount, 0, false),
-        "the public deposit path records the valid slot-zero timestamp"
+        (amount, 1, false),
+        "the public deposit path records the earliest valid post-grant timestamp"
     );
 
     let dest = Pubkey::new_unique();
     let (_dist_proposal, gv_proposal) =
         create_and_register_proposal(&mut env, &ve, 1, &dest);
     gv_vote(&mut env, &ve, &alice, &gv_proposal, 1)
-        .expect("a slot-zero position has immediate principal weight");
+        .expect("the first post-grant-slot position has immediate principal weight");
     assert_eq!(
         gv_proposal_support(&env, &gv_proposal),
         (amount, amount),
-        "one deposited base unit gives one vote at slot zero"
+        "one deposited base unit gives one vote in the first post-grant slot"
     );
 }
 

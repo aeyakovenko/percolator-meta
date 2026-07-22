@@ -106,8 +106,9 @@ principal from both protection classes, subject to losses incurred during their 
   insurance roles, and asset-0 `asset_admin`, excluding any surviving key that could rotate and drain.
   A genesis-pool grant cannot rotate nonzero external insurance or any nonempty external backing
   state into pool custody: the recorded providers exit first, after which the same grant can proceed.
-  Its first successful grant also sets an immutable pool-local seal, so a deposit authorized for that
-  pool cannot be replayed after the raw slab key is closed and initialized as a different market.
+  Its first successful grant also records an immutable pool-local seal and grant slot. Deposits begin
+  in the following slot, so neither a deposit nor an atomic grant-plus-deposit authorization can be
+  replayed after the raw slab key is closed and initialized as a different market.
 - **Custody transitions are fixed.** Asset-0 custody moves
   `market-controller -> genesis pool -> TWAP PDA`. The pool-to-TWAP handoff atomically imports the
   pool's live `outstanding_principal` minus live backing-protected principal as the complementary
@@ -209,8 +210,8 @@ slot-only wire remains valid only for predecessor books that are exit-only under
 
 1. **Create the market.** Anyone initializes a market with the governance-bound controller PDA as
    `marketauth`, but the fresh rent-funded slab key must sign once so another payer cannot consume it.
-   Before user funding, Squads grants asset-0 custody to the canonical genesis pool;
-   the only governance-held asset role is the oracle role.
+   Before user funding, Squads grants asset-0 custody to the canonical genesis pool. Deposits become
+   valid in the slot after that grant; the only governance-held asset role is the oracle role.
 2. **Deposit window.** Deposits are accepted only during
    `[bootstrap_start, bootstrap_start + deposit_window)`. The default window is about one week and
    cannot extend past bootstrap end. Pool-wide accounting sends 50% of aggregate principal to

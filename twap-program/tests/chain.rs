@@ -9,13 +9,13 @@ use litesvm::LiteSVM;
 use solana_sdk::{
     account::Account,
     clock::Clock,
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
     program_option::COption,
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -250,6 +250,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         &grant_remaining,
     )
     .expect("governance grants asset-0 custody to the pool");
+    advance_one_slot(&mut svm);
 
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
@@ -9044,6 +9045,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         &mut svm, &squads, &multisig, &dao, &payer, 1, &message, &remaining,
     )
     .expect("squads grants operator to subledger pool");
+    advance_one_slot(&mut svm);
 
     // Now the subledger pool is the asset-0 insurance authority: a depositor can top up
     // REAL percolator insurance through it.
@@ -15991,6 +15993,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &grant_remaining,
     )
     .expect("controller grants custody to the owner-bound pool");
+    advance_one_slot(&mut svm);
     let slab_account = svm.get_account(&slab).unwrap();
     let (cfg_after_grant, _, _, _) =
         percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
@@ -17421,6 +17424,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &grant_remaining,
     )
     .expect("Squads grants asset-0 custody to the share pool");
+    advance_one_slot(&mut svm);
 
     let owner = Keypair::new();
     svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
@@ -17624,7 +17628,8 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
     )
     .expect("public user funds one maintenance-fee atom");
     let mut clock = svm.get_sysvar::<Clock>();
-    clock.slot = 101;
+    let fee_sync_slot = clock.slot.checked_add(1).unwrap();
+    clock.slot = fee_sync_slot;
     svm.set_sysvar(&clock);
     send(
         &mut svm,
@@ -17634,7 +17639,9 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
                 AccountMeta::new(market, false),
                 AccountMeta::new(fee_portfolio.pubkey(), false),
             ],
-            PIx::SyncMaintenanceFee { now_slot: 101 },
+            PIx::SyncMaintenanceFee {
+                now_slot: fee_sync_slot,
+            },
         ),
     )
     .expect("any cranker converts the abandoned atom into protocol insurance");
@@ -19426,6 +19433,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
         &grant_remaining,
     )
     .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
     let alice = Keypair::new();
     svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
     let amount = 1_000_000u64;
@@ -20094,6 +20102,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &grant, &gr)
         .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
 
     // Genesis deposit P = 1,000,000.
     let principal = 1_000_000u64;
@@ -20388,6 +20397,7 @@ fn e2e_fresh_position_gets_one_vote_per_principal_unit() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &grant, &gr)
         .expect("grant operator");
+    advance_one_slot(&mut svm);
 
     // distribution: fund a fixed-supply COIN, init dist (authority = gv config) + gv config.
     let total = 100u64;
@@ -22386,6 +22396,7 @@ fn setup_genesis_with_policy_backing_and_funding(
         AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(svm, &squads, &multisig, &dao, payer, 1, &grant, &gr).expect("grant operator");
+    advance_one_slot(svm);
 
     let total = 100u64;
     let dist_vault = Pubkey::new_unique();
@@ -22689,6 +22700,7 @@ fn materialize_public_transient_backing(
     for owner in [oracle, &observer, &long, &short] {
         svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
     }
+    let initial_mark_slot = svm.get_sysvar::<Clock>().slot;
     send(
         svm,
         &[payer, oracle],
@@ -22699,7 +22711,7 @@ fn materialize_public_transient_backing(
             ],
             PIx::ConfigureAuthMark {
                 asset_index: 0,
-                now_slot: 100,
+                now_slot: initial_mark_slot,
                 initial_mark_e6: 100,
             },
         ),
@@ -22734,7 +22746,7 @@ fn materialize_public_transient_backing(
     .expect("open public loss pair");
 
     let target = 1_002_100u64;
-    let mut slot = 101u64;
+    let mut slot = initial_mark_slot.checked_add(1).unwrap();
     warp_to(svm, slot);
     send(
         svm,
@@ -27168,6 +27180,11 @@ fn run_presigned_genesis_deposit_market_replay(grant_generation_a: bool) {
             2,
             "the first grant permanently seals this pool to generation A",
         );
+        svm.set_sysvar(&Clock {
+            slot: 101,
+            unix_timestamp: 101,
+            ..Clock::default()
+        });
     }
 
     let victim_source = Pubkey::new_unique();
@@ -27225,12 +27242,35 @@ fn run_presigned_genesis_deposit_market_replay(grant_generation_a: bool) {
         &stale_signers,
         retained_blockhash,
     );
-    if !grant_generation_a {
+    if grant_generation_a {
         assert!(
             svm.simulate_transaction(stale_deposit.clone().into())
                 .is_ok(),
-            "the atomic first grant plus deposit is valid against generation A",
+            "the post-grant deposit is valid against generation A",
         );
+    } else {
+        let market_before = svm.get_account(&market).unwrap();
+        let pool_before = svm.get_account(&pool).unwrap();
+        let source_before = svm.get_account(&victim_source).unwrap();
+        let error = svm
+            .simulate_transaction(stale_deposit.clone().into())
+            .expect_err("same-slot first grant plus deposit must be rejected");
+        assert_eq!(
+            error.err,
+            TransactionError::InstructionError(1, InstructionError::InvalidInstructionData),
+        );
+        let error = svm
+            .send_transaction(stale_deposit)
+            .expect_err("executing the same-slot transaction must fail atomically");
+        assert_eq!(
+            error.err,
+            TransactionError::InstructionError(1, InstructionError::InvalidInstructionData),
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before);
+        assert_eq!(svm.get_account(&victim_source).unwrap(), source_before);
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+        return;
     }
     let submit = |svm: &mut LiteSVM, instructions: &[Instruction], signers: &[&Keypair]| {
         svm.send_transaction(Transaction::new_signed_with_payer(
@@ -27309,7 +27349,7 @@ fn run_presigned_genesis_deposit_market_replay(grant_generation_a: bool) {
                 ],
                 PIx::ConfigureAuthMark {
                     asset_index: 0,
-                    now_slot: 100,
+                    now_slot: if grant_generation_a { 101 } else { 100 },
                     initial_mark_e6: ENTRY_PRICE,
                 },
             ),
@@ -27642,7 +27682,7 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
 }
 
 #[test]
-fn probe_presigned_pregrant_deposit_cannot_cross_raw_market_generations() {
+fn e2e_presigned_pregrant_deposit_cannot_cross_raw_market_generations() {
     run_presigned_genesis_deposit_market_replay(false);
 }
 
@@ -29375,6 +29415,27 @@ fn warp_to(svm: &mut LiteSVM, slot: u64) {
     let mut c = svm.get_sysvar::<Clock>();
     c.slot = slot;
     svm.set_sysvar(&c);
+}
+fn advance_one_slot(svm: &mut LiteSVM) {
+    let slot = svm
+        .get_sysvar::<Clock>()
+        .slot
+        .checked_add(1)
+        .expect("test clock slot must fit");
+    warp_to(svm, slot);
+}
+fn warp_to_first_pool_deposit_slot(svm: &mut LiteSVM, pool: &Pubkey) {
+    let data = svm
+        .get_account(pool)
+        .expect("genesis pool must exist")
+        .data;
+    let slot = u64::from_le_bytes(
+        data[321..329]
+            .try_into()
+            .expect("current pool stores its custody grant slot"),
+    );
+    assert_ne!(slot, 0, "genesis pool must have completed its first grant");
+    warp_to(svm, slot);
 }
 fn mint_coin(
     svm: &mut LiteSVM,
@@ -32979,6 +33040,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &grant_remaining,
     )
     .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
 
     // --- Genesis deposit (subledger TopUp as the granted authority) ---
     let alice = Keypair::new();
@@ -46634,6 +46696,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &mut svm, &squads, &multisig, &dao, &payer, 3, &message, &remaining,
     )
     .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
 
     let alice = Keypair::new();
     svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
@@ -53550,6 +53613,7 @@ fn e2e_transient_trader_backing_cannot_lower_the_twap_principal_floor() {
     let env = setup_cross_backing_genesis(&mut svm, &payer);
     let oracle = Keypair::new();
     install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
+    warp_to_first_pool_deposit_slot(&mut svm, &env.pool);
 
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
@@ -53734,6 +53798,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
         &oracle.pubkey(),
         10_000,
     );
+    warp_to_first_pool_deposit_slot(&mut svm, &env.pool);
 
     let owners = [Keypair::new(), Keypair::new()];
     let principal = 14u64;
@@ -53834,6 +53899,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
         2 * principal + 1,
     );
 
+    let initial_mark_slot = svm.get_sysvar::<Clock>().slot;
     send(
         &mut svm,
         &[&payer, &oracle],
@@ -53844,7 +53910,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
             ],
             PIx::ConfigureAuthMark {
                 asset_index: 0,
-                now_slot: 100,
+                now_slot: initial_mark_slot,
                 initial_mark_e6: 100,
             },
         ),
@@ -53962,7 +54028,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
     .expect("permissionless users open a balanced pair after lifecycle handoff");
 
     let target_mark = 301u64;
-    let mut slot = 101u64;
+    let mut slot = initial_mark_slot.checked_add(1).unwrap();
     warp_to(&mut svm, slot);
     send(
         &mut svm,
