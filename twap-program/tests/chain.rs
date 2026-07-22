@@ -4359,6 +4359,228 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
 }
 
+// PUBLIC LOF: the controller donation wire must bind the asset generation, not only the slab.
+// Otherwise a relayer can withhold a valid donor-signed transaction across a normal in-place
+// restart and spend the donor's collateral on the replacement generation.
+#[test]
+fn e2e_presigned_controller_insurance_donation_cannot_cross_asset0_restart() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let donor = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000)
+        .unwrap();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    svm.set_account(
+        market,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![
+                0;
+                percolator_prog::state::market_account_len_for_capacity(1).unwrap()
+            ],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionlessly initialize a controller-owned market");
+
+    let proxy = |percolator_instruction: percolator_prog::ix::Instruction,
+                 generation_witness: Option<Pubkey>| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&percolator_instruction.encode());
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if let Some(witness) = generation_witness {
+            accounts.push(AccountMeta::new_readonly(witness, false));
+        }
+        Instruction {
+            program_id: controller_id(),
+            accounts,
+            data,
+        }
+    };
+    let market_generation_witness = controller_market_generation_witness(&svm, &market);
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 5,
+            },
+            Some(market_generation_witness),
+        ),
+    )
+    .expect("configure the ordinary shutdown delay");
+    svm.set_sysvar(&Clock {
+        slot: 110,
+        unix_timestamp: 110,
+        ..Clock::default()
+    });
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let donor_source = Pubkey::new_unique();
+    let controller_holding = Pubkey::new_unique();
+    let amount = 123u64;
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        amount,
+    );
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let old_market_id = percolator_accounting::read_asset_market_id(
+        &svm.get_account(&market).unwrap().data,
+        0,
+    )
+    .unwrap();
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let stale_donation = Transaction::new_signed_with_payer(
+        &[controller_donate_insurance_ix(
+            &donor.pubkey(),
+            &governance.pubkey(),
+            &controller,
+            &market,
+            &donor_source,
+            &controller_holding,
+            &percolator_vault,
+            amount,
+        )],
+        Some(&donor.pubkey()),
+        &[&donor],
+        shared_blockhash,
+    );
+    svm.simulate_transaction(stale_donation.clone().into())
+        .expect("the donor signs a valid generation-A donation");
+
+    let shutdown = Transaction::new_signed_with_payer(
+        &[proxy(
+            percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: 110,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            },
+            None,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        shared_blockhash,
+    );
+    let restart = Transaction::new_signed_with_payer(
+        &[proxy(
+            percolator_prog::ix::Instruction::RestartAssetOracle {
+                asset_index: 0,
+                now_slot: 111,
+                initial_price: 1_000_000,
+            },
+            None,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        shared_blockhash,
+    );
+    svm.send_transaction(shutdown)
+        .expect("normally shut down generation A");
+    svm.set_sysvar(&Clock {
+        slot: 111,
+        unix_timestamp: 111,
+        ..Clock::default()
+    });
+    svm.send_transaction(restart)
+        .expect("normally restart asset 0 as generation B");
+    assert!(
+        percolator_accounting::read_asset_market_id(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap()
+            > old_market_id,
+    );
+
+    let insurance_before = read_asset0_insurance(&svm, &market);
+    let market_before = svm.get_account(&market).unwrap();
+    let replay = svm.send_transaction(stale_donation);
+    if replay.is_ok() {
+        assert_eq!(token_amount(&svm, &donor_source), 0);
+        assert_eq!(
+            read_asset0_insurance(&svm, &market),
+            insurance_before + amount as u128,
+        );
+        panic!("a generation-A signature donated the victim's collateral to generation B");
+    }
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(svm.get_account(&market).unwrap(), market_before);
+}
+
 // CROSS-GENERATION ADMIN DOS: Squads approves an oracle configuration for generation A, but a
 // separate governed lifecycle shuts down and restarts the same asset slot as generation B before
 // execution. The old transaction commits only to the slab and asset index; it must not re-anchor
