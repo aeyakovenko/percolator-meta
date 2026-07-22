@@ -3232,6 +3232,26 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
     );
     assert_eq!(env.token_amount(&pool_holding), 1);
 
+    // Keep the exact one-atom staging assertion above, then add a larger owner
+    // whose partial exit crosses the pending/canonical backing split. Repeating
+    // one nominal claim in pieces must not let that owner consume another
+    // depositor's liquid protection or leave staged principal behind.
+    let (fourth, fourth_ata) = new_depositor(&mut env, 5);
+    env.cross_backing_deposit(&fourth, &fourth_ata, &pool_holding, 5)
+        .expect("a larger deposit remains live with one incompatible backing domain");
+    assert_eq!(env.pool_outstanding(), 8);
+    let pool_data = env.svm.get_account(&env.pool).unwrap().data;
+    let staged_after_larger_deposit = [
+        u64::from_le_bytes(pool_data[273..281].try_into().unwrap()),
+        u64::from_le_bytes(pool_data[281..289].try_into().unwrap()),
+    ];
+    assert!(staged_after_larger_deposit[0] > 1);
+    assert_eq!(staged_after_larger_deposit[1], 0);
+    assert_eq!(
+        env.token_amount(&pool_holding),
+        staged_after_larger_deposit[0],
+    );
+
     env.send(
         &[Instruction {
             program_id: perc_id(),
@@ -3253,6 +3273,10 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
         ],
     );
 
+    env.cross_backing_withdraw(&fourth, &fourth_ata, &pool_holding, 2)
+        .expect("partial exit crosses staged and canonical backing safely");
+    assert_eq!(env.token_amount(&fourth_ata), 2);
+
     for (owner, destination) in [
         (&first, &first_ata),
         (&second, &second_ata),
@@ -3262,6 +3286,9 @@ fn transient_source_backing_cannot_block_a_later_genesis_deposit() {
             .expect("each one-vote depositor retains an owner-bound exit");
         assert_eq!(env.token_amount(destination), 1);
     }
+    env.cross_backing_withdraw(&fourth, &fourth_ata, &pool_holding, 3)
+        .expect("the split exiter recovers only its remaining principal");
+    assert_eq!(env.token_amount(&fourth_ata), 5);
     let final_pool_data = env.svm.get_account(&env.pool).unwrap().data;
     assert_eq!(
         [
