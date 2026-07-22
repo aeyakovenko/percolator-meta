@@ -1557,6 +1557,16 @@ fn open_public_pair(
     price: u64,
     capital: u64,
 ) -> (Keypair, Pubkey, Keypair, Pubkey) {
+    open_public_pair_with_fee(env, position_q, price, capital, 0)
+}
+
+fn open_public_pair_with_fee(
+    env: &mut Env,
+    position_q: i128,
+    price: u64,
+    capital: u64,
+    fee_bps: u64,
+) -> (Keypair, Pubkey, Keypair, Pubkey) {
     use percolator_prog::ix::Instruction as PIx;
 
     let long = Keypair::new();
@@ -1580,7 +1590,7 @@ fn open_public_pair(
                 asset_index: 0,
                 size_q: position_q,
                 exec_price: price,
-                fee_bps: 0,
+                fee_bps,
             }
             .encode(),
         }],
@@ -1731,6 +1741,35 @@ fn run_complete_public_insurance_loss(
     domain_tranche: u64,
     expected_remaining: u128,
 ) -> Vec<(Keypair, Pubkey)> {
+    run_complete_public_insurance_loss_with_fee(
+        env,
+        oracle,
+        observer_portfolio,
+        slot,
+        low_entry,
+        low_capital,
+        high_entry,
+        high_capital,
+        domain_tranche,
+        expected_remaining,
+        0,
+    )
+    .0
+}
+
+fn run_complete_public_insurance_loss_with_fee(
+    env: &mut Env,
+    oracle: &Keypair,
+    observer_portfolio: Pubkey,
+    slot: &mut u64,
+    low_entry: u64,
+    low_capital: u64,
+    high_entry: u64,
+    high_capital: u64,
+    domain_tranche: u64,
+    expected_remaining_without_fee: u128,
+    opening_fee_bps: u64,
+) -> (Vec<(Keypair, Pubkey)>, u128) {
     let position_q = 1_000_000_000_000i128;
     let pnl_atoms_per_price = position_q.unsigned_abs() / percolator::POS_SCALE;
     let insurance_before = asset_insurance_remaining(env, 0);
@@ -1739,9 +1778,25 @@ fn run_complete_public_insurance_loss(
         (domain_tranche as u128 + low_capital as u128) % pnl_atoms_per_price,
         0,
     );
+    let opening_fee_budget = pnl_atoms_per_price
+        .checked_mul(low_entry as u128)
+        .and_then(|notional| notional.checked_mul(opening_fee_bps as u128))
+        .map(|numerator| numerator.div_ceil(10_000))
+        .and_then(|fee| u64::try_from(fee).ok())
+        .unwrap();
+    let fee_adjusted_capital = low_capital.checked_add(opening_fee_budget).unwrap();
 
     let (low_long, low_long_portfolio, low_short, low_short_portfolio) =
-        open_public_pair(env, position_q, low_entry, low_capital);
+        open_public_pair_with_fee(
+            env,
+            position_q,
+            low_entry,
+            fee_adjusted_capital,
+            opening_fee_bps,
+        );
+    let opening_fee = asset_insurance_remaining(env, 0)
+        .checked_sub(insurance_before)
+        .expect("opening trade fees cannot reduce insurance");
     let high_target = low_entry
         .checked_add(
             u64::try_from(
@@ -1754,7 +1809,7 @@ fn run_complete_public_insurance_loss(
     liquidate_stale_public_loser(env, low_short_portfolio, *slot);
     assert_eq!(
         asset_insurance_remaining(env, 0),
-        insurance_before - domain_tranche as u128,
+        insurance_before + opening_fee - domain_tranche as u128,
     );
     clear_stale_public_winner(env, &low_long, low_long_portfolio, *slot);
 
@@ -1768,22 +1823,25 @@ fn run_complete_public_insurance_loss(
     let second_insurance_loss = long_loss.checked_sub(high_capital as u128).unwrap();
     assert_eq!(
         second_insurance_loss,
-        insurance_before - domain_tranche as u128 - expected_remaining,
+        insurance_before - domain_tranche as u128 - expected_remaining_without_fee,
     );
     advance_public_mark(env, oracle, observer_portfolio, slot, terminal_low, 400);
     liquidate_stale_public_loser(env, high_long_portfolio, *slot);
     assert_eq!(
         asset_insurance_remaining(env, 0),
-        expected_remaining,
+        expected_remaining_without_fee + opening_fee,
     );
     clear_stale_public_winner(env, &high_short, high_short_portfolio, *slot);
 
-    vec![
-        (low_long, low_long_portfolio),
-        (low_short, low_short_portfolio),
-        (high_long, high_long_portfolio),
-        (high_short, high_short_portfolio),
-    ]
+    (
+        vec![
+            (low_long, low_long_portfolio),
+            (low_short, low_short_portfolio),
+            (high_long, high_long_portfolio),
+            (high_short, high_short_portfolio),
+        ],
+        opening_fee,
+    )
 }
 
 fn create_mint(svm: &mut LiteSVM, payer: &Keypair, authority: &Pubkey) -> Pubkey {
@@ -5449,6 +5507,219 @@ fn public_repeated_total_losses_cannot_exhaust_the_insurance_share_namespace() {
         (successful_dust_recapitalizations as u128 + 1) * 1_000_000,
     );
     assert_eq!(asset_insurance_remaining(&env, 0), 201);
+}
+
+// PUBLIC LOF PROBE: an incumbent partially exits, its remaining tranche is impaired, a second
+// owner recapitalizes, and both then bear another public loss. Trade fees in the second epoch are
+// protocol reserve; they must not change either owner's loss-adjusted claim or the exit order.
+#[test]
+fn staggered_partial_exit_and_second_loss_cannot_shift_fees_between_owners() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    #[derive(Clone, Copy, Debug)]
+    struct Outcome {
+        incumbent_partial: u64,
+        incumbent_total: u64,
+        late_total: u64,
+        insurance_spent: u128,
+        opening_fee: u128,
+        protocol_reserve: u128,
+    }
+
+    let run = |opening_fee_bps: u64| {
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for owner in [&oracle, &observer] {
+        env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture_with_margin(&mut env, &oracle.pubkey(), 1_000);
+    env.init_insurance_pool();
+
+    let low_entry = 100u64;
+    let high_entry = 1_000_100u64;
+    let low_capital = 10_000_000u64;
+    let first_loss = 50_000_000u64;
+    let long_loss = (high_entry - low_entry).checked_mul(1_000_000).unwrap();
+    let late_principal = first_loss.checked_mul(2).unwrap();
+    let first_principal = first_loss.checked_mul(4).unwrap();
+
+    let (incumbent, incumbent_ata) = new_depositor(&mut env, first_principal);
+    let pool = env.pool;
+    let incumbent_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(
+        &incumbent,
+        &incumbent_ata,
+        &incumbent_holding,
+        first_principal,
+    )
+    .expect("incumbent funds both domains before the first loss");
+    let virtual_shares = 1_000_000u128;
+    let incumbent_shares = (first_principal as u128)
+        .checked_mul(virtual_shares)
+        .unwrap();
+    let partial_principal = first_principal / 2;
+    let shares_to_retire = incumbent_shares
+        .checked_mul(partial_principal as u128)
+        .unwrap()
+        / first_principal as u128;
+    let expected_partial = shares_to_retire
+        .checked_mul(asset_insurance_remaining(&env, 0) + 1)
+        .unwrap()
+        / env.pool_total_shares().checked_add(virtual_shares).unwrap();
+    env.insurance_withdraw(
+        &incumbent,
+        &incumbent_ata,
+        &incumbent_holding,
+        &incumbent,
+        partial_principal,
+    )
+    .expect("incumbent partially exits before public exposure");
+    let incumbent_partial = env.token_amount(&incumbent_ata);
+    assert_eq!(incumbent_partial as u128, expected_partial);
+    assert_eq!(env.read_position(&incumbent.pubkey()).0, partial_principal);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: low_entry,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure authenticated mark");
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let mut slot = 100;
+
+    let expected_after_first = asset_insurance_remaining(&env, 0)
+        .checked_sub(u128::from(first_loss))
+        .unwrap();
+    let mut loss_portfolios = run_complete_public_insurance_loss(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        low_entry,
+        low_capital,
+        high_entry,
+        long_loss,
+        first_loss,
+        expected_after_first,
+    );
+    assert_eq!(asset_insurance_remaining(&env, 0), expected_after_first);
+
+    let (late, late_ata) = new_depositor(&mut env, late_principal);
+    let late_holding = create_holding(&mut env, &pool);
+    env.insurance_deposit(&late, &late_ata, &late_holding, late_principal)
+        .expect("late owner enters at the first loss-adjusted share price");
+
+    let protected_before_second = asset_insurance_remaining(&env, 0);
+    let second_domain_loss = first_loss / 5;
+    let expected_without_fee = protected_before_second
+        .checked_sub(u128::from(second_domain_loss) * 2)
+        .unwrap();
+    let (second_portfolios, opening_fee) = run_complete_public_insurance_loss_with_fee(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        low_entry,
+        low_capital,
+        high_entry,
+        long_loss.checked_sub(second_domain_loss).unwrap(),
+        second_domain_loss,
+        expected_without_fee,
+        opening_fee_bps,
+    );
+    loss_portfolios.extend(second_portfolios);
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        expected_without_fee + opening_fee,
+    );
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve after both public loss epochs");
+    loss_portfolios.push((observer, observer_portfolio));
+    let terminal: Vec<_> = loss_portfolios
+        .iter()
+        .map(|(owner, portfolio)| (owner, *portfolio))
+        .collect();
+    close_resolved_portfolios(&mut env, &terminal);
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let insurance_spent = percolator_accounting::read_asset_insurance_spent(&market.data, 0)
+        .unwrap()
+        .into_iter()
+        .sum::<u128>();
+    env.insurance_withdraw(&late, &late_ata, &late_holding, &late, late_principal)
+        .expect("late owner realizes only the losses from its own tenure");
+    env.insurance_withdraw(
+        &incumbent,
+        &incumbent_ata,
+        &incumbent_holding,
+        &incumbent,
+        partial_principal,
+    )
+    .expect("incumbent retires its remaining impaired principal");
+
+    let incumbent_total = env.token_amount(&incumbent_ata);
+    let late_total = env.token_amount(&late_ata);
+    let protocol_reserve = asset_insurance_remaining(&env, 0);
+    assert_eq!(
+        u128::from(incumbent_total) + u128::from(late_total) + protocol_reserve,
+        u128::from(first_principal + late_principal) - insurance_spent + opening_fee,
+        "owner payouts and protocol reserve conserve deposits, public losses, and fees",
+    );
+    assert!(incumbent_total < first_principal);
+    assert!(late_total < late_principal);
+
+    Outcome {
+        incumbent_partial,
+        incumbent_total,
+        late_total,
+        insurance_spent,
+        opening_fee,
+        protocol_reserve,
+    }
+    };
+
+    let control = run(0);
+    let with_fees = run(100);
+    assert!(with_fees.opening_fee > 0);
+    assert_eq!(control.insurance_spent, with_fees.insurance_spent);
+    assert_eq!(control.incumbent_partial, with_fees.incumbent_partial);
+    assert_eq!(
+        control.incumbent_total, with_fees.incumbent_total,
+        "second-epoch fees cannot restore the incumbent's impaired claim",
+    );
+    assert_eq!(
+        control.late_total, with_fees.late_total,
+        "second-epoch fees cannot increase the later owner's principal-only claim",
+    );
+    assert_eq!(
+        with_fees.protocol_reserve,
+        control.protocol_reserve + with_fees.opening_fee,
+        "every fee atom remains protocol reserve after both owners exit",
+    );
 }
 
 // PUBLIC LOF: the first partial exit from an obsolete share generation pays zero and lazily
