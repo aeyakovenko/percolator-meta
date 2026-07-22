@@ -4210,7 +4210,7 @@ fn process_handoff_to_twap(
     )
 }
 
-// assert_no_principal accounts: [pool, optional holding]
+// assert_no_principal accounts: [pool, optional holding_or_system]
 // data: none
 //
 // This read-only CPI keeps the terminal owner-claim check in the program that
@@ -4239,10 +4239,17 @@ fn process_assert_no_principal(
     if !pool.is_insurance() || !pool.owner_claims_cleared() {
         return Err(ProgramError::InvalidAccountData);
     }
-    if let Some(holding) = holding {
-        if validate_insurance_holding(pool_account, &pool, holding)? != 0 {
-            return Err(ProgramError::InvalidAccountData);
+    match holding {
+        Some(system)
+            if !pool.cross_backing
+                && *system.key == solana_program::system_program::ID =>
+        {}
+        Some(holding) => {
+            if validate_insurance_holding(pool_account, &pool, holding)? != 0 {
+                return Err(ProgramError::InvalidAccountData);
+            }
         }
+        None => {}
     }
     Ok(())
 }
