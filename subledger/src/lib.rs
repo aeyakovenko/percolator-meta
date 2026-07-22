@@ -80,6 +80,7 @@ const POOL_SIZE_CROSS_BACKING_V2: usize = 289;
 const POOL_SIZE_CROSS_BACKING_V3: usize = 321;
 const POOL_SIZE_CUSTODY_GRANT_LEGACY: usize = 329;
 const POOL_SIZE_CROSS_BACKING: usize = 345;
+const POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT: usize = 353;
 const POOL_SIZE_CUSTODY_GRANT: usize = 361;
 const POOL_FLAGS_OFF: usize = 272;
 const POOL_SIZE_CUSTODY_FLAGS: usize = POOL_SIZE_CROSS_BACKING_V1;
@@ -91,7 +92,7 @@ const POOL_SHARE_RATE_NUMERATOR_OFF: usize = 289;
 const POOL_SHARE_RATE_DENOMINATOR_OFF: usize = 305;
 const POOL_INSURANCE_SPENT_CHECKPOINT_OFF: usize = 321;
 const POOL_BACKING_PROTECTED_CHECKPOINT_OFF: usize = 337;
-// Bytes 345..353 are reserved for the ordinary-principal loss checkpoint.
+const POOL_PRINCIPAL_PROTECTED_CHECKPOINT_OFF: usize = 345;
 const POOL_CUSTODY_GRANT_SLOT_OFF: usize = 353;
 const POOL_CUSTODY_GRANT_SLOT_LEGACY_OFF: usize = 321;
 const POSITION_SIZE_BASE: usize = 96;
@@ -403,6 +404,10 @@ struct Pool {
     /// This excludes trader source backing, utilization earnings, and backing
     /// above the pool's nominal 50/50 tranche.
     backing_protected_checkpoint: u64,
+    /// Ordinary principal-only insurance protected by the depositor subledger.
+    /// Deposits raise this value and realized payouts lower it; fees and donations
+    /// cannot raise it, while cumulative insurance consumption can lower it.
+    principal_protected_checkpoint: u64,
 }
 
 impl Pool {
@@ -552,6 +557,18 @@ impl Pool {
             } else {
                 0
             },
+            principal_protected_checkpoint: if data.len()
+                >= POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT
+            {
+                u64::from_le_bytes(
+                    data[POOL_PRINCIPAL_PROTECTED_CHECKPOINT_OFF
+                        ..POOL_PRINCIPAL_PROTECTED_CHECKPOINT_OFF + 8]
+                        .try_into()
+                        .unwrap(),
+                )
+            } else {
+                0
+            },
         })
     }
 
@@ -631,6 +648,13 @@ impl Pool {
                 ..POOL_BACKING_PROTECTED_CHECKPOINT_OFF + 8]
                 .copy_from_slice(&self.backing_protected_checkpoint.to_le_bytes());
         } else if self.backing_protected_checkpoint != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data.len() >= POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT {
+            data[POOL_PRINCIPAL_PROTECTED_CHECKPOINT_OFF
+                ..POOL_PRINCIPAL_PROTECTED_CHECKPOINT_OFF + 8]
+                .copy_from_slice(&self.principal_protected_checkpoint.to_le_bytes());
+        } else if self.principal_protected_checkpoint != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
         if self.custody_granted != (self.custody_grant_slot_plus_one != 0) {
@@ -1352,8 +1376,16 @@ fn uses_indexed_cross_backing(pool: &Pool, pool_data_len: usize) -> bool {
     pool.cross_backing && pool_data_len >= POOL_SIZE_CROSS_BACKING_V3
 }
 
+fn uses_principal_loss_checkpoint(pool: &Pool, pool_data_len: usize) -> bool {
+    !pool.cross_backing
+        && pool.policy == POLICY_PRINCIPAL
+        && pool.is_insurance()
+        && pool_data_len >= POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT
+}
+
 fn uses_external_loss_checkpoints(pool: &Pool, pool_data_len: usize) -> bool {
-    pool.cross_backing && pool_data_len >= POOL_SIZE_CROSS_BACKING
+    (pool.cross_backing && pool_data_len >= POOL_SIZE_CROSS_BACKING)
+        || uses_principal_loss_checkpoint(pool, pool_data_len)
 }
 
 fn owner_backing_protection(pool: &Pool, protected_backing: u128) -> Result<u64, ProgramError> {
@@ -1517,6 +1549,34 @@ fn sync_indexed_cross_backing_external_loss(
     sync_indexed_share_rate(pool, protected)?;
     pool.insurance_spent_checkpoint = observed_insurance_spent;
     pool.backing_protected_checkpoint = observed_backing_protected;
+    Ok(())
+}
+
+fn principal_protected_after_external_loss(
+    pool: &Pool,
+    physical_insurance: u64,
+    observed_insurance_spent: u128,
+) -> Result<u64, ProgramError> {
+    let new_loss = observed_insurance_spent
+        .checked_sub(pool.insurance_spent_checkpoint)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let protected = u128::from(pool.principal_protected_checkpoint)
+        .saturating_sub(new_loss)
+        .min(u128::from(physical_insurance));
+    u64::try_from(protected).map_err(|_| ProgramError::ArithmeticOverflow)
+}
+
+fn sync_principal_protected_checkpoint(
+    pool: &mut Pool,
+    physical_insurance: u64,
+    observed_insurance_spent: u128,
+) -> ProgramResult {
+    pool.principal_protected_checkpoint = principal_protected_after_external_loss(
+        pool,
+        physical_insurance,
+        observed_insurance_spent,
+    )?;
+    pool.insurance_spent_checkpoint = observed_insurance_spent;
     Ok(())
 }
 
@@ -2075,6 +2135,7 @@ fn process_init_pool(
         share_rate_denominator: 0,
         insurance_spent_checkpoint: 0,
         backing_protected_checkpoint: 0,
+        principal_protected_checkpoint: 0,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2753,6 +2814,7 @@ fn process_init_insurance_pool(
 
     let bump_arr = [bump];
     pool_pda_seeds.push(&bump_arr);
+    let tracks_principal_loss = policy == POLICY_PRINCIPAL;
     let pool_size = POOL_SIZE_CUSTODY_GRANT;
     create_pda_robust(
         payer,
@@ -2797,7 +2859,7 @@ fn process_init_insurance_pool(
         }
     }
 
-    let insurance_spent_checkpoint = if cross_backing {
+    let insurance_spent_checkpoint = if tracks_principal_loss {
         percolator_accounting::read_asset_insurance_spent(
             &market_slab.try_borrow_data()?,
             0,
@@ -2835,6 +2897,7 @@ fn process_init_insurance_pool(
         share_rate_denominator: if cross_backing { VIRTUAL_SHARES } else { 0 },
         insurance_spent_checkpoint,
         backing_protected_checkpoint: 0,
+        principal_protected_checkpoint: 0,
     };
     pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -2898,6 +2961,9 @@ fn process_insurance_deposit(
     if pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT
         || !pool.custody_granted
         || (pool.cross_backing && pool_account.data_len() < POOL_SIZE_CROSS_BACKING)
+        || (!pool.cross_backing
+            && pool.policy == POLICY_PRINCIPAL
+            && pool_account.data_len() < POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT)
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -2969,13 +3035,17 @@ fn process_insurance_deposit(
         let market_data = market_slab.try_borrow_data()?;
         let insurance = percolator_accounting::read_asset_insurance_balance(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?;
-        let (spent, backing, sources) = if pool.cross_backing {
+        let spent = if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+            Some(
+                percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+                    .map_err(|_| ProgramError::InvalidAccountData)
+                    .and_then(aggregate_insurance_spent)?,
+            )
+        } else {
+            None
+        };
+        let (backing, sources) = if pool.cross_backing {
             (
-                Some(
-                    percolator_accounting::read_asset_insurance_spent(&market_data, 0)
-                        .map_err(|_| ProgramError::InvalidAccountData)
-                        .and_then(aggregate_insurance_spent)?,
-                ),
                 Some(
                     percolator_accounting::read_asset_backing_balances(&market_data, 0)
                         .map_err(|_| ProgramError::InvalidAccountData)?,
@@ -2986,7 +3056,7 @@ fn process_insurance_deposit(
                 ),
             )
         } else {
-            (None, None, None)
+            (None, None)
         };
         (insurance, spent, backing, sources)
     };
@@ -3018,14 +3088,23 @@ fn process_insurance_deposit(
         .checked_add(backing_effective_domains[1])
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let owner_backing_before = owner_backing_protection(&pool, backing_before)?;
-    let protected_before = insurance_balance_before
-        .remaining_atoms
+    let insurance_before = u64::try_from(insurance_balance_before.remaining_atoms)
+        .map_err(|_| ProgramError::ArithmeticOverflow)?;
+    let protected_before = u128::from(insurance_before)
         .checked_add(backing_before)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let protected_before = u64::try_from(protected_before)
         .map_err(|_| ProgramError::ArithmeticOverflow)?;
     let indexed_cross_backing = uses_indexed_cross_backing(&pool, pool_account.data_len());
-    if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+    let principal_loss_checkpoint =
+        uses_principal_loss_checkpoint(&pool, pool_account.data_len());
+    if principal_loss_checkpoint {
+        sync_principal_protected_checkpoint(
+            &mut pool,
+            insurance_before,
+            insurance_spent_before.ok_or(ProgramError::InvalidAccountData)?,
+        )?;
+    } else if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
         sync_indexed_cross_backing_external_loss(
             &mut pool,
             protected_before,
@@ -3035,7 +3114,9 @@ fn process_insurance_deposit(
     } else if indexed_cross_backing {
         sync_indexed_share_rate(&mut pool, protected_before)?;
     }
-    let priced_balance_before = if pool.policy == POLICY_PRINCIPAL {
+    let priced_balance_before = if principal_loss_checkpoint {
+        pool.principal_protected_checkpoint
+    } else if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(protected_before, pool.outstanding_principal)
     } else {
         protected_before
@@ -3262,7 +3343,13 @@ fn process_insurance_deposit(
     }
 
     pool.outstanding_principal = outstanding_after;
-    if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+    if principal_loss_checkpoint {
+        pool.principal_protected_checkpoint = pool
+            .principal_protected_checkpoint
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+    }
+    if pool.cross_backing && uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
         let backing_after = backing_before
             .checked_add(protection_deposit[1])
             .ok_or(ProgramError::ArithmeticOverflow)?;
@@ -3609,7 +3696,7 @@ fn process_insurance_withdraw_impl(
     ) = {
         let market_data = market_slab.try_borrow_data()?;
         let insurance = read_asset0_insurance(&market_data)?;
-        let insurance_spent = if pool.cross_backing {
+        let insurance_spent = if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
             percolator_accounting::read_asset_insurance_spent(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)
                 .and_then(aggregate_insurance_spent)?
@@ -3680,7 +3767,11 @@ fn process_insurance_withdraw_impl(
         .and_then(|value| u64::try_from(value).ok())
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let indexed_cross_backing = uses_indexed_cross_backing(&pool, pool_account.data_len());
-    if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+    let principal_loss_checkpoint =
+        uses_principal_loss_checkpoint(&pool, pool_account.data_len());
+    if principal_loss_checkpoint {
+        sync_principal_protected_checkpoint(&mut pool, insurance, insurance_spent)?;
+    } else if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
         sync_indexed_cross_backing_external_loss(
             &mut pool,
             protected_balance,
@@ -3693,7 +3784,9 @@ fn process_insurance_withdraw_impl(
         // so this accumulator never rises from another owner's action.
         sync_indexed_share_rate(&mut pool, protected_balance)?;
     }
-    let priced_balance = if pool.policy == POLICY_PRINCIPAL {
+    let priced_balance = if principal_loss_checkpoint {
+        pool.principal_protected_checkpoint
+    } else if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(protected_balance, pool.outstanding_principal)
     } else {
         protected_balance
@@ -3876,7 +3969,20 @@ fn process_insurance_withdraw_impl(
         .checked_add(backing_after)
         .and_then(|value| u64::try_from(value).ok())
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    let priced_balance_after = if pool.policy == POLICY_PRINCIPAL {
+    let principal_protected_after = if principal_loss_checkpoint {
+        if outstanding_after == 0 {
+            0
+        } else {
+            pool.principal_protected_checkpoint
+                .checked_sub(owed)
+                .ok_or(ProgramError::InvalidAccountData)?
+        }
+    } else {
+        0
+    };
+    let priced_balance_after = if principal_loss_checkpoint {
+        principal_protected_after
+    } else if pool.policy == POLICY_PRINCIPAL {
         core::cmp::min(protected_after, outstanding_after)
     } else {
         protected_after
@@ -4171,7 +4277,10 @@ fn process_insurance_withdraw_impl(
     // realized); the owner collected `owed` (their pro-rata share).
     pool.pending_backing = pending_backing_after;
     pool.outstanding_principal = outstanding_after;
-    if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+    if principal_loss_checkpoint {
+        pool.principal_protected_checkpoint = principal_protected_after;
+    }
+    if pool.cross_backing && uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
         pool.backing_protected_checkpoint = owner_backing_protection(&pool, backing_after)?;
     }
     position.principal -= amount;
@@ -5016,8 +5125,25 @@ fn process_handoff_to_twap(
                 u128::from(pool.outstanding_principal).saturating_sub(backing);
             core::cmp::min(nominal_insurance, live_insurance)
         };
+        (protected_insurance, Some(insurance_spent))
+    } else if uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+        let market_data = market_slab.try_borrow_data()?;
+        let insurance_spent =
+            percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)
+                .and_then(aggregate_insurance_spent)?;
+        let live_insurance =
+            percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)
+                .and_then(|value| {
+                    u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+                })?;
         (
-            protected_insurance,
+            u128::from(principal_protected_after_external_loss(
+                &pool,
+                live_insurance,
+                insurance_spent,
+            )?),
             Some(insurance_spent),
         )
     } else {
@@ -6022,6 +6148,7 @@ mod tests {
             share_rate_denominator: 0,
             insurance_spent_checkpoint: 0,
             backing_protected_checkpoint: 0,
+            principal_protected_checkpoint: 0,
         };
         let mut buf = [0u8; POOL_SIZE];
         pool.serialize(&mut buf).unwrap();
@@ -6145,6 +6272,7 @@ mod tests {
             share_rate_denominator: 0,
             insurance_spent_checkpoint: 0,
             backing_protected_checkpoint: 0,
+            principal_protected_checkpoint: 0,
         }
     }
 
@@ -6275,6 +6403,47 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_principal_loss_checkpoint_layout_is_explicit() {
+        let mut pool = historical_pool_fixture();
+        pool.policy = POLICY_PRINCIPAL;
+        pool.domain = DOMAIN_INSURANCE;
+        pool.insurance_spent_checkpoint = 19;
+        pool.principal_protected_checkpoint = 31;
+        pool.custody_granted = true;
+        pool.custody_grant_slot_plus_one = 101;
+
+        let mut current = [0u8; POOL_SIZE_CUSTODY_GRANT];
+        pool.serialize(&mut current).unwrap();
+        let decoded = Pool::deserialize(&current).unwrap();
+        assert!(!decoded.cross_backing);
+        assert_eq!(decoded.insurance_spent_checkpoint, 19);
+        assert_eq!(decoded.principal_protected_checkpoint, 31);
+        assert!(decoded.custody_granted);
+        assert_eq!(decoded.custody_grant_slot_plus_one, 101);
+
+        pool.custody_granted = false;
+        pool.custody_grant_slot_plus_one = 0;
+        let mut loss_checkpoint_predecessor =
+            [0u8; POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT];
+        pool.serialize(&mut loss_checkpoint_predecessor).unwrap();
+        let decoded_predecessor = Pool::deserialize(&loss_checkpoint_predecessor).unwrap();
+        assert_eq!(decoded_predecessor.insurance_spent_checkpoint, 19);
+        assert_eq!(decoded_predecessor.principal_protected_checkpoint, 31);
+        assert!(!decoded_predecessor.custody_granted);
+
+        let mut predecessor = [0u8; POOL_SIZE_CROSS_BACKING];
+        assert!(pool.serialize(&mut predecessor).is_err());
+        pool.principal_protected_checkpoint = 0;
+        pool.serialize(&mut predecessor).unwrap();
+        assert_eq!(
+            Pool::deserialize(&predecessor)
+                .unwrap()
+                .principal_protected_checkpoint,
+            0,
+        );
+    }
+
+    #[test]
     fn historical_pool_and_position_layouts_round_trip_without_growth() {
         let pool = historical_pool_fixture();
         for size in [
@@ -6292,6 +6461,7 @@ mod tests {
             POOL_SIZE_CROSS_BACKING_V3,
             POOL_SIZE_CUSTODY_GRANT_LEGACY,
             POOL_SIZE_CROSS_BACKING,
+            POOL_SIZE_PRINCIPAL_LOSS_CHECKPOINT,
             POOL_SIZE_CUSTODY_GRANT,
         ] {
             let mut data = vec![0u8; size];
