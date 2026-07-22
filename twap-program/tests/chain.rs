@@ -57940,6 +57940,38 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     let oracle = Keypair::new();
     install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
 
+    // Controller adoption must precede public portfolio admission. The current
+    // Subledger pool itself proves that asset-0 custody is constrained; TWAP takes
+    // over that same custody only after the public source mismatch stages principal.
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &env.pool,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("controller accepts the empty market under constrained Subledger custody");
+
     let actors = materialize_public_transient_backing(&mut svm, &payer, &env, &oracle);
 
     let depositor = Keypair::new();
@@ -58070,41 +58102,76 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         &env.multisig,
         &env.dao,
         &payer,
-        2,
+        3,
         &handoff,
         &handoff_remaining,
     )
     .expect("handoff preserves the staged unit outside TWAP custody");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 0);
 
-    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
-    let donate_market = build_controller_accept_market_authority_message(
-        &env.squads_vault,
-        &controller,
-        &env.slab,
-        &perc_id(),
-        &twap_cfg,
-    );
-    let donate_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    squads_execute(
+    // Exercise the real pending counter through the public route. Any token holder
+    // can donate protocol value to the pool escrow; the permissionless route must
+    // move only that donation and leave the staged owner atom in place.
+    let donation_source = Pubkey::new_unique();
+    let staged_route_destination = Pubkey::new_unique();
+    set_token(
         &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        3,
-        &donate_market,
-        &donate_remaining,
+        &donation_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        4,
+    );
+    set_token(
+        &mut svm,
+        &staged_route_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donation_source,
+            &pool_holding,
+            &payer.pubkey(),
+            &[],
+            4,
+        )
+        .unwrap(),
     )
-    .expect("donate lifecycle control while TWAP retains constrained custody");
+    .expect("a public donor adds protocol value beside staged owner principal");
+    assert_eq!(token_amount(&svm, &pool_holding), 5);
+    send(
+        &mut svm,
+        &[&payer],
+        subledger_route_cross_backing_earnings_ix(
+            &env.pool,
+            &env.squads_vault,
+            &env.slab,
+            &pool_holding,
+            &env.perc_vault,
+            &perc_vault_authority(&env.slab, &perc_id()),
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            &perc_id(),
+            &twap_cfg,
+            &staged_route_destination,
+        ),
+    )
+    .expect("any cranker routes only protocol value around staged principal");
+    assert_eq!(token_amount(&svm, &staged_route_destination), 4);
+    assert_eq!(token_amount(&svm, &pool_holding), 1);
+    let pool_after_route = svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        [
+            u64::from_le_bytes(pool_after_route[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_after_route[281..289].try_into().unwrap()),
+        ],
+        [0, 1],
+        "routing protocol value cannot reclassify staged owner backing",
+    );
 
     let governance_destination = Pubkey::new_unique();
     set_token(
