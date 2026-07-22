@@ -224,6 +224,7 @@ const PERC_IX_TOP_UP_INSURANCE_DOMAIN: u8 = 56;
 const PERC_IX_TOP_UP_BACKING_BUCKET: u8 = 24;
 const PERC_IX_WITHDRAW_BACKING_BUCKET: u8 = 50;
 const PERC_IX_WITHDRAW_BACKING_BUCKET_EARNINGS: u8 = 52;
+const PERC_IX_SYNC_BACKING_DOMAIN_LEDGER: u8 = 53;
 // tag 57 = WithdrawInsuranceAsset { asset_index: u16, amount: u128 } — the consolidated, asset-indexed,
 // insurance-operator-gated, during-Live insurance withdraw that replaced the removed asset-0 tag-23.
 // The percolator caps `amount` to the available
@@ -2083,6 +2084,74 @@ fn validate_backing_ledger(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn bind_backing_ledger_if_needed<'a>(
+    program_id: &Pubkey,
+    pool: &Pool,
+    pool_seed_version: PoolSeedVersion,
+    pool_account: &AccountInfo<'a>,
+    market_slab: &AccountInfo<'a>,
+    percolator_program: &AccountInfo<'a>,
+    ledger: &AccountInfo<'a>,
+    domain: u16,
+) -> Result<u128, ProgramError> {
+    let expected = backing_ledger_pda(program_id, pool_account.key, domain).0;
+    if *ledger.key != expected
+        || ledger.data_len() < percolator_accounting::backing_domain_ledger_account_len()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    // New pools quarantine zeroed ledgers under Subledger ownership. Percolator
+    // therefore cannot bind a deterministic ledger to a foreign market before
+    // the pool has acquired the configured backing authority. Existing blank
+    // Percolator-owned ledgers remain upgrade-compatible with the same sync path.
+    if ledger.owner == program_id {
+        if ledger.try_borrow_data()?.iter().any(|byte| *byte != 0) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        ledger.assign(percolator_program.key);
+    } else if ledger.owner != percolator_program.key {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    let initialized = percolator_accounting::read_backing_domain_ledger(&ledger.try_borrow_data()?)
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        .is_some();
+    if !initialized {
+        let mut ix_data = vec![PERC_IX_SYNC_BACKING_DOMAIN_LEDGER];
+        ix_data.extend_from_slice(&domain.to_le_bytes());
+        invoke_signed_for_pool(
+            pool,
+            pool_seed_version,
+            &Instruction {
+                program_id: *percolator_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*pool_account.key, true),
+                    AccountMeta::new(*market_slab.key, false),
+                    AccountMeta::new(*ledger.key, false),
+                ],
+                data: ix_data,
+            },
+            &[
+                pool_account.clone(),
+                market_slab.clone(),
+                ledger.clone(),
+                percolator_program.clone(),
+            ],
+        )?;
+    }
+
+    validate_backing_ledger(
+        program_id,
+        pool_account.key,
+        market_slab.key,
+        percolator_program.key,
+        ledger,
+        domain,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn withdraw_cross_backing_earnings<'a>(
     pool: &Pool,
     pool_seed_version: PoolSeedVersion,
@@ -2309,6 +2378,9 @@ fn process_init_insurance_pool(
         {
             return Err(ProgramError::AccountAlreadyInitialized);
         }
+        // Keep blank deterministic ledgers under Subledger ownership. The first
+        // valid deposit transfers and binds both only after this pool is the
+        // configured backing authority, leaving no public Percolator first write.
         for (domain, ledger) in [(0u16, long_ledger), (1u16, short_ledger)] {
             let domain_bytes = domain.to_le_bytes();
             let (expected, bump) = backing_ledger_pda(program_id, pool_account.key, domain);
@@ -2326,7 +2398,7 @@ fn process_init_insurance_pool(
                 payer,
                 ledger,
                 system_program,
-                percolator_program.key,
+                program_id,
                 &ledger_seeds,
                 percolator_accounting::backing_domain_ledger_account_len(),
             )?;
@@ -2432,25 +2504,24 @@ fn process_insurance_deposit(
         return Err(ProgramError::InvalidAccountData);
     }
     let backing_ledger_principals = if let Some(ledgers) = backing_ledgers {
-        let mut principals = [0u128; 2];
-        for (domain, ledger) in ledgers.into_iter().enumerate() {
-            principals[domain] = validate_backing_ledger(
-                program_id,
-                pool_account.key,
-                market_slab.key,
-                percolator_program.key,
-                ledger,
-                domain as u16,
-            )?;
-        }
-        if percolator_accounting::read_asset_backing_authority(
-            &market_slab.try_borrow_data()?,
-            0,
-        )
-        .map_err(|_| ProgramError::InvalidAccountData)?
+        if percolator_accounting::read_asset_backing_authority(&market_slab.try_borrow_data()?, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
             != pool_account.key.to_bytes()
         {
             return Err(ProgramError::InvalidAccountData);
+        }
+        let mut principals = [0u128; 2];
+        for (domain, ledger) in ledgers.into_iter().enumerate() {
+            principals[domain] = bind_backing_ledger_if_needed(
+                program_id,
+                &pool,
+                pool_seed_version,
+                pool_account,
+                market_slab,
+                percolator_program,
+                ledger,
+                domain as u16,
+            )?;
         }
         Some(principals)
     } else {
