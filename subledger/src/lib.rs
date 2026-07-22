@@ -59,7 +59,10 @@ const POSITION_DISC: [u8; 8] = *b"SUBPOS01";
 // generation (u40 @91) and an active-position generation (u40 @99); terminal
 // positions continue to use @99 for their return slot. All cross-program reads (genesis-vote
 // principal@72 / start_slot@89 / outstanding@80) keep their offsets — the new fields are
-// appended, so those programs are unaffected.
+// appended, so those programs are unaffected. Byte 272 is a flags byte for
+// cross-backing and the immutable first-custody-grant commitment. Current
+// genesis pools append the slot of that first grant so no transaction can
+// atomically grant custody and admit a replayable deposit.
 // Historical accounts cannot be reallocated by an upgrade. Keep every deployed
 // wire size readable so owners retain an exit path, while new pools always use
 // the current layout. Sizes that never existed remain invalid.
@@ -75,10 +78,16 @@ const POOL_SIZE: usize = 272;
 const POOL_SIZE_CROSS_BACKING_V1: usize = 273;
 const POOL_SIZE_CROSS_BACKING_V2: usize = 289;
 const POOL_SIZE_CROSS_BACKING: usize = 321;
-const POOL_CROSS_BACKING_OFF: usize = 272;
+const POOL_SIZE_CUSTODY_GRANT: usize = 329;
+const POOL_FLAGS_OFF: usize = 272;
+const POOL_SIZE_CUSTODY_FLAGS: usize = POOL_SIZE_CROSS_BACKING_V1;
+const POOL_FLAG_CROSS_BACKING: u8 = 1 << 0;
+const POOL_FLAG_CUSTODY_GRANTED: u8 = 1 << 1;
+const POOL_FLAGS_MASK: u8 = POOL_FLAG_CROSS_BACKING | POOL_FLAG_CUSTODY_GRANTED;
 const POOL_PENDING_BACKING_OFF: usize = 273;
 const POOL_SHARE_RATE_NUMERATOR_OFF: usize = 289;
 const POOL_SHARE_RATE_DENOMINATOR_OFF: usize = 305;
+const POOL_CUSTODY_GRANT_SLOT_OFF: usize = 321;
 const POSITION_SIZE_BASE: usize = 96;
 const POSITION_SIZE_TENURE: usize = 104;
 const POSITION_SIZE: usize = 120;
@@ -357,6 +366,14 @@ struct Pool {
     /// aggregate deposit across insurance and backing. Historical layouts leave
     /// this false and retain their insurance-only behavior.
     cross_backing: bool,
+    /// A fresh Percolator custody grant is one-shot for this pool incarnation.
+    /// Raw slab reuse must create a differently seeded pool rather than revive
+    /// signatures that users authorized for the original market.
+    custody_granted: bool,
+    /// First successful custody-grant slot encoded as slot + 1. Zero means no
+    /// grant. Deposits must execute in a later slot, so grant-plus-deposit
+    /// transactions cannot become valid signatures for a later slab generation.
+    custody_grant_slot_plus_one: u64,
     /// Genesis backing that could not enter a Percolator domain because public
     /// trader-source capital fixed a conflicting bucket expiry. These atoms stay
     /// in the canonical pool ATA and remain owner principal, segregated by domain.
@@ -376,18 +393,30 @@ impl Pool {
         }
         let policy = data[88];
         let domain = data[90];
-        let cross_backing = if data.len() >= POOL_SIZE_CROSS_BACKING_V1 {
-            match data[POOL_CROSS_BACKING_OFF] {
-                0 => false,
-                1 => true,
-                _ => return Err(ProgramError::InvalidAccountData),
-            }
+        let pool_flags = if data.len() >= POOL_SIZE_CUSTODY_FLAGS {
+            data[POOL_FLAGS_OFF]
         } else {
-            false
+            0
+        };
+        if pool_flags & !POOL_FLAGS_MASK != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let cross_backing = pool_flags & POOL_FLAG_CROSS_BACKING != 0;
+        let custody_granted = pool_flags & POOL_FLAG_CUSTODY_GRANTED != 0;
+        let custody_grant_slot_plus_one = if data.len() >= POOL_SIZE_CUSTODY_GRANT {
+            u64::from_le_bytes(
+                data[POOL_CUSTODY_GRANT_SLOT_OFF..POOL_CUSTODY_GRANT_SLOT_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            0
         };
         if policy > POLICY_WITH_SURPLUS
             || domain > DOMAIN_BACKING
             || (cross_backing && (policy != POLICY_PRINCIPAL || domain != DOMAIN_INSURANCE))
+            || (data.len() >= POOL_SIZE_CUSTODY_GRANT
+                && custody_granted != (custody_grant_slot_plus_one != 0))
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -452,6 +481,8 @@ impl Pool {
                 OWN_VAULT_BOOTSTRAP_DELAY_SLOTS
             },
             cross_backing,
+            custody_granted,
+            custody_grant_slot_plus_one,
             pending_backing: if data.len() >= POOL_SIZE_CROSS_BACKING_V2 {
                 [
                     u64::from_le_bytes(
@@ -531,9 +562,10 @@ impl Pool {
         if data.len() >= POOL_SIZE {
             data[264..272].copy_from_slice(&self.bootstrap_delay_slots.to_le_bytes());
         }
-        if data.len() >= POOL_SIZE_CROSS_BACKING_V1 {
-            data[POOL_CROSS_BACKING_OFF] = self.cross_backing as u8;
-        } else if self.cross_backing {
+        if data.len() >= POOL_SIZE_CUSTODY_FLAGS {
+            data[POOL_FLAGS_OFF] = u8::from(self.cross_backing)
+                | (u8::from(self.custody_granted) << 1);
+        } else if self.cross_backing || self.custody_granted {
             return Err(ProgramError::InvalidAccountData);
         }
         if data.len() >= POOL_SIZE_CROSS_BACKING_V2 {
@@ -550,6 +582,15 @@ impl Pool {
             data[POOL_SHARE_RATE_DENOMINATOR_OFF..POOL_SHARE_RATE_DENOMINATOR_OFF + 16]
                 .copy_from_slice(&self.share_rate_denominator.to_le_bytes());
         } else if self.share_rate_numerator != 0 || self.share_rate_denominator != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if data.len() >= POOL_SIZE_CUSTODY_GRANT {
+            if self.custody_granted != (self.custody_grant_slot_plus_one != 0) {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            data[POOL_CUSTODY_GRANT_SLOT_OFF..POOL_CUSTODY_GRANT_SLOT_OFF + 8]
+                .copy_from_slice(&self.custody_grant_slot_plus_one.to_le_bytes());
+        } else if self.custody_grant_slot_plus_one != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
@@ -1881,6 +1922,8 @@ fn process_init_pool(
         deposit_start_slot: OWN_VAULT_DEPOSIT_START_SLOT,
         bootstrap_delay_slots: OWN_VAULT_BOOTSTRAP_DELAY_SLOTS,
         cross_backing: false,
+        custody_granted: false,
+        custody_grant_slot_plus_one: 0,
         pending_backing: [0, 0],
         share_rate_numerator: 0,
         share_rate_denominator: 0,
@@ -2561,11 +2604,7 @@ fn process_init_insurance_pool(
 
     let bump_arr = [bump];
     pool_pda_seeds.push(&bump_arr);
-    let pool_size = if cross_backing {
-        POOL_SIZE_CROSS_BACKING
-    } else {
-        POOL_SIZE
-    };
+    let pool_size = POOL_SIZE_CUSTODY_GRANT;
     create_pda_robust(
         payer,
         pool_account,
@@ -2628,6 +2667,8 @@ fn process_init_insurance_pool(
         deposit_start_slot,
         bootstrap_delay_slots,
         cross_backing,
+        custody_granted: false,
+        custody_grant_slot_plus_one: 0,
         pending_backing: [0, 0],
         share_rate_numerator: u128::from(cross_backing),
         share_rate_denominator: if cross_backing { VIRTUAL_SHARES } else { 0 },
@@ -2690,7 +2731,8 @@ fn process_insurance_deposit(
     // Historical genesis layouts either had no deposit deadline or did not bind
     // the complete bootstrap schedule into their PDA. Upgrades preserve exits,
     // never reopen those pools to late capital.
-    if pool_account.data_len() < POOL_SIZE
+    if pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT
+        || !pool.custody_granted
         || (pool.cross_backing && pool_account.data_len() < POOL_SIZE_CROSS_BACKING)
     {
         return Err(ProgramError::InvalidAccountData);
@@ -2699,7 +2741,14 @@ fn process_insurance_deposit(
     // the start slot into the pool PDA prevents a permissionless first writer
     // from opening deposits early or starting the clock before launch.
     let now = Clock::get()?.slot;
-    if now < pool.deposit_start_slot || now >= pool.deposit_deadline_slot {
+    let custody_grant_slot = pool
+        .custody_grant_slot_plus_one
+        .checked_sub(1)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    if now <= custody_grant_slot
+        || now < pool.deposit_start_slot
+        || now >= pool.deposit_deadline_slot
+    {
         return Err(ProgramError::InvalidInstructionData);
     }
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
@@ -4050,7 +4099,7 @@ fn validate_twap_recovery_grant(
     Ok(())
 }
 
-// accept_operator accounts: [asset_admin(signer), pool, market_slab(w), percolator_program,
+// accept_operator accounts: [asset_admin(signer), pool(w on first grant), market_slab(w), percolator_program,
 //   twap_config(optional; required after any user/provider value is admitted)]
 // data: none
 //
@@ -4083,7 +4132,7 @@ fn process_accept_operator(
     if pool_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     if !pool.is_insurance() {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -4095,6 +4144,28 @@ fn process_accept_operator(
         &market_slab.try_borrow_data()?,
     )
     .map_err(|_| ProgramError::InvalidAccountData)?;
+    if first_grant
+        && (!pool_account.is_writable
+            || pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT
+            || pool.custody_granted)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if !pool.custody_granted
+        && (!pool_account.is_writable || pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let custody_grant_slot_plus_one = if pool.custody_granted {
+        None
+    } else {
+        Some(
+            Clock::get()?
+                .slot
+                .checked_add(1)
+                .ok_or(ProgramError::ArithmeticOverflow)?,
+        )
+    };
     if let Some(twap_config) = twap_config {
         validate_twap_recovery_grant(
             asset_admin,
@@ -4158,6 +4229,11 @@ fn process_accept_operator(
                 percolator_program.clone(),
             ],
         )?;
+    }
+    if let Some(custody_grant_slot_plus_one) = custody_grant_slot_plus_one {
+        pool.custody_granted = true;
+        pool.custody_grant_slot_plus_one = custody_grant_slot_plus_one;
+        pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     }
     Ok(())
 }
@@ -5478,6 +5554,8 @@ mod tests {
             deposit_start_slot: 12_345,
             bootstrap_delay_slots: 30_000,
             cross_backing: false,
+            custody_granted: false,
+            custody_grant_slot_plus_one: 0,
             pending_backing: [0, 0],
             share_rate_numerator: 0,
             share_rate_denominator: 0,
@@ -5597,6 +5675,8 @@ mod tests {
             deposit_start_slot: 100,
             bootstrap_delay_slots: 1_000,
             cross_backing: false,
+            custody_granted: false,
+            custody_grant_slot_plus_one: 0,
             pending_backing: [0, 0],
             share_rate_numerator: 0,
             share_rate_denominator: 0,
@@ -5632,16 +5712,30 @@ mod tests {
         pool.pending_backing = [3, 5];
         pool.share_rate_numerator = 1;
         pool.share_rate_denominator = VIRTUAL_SHARES;
+        pool.custody_granted = true;
+        pool.custody_grant_slot_plus_one = 101;
 
-        let mut current = [0u8; POOL_SIZE_CROSS_BACKING];
+        let mut current = [0u8; POOL_SIZE_CUSTODY_GRANT];
         pool.serialize(&mut current).unwrap();
-        assert_eq!(current[POOL_CROSS_BACKING_OFF], 1);
+        assert_eq!(current[POOL_FLAGS_OFF], 3);
+        assert_eq!(
+            u64::from_le_bytes(
+                current[POOL_CUSTODY_GRANT_SLOT_OFF..POOL_CUSTODY_GRANT_SLOT_OFF + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            101,
+        );
         let decoded = Pool::deserialize(&current).unwrap();
         assert!(decoded.cross_backing);
+        assert!(decoded.custody_granted);
+        assert_eq!(decoded.custody_grant_slot_plus_one, 101);
         assert_eq!(decoded.pending_backing, [3, 5]);
         assert_eq!(decoded.share_rate_numerator, 1);
         assert_eq!(decoded.share_rate_denominator, VIRTUAL_SHARES);
 
+        pool.custody_granted = false;
+        pool.custody_grant_slot_plus_one = 0;
         pool.share_rate_numerator = 0;
         pool.share_rate_denominator = 0;
         let mut predecessor_v2 = [0u8; POOL_SIZE_CROSS_BACKING_V2];
@@ -5670,7 +5764,23 @@ mod tests {
         pool.serialize(&mut legacy).unwrap();
         assert!(!Pool::deserialize(&legacy).unwrap().cross_backing);
 
-        current[POOL_CROSS_BACKING_OFF] = 2;
+        pool.custody_granted = true;
+        pool.custody_grant_slot_plus_one = 202;
+        let mut standard = [0u8; POOL_SIZE_CUSTODY_GRANT];
+        pool.serialize(&mut standard).unwrap();
+        assert_eq!(standard[POOL_FLAGS_OFF], POOL_FLAG_CUSTODY_GRANTED);
+        let decoded_standard = Pool::deserialize(&standard).unwrap();
+        assert!(!decoded_standard.cross_backing);
+        assert!(decoded_standard.custody_granted);
+        assert_eq!(decoded_standard.custody_grant_slot_plus_one, 202);
+
+        standard[POOL_CUSTODY_GRANT_SLOT_OFF..POOL_CUSTODY_GRANT_SLOT_OFF + 8].fill(0);
+        assert!(
+            Pool::deserialize(&standard).is_err(),
+            "a current pool cannot claim custody without its immutable grant slot"
+        );
+
+        current[POOL_FLAGS_OFF] = 4;
         assert!(Pool::deserialize(&current).is_err());
     }
 
@@ -5690,6 +5800,7 @@ mod tests {
             POOL_SIZE_CROSS_BACKING_V1,
             POOL_SIZE_CROSS_BACKING_V2,
             POOL_SIZE_CROSS_BACKING,
+            POOL_SIZE_CUSTODY_GRANT,
         ] {
             let mut data = vec![0u8; size];
             pool.serialize(&mut data).unwrap();

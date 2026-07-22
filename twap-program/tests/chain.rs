@@ -9,13 +9,13 @@ use litesvm::LiteSVM;
 use solana_sdk::{
     account::Account,
     clock::Clock,
-    instruction::{AccountMeta, Instruction},
+    instruction::{AccountMeta, Instruction, InstructionError},
     program_option::COption,
     program_pack::Pack,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_program,
-    transaction::Transaction,
+    transaction::{Transaction, TransactionError},
 };
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -233,8 +233,8 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -250,6 +250,7 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         &grant_remaining,
     )
     .expect("governance grants asset-0 custody to the pool");
+    advance_one_slot(&mut svm);
 
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
@@ -7859,7 +7860,7 @@ fn canonical_insurance_vault(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey 
 
 // Squads TransactionMessage wrapping subledger.accept_operator. The pool receives the
 // asset-0 insurance authority, operator, and asset-admin roles atomically.
-// subledger.accept_operator accounts: [asset_admin(signer), pool, market_slab(w), perc].
+// subledger.accept_operator accounts: [asset_admin(signer), pool(w), market_slab(w), perc].
 fn build_subledger_accept_operator_message(
     squads_vault: &Pubkey,
     pool: &Pubkey,
@@ -7869,7 +7870,7 @@ fn build_subledger_accept_operator_message(
     let mut m = Vec::new();
     m.push(1); // num_signers
     m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (market_slab)
+    m.push(2); // num_writable_non_signers (market_slab, pool)
     m.push(5); // account_keys count
     m.extend_from_slice(squads_vault.as_ref()); // 0 signer (asset_admin)
     m.extend_from_slice(market_slab.as_ref()); // 1 writable
@@ -8530,19 +8531,19 @@ fn build_controller_grant_pool_message(
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
-    m.push(1); // market writable
+    m.push(2); // market and pool writable
     m.push(7);
     m.extend_from_slice(governance.as_ref()); // 0
     m.extend_from_slice(market.as_ref()); // 1 writable
-    m.extend_from_slice(controller.as_ref()); // 2
-    m.extend_from_slice(pool.as_ref()); // 3
+    m.extend_from_slice(pool.as_ref()); // 2 writable
+    m.extend_from_slice(controller.as_ref()); // 3
     m.extend_from_slice(percolator_program.as_ref()); // 4
     m.extend_from_slice(sub_id().as_ref()); // 5
     m.extend_from_slice(controller_id().as_ref()); // 6 program
     m.push(1);
     m.push(6);
     m.push(6);
-    for index in [0u8, 2, 3, 1, 4, 5] {
+    for index in [0u8, 3, 2, 1, 4, 5] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -8734,20 +8735,20 @@ fn build_return_to_subledger_message(
     let mut m = Vec::new();
     m.push(1); // num_signers
     m.push(0); // num_writable_signers
-    m.push(1); // market_slab
+    m.push(2); // market_slab, pool
     m.push(8); // account_keys count
     m.extend_from_slice(squads_vault.as_ref()); // 0 signer
     m.extend_from_slice(market_slab.as_ref()); // 1 writable
-    m.extend_from_slice(twap_config.as_ref()); // 2
-    m.extend_from_slice(twap_authority.as_ref()); // 3
-    m.extend_from_slice(pool.as_ref()); // 4
+    m.extend_from_slice(pool.as_ref()); // 2 writable
+    m.extend_from_slice(twap_config.as_ref()); // 3
+    m.extend_from_slice(twap_authority.as_ref()); // 4
     m.extend_from_slice(percolator_program.as_ref()); // 5
     m.extend_from_slice(sub_id().as_ref()); // 6
     m.extend_from_slice(twap_id().as_ref()); // 7 program id
     m.push(1); // instructions count
     m.push(7); // program_id_index -> twap
     m.push(7); // account_indexes count
-    for index in [0u8, 2, 3, 4, 1, 5, 6] {
+    for index in [0u8, 3, 4, 2, 1, 5, 6] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -8770,7 +8771,7 @@ fn twap_return_to_subledger_ix(
             AccountMeta::new_readonly(*squads_vault, false),
             AccountMeta::new_readonly(*twap_config, false),
             AccountMeta::new_readonly(*twap_authority, false),
-            AccountMeta::new_readonly(*pool, false),
+            AccountMeta::new(*pool, false),
             AccountMeta::new(*market_slab, false),
             AccountMeta::new_readonly(*percolator_program, false),
             AccountMeta::new_readonly(sub_id(), false),
@@ -9036,7 +9037,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -9044,6 +9045,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
         &mut svm, &squads, &multisig, &dao, &payer, 1, &message, &remaining,
     )
     .expect("squads grants operator to subledger pool");
+    advance_one_slot(&mut svm);
 
     // Now the subledger pool is the asset-0 insurance authority: a depositor can top up
     // REAL percolator insurance through it.
@@ -10921,7 +10923,7 @@ fn e2e_funded_creator_insurance_exits_before_donation_and_genesis_grant() {
         accounts: vec![
             AccountMeta::new_readonly(governance.pubkey(), true),
             AccountMeta::new_readonly(controller, false),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(sub_id(), false),
@@ -15974,8 +15976,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -15991,6 +15993,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &grant_remaining,
     )
     .expect("controller grants custody to the owner-bound pool");
+    advance_one_slot(&mut svm);
     let slab_account = svm.get_account(&slab).unwrap();
     let (cfg_after_grant, _, _, _) =
         percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
@@ -17404,8 +17407,8 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -17421,6 +17424,7 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
         &grant_remaining,
     )
     .expect("Squads grants asset-0 custody to the share pool");
+    advance_one_slot(&mut svm);
 
     let owner = Keypair::new();
     svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
@@ -17624,7 +17628,8 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
     )
     .expect("public user funds one maintenance-fee atom");
     let mut clock = svm.get_sysvar::<Clock>();
-    clock.slot = 101;
+    let fee_sync_slot = clock.slot.checked_add(1).unwrap();
+    clock.slot = fee_sync_slot;
     svm.set_sysvar(&clock);
     send(
         &mut svm,
@@ -17634,7 +17639,9 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
                 AccountMeta::new(market, false),
                 AccountMeta::new(fee_portfolio.pubkey(), false),
             ],
-            PIx::SyncMaintenanceFee { now_slot: 101 },
+            PIx::SyncMaintenanceFee {
+                now_slot: fee_sync_slot,
+            },
         ),
     )
     .expect("any cranker converts the abandoned atom into protocol insurance");
@@ -18967,7 +18974,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(attacker.pubkey(), true), // forged asset_admin
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -18991,7 +18998,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -19411,7 +19418,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -19426,6 +19433,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
         &grant_remaining,
     )
     .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
     let alice = Keypair::new();
     svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
     let amount = 1_000_000u64;
@@ -19708,9 +19716,9 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let decoy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(decoy_pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(decoy_pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -19743,9 +19751,9 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let regrant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -20088,12 +20096,13 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let gr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &grant, &gr)
         .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
 
     // Genesis deposit P = 1,000,000.
     let principal = 1_000_000u64;
@@ -20382,12 +20391,13 @@ fn e2e_fresh_position_gets_one_vote_per_principal_unit() {
     let gr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &grant, &gr)
         .expect("grant operator");
+    advance_one_slot(&mut svm);
 
     // distribution: fund a fixed-supply COIN, init dist (authority = gv config) + gv config.
     let total = 100u64;
@@ -22381,11 +22391,12 @@ fn setup_genesis_with_policy_backing_and_funding(
     let gr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
     squads_execute(svm, &squads, &multisig, &dao, payer, 1, &grant, &gr).expect("grant operator");
+    advance_one_slot(svm);
 
     let total = 100u64;
     let dist_vault = Pubkey::new_unique();
@@ -22689,6 +22700,7 @@ fn materialize_public_transient_backing(
     for owner in [oracle, &observer, &long, &short] {
         svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
     }
+    let initial_mark_slot = svm.get_sysvar::<Clock>().slot;
     send(
         svm,
         &[payer, oracle],
@@ -22699,7 +22711,7 @@ fn materialize_public_transient_backing(
             ],
             PIx::ConfigureAuthMark {
                 asset_index: 0,
-                now_slot: 100,
+                now_slot: initial_mark_slot,
                 initial_mark_e6: 100,
             },
         ),
@@ -22734,7 +22746,7 @@ fn materialize_public_transient_backing(
     .expect("open public loss pair");
 
     let target = 1_002_100u64;
-    let mut slot = 101u64;
+    let mut slot = initial_mark_slot.checked_add(1).unwrap();
     warp_to(svm, slot);
     send(
         svm,
@@ -26802,7 +26814,7 @@ fn e2e_presigned_empty_pool_grant_cannot_capture_funded_replacement_slab() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(admin.pubkey(), true),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -27013,6 +27025,665 @@ fn e2e_presigned_empty_pool_grant_cannot_capture_funded_replacement_slab() {
     )
     .expect("generation-B provider retains its ordinary withdrawal path");
     assert_eq!(token_amount(&svm, &replacement_destination), PRINCIPAL);
+}
+
+// PUBLIC LOF PROBE: the Subledger pool survives a raw slab close, but its deposit wire does not
+// identify the market incarnation. A deposit signed while generation A owns the slab must not land
+// after the empty pool is freshly granted to generation B, where a different oracle can consume it.
+fn run_presigned_genesis_deposit_market_replay(grant_generation_a: bool) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const VICTIM_PRINCIPAL: u64 = 14;
+    const LONG_CAPITAL: u64 = 1_000_000;
+    const SHORT_CAPITAL: u64 = 200;
+    const ENTRY_PRICE: u64 = 100;
+    const EXIT_PRICE: u64 = 303;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = Keypair::new();
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for signer in [&payer, &attacker, &victim, &long, &short] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate generation-A market");
+    let market = market.pubkey();
+    let init_market = || {
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: ENTRY_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        )
+    };
+    send(&mut svm, &[&payer, &attacker], init_market()).expect("initialize generation A");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral,
+        &vault_authority,
+        0,
+    );
+    let coin_mint = Pubkey::new_unique();
+    let pool = sub_pool_pda(
+        &collateral,
+        0,
+        &market,
+        &perc_id(),
+        &coin_mint,
+        POLICY_PRINCIPAL,
+        DOMAIN_INSURANCE,
+    );
+    let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
+    let mut pool_data = vec![3u8];
+    pool_data.extend_from_slice(&0u64.to_le_bytes());
+    pool_data.push(POLICY_PRINCIPAL);
+    append_test_genesis_schedule(&mut pool_data);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(collateral, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(percolator_vault, false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(vote_authority, false),
+                AccountMeta::new_readonly(coin_mint, false),
+            ],
+            data: pool_data,
+        },
+    )
+    .expect("initialize generation-A pool");
+
+    let accept_pool = || Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(attacker.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+        data: vec![7u8],
+    };
+    if grant_generation_a {
+        send(&mut svm, &[&payer, &attacker], accept_pool())
+            .expect("generation A grants custody to its empty pool");
+        assert_eq!(
+            svm.get_account(&pool).unwrap().data[272],
+            2,
+            "the first grant permanently seals this pool to generation A",
+        );
+        svm.set_sysvar(&Clock {
+            slot: 101,
+            unix_timestamp: 101,
+            ..Clock::default()
+        });
+    }
+
+    let victim_source = Pubkey::new_unique();
+    let victim_destination = Pubkey::new_unique();
+    let holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_source,
+        &collateral,
+        &victim.pubkey(),
+        VICTIM_PRINCIPAL,
+    );
+    set_token(
+        &mut svm,
+        &victim_destination,
+        &collateral,
+        &victim.pubkey(),
+        0,
+    );
+    set_token(&mut svm, &holding, &collateral, &pool, 0);
+    let position = sub_position_pda(&pool, &victim.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&VICTIM_PRINCIPAL.to_le_bytes());
+    let deposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(victim.pubkey(), true),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(victim_source, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(percolator_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        data: deposit_data,
+    };
+    svm.expire_blockhash();
+    let retained_blockhash = svm.latest_blockhash();
+    let stale_instructions = if grant_generation_a {
+        vec![deposit]
+    } else {
+        vec![accept_pool(), deposit]
+    };
+    let stale_signers = if grant_generation_a {
+        vec![&payer, &victim]
+    } else {
+        vec![&payer, &attacker, &victim]
+    };
+    let stale_deposit = Transaction::new_signed_with_payer(
+        &stale_instructions,
+        Some(&payer.pubkey()),
+        &stale_signers,
+        retained_blockhash,
+    );
+    if grant_generation_a {
+        assert!(
+            svm.simulate_transaction(stale_deposit.clone().into())
+                .is_ok(),
+            "the post-grant deposit is valid against generation A",
+        );
+    } else {
+        let market_before = svm.get_account(&market).unwrap();
+        let pool_before = svm.get_account(&pool).unwrap();
+        let source_before = svm.get_account(&victim_source).unwrap();
+        let error = svm
+            .simulate_transaction(stale_deposit.clone().into())
+            .expect_err("same-slot first grant plus deposit must be rejected");
+        assert_eq!(
+            error.err,
+            TransactionError::InstructionError(1, InstructionError::InvalidInstructionData),
+        );
+        let error = svm
+            .send_transaction(stale_deposit)
+            .expect_err("executing the same-slot transaction must fail atomically");
+        assert_eq!(
+            error.err,
+            TransactionError::InstructionError(1, InstructionError::InvalidInstructionData),
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before);
+        assert_eq!(svm.get_account(&victim_source).unwrap(), source_before);
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+        return;
+    }
+    let submit = |svm: &mut LiteSVM, instructions: &[Instruction], signers: &[&Keypair]| {
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            instructions,
+            Some(&payer.pubkey()),
+            signers,
+            retained_blockhash,
+        ))
+        .map(|_| ())
+        .map_err(|error| format!("{error:?}"))
+    };
+
+    submit(
+        &mut svm,
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(29_999),
+            pix(
+                vec![
+                    AccountMeta::new_readonly(attacker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ResolveMarket,
+            ),
+        ],
+        &[&payer, &attacker],
+    )
+    .expect("resolve empty generation A");
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral,
+        &attacker.pubkey(),
+        0,
+    );
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseSlab,
+        )],
+        &[&payer, &attacker],
+    )
+    .expect("close empty generation A");
+    submit(
+        &mut svm,
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1),
+            init_market(),
+        ],
+        &[&payer, &attacker],
+    )
+    .expect("initialize generation B at the same slab key");
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral,
+        &vault_authority,
+        0,
+    );
+    submit(
+        &mut svm,
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(2),
+            pix(
+                vec![
+                    AccountMeta::new_readonly(attacker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: if grant_generation_a { 101 } else { 100 },
+                    initial_mark_e6: ENTRY_PRICE,
+                },
+            ),
+        ],
+        &[&payer, &attacker],
+    )
+    .expect("generation-B creator configures its oracle");
+    if grant_generation_a {
+        let market_before_regrant = svm.get_account(&market).unwrap();
+        let pool_before_regrant = svm.get_account(&pool).unwrap();
+        let regrant = submit(
+            &mut svm,
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(3),
+                accept_pool(),
+            ],
+            &[&payer, &attacker],
+        );
+        if regrant.is_err() {
+            assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
+            assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
+            let source_before_replay = svm.get_account(&victim_source).unwrap();
+            assert!(
+                svm.send_transaction(stale_deposit).is_err(),
+                "an ungranted replacement market cannot admit the stale deposit",
+            );
+            assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
+            assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
+            assert_eq!(svm.get_account(&victim_source).unwrap(), source_before_replay);
+            return;
+        }
+    }
+
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let source_before_replay = svm.get_account(&victim_source).unwrap();
+    let pool_before_replay = svm.get_account(&pool).unwrap();
+    if svm.send_transaction(stale_deposit).is_err() {
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_replay);
+        assert_eq!(svm.get_account(&victim_source).unwrap(), source_before_replay);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_replay);
+        return;
+    }
+    assert_eq!(token_amount(&svm, &victim_source), 0);
+    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 14);
+
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let long_portfolio = Keypair::new();
+    let short_portfolio = Keypair::new();
+    for (owner, portfolio, capital) in [
+        (&long, &long_portfolio, LONG_CAPITAL),
+        (&short, &short_portfolio, SHORT_CAPITAL),
+    ] {
+        submit(
+            &mut svm,
+            &[solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            )],
+            &[&payer, portfolio],
+        )
+        .expect("allocate attacker portfolio");
+        submit(
+            &mut svm,
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            )],
+            &[&payer, owner],
+        )
+        .expect("initialize attacker portfolio");
+        let source = Pubkey::new_unique();
+        set_token(&mut svm, &source, &collateral, &owner.pubkey(), capital);
+        submit(
+            &mut svm,
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(capital),
+                },
+            )],
+            &[&payer, owner],
+        )
+        .expect("fund attacker portfolio");
+    }
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(long.pubkey(), true),
+                AccountMeta::new_readonly(short.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: percolator::POS_SCALE as i128,
+                exec_price: ENTRY_PRICE,
+                fee_bps: 0,
+            },
+        )],
+        &[&payer, &long, &short],
+    )
+    .expect("open attacker-controlled balanced pair");
+
+    let mut slot = 100u64;
+    while read_asset0_effective_price(&svm, &market) != EXIT_PRICE {
+        slot += 1;
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+        submit(
+            &mut svm,
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(slot),
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(attacker.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::PushAuthMark {
+                        asset_index: 0,
+                        now_slot: slot,
+                        mark_e6: EXIT_PRICE,
+                    },
+                ),
+            ],
+            &[&payer, &attacker],
+        )
+        .expect("attacker advances the generation-B oracle");
+        submit(
+            &mut svm,
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+                    slot + 10_000,
+                ),
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(long_portfolio.pubkey(), false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: slot,
+                        observations: vec![percolator_prog::ix::CrankObservationHint {
+                            asset_index: 0,
+                            oracle_accounts: 0,
+                        }],
+                    },
+                ),
+            ],
+            &[&payer],
+        )
+        .expect("public crank advances the bounded mark");
+        assert!(slot < 110, "bounded mark failed to converge");
+    }
+    for nonce in 0..6u64 {
+        submit(
+            &mut svm,
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(
+                    20_000 + nonce,
+                ),
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(short_portfolio.pubkey(), false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: slot,
+                        observations: if nonce == 0 {
+                            vec![percolator_prog::ix::CrankObservationHint {
+                                asset_index: 0,
+                                oracle_accounts: 0,
+                            }]
+                        } else {
+                            vec![]
+                        },
+                    },
+                ),
+            ],
+            &[&payer],
+        )
+        .expect("permissionless liquidation makes bounded progress");
+    }
+    let protected_after_attack = read_asset_insurance_remaining(&svm, &market, 0);
+    assert!(
+        protected_after_attack < u128::from(VICTIM_PRINCIPAL),
+        "the public attack must consume victim insurance"
+    );
+
+    submit(
+        &mut svm,
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        )],
+        &[&payer, &attacker],
+    )
+    .expect("attacker resolves generation B");
+    for (owner, portfolio) in [(&long, &long_portfolio), (&short, &short_portfolio)] {
+        let destination = Pubkey::new_unique();
+        set_token(&mut svm, &destination, &collateral, &owner.pubkey(), 0);
+        let mut closed = false;
+        for _ in 0..64 {
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), false),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    },
+                ),
+            );
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), false),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::ClaimResolvedPayoutTopup,
+                ),
+            );
+            if send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                    ],
+                    PIx::ClosePortfolio,
+                ),
+            )
+            .is_ok()
+            {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "bounded public payout must retire the attacker portfolio");
+    }
+    assert!(
+        percolator_accounting::market_is_resolved_and_empty(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap(),
+        "terminal market is ready for the victim's owner-bound refund",
+    );
+
+    let position_account = svm.get_account(&position).unwrap();
+    let principal = u64::from_le_bytes(position_account.data[72..80].try_into().unwrap());
+    let start_slot = u64::from_le_bytes(position_account.data[89..97].try_into().unwrap());
+    let action_nonce = u64::from_le_bytes(position_account.data[80..88].try_into().unwrap());
+    let mut withdraw_data = vec![5u8];
+    withdraw_data.extend_from_slice(&VICTIM_PRINCIPAL.to_le_bytes());
+    withdraw_data.extend_from_slice(&principal.to_le_bytes());
+    withdraw_data.extend_from_slice(&start_slot.to_le_bytes());
+    withdraw_data.extend_from_slice(&action_nonce.to_le_bytes());
+    submit(
+        &mut svm,
+        &[Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(victim_destination, false),
+                AccountMeta::new(holding, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: withdraw_data,
+        }],
+        &[&payer, &victim],
+    )
+    .expect("victim exits the replacement market");
+    let recovered = token_amount(&svm, &victim_destination);
+    assert!(recovered < VICTIM_PRINCIPAL);
+    panic!(
+        "generation-A consent landed in generation B: victim recovered {recovered}/{VICTIM_PRINCIPAL}"
+    );
+}
+
+#[test]
+fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
+    run_presigned_genesis_deposit_market_replay(true);
+}
+
+#[test]
+fn e2e_presigned_pregrant_deposit_cannot_cross_raw_market_generations() {
+    run_presigned_genesis_deposit_market_replay(false);
 }
 
 // ATTACK PROBE (voting with NO capital at all): a voter must have a real subledger position
@@ -28744,6 +29415,27 @@ fn warp_to(svm: &mut LiteSVM, slot: u64) {
     let mut c = svm.get_sysvar::<Clock>();
     c.slot = slot;
     svm.set_sysvar(&c);
+}
+fn advance_one_slot(svm: &mut LiteSVM) {
+    let slot = svm
+        .get_sysvar::<Clock>()
+        .slot
+        .checked_add(1)
+        .expect("test clock slot must fit");
+    warp_to(svm, slot);
+}
+fn warp_to_first_pool_deposit_slot(svm: &mut LiteSVM, pool: &Pubkey) {
+    let data = svm
+        .get_account(pool)
+        .expect("genesis pool must exist")
+        .data;
+    let slot = u64::from_le_bytes(
+        data[321..329]
+            .try_into()
+            .expect("current pool stores its custody grant slot"),
+    );
+    assert_ne!(slot, 0, "genesis pool must have completed its first grant");
+    warp_to(svm, slot);
 }
 fn mint_coin(
     svm: &mut LiteSVM,
@@ -32323,48 +33015,9 @@ fn e2e_full_genesis_to_buy_burn() {
     ))
     .expect("init pool");
 
-    // --- Inject insurance SURPLUS (squads is still the insurance_authority) ---
+    // Protocol surplus enters only after custody is constrained to TWAP. A first
+    // pool grant intentionally rejects every pre-existing provider balance.
     let surplus = 500_000u64;
-    let squads_src = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &squads_src,
-        &collateral_mint,
-        &squads_vault,
-        surplus,
-    );
-    let topup_msg = build_topup_message(
-        &squads_vault,
-        &slab,
-        &squads_src,
-        &perc_vault,
-        &perc_id(),
-        surplus as u128,
-    );
-    let topup_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new(squads_src, false),
-        AccountMeta::new(perc_vault, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(perc_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &squads,
-        &multisig,
-        &dao,
-        &payer,
-        1,
-        &topup_msg,
-        &topup_remaining,
-    )
-    .expect("squads injects insurance surplus");
-    assert_eq!(
-        token_amount(&svm, &perc_vault),
-        surplus,
-        "surplus in insurance"
-    );
 
     // --- Grant operator+authority to the subledger pool ---
     let grant_msg =
@@ -32372,7 +33025,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -32382,11 +33035,12 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        2,
+        1,
         &grant_msg,
         &grant_remaining,
     )
     .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
 
     // --- Genesis deposit (subledger TopUp as the granted authority) ---
     let alice = Keypair::new();
@@ -32434,7 +33088,7 @@ fn e2e_full_genesis_to_buy_burn() {
     .expect("genesis deposit");
     assert_eq!(
         token_amount(&svm, &perc_vault),
-        surplus + principal,
+        principal,
         "all genesis capital stays in the canonical Percolator vault"
     );
     assert_eq!(
@@ -32443,7 +33097,7 @@ fn e2e_full_genesis_to_buy_burn() {
             0,
         )
         .unwrap(),
-        u128::from(surplus + principal / 2),
+        u128::from(principal / 2),
         "exactly half the genesis principal is insurance",
     );
     assert_eq!(
@@ -32925,7 +33579,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        3,
+        2,
         &policy_msg,
         &policy_remaining,
     )
@@ -32960,11 +33614,59 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        4,
+        3,
         &op_msg,
         &op_remaining,
     )
     .expect("rotate operator to twap");
+
+    let surplus_source = Pubkey::new_unique();
+    let surplus_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &surplus_source,
+        &collateral_mint,
+        &payer.pubkey(),
+        surplus,
+    );
+    set_token(
+        &mut svm,
+        &surplus_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
+    donation_data.extend_from_slice(&surplus.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: twap_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(surplus_source, false),
+                AccountMeta::new(surplus_holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: donation_data,
+        },
+    )
+    .expect("public donor adds protocol surplus after constrained custody");
+    assert_eq!(token_amount(&svm, &perc_vault), principal + surplus);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        u128::from(principal / 2 + surplus),
+    );
 
     // Cross backing protects half the principal outside TWAP custody. The imported
     // insurance floor therefore protects the complementary half, not the full bond.
@@ -32982,7 +33684,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        5,
+        4,
         &floor_msg,
         &floor_remaining,
     )
@@ -33010,7 +33712,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        6,
+        5,
         &oracle_config,
         &oracle_remaining,
     )
@@ -33036,7 +33738,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        7,
+        6,
         &epoch_oracle_config,
         &epoch_oracle_remaining,
     )
@@ -33080,7 +33782,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        8,
+        7,
         &reward_init,
         &reward_init_remaining,
     )
@@ -33166,7 +33868,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        9,
+        8,
         &economics,
         &economics_remaining,
     )
@@ -33203,7 +33905,7 @@ fn e2e_full_genesis_to_buy_burn() {
         AccountMeta::new_readonly(reward_vault, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 10, &ib, &ib_rem)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 9, &ib, &ib_rem)
         .expect("init auction book");
 
     let epoch_long_start = read_portfolio_funding_long_paid(&svm, &epoch_long_pf);
@@ -33266,7 +33968,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        11,
+        10,
         &premium,
         &epoch_oracle_remaining,
     )
@@ -33303,7 +34005,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        12,
+        11,
         &discount,
         &epoch_oracle_remaining,
     )
@@ -33413,7 +34115,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &multisig,
             &dao,
             &payer,
-            13 + round,
+            12 + round,
             &oracle_push,
             &oracle_remaining,
         )
@@ -33719,9 +34421,9 @@ fn e2e_full_genesis_to_buy_burn() {
     let return_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -33732,7 +34434,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        16,
+        15,
         &return_message,
         &return_remaining,
     )
@@ -45891,13 +46593,12 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    // The market earns 500k surplus during genesis through the controller's
-    // inbound-only donation path. Governance never receives an insurance key.
+    // Stage a public donation for after custody is constrained to TWAP. The
+    // first pool grant must observe an empty provider state.
     let surplus = 500_000u64;
     let surplus_donor = Keypair::new();
     svm.airdrop(&surplus_donor.pubkey(), 1_000_000_000).unwrap();
     let surplus_src = Pubkey::new_unique();
-    let controller_holding = Pubkey::new_unique();
     set_token(
         &mut svm,
         &surplus_src,
@@ -45905,28 +46606,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &surplus_donor.pubkey(),
         surplus,
     );
-    set_token(
-        &mut svm,
-        &controller_holding,
-        &collateral_mint,
-        &controller,
-        0,
-    );
-    send(
-        &mut svm,
-        &[&surplus_donor],
-        controller_donate_insurance_ix(
-            &surplus_donor.pubkey(),
-        &squads_vault,
-            &controller,
-        &slab,
-        &surplus_src,
-            &controller_holding,
-        &perc_vault,
-            surplus,
-        ),
-    )
-    .expect("market earns surplus (controller donation)");
     let bootstrap_policy = build_controller_proxy_message(
         &squads_vault,
         &controller,
@@ -46007,8 +46686,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -46017,6 +46696,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &mut svm, &squads, &multisig, &dao, &payer, 3, &message, &remaining,
     )
     .expect("grant operator to pool");
+    advance_one_slot(&mut svm);
 
     let alice = Keypair::new();
     svm.airdrop(&alice.pubkey(), 1_000_000_000).unwrap();
@@ -46061,8 +46741,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     .expect("insurance deposit");
     assert_eq!(
         token_amount(&svm, &perc_vault),
-        surplus + amount,
-        "market insurance = genesis surplus + depositor principal"
+        amount,
+        "market insurance initially contains only depositor principal"
     );
 
     // Separate own-vault backing pool. It is share-value accounted like insurance, but it does not give the
@@ -47514,6 +48194,42 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 8, &op, &or)
         .expect("operator -> twap (handoff)");
+
+    let surplus_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &surplus_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
+    donation_data.extend_from_slice(&surplus.to_le_bytes());
+    let vault_before_surplus = token_amount(&svm, &perc_vault);
+    send(
+        &mut svm,
+        &[&surplus_donor],
+        Instruction {
+            program_id: twap_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(surplus_donor.pubkey(), true),
+                AccountMeta::new_readonly(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(surplus_src, false),
+                AccountMeta::new(surplus_holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: donation_data,
+        },
+    )
+    .expect("public donor adds protocol surplus after constrained custody");
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        vault_before_surplus + surplus,
+    );
     let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, amount as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -48376,9 +49092,9 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let return_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -52846,7 +53562,7 @@ fn e2e_cross_backing_pool_cannot_capture_external_principal() {
                 program_id: sub_id(),
                 accounts: vec![
                     AccountMeta::new_readonly(external_provider.pubkey(), true),
-                    AccountMeta::new_readonly(pool, false),
+                    AccountMeta::new(pool, false),
                     AccountMeta::new(slab, false),
                     AccountMeta::new_readonly(perc_id(), false),
                 ],
@@ -52897,6 +53613,7 @@ fn e2e_transient_trader_backing_cannot_lower_the_twap_principal_floor() {
     let env = setup_cross_backing_genesis(&mut svm, &payer);
     let oracle = Keypair::new();
     install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
+    warp_to_first_pool_deposit_slot(&mut svm, &env.pool);
 
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
@@ -53081,6 +53798,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
         &oracle.pubkey(),
         10_000,
     );
+    warp_to_first_pool_deposit_slot(&mut svm, &env.pool);
 
     let owners = [Keypair::new(), Keypair::new()];
     let principal = 14u64;
@@ -53181,6 +53899,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
         2 * principal + 1,
     );
 
+    let initial_mark_slot = svm.get_sysvar::<Clock>().slot;
     send(
         &mut svm,
         &[&payer, &oracle],
@@ -53191,7 +53910,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
             ],
             PIx::ConfigureAuthMark {
                 asset_index: 0,
-                now_slot: 100,
+                now_slot: initial_mark_slot,
                 initial_mark_e6: 100,
             },
         ),
@@ -53309,7 +54028,7 @@ fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
     .expect("permissionless users open a balanced pair after lifecycle handoff");
 
     let target_mark = 301u64;
-    let mut slot = 101u64;
+    let mut slot = initial_mark_slot.checked_add(1).unwrap();
     warp_to(&mut svm, slot);
     send(
         &mut svm,
