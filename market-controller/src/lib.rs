@@ -61,6 +61,11 @@ const SUBLEDGER_CROSS_BACKING_POOL_SEED: &[u8] = b"cross-backing";
 const SUBLEDGER_POOL_DISC: [u8; 8] = *b"SUBPOOL1";
 const SUBLEDGER_MARKET_POOL_SIZE: usize = 160;
 const SUBLEDGER_POOL_SIZE: usize = 272;
+const SUBLEDGER_POOL_FLAGS_OFF: usize = 272;
+const SUBLEDGER_POOL_FLAG_CROSS_BACKING: u8 = 1 << 0;
+const SUBLEDGER_POOL_FLAG_CUSTODY_GRANTED: u8 = 1 << 1;
+const SUBLEDGER_POOL_FLAGS_MASK: u8 =
+    SUBLEDGER_POOL_FLAG_CROSS_BACKING | SUBLEDGER_POOL_FLAG_CUSTODY_GRANTED;
 
 const IX_PROXY_ADMIN: u8 = 0;
 const IX_INIT_MARKET: u8 = 1;
@@ -450,11 +455,14 @@ fn validate_subledger_custody_admin(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let cross_backing = match data.get(272).copied().unwrap_or(0) {
-        0 => false,
-        1 => true,
-        _ => return Err(ProgramError::InvalidAccountData),
-    };
+    let pool_flags = data
+        .get(SUBLEDGER_POOL_FLAGS_OFF)
+        .copied()
+        .unwrap_or(0);
+    if pool_flags & !SUBLEDGER_POOL_FLAGS_MASK != 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let cross_backing = pool_flags & SUBLEDGER_POOL_FLAG_CROSS_BACKING != 0;
     let bump = [data[89]];
     let mut pool_seeds: alloc::vec::Vec<&[u8]> = vec![
         SUBLEDGER_POOL_SEED,
@@ -2700,7 +2708,7 @@ fn process_init_market<'a>(
 }
 
 // grant_genesis_pool accounts:
-// [governance(signer), controller_pda, pool, market(w), percolator_program,
+// [governance(signer), controller_pda, pool(w), market(w), percolator_program,
 //  subledger_program]
 fn process_grant_genesis_pool<'a>(
     program_id: &Pubkey,
@@ -2719,6 +2727,9 @@ fn process_grant_genesis_pool<'a>(
     let subledger_program = next_account_info(iter)?;
     if !governance.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !pool.is_writable {
+        return Err(ProgramError::InvalidAccountData);
     }
     if *subledger_program.key != SUBLEDGER_PROGRAM_ID || !subledger_program.executable {
         return Err(ProgramError::IncorrectProgramId);
@@ -2781,7 +2792,7 @@ fn process_grant_genesis_pool<'a>(
             program_id: *subledger_program.key,
             accounts: vec![
                 AccountMeta::new_readonly(*controller.key, true),
-                AccountMeta::new_readonly(*pool.key, false),
+                AccountMeta::new(*pool.key, false),
                 AccountMeta::new(*market.key, false),
                 AccountMeta::new_readonly(*percolator_program.key, false),
             ],

@@ -1182,7 +1182,7 @@ fn process_accept_custody<'a>(
 }
 
 // return_to_subledger accounts: [squads_vault(signer unless fixed public return), config,
-//   twap_authority(current_admin), pool, market_slab(w), percolator_program,
+//   twap_authority(current_admin), pool(w), market_slab(w), percolator_program,
 //   subledger_program, owner(signer, optional), position(w, optional),
 //   owner_destination(w, optional), pool_holding(w, optional),
 //   percolator_vault(w, optional), vault_authority(optional), token_program(optional)]
@@ -1268,6 +1268,9 @@ fn process_return_to_subledger(
     {
         return Err(ProgramError::InvalidAccountData);
     }
+    if !pool.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let auth_bump = [config.authority_bump];
     let auth_seeds: [&[u8]; 3] = [TWAP_AUTHORITY_SEED, config_account.key.as_ref(), &auth_bump];
     let expected_authority = Pubkey::create_program_address(&auth_seeds, program_id)
@@ -1335,7 +1338,6 @@ fn process_return_to_subledger(
                 token_program,
             ) = owner_exit.ok_or(ProgramError::MissingRequiredSignature)?;
             if !owner.is_signer
-                || !pool.is_writable
                 || !position.is_writable
                 || !owner_destination.is_writable
                 || !pool_holding.is_writable
@@ -1357,7 +1359,7 @@ fn process_return_to_subledger(
             program_id: *subledger_program.key,
             accounts: vec![
                 AccountMeta::new_readonly(*twap_authority.key, true),
-                AccountMeta::new_readonly(*pool.key, false),
+                AccountMeta::new(*pool.key, false),
                 AccountMeta::new(*market_slab.key, false),
                 AccountMeta::new_readonly(*percolator_program.key, false),
                 AccountMeta::new_readonly(*config_account.key, false),

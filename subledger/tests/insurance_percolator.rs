@@ -13,18 +13,10 @@
 //! 3. The user does a principal-only, owner-authorized exit through the subledger
 //!    and gets their principal back. Non-owner exits and over-principal exits fail.
 //!
-//! Market-0 setup note: the percolator `UpdateAssetAuthority` handler requires the
-//! *incoming* authority to co-sign when it is non-zero. The subledger pool is a
-//! PDA, which cannot co-sign a top-level instruction, so we cannot rotate authority
-//! to it with a plain `UpdateAssetAuthority`. Instead — exactly like the existing
-//! genesis integration's manual market — we build the Live market-0 slab with the
-//! real percolator state helper `init_market_account_zero_copy`, setting
-//! `marketauth = pool_pda` (which percolator copies into asset-0's
-//! insurance_authority + insurance_operator + asset_admin) and the deposits-only
-//! insurance-withdraw policy (max_bps=10000, deposits_only=1, cooldown=0). The real
-//! percolator binary then validates every TopUp/Withdraw CPI against that stored
-//! state. This is the on-chain equivalent of the production flow, where the market
-//! is born under the controlling PDA via a PDA-signed `InitMarket` CPI.
+//! Market-0 setup starts under a temporary signer and executes Subledger's real
+//! pool-cosigned `accept_operator` path. That CPI rotates the insurance roles and
+//! asset admin to the pool and seals its market generation before any deposit. The
+//! real Percolator binary then validates every TopUp/Withdraw CPI against that state.
 
 use litesvm::LiteSVM;
 use solana_program_runtime::compute_budget::ComputeBudget;
@@ -185,6 +177,7 @@ struct Env {
     /// revoked at distribution init). genesis-vote + distribution are keyed by this.
     coin_mint: Pubkey,
     mint_auth: Keypair,
+    market_admin: Keypair,
     slab: Pubkey,
     vault_authority: Pubkey,
     perc_vault: Pubkey,
@@ -274,6 +267,9 @@ impl Env {
         // The distributed COIN is a separate fixed-supply token (authority revoked in
         // setup_vote once the distribution vault is funded).
         let coin_mint = create_mint(&mut svm, &payer, &mint_auth.pubkey());
+        let market_admin = Keypair::new();
+        svm.airdrop(&market_admin.pubkey(), 1_000_000_000)
+            .unwrap();
 
         // The market slab is chosen first; the pool PDA commits to it (finding Q).
         let slab = Pubkey::new_unique();
@@ -304,10 +300,10 @@ impl Env {
             )
         };
 
-        // Build the real Live market-0 slab with marketauth = pool PDA and the
-        // deposits-only principal-recovery insurance policy.
+        // Build the real Live market-0 slab under a temporary signer, then run
+        // the same pool-cosigned custody grant used by production.
         let init_slot = 100u64;
-        let slab_data = make_live_market(&slab, &mint, &pool, init_slot);
+        let slab_data = make_live_market(&slab, &mint, &market_admin.pubkey(), init_slot);
         svm.set_account(
             slab,
             Account {
@@ -352,6 +348,7 @@ impl Env {
             mint,
             coin_mint,
             mint_auth,
+            market_admin,
             slab,
             vault_authority,
             perc_vault,
@@ -463,6 +460,7 @@ impl Env {
             data,
         };
         self.send(&[ix], &[]).expect("init insurance pool");
+        self.grant_insurance_pool();
     }
 
     fn init_cross_backing_genesis_pool(&mut self) {
@@ -491,6 +489,28 @@ impl Env {
         };
         self.send(&[ix], &[])
             .expect("init cross-backing genesis pool");
+        self.grant_insurance_pool();
+    }
+
+    fn grant_insurance_pool(&mut self) {
+        let market_admin = clone_kp(&self.market_admin);
+        let ix = Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(market_admin.pubkey(), true),
+                AccountMeta::new(self.pool, false),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+            data: vec![7u8], // IX_ACCEPT_OPERATOR
+        };
+        self.send(&[ix], &[&market_admin])
+            .expect("grant market custody to insurance pool");
+        assert_eq!(
+            self.svm.get_account(&self.pool).unwrap().data[272] & 2,
+            2,
+            "the production first-grant path seals the pool generation",
+        );
     }
 
     fn cross_backing_deposit(
@@ -1248,7 +1268,7 @@ fn install_public_loss_fixture(env: &mut Env, oracle_authority: &Pubkey) {
     let mut data = make_live_market_with_public_chunk(
         &env.slab,
         &env.mint,
-        &env.pool,
+        &env.market_admin.pubkey(),
         100,
         percolator::MAX_VAULT_TVL,
     );
@@ -1272,7 +1292,7 @@ fn install_public_loss_fixture_with_margin(
     let mut data = make_live_market_with_public_chunk_and_margin(
         &env.slab,
         &env.mint,
-        &env.pool,
+        &env.market_admin.pubkey(),
         100,
         percolator::MAX_VAULT_TVL,
         margin_bps,
@@ -2206,7 +2226,7 @@ fn legacy_genesis_pool_cannot_squat_cross_backing_genesis_address() {
     env.send(&[ix], &[])
         .expect("cross-backed genesis init remains available after legacy init");
 
-    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 272);
+    assert_eq!(env.svm.get_account(&env.pool).unwrap().data.len(), 273);
     assert_eq!(env.svm.get_account(&cross_pool).unwrap().data.len(), 321);
 }
 

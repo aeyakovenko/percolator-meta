@@ -233,8 +233,8 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -7859,7 +7859,7 @@ fn canonical_insurance_vault(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey 
 
 // Squads TransactionMessage wrapping subledger.accept_operator. The pool receives the
 // asset-0 insurance authority, operator, and asset-admin roles atomically.
-// subledger.accept_operator accounts: [asset_admin(signer), pool, market_slab(w), perc].
+// subledger.accept_operator accounts: [asset_admin(signer), pool(w), market_slab(w), perc].
 fn build_subledger_accept_operator_message(
     squads_vault: &Pubkey,
     pool: &Pubkey,
@@ -7869,7 +7869,7 @@ fn build_subledger_accept_operator_message(
     let mut m = Vec::new();
     m.push(1); // num_signers
     m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (market_slab)
+    m.push(2); // num_writable_non_signers (market_slab, pool)
     m.push(5); // account_keys count
     m.extend_from_slice(squads_vault.as_ref()); // 0 signer (asset_admin)
     m.extend_from_slice(market_slab.as_ref()); // 1 writable
@@ -8530,19 +8530,19 @@ fn build_controller_grant_pool_message(
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
-    m.push(1); // market writable
+    m.push(2); // market and pool writable
     m.push(7);
     m.extend_from_slice(governance.as_ref()); // 0
     m.extend_from_slice(market.as_ref()); // 1 writable
-    m.extend_from_slice(controller.as_ref()); // 2
-    m.extend_from_slice(pool.as_ref()); // 3
+    m.extend_from_slice(pool.as_ref()); // 2 writable
+    m.extend_from_slice(controller.as_ref()); // 3
     m.extend_from_slice(percolator_program.as_ref()); // 4
     m.extend_from_slice(sub_id().as_ref()); // 5
     m.extend_from_slice(controller_id().as_ref()); // 6 program
     m.push(1);
     m.push(6);
     m.push(6);
-    for index in [0u8, 2, 3, 1, 4, 5] {
+    for index in [0u8, 3, 2, 1, 4, 5] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -8734,20 +8734,20 @@ fn build_return_to_subledger_message(
     let mut m = Vec::new();
     m.push(1); // num_signers
     m.push(0); // num_writable_signers
-    m.push(1); // market_slab
+    m.push(2); // market_slab, pool
     m.push(8); // account_keys count
     m.extend_from_slice(squads_vault.as_ref()); // 0 signer
     m.extend_from_slice(market_slab.as_ref()); // 1 writable
-    m.extend_from_slice(twap_config.as_ref()); // 2
-    m.extend_from_slice(twap_authority.as_ref()); // 3
-    m.extend_from_slice(pool.as_ref()); // 4
+    m.extend_from_slice(pool.as_ref()); // 2 writable
+    m.extend_from_slice(twap_config.as_ref()); // 3
+    m.extend_from_slice(twap_authority.as_ref()); // 4
     m.extend_from_slice(percolator_program.as_ref()); // 5
     m.extend_from_slice(sub_id().as_ref()); // 6
     m.extend_from_slice(twap_id().as_ref()); // 7 program id
     m.push(1); // instructions count
     m.push(7); // program_id_index -> twap
     m.push(7); // account_indexes count
-    for index in [0u8, 2, 3, 4, 1, 5, 6] {
+    for index in [0u8, 3, 4, 2, 1, 5, 6] {
         m.push(index);
     }
     m.extend_from_slice(&1u16.to_le_bytes());
@@ -8770,7 +8770,7 @@ fn twap_return_to_subledger_ix(
             AccountMeta::new_readonly(*squads_vault, false),
             AccountMeta::new_readonly(*twap_config, false),
             AccountMeta::new_readonly(*twap_authority, false),
-            AccountMeta::new_readonly(*pool, false),
+            AccountMeta::new(*pool, false),
             AccountMeta::new(*market_slab, false),
             AccountMeta::new_readonly(*percolator_program, false),
             AccountMeta::new_readonly(sub_id(), false),
@@ -9036,7 +9036,7 @@ fn e2e_squads_grants_operator_to_subledger_then_real_deposit() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -10921,7 +10921,7 @@ fn e2e_funded_creator_insurance_exits_before_donation_and_genesis_grant() {
         accounts: vec![
             AccountMeta::new_readonly(governance.pubkey(), true),
             AccountMeta::new_readonly(controller, false),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(sub_id(), false),
@@ -15974,8 +15974,8 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -17404,8 +17404,8 @@ fn e2e_empty_with_surplus_pool_can_return_late_protocol_fees_after_resolution() 
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -18967,7 +18967,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(attacker.pubkey(), true), // forged asset_admin
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -18991,7 +18991,7 @@ fn e2e_attacker_cannot_grant_operator_bypassing_squads() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(payer.pubkey(), true),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(slab, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -19411,7 +19411,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -19708,9 +19708,9 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let decoy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(decoy_pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(decoy_pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -19743,9 +19743,9 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     let regrant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -20088,7 +20088,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let gr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -20382,7 +20382,7 @@ fn e2e_fresh_position_gets_one_vote_per_principal_unit() {
     let gr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -22381,7 +22381,7 @@ fn setup_genesis_with_policy_backing_and_funding(
     let gr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -26802,7 +26802,7 @@ fn e2e_presigned_empty_pool_grant_cannot_capture_funded_replacement_slab() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(admin.pubkey(), true),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -27155,7 +27155,7 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
         program_id: sub_id(),
         accounts: vec![
             AccountMeta::new_readonly(attacker.pubkey(), true),
-            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new(pool, false),
             AccountMeta::new(market, false),
             AccountMeta::new_readonly(perc_id(), false),
         ],
@@ -27163,6 +27163,11 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
     };
     send(&mut svm, &[&payer, &attacker], accept_pool())
         .expect("generation A grants custody to its empty pool");
+    assert_eq!(
+        svm.get_account(&pool).unwrap().data[272],
+        2,
+        "the first grant permanently seals this pool to generation A",
+    );
 
     let victim_source = Pubkey::new_unique();
     let victim_destination = Pubkey::new_unique();
@@ -27294,15 +27299,29 @@ fn e2e_presigned_genesis_deposit_cannot_cross_raw_market_generations() {
         &[&payer, &attacker],
     )
     .expect("generation-B creator configures its oracle");
-    submit(
+    let market_before_regrant = svm.get_account(&market).unwrap();
+    let pool_before_regrant = svm.get_account(&pool).unwrap();
+    let regrant = submit(
         &mut svm,
         &[
             solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(3),
             accept_pool(),
         ],
         &[&payer, &attacker],
-    )
-    .expect("generation B freshly grants the persistent empty pool");
+    );
+    if regrant.is_err() {
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
+        let source_before_replay = svm.get_account(&victim_source).unwrap();
+        assert!(
+            svm.send_transaction(stale_deposit).is_err(),
+            "an ungranted replacement market cannot admit the stale deposit",
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_regrant);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_regrant);
+        assert_eq!(svm.get_account(&victim_source).unwrap(), source_before_replay);
+        return;
+    }
 
     let market_before_replay = svm.get_account(&market).unwrap();
     let source_before_replay = svm.get_account(&victim_source).unwrap();
@@ -32905,48 +32924,9 @@ fn e2e_full_genesis_to_buy_burn() {
     ))
     .expect("init pool");
 
-    // --- Inject insurance SURPLUS (squads is still the insurance_authority) ---
+    // Protocol surplus enters only after custody is constrained to TWAP. A first
+    // pool grant intentionally rejects every pre-existing provider balance.
     let surplus = 500_000u64;
-    let squads_src = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &squads_src,
-        &collateral_mint,
-        &squads_vault,
-        surplus,
-    );
-    let topup_msg = build_topup_message(
-        &squads_vault,
-        &slab,
-        &squads_src,
-        &perc_vault,
-        &perc_id(),
-        surplus as u128,
-    );
-    let topup_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new(squads_src, false),
-        AccountMeta::new(perc_vault, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(perc_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &squads,
-        &multisig,
-        &dao,
-        &payer,
-        1,
-        &topup_msg,
-        &topup_remaining,
-    )
-    .expect("squads injects insurance surplus");
-    assert_eq!(
-        token_amount(&svm, &perc_vault),
-        surplus,
-        "surplus in insurance"
-    );
 
     // --- Grant operator+authority to the subledger pool ---
     let grant_msg =
@@ -32954,7 +32934,7 @@ fn e2e_full_genesis_to_buy_burn() {
     let grant_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(pool, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
@@ -32964,7 +32944,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        2,
+        1,
         &grant_msg,
         &grant_remaining,
     )
@@ -33016,7 +32996,7 @@ fn e2e_full_genesis_to_buy_burn() {
     .expect("genesis deposit");
     assert_eq!(
         token_amount(&svm, &perc_vault),
-        surplus + principal,
+        principal,
         "all genesis capital stays in the canonical Percolator vault"
     );
     assert_eq!(
@@ -33025,7 +33005,7 @@ fn e2e_full_genesis_to_buy_burn() {
             0,
         )
         .unwrap(),
-        u128::from(surplus + principal / 2),
+        u128::from(principal / 2),
         "exactly half the genesis principal is insurance",
     );
     assert_eq!(
@@ -33507,7 +33487,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        3,
+        2,
         &policy_msg,
         &policy_remaining,
     )
@@ -33542,11 +33522,59 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        4,
+        3,
         &op_msg,
         &op_remaining,
     )
     .expect("rotate operator to twap");
+
+    let surplus_source = Pubkey::new_unique();
+    let surplus_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &surplus_source,
+        &collateral_mint,
+        &payer.pubkey(),
+        surplus,
+    );
+    set_token(
+        &mut svm,
+        &surplus_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
+    donation_data.extend_from_slice(&surplus.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: twap_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(surplus_source, false),
+                AccountMeta::new(surplus_holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: donation_data,
+        },
+    )
+    .expect("public donor adds protocol surplus after constrained custody");
+    assert_eq!(token_amount(&svm, &perc_vault), principal + surplus);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&slab).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        u128::from(principal / 2 + surplus),
+    );
 
     // Cross backing protects half the principal outside TWAP custody. The imported
     // insurance floor therefore protects the complementary half, not the full bond.
@@ -33564,7 +33592,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        5,
+        4,
         &floor_msg,
         &floor_remaining,
     )
@@ -33592,7 +33620,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        6,
+        5,
         &oracle_config,
         &oracle_remaining,
     )
@@ -33618,7 +33646,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        7,
+        6,
         &epoch_oracle_config,
         &epoch_oracle_remaining,
     )
@@ -33662,7 +33690,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        8,
+        7,
         &reward_init,
         &reward_init_remaining,
     )
@@ -33748,7 +33776,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        9,
+        8,
         &economics,
         &economics_remaining,
     )
@@ -33785,7 +33813,7 @@ fn e2e_full_genesis_to_buy_burn() {
         AccountMeta::new_readonly(reward_vault, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 10, &ib, &ib_rem)
+    squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 9, &ib, &ib_rem)
         .expect("init auction book");
 
     let epoch_long_start = read_portfolio_funding_long_paid(&svm, &epoch_long_pf);
@@ -33848,7 +33876,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        11,
+        10,
         &premium,
         &epoch_oracle_remaining,
     )
@@ -33885,7 +33913,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        12,
+        11,
         &discount,
         &epoch_oracle_remaining,
     )
@@ -33995,7 +34023,7 @@ fn e2e_full_genesis_to_buy_burn() {
             &multisig,
             &dao,
             &payer,
-            13 + round,
+            12 + round,
             &oracle_push,
             &oracle_remaining,
         )
@@ -34301,9 +34329,9 @@ fn e2e_full_genesis_to_buy_burn() {
     let return_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -34314,7 +34342,7 @@ fn e2e_full_genesis_to_buy_burn() {
         &multisig,
         &dao,
         &payer,
-        16,
+        15,
         &return_message,
         &return_remaining,
     )
@@ -46473,13 +46501,12 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
     set_token(&mut svm, &perc_vault, &collateral_mint, &vault_authority, 0);
-    // The market earns 500k surplus during genesis through the controller's
-    // inbound-only donation path. Governance never receives an insurance key.
+    // Stage a public donation for after custody is constrained to TWAP. The
+    // first pool grant must observe an empty provider state.
     let surplus = 500_000u64;
     let surplus_donor = Keypair::new();
     svm.airdrop(&surplus_donor.pubkey(), 1_000_000_000).unwrap();
     let surplus_src = Pubkey::new_unique();
-    let controller_holding = Pubkey::new_unique();
     set_token(
         &mut svm,
         &surplus_src,
@@ -46487,28 +46514,6 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &surplus_donor.pubkey(),
         surplus,
     );
-    set_token(
-        &mut svm,
-        &controller_holding,
-        &collateral_mint,
-        &controller,
-        0,
-    );
-    send(
-        &mut svm,
-        &[&surplus_donor],
-        controller_donate_insurance_ix(
-            &surplus_donor.pubkey(),
-        &squads_vault,
-            &controller,
-        &slab,
-        &surplus_src,
-            &controller_holding,
-        &perc_vault,
-            surplus,
-        ),
-    )
-    .expect("market earns surplus (controller donation)");
     let bootstrap_policy = build_controller_proxy_message(
         &squads_vault,
         &controller,
@@ -46589,8 +46594,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
@@ -46643,8 +46648,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     .expect("insurance deposit");
     assert_eq!(
         token_amount(&svm, &perc_vault),
-        surplus + amount,
-        "market insurance = genesis surplus + depositor principal"
+        amount,
+        "market insurance initially contains only depositor principal"
     );
 
     // Separate own-vault backing pool. It is share-value accounted like insurance, but it does not give the
@@ -48096,6 +48101,42 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 8, &op, &or)
         .expect("operator -> twap (handoff)");
+
+    let surplus_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &surplus_holding,
+        &collateral_mint,
+        &twap_authority,
+        0,
+    );
+    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
+    donation_data.extend_from_slice(&surplus.to_le_bytes());
+    let vault_before_surplus = token_amount(&svm, &perc_vault);
+    send(
+        &mut svm,
+        &[&surplus_donor],
+        Instruction {
+            program_id: twap_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(surplus_donor.pubkey(), true),
+                AccountMeta::new_readonly(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(surplus_src, false),
+                AccountMeta::new(surplus_holding, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new(perc_vault, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: donation_data,
+        },
+    )
+    .expect("public donor adds protocol surplus after constrained custody");
+    assert_eq!(
+        token_amount(&svm, &perc_vault),
+        vault_before_surplus + surplus,
+    );
     let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, amount as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -48958,9 +48999,9 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     let return_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(pool, false),
         AccountMeta::new_readonly(twap_cfg, false),
         AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(pool, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -53428,7 +53469,7 @@ fn e2e_cross_backing_pool_cannot_capture_external_principal() {
                 program_id: sub_id(),
                 accounts: vec![
                     AccountMeta::new_readonly(external_provider.pubkey(), true),
-                    AccountMeta::new_readonly(pool, false),
+                    AccountMeta::new(pool, false),
                     AccountMeta::new(slab, false),
                     AccountMeta::new_readonly(perc_id(), false),
                 ],
