@@ -513,8 +513,17 @@ impl Env {
             2,
             "the production first-grant path seals the pool generation",
         );
+        let grant_slot_offset = match pool_data.len() {
+            329 => 321,
+            size if size >= 361 => 353,
+            size => panic!("pool layout {size} has no custody grant slot"),
+        };
         assert_eq!(
-            u64::from_le_bytes(pool_data[321..329].try_into().unwrap()),
+            u64::from_le_bytes(
+                pool_data[grant_slot_offset..grant_slot_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
             grant_slot + 1,
             "the pool records its first custody grant slot plus one",
         );
