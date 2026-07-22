@@ -19,7 +19,10 @@ principal from both protection classes, subject to losses incurred during their 
 - **Capital stays segregated.** Insurance and backing principal stays in Percolator or an
   owner-bound subledger vault. Insurance haircuts and TWAP surplus are computed from the selected
   asset's own long/short domain budgets, so another asset's backing cannot mask a loss or authorize
-  a withdrawal. Genesis cross backing uses two canonical Percolator-owned ledgers while the
+  a withdrawal. A current TWAP handoff checkpoints asset-0's cumulative insurance consumption;
+  recovery applies only the loss-adjusted owner insurance plus canonical provider backing before
+  rotating custody, so later fees or donations cannot restore an already-incurred owner loss.
+  Genesis cross backing uses two canonical Percolator-owned ledgers while the
   owner-bound pool remains its backing authority through the TWAP handoff. Neither the DAO nor a
   cranker can select a principal amount or recipient. Backing utilization earnings are excluded
   from depositor claims; an owner exit first isolates the exact live counters in the canonical
@@ -274,7 +277,10 @@ slot-only wire remains valid only for predecessor books that are exit-only under
    withdrawal/rotation role is already the constrained controller.
 7. **Handoff.** If capital remains for continuous operation, Squads authorizes the fixed
    principal-pool-to-TWAP transition. The transition records the exact pool identity and live
-   insurance complement in the TWAP floor while the pool keeps backing authority. An atomic live
+   insurance complement in the TWAP floor, capped by live insurance, and checkpoints the selected
+   asset's monotonic insurance-consumption counters while the pool keeps backing authority. On
+   return, Subledger combines the post-checkpoint insurance loss with canonical long/short backing
+   ledgers before updating its loss-only share rate. An atomic live
    owner exit creates a one-use permit for any cranker to re-handoff that same pool to that same
    config; the crank replaces only the exited principal component. Retained insurance stays protected
    and exited principal no longer strands fee surplus.

@@ -254,6 +254,12 @@ const TWAP_PROGRAM_ID: Pubkey =
 const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
 const TWAP_CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
 const TWAP_CUSTODY_CONFIG_MIN_SIZE: usize = 264;
+const TWAP_PROVENANCE_CONFIG_MIN_SIZE: usize = 272;
+const TWAP_LOSS_CHECKPOINT_CONFIG_MIN_SIZE: usize = 288;
+const TWAP_CUSTODY_PRINCIPAL_OFF: usize = 257;
+const TWAP_CUSTODY_MODE_OFF: usize = 265;
+const TWAP_INSURANCE_SPENT_OFF: usize = 272;
+const TWAP_CUSTODY_MODE_POOL_BOUND: u8 = 1;
 const TWAP_IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
 const TWAP_IX_ACCEPT_CROSS_BACKING_EARNINGS: u8 = 22;
 const CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
@@ -4075,7 +4081,8 @@ fn validate_twap_recovery_grant(
     pool_account: &AccountInfo,
     market_slab: &AccountInfo,
     percolator_program: &AccountInfo,
-) -> ProgramResult {
+    require_loss_checkpoint: bool,
+) -> Result<Option<(Option<u64>, Option<u128>)>, ProgramError> {
     if twap_config.owner != &TWAP_PROGRAM_ID {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -4096,11 +4103,40 @@ fn validate_twap_recovery_grant(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    Ok(())
+    if require_loss_checkpoint {
+        // A 264-byte deployed config predates custody provenance. It still binds
+        // the exact pool and had a working governance/terminal return path before
+        // this upgrade, so recover it with the predecessor balance cap below.
+        if config_data.len() == TWAP_CUSTODY_CONFIG_MIN_SIZE {
+            return Ok(Some((None, None)));
+        }
+        if config_data.len() < TWAP_PROVENANCE_CONFIG_MIN_SIZE
+            || config_data[TWAP_CUSTODY_MODE_OFF] != TWAP_CUSTODY_MODE_POOL_BOUND
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(Some((
+            Some(u64::from_le_bytes(
+                config_data[TWAP_CUSTODY_PRINCIPAL_OFF..TWAP_CUSTODY_PRINCIPAL_OFF + 8]
+                    .try_into()
+                    .unwrap(),
+            )),
+            (config_data.len() >= TWAP_LOSS_CHECKPOINT_CONFIG_MIN_SIZE).then(|| {
+                u128::from_le_bytes(
+                    config_data[TWAP_INSURANCE_SPENT_OFF..TWAP_INSURANCE_SPENT_OFF + 16]
+                        .try_into()
+                        .unwrap(),
+                )
+            }),
+        )))
+    } else {
+        Ok(None)
+    }
 }
 
-// accept_operator accounts: [asset_admin(signer), pool(w on first grant), market_slab(w), percolator_program,
-//   twap_config(optional; required after any user/provider value is admitted)]
+// accept_operator accounts: [asset_admin(signer), pool(w), market_slab(w), percolator_program,
+//   twap_config(optional; required after any user/provider value is admitted),
+//   cross_backing_long_ledger?, cross_backing_short_ledger?]
 // data: none
 //
 // The incoming pool PDA co-signs every rotation. Asset-admin moves LAST, after the
@@ -4122,9 +4158,11 @@ fn process_accept_operator(
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let twap_config = iter.next();
-    if iter.next().is_some() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
+    let backing_ledgers = match iter.as_slice() {
+        [] => None,
+        [long, short] => Some([long, short]),
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
 
     if !asset_admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -4166,17 +4204,113 @@ fn process_accept_operator(
                 .ok_or(ProgramError::ArithmeticOverflow)?,
         )
     };
-    if let Some(twap_config) = twap_config {
+    if backing_ledgers.is_some() != (pool.cross_backing && twap_config.is_some()) {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let recovery_checkpoint = if let Some(twap_config) = twap_config {
         validate_twap_recovery_grant(
             asset_admin,
             twap_config,
             pool_account,
             market_slab,
             percolator_program,
-        )?;
+            pool.cross_backing,
+        )?
     } else if !first_grant {
         return Err(ProgramError::InvalidAccountData);
-    }
+    } else {
+        None
+    };
+    let persist_pool = if let Some((custody_principal, insurance_spent_checkpoint)) =
+        recovery_checkpoint
+    {
+        if !pool_account.is_writable
+            || !uses_indexed_cross_backing(&pool, pool_account.data_len())
+            || custody_principal.is_some_and(|value| value > pool.outstanding_principal)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let mut provider_principals = [0u128; 2];
+        for (domain, ledger) in backing_ledgers
+            .ok_or(ProgramError::NotEnoughAccountKeys)?
+            .into_iter()
+            .enumerate()
+        {
+            provider_principals[domain] = validate_backing_ledger(
+                program_id,
+                pool_account.key,
+                market_slab.key,
+                percolator_program.key,
+                ledger,
+                domain as u16,
+            )?;
+        }
+        let market_data = market_slab.try_borrow_data()?;
+        if percolator_accounting::read_asset_backing_authority(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != pool_account.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let live_insurance = percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let insurance_spent = percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            .into_iter()
+            .try_fold(0u128, |total, spent| total.checked_add(spent))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let backing_balances =
+            percolator_accounting::read_asset_backing_balances(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let backing_sources =
+            percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let mut owner_backing = u128::from(pool.pending_backing_total()?);
+        for domain in 0..2 {
+            owner_backing = owner_backing
+                .checked_add(
+                    backing_balances[domain]
+                        .provider_protected_principal_atoms(
+                            provider_principals[domain],
+                            backing_sources[domain],
+                        )
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                )
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+        let owner_insurance = if let Some(checkpoint) = insurance_spent_checkpoint {
+            let insurance_loss = insurance_spent
+                .checked_sub(checkpoint)
+                .ok_or(ProgramError::InvalidAccountData)?;
+            core::cmp::min(
+                live_insurance,
+                u128::from(custody_principal.ok_or(ProgramError::InvalidAccountData)?)
+                    .saturating_sub(insurance_loss),
+            )
+        } else if let Some(custody_principal) = custody_principal {
+            // A deployed 272-byte predecessor cannot persist a loss checkpoint.
+            // Preserve its existing owner-recovery semantics instead of making an
+            // upgrade strand custody. Every newly initialized config has a checkpoint.
+            core::cmp::min(live_insurance, u128::from(custody_principal))
+        } else {
+            // A deployed 264-byte config records only the bound pool. Its old
+            // recovery path priced owners from the live aggregate balance, so cap
+            // insurance at the nominal complement and retain that behavior.
+            core::cmp::min(
+                live_insurance,
+                u128::from(pool.outstanding_principal).saturating_sub(owner_backing),
+            )
+        };
+        let protected = owner_insurance
+            .checked_add(owner_backing)
+            .map(|value| value.min(u128::from(pool.outstanding_principal)))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        sync_indexed_share_rate(&mut pool, protected)?;
+        true
+    } else {
+        false
+    };
     let rotate_backing = if pool.cross_backing {
         let market_data = market_slab.try_borrow_data()?;
         let authority = percolator_accounting::read_asset_backing_authority(&market_data, 0)
@@ -4233,6 +4367,8 @@ fn process_accept_operator(
     if let Some(custody_grant_slot_plus_one) = custody_grant_slot_plus_one {
         pool.custody_granted = true;
         pool.custody_grant_slot_plus_one = custody_grant_slot_plus_one;
+    }
+    if persist_pool || custody_grant_slot_plus_one.is_some() {
         pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
     }
     Ok(())
@@ -4524,8 +4660,9 @@ fn process_route_cross_backing_earnings(
 // again without governance; TWAP verifies that immutable binding before changing a
 // role. The pool signs a CPI to the fixed TWAP program, which hardcodes the only
 // incoming authority to its config-bound PDA and atomically protects this pool's live
-// outstanding principal. POLICY_WITH_SURPLUS may cross this boundary only after every
-// owner claim is gone: while principal exists the live balance is depositor share value,
+// owner-insurance claim while canonical cross backing stays under the pool PDA.
+// POLICY_WITH_SURPLUS may cross this boundary only after every owner claim is gone:
+// while principal exists the live balance is depositor share value,
 // but after the final exit any later fee or rounding reserve is protocol insurance that
 // otherwise has no signer-backed terminal path.
 // Percolator verifies that this pool is the current asset_admin, while the TWAP verifies
@@ -4572,7 +4709,7 @@ fn process_handoff_to_twap(
 
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
 
-    let protected_insurance_floor = if pool.cross_backing {
+    let (protected_insurance_floor, insurance_spent_checkpoint) = if pool.cross_backing {
         let mut provider_principals = [0u128; 2];
         for (domain, ledger) in backing_ledgers
             .ok_or(ProgramError::NotEnoughAccountKeys)?
@@ -4621,12 +4758,28 @@ fn process_handoff_to_twap(
         backing = backing
             .checked_add(u128::from(pending_backing))
             .ok_or(ProgramError::InvalidAccountData)?;
-        u128::from(pool.outstanding_principal).saturating_sub(backing)
+        let insurance_spent = percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            .into_iter()
+            .try_fold(0u128, |total, spent| total.checked_add(spent))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let live_insurance =
+            percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let nominal_insurance =
+            u128::from(pool.outstanding_principal).saturating_sub(backing);
+        (
+            core::cmp::min(nominal_insurance, live_insurance),
+            Some(insurance_spent),
+        )
     } else {
-        u128::from(pool.outstanding_principal)
+        (u128::from(pool.outstanding_principal), None)
     };
     let mut handoff_data = vec![TWAP_IX_ACCEPT_FROM_SUBLEDGER];
     handoff_data.extend_from_slice(&protected_insurance_floor.to_le_bytes());
+    if let Some(insurance_spent_checkpoint) = insurance_spent_checkpoint {
+        handoff_data.extend_from_slice(&insurance_spent_checkpoint.to_le_bytes());
+    }
     invoke_signed_for_pool(
         &pool,
         pool_seed_version,

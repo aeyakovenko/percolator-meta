@@ -2,6 +2,37 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - later protocol insurance could erase an unsynchronized cross-backing loss (surface B/C)
+
+A cross-backed genesis pool prices owner claims lazily. While TWAP held the asset-0 roles, a public
+trade consumed one insurance atom and one canonical backing atom from 29 owner principal atoms.
+Before Subledger observed that loss, an unrelated public donor added 10 protocol-insurance atoms.
+The predecessor return path saw only the increased aggregate balance, so a one-unit depositor could
+withdraw one atom instead of realizing a zero payout. The same stale boundary existed when the real
+market loss completed immediately before the first TWAP handoff: the handoff imported a 15-atom
+insurance complement even though only 13 owner-insurance atoms remained.
+
+The retained real-SBF LiteSVM regressions execute both orderings through Squads, the constrained
+controller, pinned Percolator trades and cranks, terminal settlement, TWAP return, two owner exits,
+re-handoff, and protocol-only custody. The old paths respectively paid the one-unit claim and
+recorded a 15-atom first-handoff floor even though only 13 owner-insurance atoms remained. The fixed
+paths record a 28/30,000,000 loss-only indexed
+rate, pay zero plus 13 plus 13 to the three independent owners, and leave the donation and rounding
+atom as protocol value. Missing and long/short-swapped recovery ledgers reject with exact market,
+pool, config, and ledger rollback. Separate upgrade fixtures prove deployed 264-byte custody and
+272-byte provenance configs can still complete owner recovery and repeated governance re-handoff
+after upgrade.
+
+FIX: `percolator-accounting` reads the pinned engine's two monotonic insurance-spent counters. New
+TWAP configs store their aggregate at every pool handoff and independently verify the supplied
+checkpoint against the slab. First handoff also caps the owner-insurance complement by live
+asset-0 insurance. Recovery subtracts post-handoff consumption, adds only canonical provider-backed
+long/short balances plus staged backing, and lowers Subledger's indexed share rate before rotating
+the fixed roles. Newly initialized configs always enforce the checkpoint; 264-byte and 272-byte
+predecessors retain their existing balance-capped recovery semantics so an upgrade cannot strand
+funds. No signer, authority, recipient, amount selector, transfer route, or admin value-moving
+surface was added.
+
 ## Tick - live insurance could exit before stale portfolios realized loss (surface B/C)
 
 Pinned Percolator allowed an asset-local live insurance withdrawal once the market-level mark had

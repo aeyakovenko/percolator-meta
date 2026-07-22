@@ -78,7 +78,8 @@ const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
 const INITIAL_CONFIG_SIZE: usize = 200;
 const LEGACY_CONFIG_SIZE: usize = 232;
 const CUSTODY_CONFIG_SIZE: usize = 264;
-const CONFIG_SIZE: usize = 272;
+const PROVENANCE_CONFIG_SIZE: usize = 272;
+const CONFIG_SIZE: usize = 288;
 const CUSTODY_MODE_UNATTESTED: u8 = 0;
 const CUSTODY_MODE_POOL_BOUND: u8 = 1;
 const CUSTODY_MODE_POOLLESS_EMPTY: u8 = 2;
@@ -360,6 +361,17 @@ fn read_asset_insurance(slab_data: &[u8], asset_index: usize) -> Result<u128, Pr
         .map_err(|_| ProgramError::InvalidAccountData)
 }
 
+fn read_asset_insurance_spent_total(
+    slab_data: &[u8],
+    asset_index: usize,
+) -> Result<u128, ProgramError> {
+    percolator_accounting::read_asset_insurance_spent(slab_data, asset_index)
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        .into_iter()
+        .try_fold(0u128, |total, spent| total.checked_add(spent))
+        .ok_or(ProgramError::ArithmeticOverflow)
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -405,9 +417,9 @@ struct Config {
     /// exactly once by the pool -> TWAP transition and used as the only permitted
     /// recovery destination. Legacy unfunded direct migrations leave this unset.
     custody_pool: Pubkey,
-    /// Pool principal included in `reserved_floor` at the most recent custody handoff.
-    /// A later recovery/re-handoff may replace only this component with the pool's new
-    /// live outstanding principal; retained insurance and DAO-raised buffers stay locked.
+    /// Pool-owned insurance included in `reserved_floor` at the most recent custody
+    /// handoff. A later recovery/re-handoff may replace only this component with the
+    /// pool's new live insurance claim; retained insurance and DAO-raised buffers stay locked.
     custody_principal: u64,
     /// Current-layout custody provenance. Historical zero means no safe inference.
     /// Pool-less terminal recovery requires the explicit empty-at-handoff marker.
@@ -424,23 +436,28 @@ struct Config {
     /// Fractional numerator used to apportion each combined pull between auction and
     /// savings. Its denominator is the current auction+savings bps total.
     auction_split_remainder_bps: u16,
+    /// Sum of asset-0's two cumulative insurance-spent counters at the most recent
+    /// pool handoff. Unlike a balance snapshot, this cannot be raised by later fees
+    /// or donations, so recovery can preserve losses that occurred under TWAP custody.
+    custody_insurance_spent: u128,
 }
 
 impl Config {
     fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
         if (data.len() != LEGACY_CONFIG_SIZE
             && data.len() != CUSTODY_CONFIG_SIZE
+            && data.len() != PROVENANCE_CONFIG_SIZE
             && data.len() < CONFIG_SIZE)
             || data[..8] != CONFIG_DISC
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        let custody_mode = if data.len() >= CONFIG_SIZE {
+        let custody_mode = if data.len() >= PROVENANCE_CONFIG_SIZE {
             data[265]
         } else {
             0
         };
-        let rehandoff_pending = if data.len() >= CONFIG_SIZE {
+        let rehandoff_pending = if data.len() >= PROVENANCE_CONFIG_SIZE {
             data[266]
         } else {
             0
@@ -487,7 +504,7 @@ impl Config {
             } else {
                 Pubkey::default()
             },
-            custody_principal: if data.len() >= CONFIG_SIZE {
+            custody_principal: if data.len() >= PROVENANCE_CONFIG_SIZE {
                 u64::from_le_bytes(data[257..265].try_into().unwrap())
             } else {
                 0
@@ -497,12 +514,18 @@ impl Config {
             buyback_remainder_bps,
             external_surplus_remainder_bps,
             auction_split_remainder_bps,
+            custody_insurance_spent: if data.len() >= CONFIG_SIZE {
+                u128::from_le_bytes(data[272..288].try_into().unwrap())
+            } else {
+                0
+            },
         })
     }
 
     fn serialize(&self, data: &mut [u8]) -> ProgramResult {
         if data.len() != LEGACY_CONFIG_SIZE
             && data.len() != CUSTODY_CONFIG_SIZE
+            && data.len() != PROVENANCE_CONFIG_SIZE
             && data.len() < CONFIG_SIZE
         {
             return Err(ProgramError::InvalidAccountData);
@@ -529,7 +552,7 @@ impl Config {
         data[193..225].copy_from_slice(self.base_unit_savings_account.as_ref());
         if data.len() >= CUSTODY_CONFIG_SIZE {
             data[225..257].copy_from_slice(self.custody_pool.as_ref());
-            if data.len() >= CONFIG_SIZE {
+            if data.len() >= PROVENANCE_CONFIG_SIZE {
                 data[257..265].copy_from_slice(&self.custody_principal.to_le_bytes());
                 data[265] = self.custody_mode;
                 data[266] = self.rehandoff_pending as u8;
@@ -549,6 +572,11 @@ impl Config {
             + (self.auction_split_remainder_bps as u64) * REMAINDER_RADIX_SQUARED;
         data[remainder_offset..remainder_offset + 5]
             .copy_from_slice(&packed_remainders.to_le_bytes()[..5]);
+        if data.len() >= CONFIG_SIZE {
+            data[272..288].copy_from_slice(&self.custody_insurance_spent.to_le_bytes());
+        } else if self.custody_insurance_spent != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(())
     }
 }
@@ -736,6 +764,7 @@ fn process_init_config(
         buyback_remainder_bps: 0,
         external_surplus_remainder_bps: 0,
         auction_split_remainder_bps: 0,
+        custody_insurance_spent: 0,
     };
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
@@ -971,7 +1000,8 @@ fn process_accept_operator(
 
 // accept_from_subledger accounts: [squads_vault(signer on first handoff), pool(current_admin signer),
 //   config, twap_authority, market_slab(w), percolator_program]
-// data: pool_outstanding_principal(u128), supplied by the fixed subledger CPI.
+// data: protected_owner_insurance(u128) |
+//   aggregate_insurance_spent(u128, present for cross-backed pools), supplied by the fixed CPI.
 //
 // The call is reachable through subledger::handoff_to_twap only: Squads chooses the
 // first handoff, while any caller may resume an established current-layout binding
@@ -982,10 +1012,14 @@ fn process_accept_from_subledger(
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 16 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let protected_floor = u128::from_le_bytes(data.try_into().unwrap());
+    let (protected_floor, insurance_spent) = match data.len() {
+        16 => (u128::from_le_bytes(data.try_into().unwrap()), None),
+        32 => (
+            u128::from_le_bytes(data[..16].try_into().unwrap()),
+            Some(u128::from_le_bytes(data[16..32].try_into().unwrap())),
+        ),
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let current_admin = next_account_info(iter)?;
@@ -1008,7 +1042,7 @@ fn process_accept_from_subledger(
         twap_authority,
         market_slab,
         percolator_program,
-        Some((current_admin, protected_floor)),
+        Some((current_admin, protected_floor, insurance_spent)),
     )
 }
 
@@ -1021,7 +1055,7 @@ fn process_accept_custody<'a>(
     twap_authority: &AccountInfo<'a>,
     market_slab: &AccountInfo<'a>,
     percolator_program: &AccountInfo<'a>,
-    source_pool: Option<(&AccountInfo<'a>, u128)>,
+    source_pool: Option<(&AccountInfo<'a>, u128, Option<u128>)>,
 ) -> ProgramResult {
     if !current_admin.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
@@ -1030,8 +1064,8 @@ fn process_accept_custody<'a>(
         return Err(ProgramError::IllegalOwner);
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    let established_rehandoff = if let Some((pool, _)) = source_pool {
-        config_account.data_len() >= CONFIG_SIZE
+    let established_rehandoff = if let Some((pool, _, _)) = source_pool {
+        config_account.data_len() >= PROVENANCE_CONFIG_SIZE
             && config.custody_mode == CUSTODY_MODE_POOL_BOUND
             && config.custody_pool == *pool.key
             && config.rehandoff_pending
@@ -1042,7 +1076,7 @@ fn process_accept_custody<'a>(
         return Err(ProgramError::MissingRequiredSignature);
     }
     let mut persist_config = false;
-    if let Some((pool, protected_floor)) = source_pool {
+    if let Some((pool, protected_floor, insurance_spent)) = source_pool {
         if !config_account.is_writable || config_account.data_len() < CUSTODY_CONFIG_SIZE {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -1054,7 +1088,7 @@ fn process_accept_custody<'a>(
             u64::try_from(protected_floor).map_err(|_| ProgramError::InvalidAccountData)?;
         let is_rehandoff = config.custody_pool == *pool.key;
         config.custody_pool = *pool.key;
-        if config_account.data_len() >= CONFIG_SIZE && is_rehandoff {
+        if config_account.data_len() >= PROVENANCE_CONFIG_SIZE && is_rehandoff {
             // The fixed subledger CPI is the only path allowed to lower any part of the floor.
             // Remove exactly the pool principal recorded at the previous handoff, preserving
             // every retained/DAO-raised buffer, then add the pool's current live principal.
@@ -1073,10 +1107,25 @@ fn process_accept_custody<'a>(
         } else if config.reserved_floor == u128::MAX || config.reserved_floor < protected_floor {
             config.reserved_floor = protected_floor;
         }
-        if config_account.data_len() >= CONFIG_SIZE {
+        if config_account.data_len() >= PROVENANCE_CONFIG_SIZE {
             config.custody_principal = new_pool_principal;
             config.custody_mode = CUSTODY_MODE_POOL_BOUND;
             config.rehandoff_pending = false;
+        }
+        if let Some(insurance_spent) = insurance_spent {
+            if insurance_spent
+                != read_asset_insurance_spent_total(
+                    &market_slab.try_borrow_data()?,
+                    config.market_0_domain as usize,
+                )?
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            if config_account.data_len() >= CONFIG_SIZE {
+                config.custody_insurance_spent = insurance_spent;
+            }
+        } else if config_account.data_len() >= CONFIG_SIZE {
+            config.custody_insurance_spent = 0;
         }
         persist_config = true;
     }
@@ -1104,7 +1153,7 @@ fn process_accept_custody<'a>(
         // Only current-layout configs can persist proof that a pool-less handoff
         // started empty. Historical unmarked configs keep their existing live
         // behavior but cannot later infer that terminal insurance is protocol-owned.
-        if config_account.data_len() >= CONFIG_SIZE {
+        if config_account.data_len() >= PROVENANCE_CONFIG_SIZE {
             if !config_account.is_writable {
                 return Err(ProgramError::InvalidAccountData);
             }
@@ -1185,7 +1234,8 @@ fn process_accept_custody<'a>(
 //   twap_authority(current_admin), pool(w), market_slab(w), percolator_program,
 //   subledger_program, owner(signer, optional), position(w, optional),
 //   owner_destination(w, optional), pool_holding(w, optional),
-//   percolator_vault(w, optional), vault_authority(optional), token_program(optional)]
+//   percolator_vault(w, optional), vault_authority(optional),
+//   cross_backing_long_ledger?, cross_backing_short_ledger?, token_program(optional)]
 // data: owner exit = expected_principal(u64) | expected_start_slot(u64) |
 //   expected_action_nonce(u64);
 //       no-owner governance/resolved return = empty
@@ -1210,31 +1260,41 @@ fn process_return_to_subledger(
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let subledger_program = next_account_info(iter)?;
-    let owner_exit = match iter.as_slice() {
-        [] => None,
+    let (owner_exit, recovery_backing_ledgers) = match iter.as_slice() {
+        [] => (None, None),
+        [long_backing_ledger, short_backing_ledger] => {
+            (None, Some([long_backing_ledger, short_backing_ledger]))
+        }
         [owner, position, owner_destination, pool_holding, percolator_vault, vault_authority, token_program] => {
-            Some((
-                owner,
-                position,
-                owner_destination,
-                pool_holding,
-                percolator_vault,
-                vault_authority,
+            (
+                Some((
+                    owner,
+                    position,
+                    owner_destination,
+                    pool_holding,
+                    percolator_vault,
+                    vault_authority,
+                    None,
+                    token_program,
+                )),
                 None,
-                token_program,
-            ))
+            )
         }
         [owner, position, owner_destination, pool_holding, percolator_vault, vault_authority, long_backing_ledger, short_backing_ledger, token_program] => {
-            Some((
-                owner,
-                position,
-                owner_destination,
-                pool_holding,
-                percolator_vault,
-                vault_authority,
-                Some([long_backing_ledger, short_backing_ledger]),
-                token_program,
-            ))
+            let ledgers = Some([long_backing_ledger, short_backing_ledger]);
+            (
+                Some((
+                    owner,
+                    position,
+                    owner_destination,
+                    pool_holding,
+                    percolator_vault,
+                    vault_authority,
+                    ledgers,
+                    token_program,
+                )),
+                ledgers,
+            )
         }
         _ => return Err(ProgramError::InvalidInstructionData),
     };
@@ -1321,7 +1381,7 @@ fn process_return_to_subledger(
             // its accept CPI revalidates the canonical Subledger PDA. This lets that
             // pool invoke the fixed asset-0 backing cleanup when its provider is absent.
         } else {
-            if config_account.data_len() < CONFIG_SIZE
+            if config_account.data_len() < PROVENANCE_CONFIG_SIZE
                 || config.custody_mode != CUSTODY_MODE_POOL_BOUND
                 || config.rehandoff_pending
             {
@@ -1354,26 +1414,39 @@ fn process_return_to_subledger(
         }
     }
 
+    let pool_meta = if pool.is_writable {
+        AccountMeta::new(*pool.key, false)
+    } else {
+        AccountMeta::new_readonly(*pool.key, false)
+    };
+    let mut accept_accounts = vec![
+        AccountMeta::new_readonly(*twap_authority.key, true),
+        pool_meta,
+        AccountMeta::new(*market_slab.key, false),
+        AccountMeta::new_readonly(*percolator_program.key, false),
+        AccountMeta::new_readonly(*config_account.key, false),
+    ];
+    let mut accept_infos = vec![
+        twap_authority.clone(),
+        pool.clone(),
+        market_slab.clone(),
+        percolator_program.clone(),
+        config_account.clone(),
+    ];
+    if let Some(ledgers) = recovery_backing_ledgers {
+        for ledger in ledgers {
+            accept_accounts.push(AccountMeta::new_readonly(*ledger.key, false));
+            accept_infos.push(ledger.clone());
+        }
+    }
+    accept_infos.push(subledger_program.clone());
     invoke_signed(
         &Instruction {
             program_id: *subledger_program.key,
-            accounts: vec![
-                AccountMeta::new_readonly(*twap_authority.key, true),
-                AccountMeta::new(*pool.key, false),
-                AccountMeta::new(*market_slab.key, false),
-                AccountMeta::new_readonly(*percolator_program.key, false),
-                AccountMeta::new_readonly(*config_account.key, false),
-            ],
+            accounts: accept_accounts,
             data: vec![SUBLEDGER_IX_ACCEPT_OPERATOR],
         },
-        &[
-            twap_authority.clone(),
-            pool.clone(),
-            market_slab.clone(),
-            percolator_program.clone(),
-            config_account.clone(),
-            subledger_program.clone(),
-        ],
+        &accept_infos,
         &[&auth_seeds],
     )?;
 
@@ -1836,7 +1909,7 @@ fn process_accept_cross_backing_earnings(
     }
 
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    if config_account.data_len() < CONFIG_SIZE
+    if config_account.data_len() < PROVENANCE_CONFIG_SIZE
         || config.market_0_domain != 0
         || config.custody_mode != CUSTODY_MODE_POOL_BOUND
         || config.custody_pool != *pool.key
@@ -4888,7 +4961,7 @@ mod tests {
 
     #[test]
     fn config_round_trips() {
-        let c = Config {
+        let mut c = Config {
             coin_mint: Pubkey::new_unique(),
             market_slab: Pubkey::new_unique(),
             percolator_program: Pubkey::new_unique(),
@@ -4909,6 +4982,7 @@ mod tests {
             buyback_remainder_bps: 9_999,
             external_surplus_remainder_bps: 8_888,
             auction_split_remainder_bps: 7_777,
+            custody_insurance_spent: 123_456_789_012_345,
         };
         let mut buf = [0u8; CONFIG_SIZE];
         c.serialize(&mut buf).unwrap();
@@ -4931,6 +5005,19 @@ mod tests {
         assert_eq!(d.buyback_remainder_bps, 9_999);
         assert_eq!(d.external_surplus_remainder_bps, 8_888);
         assert_eq!(d.auction_split_remainder_bps, 7_777);
+        assert_eq!(d.custody_insurance_spent, c.custody_insurance_spent);
+
+        assert!(c
+            .serialize(&mut [0u8; PROVENANCE_CONFIG_SIZE])
+            .is_err());
+        c.custody_insurance_spent = 0;
+
+        let mut provenance_predecessor = [0u8; PROVENANCE_CONFIG_SIZE];
+        c.serialize(&mut provenance_predecessor).unwrap();
+        let provenance_old = Config::deserialize(&provenance_predecessor).unwrap();
+        assert_eq!(provenance_old.custody_principal, c.custody_principal);
+        assert_eq!(provenance_old.custody_mode, c.custody_mode);
+        assert_eq!(provenance_old.custody_insurance_spent, 0);
 
         let mut predecessor = [0u8; CUSTODY_CONFIG_SIZE];
         c.serialize(&mut predecessor).unwrap();
@@ -4952,7 +5039,7 @@ mod tests {
 
         // The immediate predecessor wrote a standalone little-endian buyback u16 at the start
         // of this reserved range. It remains a valid packed value with both new carries zero.
-        buf[267..CONFIG_SIZE].fill(0);
+        buf[267..272].fill(0);
         buf[267..269].copy_from_slice(&9_999u16.to_le_bytes());
         let predecessor_buyback_only = Config::deserialize(&buf).unwrap();
         assert_eq!(predecessor_buyback_only.buyback_remainder_bps, 9_999);
@@ -4972,7 +5059,7 @@ mod tests {
         ));
         buf[266] = 1;
         let invalid_packed = 1_000_000_000_000u64.to_le_bytes();
-        buf[267..CONFIG_SIZE].copy_from_slice(&invalid_packed[..5]);
+        buf[267..272].copy_from_slice(&invalid_packed[..5]);
         assert!(matches!(
             Config::deserialize(&buf),
             Err(ProgramError::InvalidAccountData)
