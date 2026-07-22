@@ -10551,6 +10551,165 @@ fn probe_controller_resolve_preflight_stays_bounded_at_10m_market_shape() {
     );
 }
 
+#[test]
+fn e2e_maximum_shape_empty_market_can_close_and_reclaim() {
+    const ASSET_COUNT: usize = 5_834;
+    const PRICE: u64 = 100;
+
+    let mut svm = LiteSVM::new().with_compute_budget(
+        solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        },
+    );
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    svm.airdrop(&governance.pubkey(), 1_000_000_000_000)
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 2,
+        unix_timestamp: 2,
+        ..Clock::default()
+    });
+
+    // Secondary-slot activation can reach this valid 10 MiB shape. Installing the equivalent
+    // empty fixture avoids thousands of setup transactions while the close itself executes both
+    // real SBF programs under the production transaction limit.
+    let market = Pubkey::new_unique();
+    let collateral_mint = Pubkey::new_unique();
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut wrapper = percolator_prog::state::WrapperConfigV16::default();
+    wrapper.marketauth = controller.to_bytes();
+    wrapper.collateral_mint = collateral_mint.to_bytes();
+    wrapper.last_good_oracle_slot = 1;
+    wrapper.oracle_mode = percolator_prog::constants::ORACLE_MODE_MANUAL;
+    wrapper.mark_ewma_e6 = PRICE;
+    wrapper.mark_ewma_last_slot = 1;
+    wrapper.oracle_target_price_e6 = PRICE;
+    let config = percolator_prog::risk::V16Config::public_user_fund_with_market_slots(
+        percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
+        ASSET_COUNT as u32,
+        0,
+        10,
+    );
+    let mut market_data = vec![
+        0u8;
+        percolator_prog::state::market_account_len_for_capacity(ASSET_COUNT).unwrap()
+    ];
+    percolator_prog::state::init_market_account_zero_copy(
+        &mut market_data,
+        &wrapper,
+        config,
+        market.to_bytes(),
+        PRICE,
+        1,
+    )
+    .expect("construct the maximum current market shape");
+    svm.set_account(
+        market,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(market_data.len()),
+            data: market_data,
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let witness = controller_market_generation_witness(&svm, &market);
+    let mut resolve_data = vec![0u8];
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(witness, false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("maximum-shape market resolves before terminal close");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let primary_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let primary_transit = Pubkey::new_unique();
+    let primary_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &primary_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &primary_transit,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &primary_destination,
+        &collateral_mint,
+        &governance.pubkey(),
+        0,
+    );
+
+    svm.expire_blockhash();
+    let metadata = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new(governance.pubkey(), true),
+                    AccountMeta::new(controller, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new(primary_vault, false),
+                    AccountMeta::new(primary_transit, false),
+                    AccountMeta::new(primary_destination, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new(retired_market_pda(&market, &perc_id()), false),
+                ],
+                data: vec![5u8],
+            }],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            svm.latest_blockhash(),
+        ))
+        .expect("a maximum-shape empty market must remain terminally closable");
+    eprintln!(
+        "10 MiB controller CloseSlab used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        metadata.compute_units_consumed < 1_200_000,
+        "maximum-shape terminal close used {} CU",
+        metadata.compute_units_consumed
+    );
+    assert!(
+        svm.get_account(&market)
+            .map_or(true, |account| account.lamports == 0),
+        "the maximum-shape slab is reclaimed"
+    );
+}
+
 // A TWAP bid is a standing COIN/collateral order rather than a
 // Percolator-position instruction. Exercise it across an asset-0 market generation change and
 // verify that neither side receives terms outside the signed bid or the protected insurance floor.
@@ -14718,6 +14877,29 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         &controller,
         0,
     );
+    let transit_dust = 7u64;
+    let dust_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &dust_source,
+        &collateral_mint,
+        &payer.pubkey(),
+        transit_dust,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &dust_source,
+            &clean_controller_transit,
+            &payer.pubkey(),
+            &[],
+            transit_dust,
+        )
+        .unwrap(),
+    )
+    .expect("an unaffiliated account can dust the public return transit");
     assert!(
         send(
             &mut svm,
@@ -14814,20 +14996,13 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
     assert_eq!(token_amount(&svm, &attacker_destination), 0);
     assert_eq!(token_amount(&svm, &provider_destination), 0);
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
-    assert!(
-        svm.get_account(&clean_controller_transit)
-            .map_or(true, |account| account.lamports == 0),
-        "fallback controller transit closes after the terminal return"
+    assert_eq!(
+        token_amount(&svm, &clean_controller_transit),
+        transit_dust,
+        "the provider receives only slab-attributed backing, never unsolicited transit value"
     );
 
-    let close_transit = Pubkey::new_unique();
-    set_token(
-        &mut svm,
-        &close_transit,
-        &collateral_mint,
-        &controller,
-        0,
-    );
+    let close_transit = clean_controller_transit;
     let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
@@ -14887,6 +15062,16 @@ fn e2e_frozen_provider_ata_cannot_block_backing_return_or_market_close() {
         close_market(close_transit),
     )
     .expect("the recovered backing and frozen canonical transit no longer block real CloseSlab");
+    assert_eq!(
+        token_amount(&svm, &governance_destination),
+        transit_dust,
+        "terminal reclaim forwards only the unattributed transit remainder to governance"
+    );
+    assert!(
+        svm.get_account(&close_transit)
+            .map_or(true, |account| account.lamports == 0),
+        "the dusted return transit closes during terminal reclaim"
+    );
     assert!(
         svm.get_account(&slab)
             .map_or(true, |account| account.lamports == 0),
@@ -16811,6 +16996,11 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     // If the provider disappears now, any cranker can complete shutdown without
     // acquiring custody: the controller must return all remaining backing only to
     // the provider recorded in Percolator's asset profile.
+    // ATTACK PROBE: a hostile cranker returns only part of the abandoned long-domain
+    // principal, then lets whole-market stale resolution mature. The resolved path
+    // must be able to continue from the already-initialized controller ledger and
+    // return the exact remainder without the absent provider or DAO signing.
+    let shutdown_return_amount = abandoned_amount / 2;
     let return_abandoned = controller_return_shutdown_backing_ix(
         &squads_vault,
         &controller,
@@ -16822,15 +17012,15 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         &backing_ledger,
         &perc_id(),
         2,
-        abandoned_amount as u128,
+        shutdown_return_amount as u128,
         live_provider_earnings as u128,
     );
     send(&mut svm, &[&payer], return_abandoned)
         .expect("permissionless crank returns abandoned backing to the recorded provider");
     assert_eq!(
         token_amount(&svm, &provider_destination),
-        asset_insurance_amount + abandoned_amount + live_provider_earnings,
-        "recorded provider receives both earnings and remaining principal"
+        asset_insurance_amount + shutdown_return_amount + live_provider_earnings,
+        "recorded provider receives the partial principal and all requested earnings"
     );
     let controller_ledger = percolator_prog::state::read_backing_domain_ledger(
         &svm.get_account(&backing_ledger).unwrap().data,
@@ -16841,6 +17031,16 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     assert_eq!(
         controller_ledger.total_earnings_withdrawn_atoms,
         live_provider_earnings as u128
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&slab).unwrap().data,
+            1,
+        )
+        .unwrap()[0]
+            .principal_atoms,
+        (abandoned_amount - shutdown_return_amount) as u128,
+        "authoritative slab accounting must retain the exact unresolved remainder"
     );
     assert!(
         svm.get_account(&controller_transit)
@@ -17010,7 +17210,7 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     assert_eq!(
         token_amount(&svm, &provider_destination),
         asset_insurance_amount
-            + abandoned_amount
+            + shutdown_return_amount
             + live_provider_earnings
             + resolved_only_insurance_amount
     );
@@ -22667,6 +22867,16 @@ fn materialize_public_transient_backing(
     env: &GenesisEnv,
     oracle: &Keypair,
 ) -> PublicTransientBackingActors {
+    materialize_public_transient_backing_with_capital(svm, payer, env, oracle, 1_000_000)
+}
+
+fn materialize_public_transient_backing_with_capital(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &GenesisEnv,
+    oracle: &Keypair,
+    trader_capital: u64,
+) -> PublicTransientBackingActors {
     use percolator_prog::ix::Instruction as PIx;
 
     let observer = Keypair::new();
@@ -22693,7 +22903,6 @@ fn materialize_public_transient_backing(
     .expect("configure authenticated public-loss mark");
     let observer_portfolio =
         create_cross_backing_loss_portfolio(svm, payer, env, &observer, 0);
-    let trader_capital = 1_000_000u64;
     let long_portfolio =
         create_cross_backing_loss_portfolio(svm, payer, env, &long, trader_capital);
     let short_portfolio =
@@ -22753,7 +22962,7 @@ fn materialize_public_transient_backing(
         crank_cross_backing_loss_portfolio(svm, payer, env, short_portfolio, slot, false);
     }
     crank_cross_backing_loss_portfolio(svm, payer, env, long_portfolio, slot, false);
-    for _ in 0..256 {
+    for _ in 0..1_024 {
         let state = percolator_prog::state::read_portfolio(
             &svm.get_account(&long_portfolio).unwrap().data,
         )
@@ -48322,6 +48531,16 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         &long_owner.pubkey(),
         &long_portfolio.pubkey(),
     );
+    send(
+        &mut svm,
+        &[&reinitializer],
+        solana_sdk::system_instruction::transfer(&reinitializer.pubkey(), &archive, 1),
+    )
+    .expect("an unaffiliated user prefunds the deterministic archive PDA");
+    let prefunded_archive = svm.get_account(&archive).unwrap();
+    assert_eq!(prefunded_archive.owner, system_program::ID);
+    assert!(prefunded_archive.data.is_empty());
+    assert_eq!(prefunded_archive.lamports, 1);
     let cleanup = Instruction {
         program_id: controller_id(),
         accounts: vec![
@@ -48361,6 +48580,10 @@ fn e2e_terminal_portfolio_cleanup_archives_uncrystallized_funding_rewards() {
         "the attacker rematerialized the victim key without its signature"
     );
     assert_eq!(svm.get_account(&archive).unwrap().owner, rd_id());
+    assert!(
+        svm.get_account(&archive).unwrap().lamports > 1,
+        "terminal cleanup adopts and rent-funds the prefunded archive PDA"
+    );
     assert_eq!(
         u64::from_le_bytes(
             svm.get_account(&archive).unwrap().data[256..264]
@@ -51929,6 +52152,314 @@ fn e2e_public_same_key_rematerialization_cannot_strand_frozen_lp_reward() {
     );
 }
 
+// PUBLIC LIVENESS PROBE: TWAP owns the insurance roles after handoff while the
+// owner-bound genesis pool still owns both backing buckets. A cross-backed owner
+// exit therefore exercises the wider fixed CPI shape. Each owner must be able to
+// recover exactly their own 50/50 principal, and an unrelated cranker must be able
+// to resume TWAP custody without another governance round-trip.
+#[test]
+fn e2e_cross_backers_exit_live_twap_custody_and_permissionlessly_rehandoff() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_cross_backing_genesis(&mut svm, &payer);
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+    let pool_holding = canonical_insurance_vault(&env.pool, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+
+    let principal = 4u64;
+    let mut owners = Vec::new();
+    for _ in 0..2 {
+        let owner = Keypair::new();
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &env.collateral_mint,
+            &owner.pubkey(),
+            principal,
+        );
+        let position = sub_position_pda(&env.pool, &owner.pubkey());
+        let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+        deposit_data.extend_from_slice(&principal.to_le_bytes());
+        send(
+            &mut svm,
+            &[&payer, &owner],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new(env.long_backing_ledger, false),
+                    AccountMeta::new(env.short_backing_ledger, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: deposit_data,
+            },
+        )
+        .expect("cross-backer deposits before handoff");
+        owners.push((owner, destination, position));
+    }
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 4);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>(),
+        4,
+    );
+
+    // Model the exact engine-valid state emitted by the separately covered
+    // backing-utilization fee path. The owner-return CPI must sweep these atoms
+    // into the canonical pool escrow without adding them to either owner claim.
+    let long_backing_earnings = 1u64;
+    let short_backing_earnings = 2u64;
+    let backing_earnings = long_backing_earnings + short_backing_earnings;
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &vault_authority,
+        2 * principal + backing_earnings,
+    );
+    let mut market_with_earnings = svm.get_account(&env.slab).unwrap();
+    {
+        let (_, group) =
+            percolator_prog::state::market_view_mut(&mut market_with_earnings.data).unwrap();
+        group.header.vault =
+            percolator::V16PodU128::new(group.header.vault.get() + u128::from(backing_earnings));
+        group.header.backing_provider_earnings_total = percolator::V16PodU128::new(
+            group.header.backing_provider_earnings_total.get() + u128::from(backing_earnings),
+        );
+        group.markets[0].engine.backing_long.utilization_fee_earnings =
+            percolator::V16PodU128::new(u128::from(long_backing_earnings));
+        group.markets[0].engine.backing_short.utilization_fee_earnings =
+            percolator::V16PodU128::new(u128::from(short_backing_earnings));
+        group
+            .validate_shape()
+            .expect("the backing-earnings fixture remains engine-valid");
+    }
+    svm.set_account(env.slab, market_with_earnings).unwrap();
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize TWAP config");
+    let twap_config = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_config.as_ref()], &twap_id()).0;
+    let handoff = build_cross_backing_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_config,
+        &twap_authority,
+        &perc_id(),
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
+    );
+    let handoff_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_config, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(env.long_backing_ledger, false),
+        AccountMeta::new_readonly(env.short_backing_ledger, false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &handoff,
+        &handoff_remaining,
+    )
+    .expect("genesis pool hands insurance custody to TWAP");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 4);
+
+    let owner_exit = |svm: &LiteSVM, owner: &Pubkey, destination: &Pubkey, position: &Pubkey| {
+        let mut exit = twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_config,
+            &twap_authority,
+            &perc_id(),
+        );
+        exit.accounts[1] = AccountMeta::new(twap_config, false);
+        exit.accounts[3] = AccountMeta::new(env.pool, false);
+        exit.accounts
+            .push(AccountMeta::new_readonly(*owner, true));
+        exit.accounts.push(AccountMeta::new(*position, false));
+        exit.accounts.push(AccountMeta::new(*destination, false));
+        exit.accounts.push(AccountMeta::new(pool_holding, false));
+        exit.accounts.push(AccountMeta::new(env.perc_vault, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(vault_authority, false));
+        exit.accounts
+            .push(AccountMeta::new(env.long_backing_ledger, false));
+        exit.accounts
+            .push(AccountMeta::new(env.short_backing_ledger, false));
+        exit.accounts
+            .push(AccountMeta::new_readonly(spl_token::ID, false));
+        bind_subledger_full_exit_witness(svm, &mut exit, position);
+        exit
+    };
+    let permissionless_rehandoff = || Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new_readonly(env.pool, false),
+            AccountMeta::new(twap_config, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(env.long_backing_ledger, false),
+            AccountMeta::new_readonly(env.short_backing_ledger, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+        data: vec![8u8], // IX_HANDOFF_TO_TWAP
+    };
+
+    let (alice, alice_destination, alice_position) = &owners[0];
+    let alice_exit = owner_exit(
+        &svm,
+        &alice.pubkey(),
+        alice_destination,
+        alice_position,
+    );
+    send(
+        &mut svm,
+        &[&payer, alice],
+        alice_exit,
+    )
+    .expect("first cross-backer atomically returns custody and exits");
+    assert_eq!(token_amount(&svm, alice_destination), principal);
+    assert_eq!(token_amount(&svm, &pool_holding), backing_earnings);
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 2);
+    assert_eq!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.principal_atoms)
+        .sum::<u128>(),
+        2,
+    );
+
+    send(&mut svm, &[&payer], permissionless_rehandoff())
+        .expect("unrelated cranker resumes TWAP after the first exit");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 2);
+
+    let (bob, bob_destination, bob_position) = &owners[1];
+    let bob_exit = owner_exit(&svm, &bob.pubkey(), bob_destination, bob_position);
+    send(&mut svm, &[&payer, bob], bob_exit)
+        .expect("second cross-backer atomically returns custody and exits");
+    assert_eq!(token_amount(&svm, bob_destination), principal);
+    assert_eq!(token_amount(&svm, &pool_holding), backing_earnings);
+    assert_eq!(read_asset_insurance_remaining(&svm, &env.slab, 0), 0);
+    assert!(
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .all(|balance| !balance.has_any_state())
+    );
+    assert_eq!(token_amount(&svm, &env.perc_vault), 0);
+
+    send(&mut svm, &[&payer], permissionless_rehandoff())
+        .expect("unrelated cranker resumes zero-principal TWAP custody");
+    assert_eq!(read_reserved_floor(&svm, &twap_config), 0);
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        subledger_route_cross_backing_earnings_ix(
+            &env.pool,
+            &env.squads_vault,
+            &env.slab,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            &perc_id(),
+            &twap_config,
+            &governance_destination,
+        ),
+    )
+    .expect("any cranker routes only the isolated earnings to bound governance");
+    assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(token_amount(&svm, &governance_destination), backing_earnings);
+    assert_eq!(
+        token_amount(&svm, alice_destination)
+            + token_amount(&svm, bob_destination)
+            + token_amount(&svm, &governance_destination),
+        2 * principal + backing_earnings,
+        "owner principal and protocol earnings conserve across both custody cycles",
+    );
+}
+
 // EXTERNAL-BACKING CAPTURE: a cross-backed genesis pool needs the backing role,
 // but it may take that role only from an empty backing state. Otherwise the pool
 // could become the withdrawal authority for principal supplied by somebody else.
@@ -52088,10 +52619,273 @@ fn e2e_cross_backing_pool_cannot_capture_external_principal() {
     }
 }
 
-// PUBLIC LOF: a bankrupt trader can temporarily materialize source-owned backing
-// above the pool's complete nominal principal. The custody handoff must not subtract
-// that transient aggregate from its insurance floor; resolved cleanup removes it,
-// after which a public TWAP crank could otherwise spend depositor insurance.
+// PUBLIC FUND-SAFETY REGRESSION: a bankruptcy after the pool-to-TWAP handoff can
+// consume one insurance domain and leave a historical B-reset anchor after every
+// position leg is gone. That unresolved loss state must keep a permissionless TWAP
+// round live without letting it pull any remaining depositor insurance.
+#[test]
+fn e2e_post_handoff_bankruptcy_blocks_twap_insurance_pull() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
+        .unwrap();
+    svm.add_program_from_file(gv_id_e2e(), so_deploy("genesis_vote_program"))
+        .unwrap();
+    svm.add_program_from_file(dist_id_e2e(), so_deploy("distribution_program"))
+        .unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let env = setup_cross_backing_genesis(&mut svm, &payer);
+    let oracle = Keypair::new();
+    install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
+
+    let depositor = Keypair::new();
+    svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
+    let principal = 4_000u64;
+    let depositor_ata = Pubkey::new_unique();
+    let pool_holding = canonical_insurance_vault(&env.pool, &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &depositor_ata,
+        &env.collateral_mint,
+        &depositor.pubkey(),
+        principal,
+    );
+    set_token(
+        &mut svm,
+        &pool_holding,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    let position = sub_position_pda(&env.pool, &depositor.pubkey());
+    let mut deposit_data = vec![4u8];
+    deposit_data.extend_from_slice(&principal.to_le_bytes());
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new(depositor_ata, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new(env.long_backing_ledger, false),
+                AccountMeta::new(env.short_backing_ledger, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: deposit_data,
+        },
+    )
+    .expect("fund cross-backed pool before handoff");
+
+    send(
+        &mut svm,
+        &[&payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &env.coin_mint,
+            &env.slab,
+            &env.multisig,
+            &env.dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize TWAP");
+    let twap_cfg = twap_config_pda(&env.slab, &env.multisig, &env.coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+    let handoff = build_cross_backing_subledger_handoff_to_twap_message(
+        &env.squads_vault,
+        &env.pool,
+        &env.slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+        &env.long_backing_ledger,
+        &env.short_backing_ledger,
+    );
+    let remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(twap_authority, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(twap_id(), false),
+        AccountMeta::new_readonly(sub_id(), false),
+        AccountMeta::new_readonly(env.long_backing_ledger, false),
+        AccountMeta::new_readonly(env.short_backing_ledger, false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &handoff,
+        &remaining,
+    )
+    .expect("handoff before public loss");
+
+    let book = book_pda(&twap_cfg);
+    let book_escrow = book_escrow_pda(&twap_cfg);
+    let coin_escrow = Pubkey::new_unique();
+    let settlement_usd = Pubkey::new_unique();
+    let twap_holding = Pubkey::new_unique();
+    set_token(&mut svm, &coin_escrow, &env.coin_mint, &book_escrow, 0);
+    set_token(
+        &mut svm,
+        &settlement_usd,
+        &env.collateral_mint,
+        &book_escrow,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &twap_holding,
+        &env.collateral_mint,
+        &twap_authority,
+        0,
+    );
+    svm.airdrop(&env.squads_vault, 1_000_000_000).unwrap();
+    let init_book = build_init_book_message(
+        &env.squads_vault,
+        &book,
+        &twap_cfg,
+        &book_escrow,
+        &coin_escrow,
+        &settlement_usd,
+        &twap_holding,
+        &env.coin_mint,
+        &env.collateral_mint,
+        0,
+        1,
+        1,
+        0,
+        0,
+        None,
+    );
+    let init_book_remaining = vec![
+        AccountMeta::new(env.squads_vault, false),
+        AccountMeta::new(book, false),
+        AccountMeta::new_readonly(twap_cfg, false),
+        AccountMeta::new_readonly(book_escrow, false),
+        AccountMeta::new_readonly(coin_escrow, false),
+        AccountMeta::new_readonly(settlement_usd, false),
+        AccountMeta::new_readonly(env.coin_mint, false),
+        AccountMeta::new_readonly(env.collateral_mint, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_holding, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        3,
+        &init_book,
+        &init_book_remaining,
+    )
+    .expect("initialize the post-handoff TWAP round");
+
+    let floor_before = read_reserved_floor(&svm, &twap_cfg);
+    let insurance_before = read_asset_insurance_remaining(&svm, &env.slab, 0);
+    assert_eq!(floor_before, u128::from(principal / 2));
+    assert_eq!(insurance_before, u128::from(principal / 2));
+
+    let _actors = materialize_public_transient_backing_with_capital(
+        &mut svm,
+        &payer,
+        &env,
+        &oracle,
+        998_000,
+    );
+    let market_data = svm.get_account(&env.slab).unwrap().data;
+    let insurance_after = read_asset_insurance_remaining(&svm, &env.slab, 0);
+    let exposed = percolator_accounting::asset_has_position_or_loss_state(&market_data, 0).unwrap();
+    assert_eq!(
+        insurance_after,
+        u128::from(principal / 4),
+        "the public bankruptcy consumes one real Genesis insurance domain",
+    );
+    assert!(
+        exposed,
+        "the settled side reset remains an unresolved historical loss until terminal recovery",
+    );
+
+    let round_before = u64::from_le_bytes(
+        svm.get_account(&book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    let current_slot = svm.get_sysvar::<Clock>().slot;
+    warp_to(&mut svm, current_slot.max(round_before));
+    let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+    let execute_env = HandoffEnv {
+        squads: env.squads,
+        multisig: env.multisig,
+        dao: env.dao,
+        squads_vault: env.squads_vault,
+        slab: env.slab,
+        collateral_mint: env.collateral_mint,
+        coin_mint: env.coin_mint,
+        coin_mint_authority: env.mint_auth,
+        twap_cfg,
+        twap_authority,
+        perc_vault: env.perc_vault,
+        vault_authority,
+        principal,
+        surplus: 0,
+    };
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &execute_env,
+            &book,
+            &twap_holding,
+            &settlement_usd,
+            &book_escrow,
+            &coin_escrow,
+            None,
+        ),
+    )
+    .expect("permissionless TWAP round advances across the historical loss");
+
+    let round_after = u64::from_le_bytes(
+        svm.get_account(&book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(round_after > round_before);
+    assert_eq!(token_amount(&svm, &twap_holding), 0);
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &execute_env.slab, 0),
+        insurance_after,
+        "unresolved backing loss keeps every remaining insurance atom in Percolator",
+    );
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), floor_before);
+}
+
 #[test]
 fn e2e_transient_trader_backing_cannot_lower_the_twap_principal_floor() {
     let mut svm =
@@ -52838,6 +53632,73 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
     )
     .expect("Squads donates lifecycle control while custody remains constrained");
 
+    // PUBLIC LOF PROBE: the controller shutdown instruction accepts a raw backing
+    // domain and an external-provider destination. Asset 0 must never acquire the
+    // secondary-asset shutdown override, or a caller could move Genesis backing to
+    // a noncanonical pool-owned token account that the Subledger cannot redeem.
+    let noncanonical_pool_destination = Pubkey::new_unique();
+    let shutdown_transit = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &noncanonical_pool_destination,
+        &env.collateral_mint,
+        &env.pool,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &shutdown_transit,
+        &env.collateral_mint,
+        &controller,
+        0,
+    );
+    let shutdown_ledger = Pubkey::new_unique();
+    svm.set_account(
+        shutdown_ledger,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::backing_domain_ledger_account_len()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    let market_before_shutdown_probe = svm.get_account(&env.slab).unwrap();
+    let vault_before_shutdown_probe = svm.get_account(&env.perc_vault).unwrap();
+    let ledger_before_shutdown_probe = svm.get_account(&shutdown_ledger).unwrap();
+    let shutdown_probe = send(
+        &mut svm,
+        &[&payer],
+        controller_return_shutdown_backing_ix(
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &noncanonical_pool_destination,
+            &shutdown_transit,
+            &env.perc_vault,
+            &vault_authority,
+            &shutdown_ledger,
+            &perc_id(),
+            0,
+            1,
+            0,
+        ),
+    )
+    .expect_err("market authority cannot exercise a shutdown override over Genesis backing");
+    assert!(
+        shutdown_probe.contains("Custom(8)"),
+        "the real Percolator must reject the otherwise valid controller path as unauthorized: {shutdown_probe}",
+    );
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_shutdown_probe);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_shutdown_probe);
+    assert_eq!(
+        svm.get_account(&shutdown_ledger).unwrap(),
+        ledger_before_shutdown_probe,
+    );
+    assert_eq!(token_amount(&svm, &noncanonical_pool_destination), 0);
+    assert_eq!(token_amount(&svm, &shutdown_transit), 0);
+
     let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
@@ -53189,8 +54050,15 @@ fn e2e_cross_backing_terminal_cleanup_preserves_claims_and_routes_only_surplus()
 // re-handoff intentionally preserves that floor, so the auction cannot pull it while CloseSlab
 // cannot close over it. Terminal recovery must prove the bound pool has no principal and route the
 // exact residual through an empty TWAP-owned transit only to the bound Squads vault.
-#[test]
-fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
+#[derive(Clone, Copy)]
+enum TerminalAuctionExit {
+    SettledClaim,
+    UnsettledCancel,
+}
+
+fn run_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
+    auction_exit: TerminalAuctionExit,
+) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -53212,12 +54080,32 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
         .unwrap();
     let env = setup_genesis(&mut svm, &payer);
+    let standing_bidder = Keypair::new();
+    svm.airdrop(&standing_bidder.pubkey(), 1_000_000_000)
+        .unwrap();
+    let standing_bidder_coin = coin_ata_of(&standing_bidder.pubkey(), &env.coin_mint);
+    let standing_bidder_usd =
+        coin_ata_of(&standing_bidder.pubkey(), &env.collateral_mint);
+    set_token(
+        &mut svm,
+        &standing_bidder_coin,
+        &env.coin_mint,
+        &standing_bidder.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &standing_bidder_usd,
+        &env.collateral_mint,
+        &standing_bidder.pubkey(),
+        0,
+    );
     let (depositor_distribution, depositor_proposal) = register_proposal(
         &mut svm,
         &payer,
         &env,
         1,
-        &Pubkey::new_unique(),
+        &standing_bidder.pubkey(),
         100,
     );
     let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
@@ -53669,33 +54557,30 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &init_book_remaining,
     )
     .expect("futarchy initializes the continuous 50/50 auction");
+    let execute_round = || Instruction {
+        program_id: twap_id(),
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new(book, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new(twap_budget_holding, false),
+            AccountMeta::new(settlement_usd, false),
+            AccountMeta::new_readonly(book_escrow, false),
+            AccountMeta::new(coin_escrow, false),
+            AccountMeta::new(env.coin_mint, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        data: vec![8u8], // IX_EXECUTE
+    };
     let mut clock = svm.get_sysvar::<Clock>();
     clock.slot += 2;
     svm.set_sysvar(&clock);
-    send(
-        &mut svm,
-        &[&payer],
-        Instruction {
-            program_id: twap_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new(twap_cfg, false),
-                AccountMeta::new(book, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new(env.perc_vault, false),
-                AccountMeta::new_readonly(perc_vault_authority(&env.slab, &perc_id()), false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new(twap_budget_holding, false),
-                AccountMeta::new(settlement_usd, false),
-                AccountMeta::new_readonly(book_escrow, false),
-                AccountMeta::new(coin_escrow, false),
-                AccountMeta::new(env.coin_mint, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: vec![8u8], // IX_EXECUTE
-        },
-    )
+    send(&mut svm, &[&payer], execute_round())
     .expect("permissionless empty-book round ratchets the retained half into insurance");
     let retained_floor = total_principal as u128 + retained_protocol_insurance as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
@@ -53982,6 +54867,54 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     )
     .expect("permissionless trigger seals the reduced re-backed vote before resolution");
 
+    send(&mut svm, &[&payer], execute_round())
+    .expect("permissionless crank rolls the expired empty round while custody is at the pool");
+
+    // The fixed supply becomes available only after Genesis seals the winning
+    // 100% distribution. Claim through that public path, then keep a real
+    // bidder-funded order open across resolution and permissionless re-handoff.
+    let mut distribution_claim_data = vec![4u8];
+    distribution_claim_data.extend_from_slice(&0u32.to_le_bytes());
+    send(
+        &mut svm,
+        &[&standing_bidder],
+        Instruction {
+            program_id: dist_id_e2e(),
+            accounts: vec![
+                AccountMeta::new_readonly(standing_bidder.pubkey(), true),
+                AccountMeta::new_readonly(env.dist_config, false),
+                AccountMeta::new(depositor_distribution, false),
+                AccountMeta::new(env.dist_vault, false),
+                AccountMeta::new(standing_bidder_coin, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: distribution_claim_data,
+        },
+    )
+    .expect("winning recipient claims the fixed coin supply");
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 100);
+    send(
+        &mut svm,
+        &[&standing_bidder],
+        place_bid_ix(
+            &standing_bidder.pubkey(),
+            &twap_cfg,
+            &book,
+            &book_escrow,
+            &coin_escrow,
+            &standing_bidder_coin,
+            &standing_bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            1,
+            1,
+            None,
+        ),
+    )
+    .expect("post-Genesis bidder escrows one coin before resolution");
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+    assert_eq!(token_amount(&svm, &coin_escrow), 1);
+
     // Resolution can race the external re-handoff crank after these owner exits. The
     // established pending permit must remain usable in resolved mode; otherwise this ordinary
     // governance lifecycle transition would leave custody on the pool until another DAO action.
@@ -54034,6 +54967,28 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         retained_floor - exiting_principal as u128 - interleaved_exit as u128;
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
     assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
+    match auction_exit {
+        TerminalAuctionExit::SettledClaim => {
+            let standing_round_end = u64::from_le_bytes(
+                svm.get_account(&book).unwrap().data[240..248]
+                    .try_into()
+                    .unwrap(),
+            );
+            warp_to(&mut svm, standing_round_end);
+            send(&mut svm, &[&payer], execute_round())
+                .expect("standing bid settles after resolved-mode re-handoff");
+            assert_eq!(token_amount(&svm, &coin_escrow), 0);
+            assert_eq!(token_amount(&svm, &settlement_usd), 1);
+        }
+        TerminalAuctionExit::UnsettledCancel => {
+            assert_eq!(token_amount(&svm, &coin_escrow), 1);
+            assert_eq!(token_amount(&svm, &settlement_usd), 0);
+        }
+    }
+    assert_eq!(read_reserved_floor(&svm, &twap_cfg), retained_floor);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), retained_floor);
+    assert_eq!(token_amount(&svm, &standing_bidder_usd), 0);
+    assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
     let market_before_replayed_exit = svm.get_account(&env.slab).unwrap();
     let config_before_replayed_exit = svm.get_account(&twap_cfg).unwrap();
     assert!(
@@ -54646,6 +55601,67 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         svm.get_account(&env.slab)
             .map_or(true, |account| account.lamports == 0),
         "resolved market closes after every user and protocol balance exits"
+    );
+    match auction_exit {
+        TerminalAuctionExit::SettledClaim => {
+            send(
+                &mut svm,
+                &[&payer],
+                claim_ix(
+                    &payer.pubkey(),
+                    &twap_cfg,
+                    &book,
+                    &book_escrow,
+                    &settlement_usd,
+                    &coin_escrow,
+                    &standing_bidder_usd,
+                    &standing_bidder_coin,
+                    0,
+                ),
+            )
+            .expect("settled bidder claim remains live after the market slab closes");
+            assert_eq!(token_amount(&svm, &standing_bidder_usd), 1);
+            assert_eq!(token_amount(&svm, &standing_bidder_coin), 99);
+        }
+        TerminalAuctionExit::UnsettledCancel => {
+            let now = svm.get_sysvar::<Clock>().slot;
+            warp_to(&mut svm, now.saturating_add(2));
+            send(
+                &mut svm,
+                &[&standing_bidder],
+                cancel_ix(
+                    &standing_bidder.pubkey(),
+                    &twap_cfg,
+                    &book,
+                    &book_escrow,
+                    &coin_escrow,
+                    &standing_bidder_coin,
+                    0,
+                ),
+            )
+            .expect("unsettled bidder recovers escrow after the market slab closes");
+            assert_eq!(token_amount(&svm, &standing_bidder_usd), 0);
+            assert_eq!(token_amount(&svm, &standing_bidder_coin), 100);
+        }
+    }
+    assert_eq!(token_amount(&svm, &coin_escrow), 0);
+    assert_eq!(token_amount(&svm, &settlement_usd), 0);
+}
+
+#[test]
+fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated() {
+    run_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
+        TerminalAuctionExit::SettledClaim,
+    );
+}
+
+// PUBLIC LOF PROBE: terminal market cleanup is independent of an open auction book. If the
+// market closes while a real bidder is still committed, the durable TWAP escrow must remain
+// owner-recoverable after its anti-spoof cooldown even though the Percolator slab is gone.
+#[test]
+fn e2e_unsettled_bidder_recovers_after_terminal_market_close() {
+    run_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
+        TerminalAuctionExit::UnsettledCancel,
     );
 }
 
@@ -56919,8 +57935,42 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
         .unwrap();
     let env = setup_cross_backing_genesis(&mut svm, &payer);
+    let (distribution_proposal, genesis_proposal) =
+        register_proposal(&mut svm, &payer, &env, 1, &Pubkey::new_unique(), 100);
     let oracle = Keypair::new();
     install_cross_backing_public_loss_market(&mut svm, &env, &oracle.pubkey());
+
+    // Controller adoption must precede public portfolio admission. The current
+    // Subledger pool itself proves that asset-0 custody is constrained; TWAP takes
+    // over that same custody only after the public source mismatch stages principal.
+    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
+    let donate_market = build_controller_accept_market_authority_message(
+        &env.squads_vault,
+        &controller,
+        &env.slab,
+        &perc_id(),
+        &env.pool,
+    );
+    let donate_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(env.pool, false),
+        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        2,
+        &donate_market,
+        &donate_remaining,
+    )
+    .expect("controller accepts the empty market under constrained Subledger custody");
 
     let actors = materialize_public_transient_backing(&mut svm, &payer, &env, &oracle);
 
@@ -56978,6 +58028,36 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     );
     assert_eq!(token_amount(&svm, &pool_holding), 1);
 
+    let ballot = Pubkey::find_program_address(
+        &[
+            b"gv_ballot",
+            env.gv_config.as_ref(),
+            depositor.pubkey().as_ref(),
+        ],
+        &gv_id_e2e(),
+    )
+    .0;
+    let vote_data = gv_vote_data_e2e(&svm, &ballot, &position, 1);
+    send(
+        &mut svm,
+        &[&payer, &depositor],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(genesis_proposal, false),
+                AccountMeta::new(position, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new_readonly(sub_id(), false),
+            ],
+            data: vote_data,
+        },
+    )
+    .expect("the sole staged-principal depositor backs the complete distribution");
+
     send(
         &mut svm,
         &[&payer],
@@ -57022,41 +58102,132 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         &env.multisig,
         &env.dao,
         &payer,
-        2,
+        3,
         &handoff,
         &handoff_remaining,
     )
     .expect("handoff preserves the staged unit outside TWAP custody");
     assert_eq!(read_reserved_floor(&svm, &twap_cfg), 0);
 
-    let controller = controller_pda(&env.squads_vault, &env.slab, &perc_id());
-    let donate_market = build_controller_accept_market_authority_message(
-        &env.squads_vault,
-        &controller,
-        &env.slab,
-        &perc_id(),
-        &twap_cfg,
-    );
-    let donate_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(retired_market_pda(&env.slab, &perc_id()), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    squads_execute(
+    // Exercise the real pending counter through the public route. Any token holder
+    // can donate protocol value to the pool escrow; the permissionless route must
+    // move only that donation and leave the staged owner atom in place.
+    let donation_source = Pubkey::new_unique();
+    let staged_route_destination = Pubkey::new_unique();
+    set_token(
         &mut svm,
-        &env.squads,
-        &env.multisig,
-        &env.dao,
-        &payer,
-        3,
-        &donate_market,
-        &donate_remaining,
+        &donation_source,
+        &env.collateral_mint,
+        &payer.pubkey(),
+        4,
+    );
+    set_token(
+        &mut svm,
+        &staged_route_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer],
+        spl_token::instruction::transfer(
+            &spl_token::ID,
+            &donation_source,
+            &pool_holding,
+            &payer.pubkey(),
+            &[],
+            4,
+        )
+        .unwrap(),
     )
-    .expect("donate lifecycle control while TWAP retains constrained custody");
+    .expect("a public donor adds protocol value beside staged owner principal");
+    assert_eq!(token_amount(&svm, &pool_holding), 5);
+    send(
+        &mut svm,
+        &[&payer],
+        subledger_route_cross_backing_earnings_ix(
+            &env.pool,
+            &env.squads_vault,
+            &env.slab,
+            &pool_holding,
+            &env.perc_vault,
+            &perc_vault_authority(&env.slab, &perc_id()),
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            &perc_id(),
+            &twap_cfg,
+            &staged_route_destination,
+        ),
+    )
+    .expect("any cranker routes only protocol value around staged principal");
+    assert_eq!(token_amount(&svm, &staged_route_destination), 4);
+    assert_eq!(token_amount(&svm, &pool_holding), 1);
+    let pool_after_route = svm.get_account(&env.pool).unwrap().data;
+    assert_eq!(
+        [
+            u64::from_le_bytes(pool_after_route[273..281].try_into().unwrap()),
+            u64::from_le_bytes(pool_after_route[281..289].try_into().unwrap()),
+        ],
+        [0, 1],
+        "routing protocol value cannot reclassify staged owner backing",
+    );
+
+    let governance_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &governance_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let market_before_earnings_route = svm.get_account(&env.slab).unwrap();
+    let vault_before_earnings_route = svm.get_account(&env.perc_vault).unwrap();
+    assert!(
+        send(
+            &mut svm,
+            &[&payer],
+            subledger_route_cross_backing_earnings_ix(
+                &env.pool,
+                &env.squads_vault,
+                &env.slab,
+                &pool_holding,
+                &env.perc_vault,
+                &perc_vault_authority(&env.slab, &perc_id()),
+                &env.long_backing_ledger,
+                &env.short_backing_ledger,
+                &perc_id(),
+                &twap_cfg,
+                &governance_destination,
+            ),
+        )
+        .is_err(),
+        "protocol routing cannot classify staged owner backing as earnings",
+    );
+    assert_eq!(token_amount(&svm, &pool_holding), 1);
+    assert_eq!(token_amount(&svm, &governance_destination), 0);
+    assert_eq!(svm.get_account(&env.slab).unwrap(), market_before_earnings_route);
+    assert_eq!(svm.get_account(&env.perc_vault).unwrap(), vault_before_earnings_route);
+
+    advance_to_test_bootstrap_end(&mut svm);
+    send(
+        &mut svm,
+        &[&payer],
+        Instruction {
+            program_id: gv_id_e2e(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(genesis_proposal, false),
+                AccountMeta::new_readonly(dist_id_e2e(), false),
+                AccountMeta::new(env.dist_config, false),
+                AccountMeta::new(distribution_proposal, false),
+                AccountMeta::new_readonly(env.pool, false),
+            ],
+            data: vec![4u8],
+        },
+    )
+    .expect("any cranker seals the staged depositor's winning distribution");
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
     let resolve = build_controller_generation_proxy_message(
@@ -57171,19 +58342,11 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     )
     .unwrap();
     let controller_transit = Pubkey::new_unique();
-    let governance_destination = Pubkey::new_unique();
     set_token(
         &mut svm,
         &controller_transit,
         &env.collateral_mint,
         &controller,
-        0,
-    );
-    set_token(
-        &mut svm,
-        &governance_destination,
-        &env.collateral_mint,
-        &env.squads_vault,
         0,
     );
     let close = build_controller_close_and_reclaim_message(
@@ -57289,14 +58452,13 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
     )
     .expect("any cranker returns live owner custody to the bound Subledger pool");
 
-    let exit_data = subledger_insurance_withdraw_data(&svm, &position, 1, 0);
     send(
         &mut svm,
-        &[&payer, &depositor],
+        &[&payer],
         Instruction {
             program_id: sub_id(),
             accounts: vec![
-                AccountMeta::new(depositor.pubkey(), true),
+                AccountMeta::new_readonly(depositor.pubkey(), false),
                 AccountMeta::new(env.pool, false),
                 AccountMeta::new(position, false),
                 AccountMeta::new(depositor_ata, false),
@@ -57311,13 +58473,26 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
                 AccountMeta::new(env.short_backing_ledger, false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(env.gv_config, false),
+                AccountMeta::new(ballot, false),
+                AccountMeta::new(genesis_proposal, false),
+                AccountMeta::new_readonly(gv_id_e2e(), false),
             ],
-            data: exit_data,
+            data: vec![12u8], // IX_RETURN_FINALIZED_POSITION
         },
     )
-    .expect("the owner recovers the staged base unit before market retirement");
+    .expect("any cranker returns the absent voter's staged unit before market retirement");
     assert_eq!(token_amount(&svm, &depositor_ata), 1);
     assert_eq!(token_amount(&svm, &pool_holding), 0);
+    assert_eq!(
+        Pubkey::new_from_array(
+            svm.get_account(&ballot).unwrap().data[40..72]
+                .try_into()
+                .unwrap(),
+        ),
+        Pubkey::default(),
+        "the refunded Genesis vote becomes worthless",
+    );
     assert_eq!(
         u64::from_le_bytes(
             svm.get_account(&env.pool).unwrap().data[80..88]
@@ -58049,4 +59224,165 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
     assert!(svm
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
+}
+
+// PUBLIC TERMINAL-DOS PROBE: InitPortfolio accepts a program-owned account larger than the
+// canonical portfolio layout, and ClosePortfolio clears the complete supplied account before
+// reclaiming it. Exercise the 10 MiB runtime maximum: an attacker can legitimately materialize
+// that account while the market is live, but cannot make the controller's permissionless
+// post-resolution cleanup exceed the transaction compute limit or leave the slab count stuck.
+#[test]
+fn e2e_maximum_size_abandoned_portfolio_cannot_dos_terminal_cleanup() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &governance, &attacker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
+    svm.set_account(
+        slab,
+        Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; percolator_prog::state::market_account_len_for_capacity(1).unwrap()],
+            owner: perc_id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let controller = controller_pda(&governance.pubkey(), &slab, &perc_id());
+    let mut init_data = vec![1u8];
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &slab_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&slab, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("initialize controller-owned market");
+
+    let portfolio = Keypair::new();
+    let len = 10 * 1024 * 1024;
+    let rent = svm.minimum_balance_for_rent_exemption(len);
+    send(
+        &mut svm,
+        &[&attacker, &portfolio],
+        solana_sdk::system_instruction::create_account(
+            &attacker.pubkey(),
+            &portfolio.pubkey(),
+            rent,
+            len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("attacker creates a maximum-size program-owned account");
+
+    svm.expire_blockhash();
+    let init = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new_readonly(attacker.pubkey(), true),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                percolator_prog::ix::Instruction::InitPortfolio,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &attacker],
+            svm.latest_blockhash(),
+        ))
+        .expect("maximum-size account is publicly materializable as a portfolio");
+
+    let witness = controller_market_generation_witness(&svm, &slab);
+    let mut resolve_data = vec![0u8];
+    resolve_data.extend_from_slice(&percolator_prog::ix::Instruction::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(witness, false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves around the abandoned maximum-size portfolio");
+
+    svm.expire_blockhash();
+    let close = svm
+        .send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(governance.pubkey(), false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new(slab, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                ],
+                data: vec![11u8],
+            }],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        ))
+        .expect("permissionless controller cleanup closes the maximum-size portfolio");
+    eprintln!(
+        "10 MiB portfolio: init={} CU, controller close={} CU",
+        init.compute_units_consumed, close.compute_units_consumed
+    );
+    assert!(
+        close.compute_units_consumed < 1_200_000,
+        "maximum-size controller cleanup needs bounded compute headroom, used {} CU",
+        close.compute_units_consumed
+    );
+    assert!(
+        svm.get_account(&portfolio.pubkey())
+            .map_or(true, |account| account.lamports == 0),
+        "terminal cleanup dematerializes the attacker account"
+    );
+    let (_, group) =
+        percolator_prog::state::read_market(&svm.get_account(&slab).unwrap().data).unwrap();
+    assert_eq!(
+        group.materialized_portfolio_count, 0,
+        "maximum-size cleanup removes the terminal CloseSlab blocker"
+    );
 }
