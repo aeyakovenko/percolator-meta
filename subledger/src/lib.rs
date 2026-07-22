@@ -1396,6 +1396,27 @@ fn owner_backing_protection(pool: &Pool, protected_backing: u128) -> Result<u64,
         .map_err(|_| ProgramError::ArithmeticOverflow)
 }
 
+fn backing_checkpoint_after_deposit(
+    checkpoint: u64,
+    backing_deposit: u128,
+    observed_after: u64,
+) -> Result<u64, ProgramError> {
+    let backing_deposit = u64::try_from(backing_deposit)
+        .map_err(|_| ProgramError::ArithmeticOverflow)?;
+    checkpoint
+        .checked_add(backing_deposit)
+        .map(|attributed| core::cmp::min(attributed, observed_after))
+        .ok_or(ProgramError::ArithmeticOverflow)
+}
+
+fn backing_checkpoint_after_withdrawal(
+    checkpoint: u64,
+    backing_payout: u64,
+    observed_after: u64,
+) -> u64 {
+    core::cmp::min(checkpoint.saturating_sub(backing_payout), observed_after)
+}
+
 fn redeem_indexed_shares(
     shares: u128,
     share_rate_numerator: u128,
@@ -1548,7 +1569,13 @@ fn sync_indexed_cross_backing_external_loss(
     };
     sync_indexed_share_rate(pool, protected)?;
     pool.insurance_spent_checkpoint = observed_insurance_spent;
-    pool.backing_protected_checkpoint = observed_backing_protected;
+    // A recovery is protocol surplus under the loss-only policy. Only an owner
+    // backing deposit may raise this checkpoint; otherwise the same recovered
+    // atom could be charged again after a later public loss.
+    pool.backing_protected_checkpoint = core::cmp::min(
+        pool.backing_protected_checkpoint,
+        observed_backing_protected,
+    );
     Ok(())
 }
 
@@ -3353,7 +3380,12 @@ fn process_insurance_deposit(
         let backing_after = backing_before
             .checked_add(protection_deposit[1])
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        pool.backing_protected_checkpoint = owner_backing_protection(&pool, backing_after)?;
+        let observed_after = owner_backing_protection(&pool, backing_after)?;
+        pool.backing_protected_checkpoint = backing_checkpoint_after_deposit(
+            pool.backing_protected_checkpoint,
+            protection_deposit[1],
+            observed_after,
+        )?;
     }
     position.principal = position
         .principal
@@ -4281,7 +4313,12 @@ fn process_insurance_withdraw_impl(
         pool.principal_protected_checkpoint = principal_protected_after;
     }
     if pool.cross_backing && uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
-        pool.backing_protected_checkpoint = owner_backing_protection(&pool, backing_after)?;
+        let observed_after = owner_backing_protection(&pool, backing_after)?;
+        pool.backing_protected_checkpoint = backing_checkpoint_after_withdrawal(
+            pool.backing_protected_checkpoint,
+            backing_owed,
+            observed_after,
+        );
     }
     position.principal -= amount;
     // The position retires its nominal shares. Historical pools burn only the
@@ -6049,7 +6086,10 @@ mod tests {
         );
         assert!(sync_indexed_cross_backing_external_loss(&mut pool, 40, 11, 15).is_err());
         assert_eq!(pool.insurance_spent_checkpoint, 12);
-        assert_eq!(pool.backing_protected_checkpoint, 15);
+        assert_eq!(
+            pool.backing_protected_checkpoint, 14,
+            "protocol recovery cannot re-arm an already charged backing loss",
+        );
 
         sync_indexed_cross_backing_external_loss(&mut pool, 40, 13, 14).unwrap();
         assert_eq!(
@@ -6059,8 +6099,29 @@ mod tests {
                 pool.share_rate_denominator,
             )
             .unwrap(),
-            23,
-            "only newly observed insurance and backing loss lower the surviving claim",
+            24,
+            "only newly observed owner loss lowers the surviving claim",
+        );
+    }
+
+    #[test]
+    fn backing_checkpoint_tracks_only_owner_capital_flows() {
+        assert_eq!(backing_checkpoint_after_deposit(13, 2, 16), Ok(15));
+        assert_eq!(
+            backing_checkpoint_after_deposit(13, 2, 14),
+            Ok(14),
+            "a deposit cannot attribute backing that is not live",
+        );
+        assert_eq!(backing_checkpoint_after_withdrawal(15, 2, 20), 13);
+        assert_eq!(
+            backing_checkpoint_after_withdrawal(15, 0, 14),
+            14,
+            "a passive loss lowers the checkpoint without a payout",
+        );
+        assert_eq!(
+            backing_checkpoint_after_withdrawal(13, 0, 16),
+            13,
+            "protocol recovery cannot raise the checkpoint",
         );
     }
 
