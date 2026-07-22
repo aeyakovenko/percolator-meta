@@ -934,6 +934,38 @@ pub fn read_asset_backing_balances(
     ])
 }
 
+/// Returns the cumulative insurance consumed by each side of one asset generation.
+/// Budget top-ups and fee credits do not change these counters, so a custody
+/// checkpoint can distinguish a real insurance loss from later protocol inflows.
+pub fn read_asset_insurance_spent(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[u128; 2], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    let engine = asset_engine_offset(asset_index)?;
+    Ok([
+        read_u128(
+            data,
+            engine
+                .checked_add(offset_of!(
+                    EngineAssetSlotV16Account,
+                    insurance_domain_spent_long
+                ))
+                .ok_or(ReadError::Truncated)?,
+        )?,
+        read_u128(
+            data,
+            engine
+                .checked_add(offset_of!(
+                    EngineAssetSlotV16Account,
+                    insurance_domain_spent_short
+                ))
+                .ok_or(ReadError::Truncated)?,
+        )?,
+    ])
+}
+
 /// Returns the paired source-credit accounting for both backing domains.
 pub fn read_asset_backing_source_credits(
     data: &[u8],
@@ -1630,6 +1662,30 @@ mod tests {
         assert_eq!(
             read_asset_insurance_balance(&market, 0),
             Err(ReadError::InvalidAccounting)
+        );
+    }
+
+    #[test]
+    fn insurance_spent_uses_pinned_domain_offsets_and_rejects_malformed_slabs() {
+        let mut market = market_with_insurance_capacity();
+        assert_eq!(read_asset_insurance_spent(&market, 0), Ok([20, 100]));
+        assert_eq!(
+            read_asset_insurance_spent(&market, 1),
+            Err(ReadError::InvalidAsset)
+        );
+
+        let short_spent_end = asset_engine_offset(0).unwrap()
+            + offset_of!(EngineAssetSlotV16Account, insurance_domain_spent_short)
+            + size_of::<u128>();
+        assert_eq!(
+            read_asset_insurance_spent(&market[..short_spent_end - 1], 0),
+            Err(ReadError::Truncated)
+        );
+
+        market[10] = KIND_PORTFOLIO;
+        assert_eq!(
+            read_asset_insurance_spent(&market, 0),
+            Err(ReadError::InvalidHeader)
         );
     }
 
