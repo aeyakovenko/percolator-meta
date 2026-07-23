@@ -14707,3 +14707,27 @@ before resolved settlement. The identical test closes both users against program
 `fc8deac9a8c2b0fb40794bdb375d1e0a143cc61d71179467fa8f83c503465628`. This branch is an isolated
 expected-RED proof pending the upstream fix and changes no Meta production code, account layout,
 signer, authority, recipient, custody path, token amount, or administrator surface.
+
+## Tick - lapsed prospective K/F source blocked resolved close (surface A/C, REAL DOS)
+
+Asynchronous portfolio snapshots can make both sides of one balanced market carry positive pending K
+relative to their own snapshots without either portfolio recording a source-domain claim. If the
+future source backing lapses before resolution, the first lapsed-backing fix still tries to settle K/F
+before preparing that unrecorded prospective source. Support valuation fails, the transaction rolls
+back, and repeated public resolved closes cannot finish either portfolio.
+
+The retained clean-room LiteSVM regression uses real System and SPL account creation, independent
+long and short owners, an independent authenticated oracle, an external finite-lived backing provider,
+and the Meta controller's generation-bound resolve path. Against exact parent program
+`9cbae70521ff65c8ce1bdaf3cdfd4351a17cc02f` and engine
+`b6827a09add5a4c7e4db074cc45339c691364428`, sixteen alternating closes leave the long with
+99,800,000 units of capital and 100,000 units of unresolved PnL and leave the short active with all
+100,000,000 units of capital; every short close returns `Custom(19)`. The parent SBF checksum is
+`fc8deac9a8c2b0fb40794bdb375d1e0a143cc61d71179467fa8f83c503465628`.
+
+CONTROL: upstream engine `b4901b93e72ba29dcedde7efd513b08eb43fb6ab` expires one lapsed
+prospective K/F source before settlement. The identical test closes both users against program
+`93e0583526d3549b5ff13c665144d9985e4fa45f`; its SBF checksum is
+`a74fd03b242d14efdcf3b2a70d8be6b981bdd3576bef93811cb8dfed83e39cb7`. This stacked branch is an
+isolated expected-RED proof pending the upstream fix and changes no Meta production code, account
+layout, signer, authority, recipient, custody path, token amount, or administrator surface.
