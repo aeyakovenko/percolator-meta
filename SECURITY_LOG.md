@@ -14784,3 +14784,32 @@ insurance remains zero. Its SBF checksum is
 `94a543366c3f7d5c9731b55db37205616e1c3912630444a08365dae1ba011178`. This isolated expected-RED
 branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
 token amount, dependency pin, or administrator surface.
+
+## Tick - fee-redirect policy replayed across market generations (surface A/C, REAL LOF)
+
+`UpdateFeeRedirectPolicy` controls whether trade fees remain in an asset creator's withdrawable
+insurance domains or move into protected market-0 insurance, but the pinned payload identifies only
+the slab address. A market administrator can validly sign a zero-redirect policy for generation A,
+close that empty market, then configure generation B at the same public address to redirect all fees
+to market 0. An unprivileged relayer retaining the old transaction can overwrite the replacement's
+policy while generation B is live.
+
+The retained clean-room LiteSVM regression creates and closes generation A through public System,
+SPL, and Percolator instructions, publicly reinitializes the same address, and sets generation B's
+redirect to 10,000 bps. An attacker then creates asset 1 through the configured permissionless
+one-atom fee. Against pinned program `19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, replaying the generation-A zero redirect sends both
+1,000-atom trade fees into asset 1. Its operator withdraws 2,000 atoms and ends 1,000 atoms ahead,
+exactly matching the independent victim's 1,000-atom loss. Protected market-0 insurance retains only
+the one-atom initialization fee and the canonical vault ends at 18,001 atoms. The pinned SBF checksum
+is `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: composed upstream program commit `247b940d0bd57c584567aed23499e0bdd13de9ae`
+persists the generation namespace and binds the fee-redirect payload to it. The identical stale
+transaction rejects with exact `AssetGenerationMismatch` (`Custom(30)`) and leaves the replacement
+market byte-identical. Both users' 1,000-atom fees plus the one-atom initialization fee remain in
+market-0 insurance, while asset-1 insurance remains zero. Its SBF checksum is
+`16dcb7c1504a3d0d65074fcee6675270f08b15ab730706b509c72a4e661a8bc8`. The upstream source suite
+passes all 570 LiteSVM tests and five unit tests. This isolated expected-RED branch changes no Meta
+production code, account layout, signer, authority, recipient, custody path, token amount, dependency
+pin, or administrator surface.
