@@ -14755,3 +14755,27 @@ victim portfolio. Its SBF checksum is
 `d3ddd59c06400b9b27dd387b8f62a2c4f0f9af8fd838249a3759c43d6cb1591d`. This isolated expected-RED
 branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
 token amount, or administrator surface.
+
+## Tick - unilateral reduction replayed across market generations (surface A/C, REAL LOF)
+
+The owner-signed `RebalanceReduce` payload identifies only the slab address and asset index. After a
+normal generation-A exit and public full slab recreation, a relayer can submit that old consent
+against fresh replacement exposure at the same portfolio address. This is independent of the
+portfolio-incarnation replay: portfolio IDs restart when the entire market account is deleted.
+
+The clean-room LiteSVM regression creates, funds, closes, preserves, and recreates the slab and both
+portfolio addresses through System and Percolator instructions. Generation B opens a balanced pair
+at 100; an authenticated mark moves to 50; then the retained generation-A reduction flattens only the
+replacement victim. Against pinned program `19f3b494049b2dfcbf8881366443c611c4e09290`, engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, and SBF checksum
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`, final payouts are 950,000
+to the victim and 1,050,000 to the attacker. Total custody remains exactly 2,000,000, proving a direct
+independent-victim transfer rather than inflation or an accounting artifact.
+
+CONTROL: composed upstream program `8a0743ab5601c33562cdb4b750fb6bcf284e0bf7` persists market
+generations through PR #231 and binds tag 44 through PR #293. The identical test observes a higher
+generation-B ID, rejects the stale transaction with exact `AssetGenerationMismatch`, proves
+byte-for-byte rollback, restores the mark, and pays both users 1,000,000. Its SBF checksum is
+`d2d88ce7afe01b3860f146335a7310759150ed7a24cf6e41a58c6a4bb2cdbd15`. This stacked expected-RED
+branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
+token amount, or administrator surface.
