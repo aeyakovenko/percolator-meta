@@ -14755,3 +14755,31 @@ victim portfolio. Its SBF checksum is
 `d3ddd59c06400b9b27dd387b8f62a2c4f0f9af8fd838249a3759c43d6cb1591d`. This isolated expected-RED
 branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
 token amount, or administrator surface.
+
+## Tick - signed withdrawal replayed across portfolio incarnations (surface A/C, REAL LOF)
+
+The pinned `Withdraw` payload commits only to an amount. A relayer can retain a withdrawal signed for
+portfolio incarnation A, wait for the same owner to close A and initialize independently funded
+incarnation B at the same public account address, then submit A's transaction immediately before an
+already signed B trade. The transfer still pays the owner, but it removes B's replacement margin
+without B-generation consent.
+
+The clean-room LiteSVM regression creates the market, mint, vault, and three portfolios through real
+System, SPL, and Percolator instructions. It proves the retained withdrawal is valid in A, obtains a
+higher market-assigned ID for B, signs B's trade before the replay, advances an independent
+authenticated mark under production risk parameters, and routes the public liquidation reward to a
+separate flat relayer portfolio. Against pinned program
+`19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, the replay removes 1,100,000 atoms of B margin and the
+relayer withdraws 498 atoms of victim-funded liquidation fee. The pinned SBF checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: upstream program commit `f72c8bdc076c107fd8085ae60a7bcd9dd03a0e6c` (percolator-prog PR
+`#299`) adds the expected monotonic
+portfolio ID to tag 4 and rejects a mismatch before accounting or token CPI, while retaining legacy
+live exits through the reserved `u64::MAX` migration identity. The identical Meta test accepts a
+valid A withdrawal, rejects its B replay, and proves byte-identical rollback of the market, B
+portfolio, and destination. The fixed SBF checksum is
+`b955cdba9726e74efc838cfa10559309fd0f9b7b1f7499f5060fa94b6e1143db`; all 566 upstream BPF tests
+pass. This isolated expected-RED branch changes no Meta production code, account layout, signer,
+authority, recipient, destination, custody path, token amount, or administrator surface.
