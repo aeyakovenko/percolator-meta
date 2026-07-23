@@ -61018,6 +61018,185 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         .map_or(true, |account| account.lamports == 0));
 }
 
+// PUBLIC LOF: an owner-authorized close must apply only to the portfolio incarnation the owner
+// signed for. Portfolio addresses are intentionally reusable; without the monotonic portfolio ID
+// in the close wire, a withheld close for incarnation A can retire a fresh empty incarnation B and
+// transfer B's newly funded rent to the market slab.
+#[test]
+fn e2e_presigned_close_cannot_drain_a_replacement_portfolio_account() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let owner = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let governance = Pubkey::new_unique();
+    let market = Keypair::new();
+    let market_key = market.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_key,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the permissionless market");
+    let controller = controller_pda(&governance, &market_key, &perc_id());
+    let mut init_market_data = vec![1u8];
+    init_market_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
+            ],
+            data: init_market_data,
+        },
+    )
+    .expect("initialize a normal controller-owned market");
+
+    let portfolio = Keypair::new();
+    let portfolio_key = portfolio.pubkey();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    send(
+        &mut svm,
+        &[&payer, &portfolio],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &portfolio_key,
+            portfolio_rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the reusable portfolio account");
+    let init_portfolio = || {
+        pix(
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(portfolio_key, false),
+            ],
+            PIx::InitPortfolio,
+        )
+    };
+    send(&mut svm, &[&payer, &owner], init_portfolio())
+        .expect("initialize portfolio incarnation A");
+    let first_id = percolator_prog::state::read_portfolio_id(
+        &svm.get_account(&portfolio_key).unwrap().data,
+    )
+    .unwrap();
+
+    let close_portfolio = || {
+        pix(
+            vec![
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(portfolio_key, false),
+            ],
+            PIx::ClosePortfolio,
+        )
+    };
+    svm.expire_blockhash();
+    let retained_blockhash = svm.latest_blockhash();
+    let stale_close = Transaction::new_signed_with_payer(
+        &[close_portfolio()],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        retained_blockhash,
+    );
+    let replace_account = Transaction::new_signed_with_payer(
+        &[
+            close_portfolio(),
+            solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &portfolio_key,
+                portfolio_rent,
+            ),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        retained_blockhash,
+    );
+    svm.send_transaction(replace_account)
+        .expect("close incarnation A while retaining the reusable account");
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[init_portfolio()],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        retained_blockhash,
+    ))
+    .expect("initialize replacement incarnation B");
+
+    let replacement = svm.get_account(&portfolio_key).unwrap();
+    let second_id = percolator_prog::state::read_portfolio_id(&replacement.data).unwrap();
+    assert!(second_id > first_id, "the replacement must have a fresh monotonic ID");
+    assert_eq!(replacement.lamports, portfolio_rent);
+    let market_lamports_before = svm.get_account(&market_key).unwrap().lamports;
+
+    let stale_result = svm.send_transaction(stale_close);
+    if stale_result.is_ok() {
+        let market_lamports_after = svm.get_account(&market_key).unwrap().lamports;
+        assert_eq!(
+            market_lamports_after - market_lamports_before,
+            portfolio_rent,
+            "the stale close transfers the replacement account's complete rent to the market",
+        );
+        assert!(
+            svm.get_account(&portfolio_key)
+                .map_or(true, |account| account.lamports == 0),
+            "the stale close must actually retire incarnation B to prove the loss",
+        );
+        panic!(
+            "a close signed for portfolio incarnation {first_id} drained replacement incarnation {second_id}"
+        );
+    }
+
+    let surviving = svm
+        .get_account(&portfolio_key)
+        .expect("a rejected stale close leaves incarnation B live");
+    assert_eq!(surviving.lamports, portfolio_rent);
+    assert_eq!(
+        percolator_prog::state::read_portfolio_id(&surviving.data).unwrap(),
+        second_id,
+    );
+}
+
 // PUBLIC DOS/LOF: ordinary funding settlement can leave fresh backing principal above the amount
 // attributed to the Genesis provider ledger. The final owner exit must sweep that protocol surplus
 // separately instead of debiting it as provider principal and underflowing the pinned ledger.
