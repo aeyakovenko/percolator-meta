@@ -61018,6 +61018,660 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         .map_or(true, |account| account.lamports == 0));
 }
 
+// PUBLIC LOF/DOS: a recovery forfeit signed for a retired market must not remain valid
+// after the same public slab and portfolio addresses are reused by a new market generation.
+#[test]
+fn e2e_stale_recovery_forfeit_cannot_cross_market_generations() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const PRICE: u64 = 100;
+    const WIN_PRICE: u64 = 150;
+    const DEPOSIT: u128 = 1_000_000;
+    const SIZE_Q: i128 = 5_000 * percolator::POS_SCALE as i128;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 1,
+        unix_timestamp: 1,
+        ..Clock::default()
+    });
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let victim = Keypair::new();
+    let counterparty = Keypair::new();
+    for signer in [&payer, &admin, &victim, &counterparty] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_account = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_account],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_account.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the first public market generation");
+    let market = market_account.pubkey();
+    let market_generation =
+        Pubkey::find_program_address(&[b"market-generation", market.as_ref()], &perc_id()).0;
+
+    let init_market = |svm: &mut LiteSVM| {
+        send(
+            svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(collateral_mint, false),
+                    AccountMeta::new(market_generation, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                PIx::InitMarket {
+                    max_portfolio_assets: 1,
+                    h_min: 0,
+                    h_max: 10,
+                    initial_price: PRICE,
+                    min_nonzero_mm_req: 1,
+                    min_nonzero_im_req: 2,
+                    maintenance_margin_bps: 10_000,
+                    initial_margin_bps: 10_000,
+                    max_trading_fee_bps: 10_000,
+                    trade_fee_base_bps: 0,
+                    liquidation_fee_bps: 0,
+                    liquidation_fee_cap: 0,
+                    min_liquidation_abs: 0,
+                    max_price_move_bps_per_slot: 10_000,
+                    max_accrual_dt_slots: 1,
+                    max_abs_funding_e9_per_slot: 0,
+                    min_funding_lifetime_slots: 1,
+                    max_account_b_settlement_chunks: 1,
+                    max_bankrupt_close_chunks: 1,
+                    max_bankrupt_close_lifetime_slots: 100,
+                    public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                    maintenance_fee_per_slot: 0,
+                },
+            ),
+        )
+    };
+    init_market(&mut svm).expect("initialize generation A");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 100,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure bounded recovery and terminal progress");
+
+    let configure_mark = |svm: &mut LiteSVM, slot: u64| {
+        send(
+            svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: slot,
+                    initial_mark_e6: PRICE,
+                },
+            ),
+        )
+    };
+    configure_mark(&mut svm, 1).expect("configure generation-A marks");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let victim_account = Keypair::new();
+    let counterparty_account = Keypair::new();
+    for portfolio in [&victim_account, &counterparty_account] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate a reusable public portfolio");
+    }
+    let victim_portfolio = victim_account.pubkey();
+    let counterparty_portfolio = counterparty_account.pubkey();
+
+    let initialize_and_deposit =
+        |svm: &mut LiteSVM, owner: &Keypair, portfolio: Pubkey| -> Result<(), String> {
+            send(
+                svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )?;
+            let source = Pubkey::new_unique();
+            set_token(
+                svm,
+                &source,
+                &collateral_mint,
+                &owner.pubkey(),
+                DEPOSIT as u64,
+            );
+            send(
+                svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit { amount: DEPOSIT },
+                ),
+            )
+        };
+    let open_pair = |svm: &mut LiteSVM| {
+        let accounts = vec![
+            AccountMeta::new(victim.pubkey(), true),
+            AccountMeta::new(counterparty.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(victim_portfolio, false),
+            AccountMeta::new(counterparty_portfolio, false),
+        ];
+        let legacy = send(
+            svm,
+            &[&payer, &victim, &counterparty],
+            pix(
+                accounts.clone(),
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: SIZE_Q,
+                    exec_price: PRICE,
+                    fee_bps: 0,
+                },
+            ),
+        );
+        if legacy.is_ok() {
+            return Ok(());
+        }
+        let mut data = vec![6u8];
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&read_asset0_market_id(svm, &market).to_le_bytes());
+        data.extend_from_slice(&SIZE_Q.to_le_bytes());
+        data.extend_from_slice(&PRICE.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        send(
+            svm,
+            &[&payer, &victim, &counterparty],
+            Instruction {
+                program_id: perc_id(),
+                accounts,
+                data,
+            },
+        )
+    };
+    let shutdown = |svm: &mut LiteSVM, slot: u64| {
+        send(
+            svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetLifecycle {
+                    action: 3,
+                    asset_index: 0,
+                    now_slot: slot,
+                    initial_price: 0,
+                    insurance_authority: [0; 32],
+                    insurance_operator: [0; 32],
+                    backing_bucket_authority: [0; 32],
+                    oracle_authority: [0; 32],
+                },
+            ),
+        )
+    };
+
+    for (owner, portfolio) in [
+        (&victim, victim_portfolio),
+        (&counterparty, counterparty_portfolio),
+    ] {
+        initialize_and_deposit(&mut svm, owner, portfolio)
+            .expect("fund a generation-A portfolio");
+    }
+    open_pair(&mut svm).expect("open generation A's balanced pair");
+    svm.set_sysvar(&Clock {
+        slot: 2,
+        unix_timestamp: 2,
+        ..Clock::default()
+    });
+    shutdown(&mut svm, 2).expect("put generation A into recovery");
+
+    let generation_a_id = read_asset0_market_id(&svm, &market);
+    let bound_forfeit = |owner: Pubkey, portfolio: Pubkey, market_id: u64| {
+        let mut data = vec![43u8];
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&market_id.to_le_bytes());
+        data.extend_from_slice(&percolator::MAX_VAULT_TVL.to_le_bytes());
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new(owner, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            data,
+        }
+    };
+    let legacy_forfeit = |owner: Pubkey, portfolio: Pubkey| {
+        pix(
+            vec![
+                AccountMeta::new(owner, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            PIx::ForfeitRecoveryLeg {
+                asset_index: 0,
+                b_delta_budget: percolator::MAX_VAULT_TVL,
+            },
+        )
+    };
+
+    let retained_blockhash = svm.latest_blockhash();
+    let stale_legacy = Transaction::new_signed_with_payer(
+        &[legacy_forfeit(victim.pubkey(), victim_portfolio)],
+        Some(&victim.pubkey()),
+        &[&victim],
+        retained_blockhash,
+    );
+    let stale_bound = Transaction::new_signed_with_payer(
+        &[bound_forfeit(
+            victim.pubkey(),
+            victim_portfolio,
+            generation_a_id,
+        )],
+        Some(&victim.pubkey()),
+        &[&victim],
+        retained_blockhash,
+    );
+    let uses_market_id_wire = svm
+        .simulate_transaction(stale_legacy.clone().into())
+        .is_err();
+    if uses_market_id_wire {
+        assert!(
+            svm.simulate_transaction(stale_bound.clone().into()).is_ok(),
+            "generation-bound consent must be valid against generation A",
+        );
+    }
+    let stale_forfeit = if uses_market_id_wire {
+        stale_bound
+    } else {
+        stale_legacy
+    };
+
+    for (owner, portfolio) in [
+        (&victim, victim_portfolio),
+        (&counterparty, counterparty_portfolio),
+    ] {
+        let current_forfeit = if uses_market_id_wire {
+            bound_forfeit(owner.pubkey(), portfolio, generation_a_id)
+        } else {
+            legacy_forfeit(owner.pubkey(), portfolio)
+        };
+        send(&mut svm, &[&payer, owner], current_forfeit)
+            .expect("clear a generation-A recovery leg");
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount: DEPOSIT },
+            ),
+        )
+        .expect("withdraw generation-A principal");
+        assert_eq!(u128::from(token_amount(&svm, &destination)), DEPOSIT);
+
+        svm.expire_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::ClosePortfolio,
+                ),
+                solana_sdk::system_instruction::transfer(
+                    &payer.pubkey(),
+                    &portfolio,
+                    portfolio_rent,
+                ),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, owner],
+            svm.latest_blockhash(),
+        ))
+        .expect("close and atomically preserve a reusable portfolio account");
+        let reusable = svm.get_account(&portfolio).unwrap();
+        assert_eq!(reusable.owner, perc_id());
+        assert!(reusable.data.is_empty());
+    }
+
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        ),
+    )
+    .expect("resolve the empty first generation");
+    let admin_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &admin_destination,
+        &collateral_mint,
+        &admin.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(admin_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(market_generation, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            PIx::CloseSlab,
+        ),
+    )
+    .expect("close generation A through the public lifecycle");
+    assert!(svm
+        .get_account(&market)
+        .is_none_or(|account| account.lamports == 0));
+
+    svm.set_sysvar(&Clock {
+        slot: 3,
+        unix_timestamp: 3,
+        ..Clock::default()
+    });
+    init_market(&mut svm).expect("permissionlessly initialize generation B at the same slab");
+    let generation_b_id = read_asset0_market_id(&svm, &market);
+    if uses_market_id_wire {
+        assert!(generation_b_id > generation_a_id);
+    } else {
+        assert_eq!(generation_b_id, generation_a_id);
+    }
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 100,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure generation-B recovery progress");
+    configure_mark(&mut svm, 3).expect("configure generation-B marks");
+    for (owner, portfolio) in [
+        (&victim, victim_portfolio),
+        (&counterparty, counterparty_portfolio),
+    ] {
+        initialize_and_deposit(&mut svm, owner, portfolio)
+            .expect("fund a generation-B replacement portfolio");
+    }
+    open_pair(&mut svm).expect("open generation B's balanced pair");
+
+    svm.set_sysvar(&Clock {
+        slot: 4,
+        unix_timestamp: 4,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: 4,
+                mark_e6: WIN_PRICE,
+            },
+        ),
+    )
+    .expect("publish the replacement victim's winning mark");
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(counterparty_portfolio, false),
+            ],
+            PIx::PermissionlessCrank {
+                now_slot: 4,
+                observations: vec![percolator_prog::ix::CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+        ),
+    )
+    .expect("settle only the losing replacement counterparty");
+    assert_eq!(read_asset0_effective_price(&svm, &market), WIN_PRICE);
+    let victim_before_shutdown = percolator_prog::state::read_portfolio(
+        &svm.get_account(&victim_portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert_eq!(victim_before_shutdown.pnl.get(), 0);
+    let pending_profit =
+        SIZE_Q.unsigned_abs() * u128::from(WIN_PRICE - PRICE) / percolator::POS_SCALE;
+    assert_eq!(pending_profit, 250_000);
+
+    svm.set_sysvar(&Clock {
+        slot: 5,
+        unix_timestamp: 5,
+        ..Clock::default()
+    });
+    shutdown(&mut svm, 5).expect("put generation B into recovery");
+    let market_before_replay = svm.get_account(&market).unwrap();
+    let victim_before_replay = svm.get_account(&victim_portfolio).unwrap();
+    let replay = svm.send_transaction(stale_forfeit);
+    if uses_market_id_wire {
+        let error = replay.expect_err("generation-A consent must reject in generation B");
+        assert_eq!(
+            error.err,
+            TransactionError::InstructionError(0, InstructionError::Custom(30)),
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_replay);
+        assert_eq!(
+            svm.get_account(&victim_portfolio).unwrap(),
+            victim_before_replay,
+        );
+        return;
+    }
+    replay.expect("the pinned legacy wire replays against generation B");
+
+    let detached = percolator_prog::state::read_portfolio(
+        &svm.get_account(&victim_portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(percolator::active_bitmap_is_empty(
+        detached.active_bitmap.map(percolator::V16PodU64::get),
+    ));
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        ),
+    )
+    .expect("resolve generation B after the stale forfeit");
+
+    let close_resolved = |svm: &mut LiteSVM, owner: &Keypair, portfolio: Pubkey| {
+        let destination = Pubkey::new_unique();
+        set_token(
+            svm,
+            &destination,
+            &collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        send(
+            svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                },
+            ),
+        )
+        .expect("permissionlessly pay a resolved replacement portfolio");
+        u128::from(token_amount(svm, &destination))
+    };
+    let counterparty_out = close_resolved(&mut svm, &counterparty, counterparty_portfolio);
+    let victim_out = close_resolved(&mut svm, &victim, victim_portfolio);
+    for (owner, portfolio) in [
+        (&counterparty, counterparty_portfolio),
+        (&victim, victim_portfolio),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::ClosePortfolio,
+            ),
+        )
+        .expect("retire a fully paid replacement portfolio");
+    }
+
+    let (_, stuck) =
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
+    assert_eq!(stuck.c_tot, 0);
+    assert_eq!(stuck.insurance, 0);
+    assert_eq!(stuck.materialized_portfolio_count, 0);
+    assert_eq!(stuck.vault, pending_profit);
+    assert_eq!(victim_out, DEPOSIT);
+    assert_eq!(token_amount(&svm, &vault) as u128, pending_profit);
+
+    let close_slab = send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(admin_destination, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseSlab,
+        ),
+    );
+    assert!(close_slab.is_err());
+    panic!(
+        "generation-A recovery consent replayed in generation B, destroyed {pending_profit} of \
+         independent victim PnL, paid victim {victim_out}, paid counterparty {counterparty_out}, \
+         and left {} permanently blocking CloseSlab: {close_slab:?}",
+        stuck.vault,
+    );
+}
+
 // PUBLIC LIFECYCLE DOS: an external backing provider can use the supported finite-expiry
 // top-up, after which ordinary mark settlement can leave a resolved portfolio unable to
 // reach the bucket-expiry transition. Repeating both public resolved-close entry points

@@ -14731,3 +14731,27 @@ prospective K/F source before settlement. The identical test closes both users a
 `a74fd03b242d14efdcf3b2a70d8be6b981bdd3576bef93811cb8dfed83e39cb7`. This stacked branch is an
 isolated expected-RED proof pending the upstream fix and changes no Meta production code, account
 layout, signer, authority, recipient, custody path, token amount, or administrator surface.
+
+## Tick - recovery-forfeit consent replayed across market generations (surface A/C, REAL LOF/DOS)
+
+`ForfeitRecoveryLeg` is irreversible owner consent, but the pinned payload identifies only the slab
+address and asset index. A victim can validly sign it for generation A, complete that market's public
+shutdown and close, then reuse the same public slab and portfolio addresses in generation B. Any
+relayer retaining the old transaction can detach the replacement winner without another signature.
+
+The clean-room LiteSVM regression creates every market and portfolio through System and Percolator
+instructions, fully closes generation A, and opens an independently funded replacement pair. Against
+pinned program `19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, the replay destroys 250,000 atoms of the victim's real
+marked PnL, pays only its 1,000,000-atom principal, and leaves exactly 250,000 atoms in the canonical
+vault after every portfolio closes. Real `CloseSlab` then fails with `Custom(21)`. The pinned SBF
+checksum is `e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: composed upstream program `cf15ff73a05c9e775f610381ec9d5ad2e4019e47` first persists the
+generation namespace across slab deletion (percolator-prog PR #231), then binds the forfeit payload
+to that generation (PR #295). The identical test observes a higher generation-B ID, rejects the stale
+transaction with exact `AssetGenerationMismatch`, and proves byte-for-byte rollback of the market and
+victim portfolio. Its SBF checksum is
+`d3ddd59c06400b9b27dd387b8f62a2c4f0f9af8fd838249a3759c43d6cb1591d`. This isolated expected-RED
+branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
+token amount, or administrator surface.
