@@ -14755,3 +14755,30 @@ victim portfolio. Its SBF checksum is
 `d3ddd59c06400b9b27dd387b8f62a2c4f0f9af8fd838249a3759c43d6cb1591d`. This isolated expected-RED
 branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
 token amount, or administrator surface.
+
+## Tick - matcher consent replayed across market generations (surface A/C, REAL LOF)
+
+`SetMatcherConfig` authorizes a matcher to trade against a portfolio without its owner signing each
+fill, but the pinned payload identifies only the slab and portfolio addresses. A victim can validly
+sign the grant for generation A, close that empty portfolio and market, then reuse both public
+addresses in generation B. An unprivileged relayer retaining the old transaction can arm the
+independently funded replacement portfolio without another victim signature.
+
+The clean-room LiteSVM regression creates the matcher context through System Program ownership,
+creates and closes generation A through public Percolator instructions, and funds independent
+attacker and victim portfolios after public same-address recreation. Against pinned program
+`19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, the replay lets the attacker fill against the unsigned
+replacement victim, move the authenticated mark, and withdraw 1,250,000 atoms from a 1,000,000-atom
+deposit while victim equity falls from 1,000,000 to 750,000. Total custody remains exact, proving an
+independent victim-to-attacker value transfer. The pinned SBF checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: composed upstream program `798b36c81ef98e14dce4dbd80af719a37689a127` persists the
+generation namespace across slab deletion (percolator-prog PR #231) and binds matcher grants to that
+generation (PR #294). The identical transaction rejects with exact `AssetGenerationMismatch`
+(`Custom(30)`) and proves byte-for-byte rollback of the market, victim portfolio, and matcher
+context. Its SBF checksum is
+`5780f5aed3400bd6c33b22d493fde2506be973b7770bc101d57b49ed65f0dc8d`. This isolated expected-RED
+branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
+token amount, or administrator surface.
