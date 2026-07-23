@@ -14682,3 +14682,28 @@ checksum is `da618a25857381910099bfcc20a4a3d97702e1a180a2e69296da6b9c4576fdf2`.
 No account layout, signer, authority, amount, destination, transfer, withdrawal path, or new value
 surface was added; terminal close gained only conditional read-only proof accounts and a no-principal
 CPI.
+
+## Tick - lapsed backing blocked resolved portfolio settlement (surface A/C, REAL DOS)
+
+An independent backing provider can use Percolator's supported finite-expiry top-up before an
+ordinary authenticated mark reversal. If the reversal leaves a portfolio with a pending source
+debit when governance resolves the market, pinned Percolator settles that debit before preparing the
+now-lapsed backing bucket. Support valuation rejects the stale Fresh bucket, every transaction rolls
+back, and neither permissionless crank nor full resolved close can reach the expiry transition.
+
+The retained clean-room LiteSVM regression creates all market, portfolio, mint, and token accounts
+through their public programs; opens balanced independent long and short positions; realizes a
+one-percent gain; adds ten finite-lived backing atoms; honestly reverses the mark; and resolves through
+the generation-bound Meta controller. Against pinned program
+`19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, sixteen rounds through both terminal entry points close
+the short but leave the long active with all 100,000,000 units of capital and 100,000 units of PnL;
+full close repeatedly returns `Custom(19)`. The pinned SBF checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: upstream engine `b6827a09add5a4c7e4db074cc45339c691364428` prepares lapsed backing
+before resolved settlement. The identical test closes both users against program
+`9cbae70521ff65c8ce1bdaf3cdfd4351a17cc02f`; its SBF checksum is
+`fc8deac9a8c2b0fb40794bdb375d1e0a143cc61d71179467fa8f83c503465628`. This branch is an isolated
+expected-RED proof pending the upstream fix and changes no Meta production code, account layout,
+signer, authority, recipient, custody path, token amount, or administrator surface.
