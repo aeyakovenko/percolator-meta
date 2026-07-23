@@ -14755,3 +14755,32 @@ victim portfolio. Its SBF checksum is
 `d3ddd59c06400b9b27dd387b8f62a2c4f0f9af8fd838249a3759c43d6cb1591d`. This isolated expected-RED
 branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
 token amount, or administrator surface.
+
+## Tick - trade-fee policy replayed across market generations (surface A/C, REAL LOF)
+
+`UpdateTradeFeePolicy` changes the minimum fee charged when a trade lands, but the pinned payload
+identifies only the slab address. A market administrator can validly sign a policy for generation A,
+close that empty market, and later create generation B at the same public address. An unprivileged
+relayer retaining the old transaction can apply it while generation B is empty, before the funded-
+market policy guard activates.
+
+The retained clean-room LiteSVM regression creates and closes generation A through public System,
+SPL, and Percolator instructions, invokes the public same-address initialization path, and has an
+attacker create asset 1 through the configured permissionless one-atom fee. The victim and attacker
+sign their deposits and a zero-fee trade before the stale policy lands. Against pinned program
+`19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, the retained policy charges 1,000 atoms to each side.
+The permissionless asset operator withdraws both 1,000-atom fee domains, ending 1,000 atoms ahead
+while the independent victim ends 1,000 atoms down. The vault retains exactly 18,001 atoms for both
+9,000-atom portfolio claims and the one-atom initialization fee. The pinned SBF checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: composed upstream program `e748ff18f113e7e39902378d8bd7d6e88731e923` persists the
+generation namespace across slab deletion (percolator-prog PR #231) and binds trade-fee policies to
+that generation (PR #296). The identical transaction rejects with exact `AssetGenerationMismatch`
+(`Custom(30)`) and leaves the replacement market byte-identical. Both pre-signed deposits and the
+generation-bound zero-fee trade remain executable, both users retain all 10,000 atoms, and asset-1
+insurance remains zero. Its SBF checksum is
+`94a543366c3f7d5c9731b55db37205616e1c3912630444a08365dae1ba011178`. This isolated expected-RED
+branch changes no Meta production code, account layout, signer, authority, recipient, custody path,
+token amount, dependency pin, or administrator surface.
