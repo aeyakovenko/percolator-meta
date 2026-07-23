@@ -14783,3 +14783,28 @@ portfolio, and destination. The fixed SBF checksum is
 `b955cdba9726e74efc838cfa10559309fd0f9b7b1f7499f5060fa94b6e1143db`; all 566 upstream BPF tests
 pass. This isolated expected-RED branch changes no Meta production code, account layout, signer,
 authority, recipient, destination, custody path, token amount, or administrator surface.
+
+## Tick - signed PnL conversion replayed across portfolio incarnations (surface A/C, REAL LOF)
+
+The pinned `ConvertReleasedPnl` payload commits only to an amount. A relayer can retain a conversion
+signed for portfolio incarnation A, wait for the same owner to close A and initialize incarnation B
+at the same public account address, then submit A's transaction against B. Conversion moves released
+junior PnL into senior capital; a public maintenance crank can then collect its configured reward from
+capital that B never authorized the stale transaction to create.
+
+The clean-room LiteSVM regression creates the market, mint, canonical vault, external backing,
+reusable portfolio, counterparty, and cranker through real System, SPL, and Percolator paths. Both
+portfolio generations earn released PnL through signed trades, authenticated mark pushes, and
+permissionless cranks. B then withdraws all ordinary capital and refreshes before the replay. Against
+pinned program `19f3b494049b2dfcbf8881366443c611c4e09290` and engine
+`4bf72ea3f9bea8682fe23b5c6fff9e04b5fb41d3`, A's retained conversion succeeds against B and the
+unprivileged maintenance cranker receives 8 atoms from B. The pinned SBF checksum is
+`e4948402cbd85b58d0de6ad57550da9ab20aed8ec5d494540cda26fb1d46f2ab`.
+
+CONTROL: upstream program commit `15f6d588305f3ec66fd63ed841cde04df818dc04` (percolator-prog PR
+`#301`, stacked only on the withdrawal-ID fix) adds the expected monotonic portfolio ID to tag 28 and
+checks it before conversion. The identical test rejects the replay with `EngineProvenanceMismatch`,
+proves byte-identical rollback of the market, B portfolio, and vault, and pays the cranker zero. Its
+SBF checksum is `05bacd937698db9a8acf3d8b77990b3229bc166712ec716a46c9ea9d0a1e729f`; all 567 upstream LiteSVM
+tests pass. The fix adds no signer, authority, recipient, custody path, token movement, or administrator
+surface. This isolated expected-RED branch changes no Meta production code.
