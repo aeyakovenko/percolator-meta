@@ -34,7 +34,7 @@ use solana_program::{
     declare_id,
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
-    program::{invoke, invoke_signed},
+    program::{invoke, invoke_signed, set_return_data},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -274,6 +274,7 @@ const TWAP_INSURANCE_SPENT_OFF: usize = 272;
 const TWAP_CUSTODY_MODE_POOL_BOUND: u8 = 1;
 const TWAP_IX_ACCEPT_FROM_SUBLEDGER: u8 = 15;
 const TWAP_IX_ACCEPT_CROSS_BACKING_EARNINGS: u8 = 22;
+const RESTART_CHECKPOINT_RETURN_DISC: [u8; 8] = *b"RSTFLR01";
 const CONTROLLER_IX_RETURN_RESOLVED_ASSET0_BACKING: u8 = 7;
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -4610,6 +4611,7 @@ fn process_prepare_asset0_restart(
         return Err(ProgramError::InvalidAccountData);
     }
 
+    let mut owner_backing = 0u64;
     if pool.cross_backing {
         if !uses_indexed_cross_backing(&pool, pool_account.data_len()) {
             return Err(ProgramError::InvalidAccountData);
@@ -4618,7 +4620,7 @@ fn process_prepare_asset0_restart(
         if pending_backing > pool.outstanding_principal {
             return Err(ProgramError::InvalidAccountData);
         }
-        let owner_backing = owner_backing_protection(&pool, u128::from(pending_backing))?;
+        owner_backing = owner_backing_protection(&pool, u128::from(pending_backing))?;
         let protected = u128::from(insurance)
             .checked_add(u128::from(owner_backing))
             .map(|value| value.min(u128::from(pool.outstanding_principal)))
@@ -4657,7 +4659,28 @@ fn process_prepare_asset0_restart(
     // Restart creates a fresh Percolator counter generation. Reset only after
     // the prior generation's delta has been charged to the durable pool claim.
     pool.insurance_spent_checkpoint = 0;
-    pool.serialize(&mut pool_account.try_borrow_mut_data()?)
+    let protected_insurance_floor = if pool.owner_claims_cleared() {
+        0
+    } else if pool.cross_backing {
+        let indexed_claim = redeem_indexed_shares(
+            pool.total_shares,
+            pool.share_rate_numerator,
+            pool.share_rate_denominator,
+        )?;
+        u128::from(indexed_claim)
+            .saturating_sub(u128::from(owner_backing))
+            .min(u128::from(insurance))
+    } else if uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+        u128::from(pool.principal_protected_checkpoint)
+    } else {
+        u128::from(pool.outstanding_principal).min(u128::from(insurance))
+    };
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    let mut return_data = [0u8; 24];
+    return_data[..8].copy_from_slice(&RESTART_CHECKPOINT_RETURN_DISC);
+    return_data[8..].copy_from_slice(&protected_insurance_floor.to_le_bytes());
+    set_return_data(&return_data);
+    Ok(())
 }
 
 // accept_operator accounts: [asset_admin(signer), pool(w), market_slab(w), percolator_program,

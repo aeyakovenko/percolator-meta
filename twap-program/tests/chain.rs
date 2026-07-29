@@ -32,6 +32,7 @@ enum PoolRestartScenario {
     HealthyLegacyPoolRestart,
     LegacyPoolRestartAfterLossRejected,
     EmptyWithSurplusPoolRestart,
+    RestartAfterLossAbsentOwnerBuyback,
 }
 
 #[test]
@@ -66,6 +67,11 @@ fn e2e_asset0_legacy_pool_with_uncheckpointed_loss_cannot_restart() {
 #[test]
 fn e2e_asset0_empty_with_surplus_pool_can_restart() {
     run_pool_restart_claim_scenario(PoolRestartScenario::EmptyWithSurplusPoolRestart);
+}
+
+#[test]
+fn e2e_asset0_restart_refreshes_floor_without_impaired_owner_signature() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback);
 }
 
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
@@ -666,6 +672,11 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             );
         }
         assert_eq!(
+            read_reserved_floor(&svm, &twap_cfg),
+            if empty_with_surplus { 0 } else { 1 },
+            "a healthy restart preserves exactly the live pool floor",
+        );
+        assert_eq!(
             percolator_accounting::read_asset_insurance_spent(
                 &svm.get_account(&market).unwrap().data,
                 0,
@@ -973,9 +984,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     if matches!(
         scenario,
         PoolRestartScenario::RestartAfterLoss
+            | PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
             | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
     ) {
         let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
+        let absent_owner_buyback =
+            scenario == PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback;
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
             &squads_vault,
@@ -1186,6 +1200,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         ];
         let pool_before_rejected_restart = svm.get_account(&pool).unwrap();
         let market_before_rejected_restart = svm.get_account(&market).unwrap();
+        let config_before_rejected_restart = svm.get_account(&twap_cfg).unwrap();
         assert!(
             squads_execute(
                 &mut svm,
@@ -1209,6 +1224,32 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             svm.get_account(&market).unwrap(),
             market_before_rejected_restart,
         );
+        assert_eq!(
+            svm.get_account(&twap_cfg).unwrap(),
+            config_before_rejected_restart,
+        );
+
+        if absent_owner_buyback {
+            let protect_retained_buffer =
+                build_set_reserved_floor_message(&squads_vault, &twap_cfg, 2);
+            let protect_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(twap_cfg, false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ];
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                10,
+                &protect_retained_buffer,
+                &protect_remaining,
+            )
+            .expect("futarchy protects one retained protocol atom above pool principal");
+            assert_eq!(read_reserved_floor(&svm, &twap_cfg), 2);
+        }
 
         let restart = build_twap_restart_asset0_message(
             &squads_vault,
@@ -1262,7 +1303,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &multisig,
             &dao,
             &payer,
-            10,
+            if absent_owner_buyback { 11 } else { 10 },
             &restart,
             &restart_remaining,
         )
@@ -1286,7 +1327,14 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
         let donor_source = Pubkey::new_unique();
         let donation_holding = Pubkey::new_unique();
-        set_token(&mut svm, &donor_source, &collateral, &donor.pubkey(), 1);
+        let donation = if absent_owner_buyback { 2 } else { 1 };
+        set_token(
+            &mut svm,
+            &donor_source,
+            &collateral,
+            &donor.pubkey(),
+            donation,
+        );
         set_token(
             &mut svm,
             &donation_holding,
@@ -1303,12 +1351,79 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 &handoff_env,
                 &donor_source,
                 &donation_holding,
-                1,
+                donation,
                 donation_market_id,
             ),
         )
-        .expect("a public donor adds one fresh-generation insurance atom");
-        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+        .expect("a public donor adds fresh-generation insurance");
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            donation as u128,
+        );
+        if absent_owner_buyback {
+            assert_eq!(
+                read_reserved_floor(&svm, &twap_cfg),
+                1,
+                "restart removes only the impaired pool component and preserves the retained buffer",
+            );
+            let supply_before = mint_supply(&svm, &coin_mint);
+            let round_end = u64::from_le_bytes(
+                svm.get_account(&book.book).unwrap().data[240..248]
+                    .try_into()
+                    .unwrap(),
+            );
+            warp_to(&mut svm, round_end);
+            send(
+                &mut svm,
+                &[&payer],
+                execute_ix(
+                    &payer.pubkey(),
+                    &handoff_env,
+                    &book.book,
+                    &book.holding,
+                    &book.settlement_usd,
+                    &book.book_escrow,
+                    &book.coin_escrow,
+                    None,
+                ),
+            )
+            .expect("an unaffiliated cranker spends the fresh protocol atom");
+            assert_eq!(token_amount(&svm, &book.settlement_usd), 1);
+            assert_eq!(
+                read_asset_insurance_remaining(&svm, &market, 0),
+                1,
+                "the retained protocol atom remains protected after buyback",
+            );
+            assert_eq!(mint_supply(&svm, &coin_mint), supply_before - 1);
+            assert_eq!(token_amount(&svm, &book.coin_escrow), 0);
+            send(
+                &mut svm,
+                &[&payer],
+                claim_ix(
+                    &payer.pubkey(),
+                    &twap_cfg,
+                    &book.book,
+                    &book.book_escrow,
+                    &book.settlement_usd,
+                    &book.coin_escrow,
+                    &bidder_usd,
+                    &bidder_coin,
+                    0,
+                ),
+            )
+            .expect("the standing bidder permissionlessly claims the bought atom");
+            assert_eq!(token_amount(&svm, &bidder_usd), 1);
+            assert_eq!(
+                u64::from_le_bytes(
+                    svm.get_account(&pool).unwrap().data[80..88]
+                        .try_into()
+                        .unwrap(),
+                ),
+                1,
+                "buyback progress does not depend on or retire the absent owner",
+            );
+            return;
+        }
 
         send(&mut svm, &[&payer, &depositor], owner_exit_ix())
             .expect("the fully impaired old-generation owner can retire");

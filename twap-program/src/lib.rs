@@ -21,7 +21,7 @@ use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
-    program::{invoke, invoke_signed},
+    program::{get_return_data, invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -113,6 +113,7 @@ const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 const SUBLEDGER_IX_ASSERT_PRINCIPAL: u8 = 11;
 const SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 const SUBLEDGER_IX_PREPARE_ASSET0_RESTART: u8 = 16;
+const RESTART_CHECKPOINT_RETURN_DISC: [u8; 8] = *b"RSTFLR01";
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
@@ -2229,7 +2230,8 @@ fn process_restart_asset0(
     let pool_checkpoint_accounts = if config.custody_pool != Pubkey::default() {
         if (config_account.data_len() >= PROVENANCE_CONFIG_SIZE
             && config.custody_mode != CUSTODY_MODE_POOL_BOUND)
-            || (config_account.data_len() >= CONFIG_SIZE && !config_account.is_writable)
+            || (config_account.data_len() >= PROVENANCE_CONFIG_SIZE
+                && !config_account.is_writable)
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -2266,6 +2268,7 @@ fn process_restart_asset0(
     }
 
     let pool_bound = pool_checkpoint_accounts.is_some();
+    let mut checkpointed_pool_principal = None;
     if let Some((custody_pool, subledger_program)) = pool_checkpoint_accounts {
         if *custody_pool.key != config.custody_pool
             || !custody_pool.is_writable
@@ -2296,6 +2299,16 @@ fn process_restart_asset0(
             ],
             &[&auth_seeds],
         )?;
+        let (return_program, return_data) =
+            get_return_data().ok_or(ProgramError::InvalidAccountData)?;
+        if return_program != SUBLEDGER_PROGRAM_ID
+            || return_data.len() != 24
+            || return_data[..8] != RESTART_CHECKPOINT_RETURN_DISC
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        checkpointed_pool_principal =
+            Some(u128::from_le_bytes(return_data[8..24].try_into().unwrap()));
     }
 
     let mut ix_data = vec![PERC_IX_RESTART_ASSET_ORACLE];
@@ -2318,8 +2331,26 @@ fn process_restart_asset0(
         ],
         &[&auth_seeds],
     )?;
-    if pool_bound && config_account.data_len() >= CONFIG_SIZE {
-        config.custody_insurance_spent = 0;
+    if pool_bound && config_account.data_len() >= PROVENANCE_CONFIG_SIZE {
+        let checkpointed_pool_principal =
+            checkpointed_pool_principal.ok_or(ProgramError::InvalidAccountData)?;
+        let old_pool_principal = u128::from(config.custody_principal);
+        let new_pool_principal = u64::try_from(checkpointed_pool_principal)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if checkpointed_pool_principal > old_pool_principal
+            || config.reserved_floor < old_pool_principal
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        config.reserved_floor = config
+            .reserved_floor
+            .checked_sub(old_pool_principal)
+            .and_then(|retained| retained.checked_add(checkpointed_pool_principal))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        config.custody_principal = new_pool_principal;
+        if config_account.data_len() >= CONFIG_SIZE {
+            config.custody_insurance_spent = 0;
+        }
         config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     }
     Ok(())
