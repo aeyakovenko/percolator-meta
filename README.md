@@ -131,6 +131,11 @@ principal from both protection classes, subject to losses incurred during their 
   A positive live payout additionally requires asset 0 to have no open position accounting or
   unresolved loss state. This prevents a stale losing portfolio from realizing its loss only after
   the reserve has left; a fully impaired zero-payout position can still retire.
+  A pool-bound TWAP restart first invokes Subledger's fixed, value-free checkpoint for that exact
+  pool. It charges the completed generation's cumulative insurance loss to owner claims before
+  Percolator clears its counters, then starts fresh pool and TWAP counter generations only if the
+  restart succeeds. The checkpoint accepts no token account, recipient, or amount, and a rejected
+  restart rolls every checkpoint change back atomically.
   After the bound Percolator market is resolved and empty, anyone can crank the
   same fixed return while the pool attests that owner principal remains. Once the bootstrap deadline
   has elapsed, an absent owner also cannot veto terminal cleanup: any cranker may
@@ -521,7 +526,9 @@ withdrawal; external funds use the provider-bound fixed cleanup, while controlle
 insurance can move only through an empty one-shot transit to a clean Squads-vault-owned account.
 TWAP's fixed restart wire also commits to asset 0's current monotonic Percolator market ID. A queued
 restart rejects after any other action replaces that generation; the comparison is read-only and
-does not add an authority, account, recipient, or collateral path.
+does not add an authority, account, recipient, or collateral path. For pool-bound custody it also
+requires the exact writable Subledger pool and executable Subledger program, so governance cannot
+substitute a claim ledger while advancing the counter generation.
 
 ## Build And Test
 

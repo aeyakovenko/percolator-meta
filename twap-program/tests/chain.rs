@@ -24,8 +24,33 @@ fn twap_id() -> Pubkey {
     twap_program::id()
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PoolRestartScenario {
+    NoRestartAfterLoss,
+    RestartAfterLoss,
+    HealthyRestart,
+}
+
 #[test]
 fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::NoRestartAfterLoss);
+}
+
+// PRIVILEGED LIFECYCLE DOS: a governed asset-0 restart resets Percolator's
+// cumulative insurance-spent counters. The owner-bound pool must preserve the
+// already realized loss so the impaired owner can retire without attempting to
+// take fresh-generation value through Percolator's durable health lock.
+#[test]
+fn e2e_asset0_restart_does_not_restore_impaired_owner_claim() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::RestartAfterLoss);
+}
+
+#[test]
+fn e2e_asset0_healthy_restart_preserves_owner_claim() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::HealthyRestart);
+}
+
+fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let mut svm =
@@ -363,6 +388,230 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
         exit
     };
 
+    if scenario == PoolRestartScenario::HealthyRestart {
+        assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+
+        let pool_before_public_checkpoint = svm.get_account(&pool).unwrap();
+        assert!(
+            send(
+                &mut svm,
+                &[&payer],
+                Instruction {
+                    program_id: sub_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(twap_authority, false),
+                        AccountMeta::new_readonly(twap_cfg, false),
+                        AccountMeta::new(pool, false),
+                        AccountMeta::new_readonly(market, false),
+                        AccountMeta::new_readonly(perc_id(), false),
+                    ],
+                    data: vec![16u8], // IX_PREPARE_ASSET0_RESTART
+                },
+            )
+            .is_err(),
+            "a public caller cannot impersonate the config-derived TWAP PDA",
+        );
+        assert_eq!(
+            svm.get_account(&pool).unwrap(),
+            pool_before_public_checkpoint,
+        );
+
+        let configure_witness = controller_market_generation_witness(&svm, &market);
+        let configure_resolution = build_controller_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market,
+            &perc_id(),
+            &[],
+            &configure_witness,
+            &PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 1,
+            }
+            .encode(),
+        );
+        let configure_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(configure_witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            3,
+            &configure_resolution,
+            &configure_remaining,
+        )
+        .expect("futarchy configures the bounded shutdown lifecycle");
+
+        let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+        let old_market_id = read_asset0_market_id(&svm, &market);
+        let generation_witness =
+            market_controller_program::asset_generation_witness_address(
+                &market,
+                0,
+                old_market_id,
+            )
+            .0;
+        let shutdown = build_controller_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market,
+            &perc_id(),
+            &[],
+            &generation_witness,
+            &PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: shutdown_slot,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            }
+            .encode(),
+        );
+        let shutdown_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(generation_witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            4,
+            &shutdown,
+            &shutdown_remaining,
+        )
+        .expect("futarchy shuts down an empty healthy generation");
+
+        warp_to(&mut svm, shutdown_slot + 1);
+        let restart_slot = svm.get_sysvar::<Clock>().slot;
+        let substituted_pool_restart = build_twap_restart_asset0_message(
+            &squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &market,
+            &perc_id(),
+            Some(&position),
+            restart_slot,
+            1_000,
+            old_market_id,
+        );
+        let substituted_pool_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(position, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        let pool_before_substitution = svm.get_account(&pool).unwrap();
+        let position_before_substitution = svm.get_account(&position).unwrap();
+        let market_before_substitution = svm.get_account(&market).unwrap();
+        let config_before_substitution = svm.get_account(&twap_cfg).unwrap();
+        assert!(
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                5,
+                &substituted_pool_restart,
+                &substituted_pool_remaining,
+            )
+            .is_err(),
+            "governance cannot substitute another Subledger account for the bound pool",
+        );
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_substitution);
+        assert_eq!(
+            svm.get_account(&position).unwrap(),
+            position_before_substitution,
+        );
+        assert_eq!(
+            svm.get_account(&market).unwrap(),
+            market_before_substitution,
+        );
+        assert_eq!(
+            svm.get_account(&twap_cfg).unwrap(),
+            config_before_substitution,
+        );
+
+        let restart = build_twap_restart_asset0_message(
+            &squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &market,
+            &perc_id(),
+            Some(&pool),
+            restart_slot,
+            1_000,
+            old_market_id,
+        );
+        let restart_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            6,
+            &restart,
+            &restart_remaining,
+        )
+        .expect("futarchy restarts the empty healthy generation");
+
+        assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_spent(
+                &svm.get_account(&market).unwrap().data,
+                0,
+            )
+            .unwrap(),
+            [0, 0],
+        );
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+
+        send(&mut svm, &[&payer, &depositor], owner_exit_ix())
+            .expect("the healthy old-generation owner retains its full claim");
+        assert_eq!(token_amount(&svm, &depositor_token), 1);
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+        assert_eq!(
+            u64::from_le_bytes(
+                svm.get_account(&pool).unwrap().data[80..88]
+                    .try_into()
+                    .unwrap(),
+            ),
+            0,
+        );
+        return;
+    }
+
     let policy = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 10_000);
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
@@ -637,6 +886,319 @@ fn e2e_zero_payout_exit_cannot_bypass_twap_custody_after_public_loss() {
     assert_eq!(svm.get_account(&position).unwrap(), position_before);
     assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before);
     assert_eq!(svm.get_account(&market).unwrap(), market_before);
+
+    if scenario == PoolRestartScenario::RestartAfterLoss {
+        let configure_witness = controller_market_generation_witness(&svm, &market);
+        let configure_resolution = build_controller_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market,
+            &perc_id(),
+            &[],
+            &configure_witness,
+            &PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 1,
+            }
+            .encode(),
+        );
+        let configure_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(configure_witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            7,
+            &configure_resolution,
+            &configure_remaining,
+        )
+        .expect("futarchy configures the bounded shutdown lifecycle");
+
+        let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+        let old_market_id = read_asset0_market_id(&svm, &market);
+        let generation_witness =
+            market_controller_program::asset_generation_witness_address(
+                &market,
+                0,
+                old_market_id,
+            )
+            .0;
+        let shutdown = build_controller_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market,
+            &perc_id(),
+            &[],
+            &generation_witness,
+            &PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: shutdown_slot,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            }
+            .encode(),
+        );
+        let shutdown_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(generation_witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            8,
+            &shutdown,
+            &shutdown_remaining,
+        )
+        .expect("futarchy shuts down the fully settled loss generation");
+
+        for (owner, portfolio) in &traders {
+            for _ in 0..8 {
+                let state = percolator_prog::state::read_portfolio(
+                    &svm.get_account(&portfolio.pubkey()).unwrap().data,
+                )
+                .unwrap();
+                if percolator::active_bitmap_is_empty(
+                    state.active_bitmap.map(percolator::V16PodU64::get),
+                ) {
+                    break;
+                }
+                send(
+                    &mut svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio.pubkey(), false),
+                        ],
+                        PIx::ForfeitRecoveryLeg {
+                            asset_index: 0,
+                            b_delta_budget: percolator::MAX_VAULT_TVL,
+                        },
+                    ),
+                )
+                .expect("old-generation trader forfeits its terminal recovery leg");
+            }
+        }
+        for side in [0u8, 1] {
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![AccountMeta::new(market, false)],
+                    PIx::FinalizeResetSide {
+                        asset_index: 0,
+                        side,
+                    },
+                ),
+            )
+            .expect("an unaffiliated cranker finalizes the old-generation side");
+        }
+
+        warp_to(&mut svm, shutdown_slot + 1);
+        let market_account = svm.get_account(&market).unwrap();
+        let backing_provider = Pubkey::new_from_array(
+            percolator_accounting::read_asset_backing_authority(&market_account.data, 0).unwrap(),
+        );
+        assert_eq!(backing_provider, admin.pubkey());
+        let backing =
+            percolator_accounting::read_asset_backing_balances(&market_account.data, 0).unwrap();
+        assert!(
+            backing[0].principal_atoms > 0,
+            "the real bankruptcy must recover controller-owned backing",
+        );
+        assert_eq!(
+            backing[1].principal_atoms + backing[1].earnings_atoms,
+            0,
+        );
+        let backing_provider_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &backing_provider_destination,
+            &collateral,
+            &backing_provider,
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(backing_provider_destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::WithdrawBackingBucket {
+                    domain: 0,
+                    amount: backing[0].principal_atoms,
+                },
+            ),
+        )
+        .expect("the segregated backing provider withdraws its old-generation principal");
+        assert_eq!(
+            token_amount(&svm, &backing_provider_destination) as u128,
+            backing[0].principal_atoms + backing[0].earnings_atoms,
+        );
+        assert_eq!(
+            read_pool_restart_checkpoints(&svm, &pool),
+            (0, 1),
+            "the old loss is still generation-local immediately before restart",
+        );
+
+        let restart_slot = svm.get_sysvar::<Clock>().slot;
+        let rejected_restart = build_twap_restart_asset0_message(
+            &squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &market,
+            &perc_id(),
+            Some(&pool),
+            restart_slot,
+            0,
+            old_market_id,
+        );
+        let restart_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        let pool_before_rejected_restart = svm.get_account(&pool).unwrap();
+        let market_before_rejected_restart = svm.get_account(&market).unwrap();
+        assert!(
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                9,
+                &rejected_restart,
+                &restart_remaining,
+            )
+            .is_err(),
+            "an invalid Percolator restart must reject after the fixed checkpoint CPI",
+        );
+        assert_eq!(
+            svm.get_account(&pool).unwrap(),
+            pool_before_rejected_restart,
+            "a rejected restart atomically rolls back the claim checkpoint",
+        );
+        assert_eq!(
+            svm.get_account(&market).unwrap(),
+            market_before_rejected_restart,
+        );
+
+        let restart = build_twap_restart_asset0_message(
+            &squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &market,
+            &perc_id(),
+            Some(&pool),
+            restart_slot,
+            1_000,
+            old_market_id,
+        );
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            10,
+            &restart,
+            &restart_remaining,
+        )
+        .expect("futarchy restarts asset 0 after the loss is fully settled");
+        assert_eq!(
+            read_pool_restart_checkpoints(&svm, &pool),
+            (0, 0),
+            "the old-generation loss is durably charged exactly once",
+        );
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_spent(
+                &svm.get_account(&market).unwrap().data,
+                0,
+            )
+            .unwrap(),
+            [0, 0],
+            "the public restart begins a fresh cumulative-loss generation",
+        );
+
+        let donor = Keypair::new();
+        svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+        let donor_source = Pubkey::new_unique();
+        let donation_holding = Pubkey::new_unique();
+        set_token(&mut svm, &donor_source, &collateral, &donor.pubkey(), 1);
+        set_token(
+            &mut svm,
+            &donation_holding,
+            &collateral,
+            &twap_authority,
+            0,
+        );
+        let donation_market_id = read_asset0_market_id(&svm, &market);
+        send(
+            &mut svm,
+            &[&payer, &donor],
+            donate_insurance_ix(
+                &donor.pubkey(),
+                &handoff_env,
+                &donor_source,
+                &donation_holding,
+                1,
+                donation_market_id,
+            ),
+        )
+        .expect("a public donor adds one fresh-generation insurance atom");
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+
+        send(&mut svm, &[&payer, &depositor], owner_exit_ix())
+            .expect("the fully impaired old-generation owner can retire");
+        assert_eq!(
+            u64::from_le_bytes(
+                svm.get_account(&pool).unwrap().data[80..88]
+                    .try_into()
+                    .unwrap()
+            ),
+            0,
+            "the old generation's zero-value claim remains retireable",
+        );
+        assert_eq!(token_amount(&svm, &depositor_token), 0);
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            1,
+            "new-generation insurance remains protocol-owned",
+        );
+        return;
+    }
 
     send(
         &mut svm,
@@ -10975,6 +11537,7 @@ fn e2e_standing_auction_bid_across_asset0_restart_conserves_value() {
         &env.twap_authority,
         &env.slab,
         &perc_id(),
+        None,
         restart_slot,
         1_000_001,
         old_market_id,
@@ -11125,6 +11688,7 @@ fn e2e_presigned_twap_insurance_donation_cannot_cross_asset0_restart() {
         &env.twap_authority,
         &env.slab,
         &perc_id(),
+        None,
         restart_slot,
         1_000_001,
         old_market_id,
@@ -19287,6 +19851,7 @@ fn build_twap_restart_asset0_message(
     twap_authority: &Pubkey,
     market: &Pubkey,
     percolator_program: &Pubkey,
+    custody_pool: Option<&Pubkey>,
     now_slot: u64,
     initial_price: u64,
     expected_market_id: u64,
@@ -19294,19 +19859,38 @@ fn build_twap_restart_asset0_message(
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
-    m.push(1); // market writable
-    m.push(6);
-    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
-    m.extend_from_slice(market.as_ref()); // 1 writable
-    m.extend_from_slice(config.as_ref()); // 2
-    m.extend_from_slice(twap_authority.as_ref()); // 3
-    m.extend_from_slice(percolator_program.as_ref()); // 4
-    m.extend_from_slice(twap_id().as_ref()); // 5 program
-    m.push(1);
-    m.push(5);
-    m.push(5);
-    for index in [0u8, 2, 3, 1, 4] {
-        m.push(index);
+    if let Some(custody_pool) = custody_pool {
+        m.push(3); // market + pool + config writable
+        m.push(8);
+        m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+        m.extend_from_slice(market.as_ref()); // 1 writable
+        m.extend_from_slice(custody_pool.as_ref()); // 2 writable
+        m.extend_from_slice(config.as_ref()); // 3
+        m.extend_from_slice(twap_authority.as_ref()); // 4
+        m.extend_from_slice(percolator_program.as_ref()); // 5
+        m.extend_from_slice(sub_id().as_ref()); // 6
+        m.extend_from_slice(twap_id().as_ref()); // 7 program
+        m.push(1);
+        m.push(7);
+        m.push(7);
+        for index in [0u8, 3, 4, 1, 5, 2, 6] {
+            m.push(index);
+        }
+    } else {
+        m.push(1); // market writable
+        m.push(6);
+        m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+        m.extend_from_slice(market.as_ref()); // 1 writable
+        m.extend_from_slice(config.as_ref()); // 2
+        m.extend_from_slice(twap_authority.as_ref()); // 3
+        m.extend_from_slice(percolator_program.as_ref()); // 4
+        m.extend_from_slice(twap_id().as_ref()); // 5 program
+        m.push(1);
+        m.push(5);
+        m.push(5);
+        for index in [0u8, 2, 3, 1, 4] {
+            m.push(index);
+        }
     }
     let mut data = vec![21u8];
     data.extend_from_slice(&now_slot.to_le_bytes());
@@ -21602,6 +22186,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.twap_authority,
         &env.slab,
         &perc_id(),
+        None,
         shutdown_slot,
         2_000_000,
         active_market_id,
@@ -21686,6 +22271,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.twap_authority,
         &env.slab,
         &perc_id(),
+        None,
         restart_slot,
         2_000_000,
         old_market_id,
@@ -21819,6 +22405,7 @@ fn e2e_post_genesis_twap_custody_restart_rejects_stale_global_resolve() {
         &env.twap_authority,
         &env.slab,
         &perc_id(),
+        None,
         restart_slot,
         initial_price,
         old_market_id,
@@ -51976,6 +52563,13 @@ fn read_asset_insurance_remaining(svm: &LiteSVM, market: &Pubkey, asset_index: u
         )
         .unwrap()
         .min(group.insurance)
+}
+fn read_pool_restart_checkpoints(svm: &LiteSVM, pool: &Pubkey) -> (u128, u64) {
+    let account = svm.get_account(pool).unwrap();
+    (
+        u128::from_le_bytes(account.data[321..337].try_into().unwrap()),
+        u64::from_le_bytes(account.data[345..353].try_into().unwrap()),
+    )
 }
 fn read_asset_insurance_domains(
     svm: &LiteSVM,

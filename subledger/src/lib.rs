@@ -237,8 +237,13 @@ const IX_INIT_CROSS_BACKING_GENESIS_POOL: u8 = 14;
 // The pool reads both exact Percolator counters and TWAP fixes the recipient to
 // the config-bound Squads vault; no caller controls an amount or owner.
 const IX_ROUTE_CROSS_BACKING_EARNINGS: u8 = 15;
+// Value-neutral checkpoint immediately before TWAP restarts asset 0. Percolator
+// resets its generation-local spent counters on restart, so the owner-bound
+// subledger must first realize that generation's loss into its durable claim
+// accumulator. Only the exact config-derived TWAP PDA can invoke this path.
+const IX_PREPARE_ASSET0_RESTART: u8 = 16;
 
-// Percolator CPI tags (verified against pinned percolator-prog 19f3b494).
+// Percolator CPI tags (verified against pinned percolator-prog 867ca977).
 const PERC_IX_TOP_UP_INSURANCE_DOMAIN: u8 = 56;
 const PERC_IX_TOP_UP_BACKING_BUCKET: u8 = 24;
 const PERC_IX_WITHDRAW_BACKING_BUCKET: u8 = 50;
@@ -1956,6 +1961,9 @@ pub fn process_instruction(
         }
         IX_ROUTE_CROSS_BACKING_EARNINGS => {
             process_route_cross_backing_earnings(program_id, accounts, &mut data)
+        }
+        IX_PREPARE_ASSET0_RESTART => {
+            process_prepare_asset0_restart(program_id, accounts, &mut data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -4495,6 +4503,146 @@ fn validate_twap_recovery_grant(
     }
 }
 
+// prepare_asset0_restart accounts:
+// [twap_authority(signer), twap_config, pool(w), market_slab, percolator_program]
+// data: none
+//
+// This instruction moves no value and accepts no token account or amount. It
+// durably prices the just-finished generation's external loss before
+// Percolator clears its cumulative spent counters. TWAP invokes it immediately
+// before the fixed restart CPI; transaction atomicity rolls it back if the
+// restart is premature or otherwise rejected.
+#[inline(never)]
+fn process_prepare_asset0_restart(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let twap_authority = next_account_info(iter)?;
+    let twap_config = next_account_info(iter)?;
+    let pool_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !twap_authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if pool_account.owner != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    if !pool_account.is_writable
+        || twap_config.owner != &TWAP_PROGRAM_ID
+        || !percolator_program.executable
+        || market_slab.owner != percolator_program.key
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    if !pool.is_insurance()
+        || pool.policy != POLICY_PRINCIPAL
+        || !pool.custody_granted
+        || pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT
+        || *market_slab.key != pool.market_slab
+        || *percolator_program.key != pool.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    validate_pool_pda(program_id, pool_account, &pool)?;
+
+    {
+        let config_data = twap_config.try_borrow_data()?;
+        if config_data.len() < TWAP_CUSTODY_CONFIG_MIN_SIZE
+            || config_data[..8] != TWAP_CONFIG_DISC
+            || config_data[40..72] != market_slab.key.to_bytes()
+            || config_data[72..104] != percolator_program.key.to_bytes()
+            || config_data[225..257] != pool_account.key.to_bytes()
+            || (config_data.len() >= TWAP_PROVENANCE_CONFIG_MIN_SIZE
+                && config_data[TWAP_CUSTODY_MODE_OFF] != TWAP_CUSTODY_MODE_POOL_BOUND)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    let expected_authority = Pubkey::find_program_address(
+        &[TWAP_AUTHORITY_SEED, twap_config.key.as_ref()],
+        &TWAP_PROGRAM_ID,
+    )
+    .0;
+    if *twap_authority.key != expected_authority {
+        return Err(ProgramError::InvalidSeeds);
+    }
+
+    let (insurance, insurance_spent, backing_empty) = {
+        let market_data = market_slab.try_borrow_data()?;
+        if percolator_accounting::asset_has_position_or_loss_state(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let insurance = percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)
+            .and_then(|value| {
+                u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+            })?;
+        let insurance_spent =
+            percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)
+                .and_then(aggregate_insurance_spent)?;
+        let backing_empty =
+            percolator_accounting::read_asset_backing_balances(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                .into_iter()
+                .all(|balance| {
+                    !balance.has_any_state()
+                        && balance.expiry_slot == 0
+                        && balance.status
+                            == percolator_accounting::BackingDomainStatus::Empty
+                });
+        (insurance, insurance_spent, backing_empty)
+    };
+    if !backing_empty {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if pool.cross_backing {
+        if !uses_indexed_cross_backing(&pool, pool_account.data_len()) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let pending_backing = pool.pending_backing_total()?;
+        if pending_backing > pool.outstanding_principal {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let owner_backing = owner_backing_protection(&pool, u128::from(pending_backing))?;
+        let protected = u128::from(insurance)
+            .checked_add(u128::from(owner_backing))
+            .map(|value| value.min(u128::from(pool.outstanding_principal)))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        sync_indexed_cross_backing_external_loss(
+            &mut pool,
+            protected,
+            insurance_spent,
+            owner_backing,
+        )?;
+    } else {
+        if !uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        sync_principal_protected_checkpoint(&mut pool, insurance, insurance_spent)?;
+    }
+
+    // Restart creates a fresh Percolator counter generation. Reset only after
+    // the prior generation's delta has been charged to the durable pool claim.
+    pool.insurance_spent_checkpoint = 0;
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)
+}
+
 // accept_operator accounts: [asset_admin(signer), pool(w), market_slab(w), percolator_program,
 //   twap_config(optional; required after any user/provider value is admitted),
 //   cross_backing_long_ledger?, cross_backing_short_ledger?]
@@ -6101,6 +6249,75 @@ mod tests {
             .unwrap(),
             24,
             "only newly observed owner loss lowers the surviving claim",
+        );
+    }
+
+    #[test]
+    fn restart_counter_generations_charge_each_external_loss_once() {
+        let mut ordinary = historical_pool_fixture();
+        ordinary.policy = POLICY_PRINCIPAL;
+        ordinary.domain = DOMAIN_INSURANCE;
+        ordinary.outstanding_principal = 10;
+        ordinary.principal_protected_checkpoint = 10;
+        ordinary.insurance_spent_checkpoint = 5;
+
+        sync_principal_protected_checkpoint(&mut ordinary, 7, 8).unwrap();
+        assert_eq!(ordinary.principal_protected_checkpoint, 7);
+        ordinary.insurance_spent_checkpoint = 0;
+        sync_principal_protected_checkpoint(&mut ordinary, 7, 0).unwrap();
+        assert_eq!(
+            ordinary.principal_protected_checkpoint, 7,
+            "a healthy replacement generation cannot charge the prior loss again",
+        );
+        sync_principal_protected_checkpoint(&mut ordinary, 5, 2).unwrap();
+        assert_eq!(
+            ordinary.principal_protected_checkpoint, 5,
+            "only replacement-generation spending lowers the durable claim",
+        );
+
+        let mut cross_backing = historical_pool_fixture();
+        cross_backing.cross_backing = true;
+        cross_backing.policy = POLICY_PRINCIPAL;
+        cross_backing.domain = DOMAIN_INSURANCE;
+        cross_backing.outstanding_principal = 10;
+        cross_backing.total_shares = 10 * VIRTUAL_SHARES;
+        cross_backing.share_rate_numerator = 1;
+        cross_backing.share_rate_denominator = VIRTUAL_SHARES;
+        cross_backing.insurance_spent_checkpoint = 5;
+        cross_backing.backing_protected_checkpoint = 5;
+
+        sync_indexed_cross_backing_external_loss(&mut cross_backing, 7, 7, 4).unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                cross_backing.total_shares,
+                cross_backing.share_rate_numerator,
+                cross_backing.share_rate_denominator,
+            )
+            .unwrap(),
+            7,
+        );
+        cross_backing.insurance_spent_checkpoint = 0;
+        sync_indexed_cross_backing_external_loss(&mut cross_backing, 7, 0, 4).unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                cross_backing.total_shares,
+                cross_backing.share_rate_numerator,
+                cross_backing.share_rate_denominator,
+            )
+            .unwrap(),
+            7,
+            "staged backing survives a healthy replacement generation",
+        );
+        sync_indexed_cross_backing_external_loss(&mut cross_backing, 6, 1, 4).unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                cross_backing.total_shares,
+                cross_backing.share_rate_numerator,
+                cross_backing.share_rate_denominator,
+            )
+            .unwrap(),
+            6,
+            "replacement-generation insurance loss is charged exactly once",
         );
     }
 
