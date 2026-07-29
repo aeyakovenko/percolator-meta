@@ -33,6 +33,7 @@ enum PoolRestartScenario {
     LegacyPoolRestartAfterLossRejected,
     EmptyWithSurplusPoolRestart,
     RestartAfterLossAbsentOwnerBuyback,
+    RestartAfterPartialLossAbsentOwnerBuyback,
 }
 
 #[test]
@@ -74,10 +75,21 @@ fn e2e_asset0_restart_refreshes_floor_without_impaired_owner_signature() {
     run_pool_restart_claim_scenario(PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback);
 }
 
+#[test]
+fn e2e_asset0_partial_loss_restart_preserves_owner_claim_through_buyback() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
+    let partial_owner_buyback =
+        scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
+    let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
+    let surviving_owner_claim = if partial_owner_buyback { 1u64 } else { 0 };
     let pool_policy = if empty_with_surplus {
         POLICY_WITH_SURPLUS
     } else {
@@ -316,12 +328,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         &depositor_token,
         &collateral,
         &depositor.pubkey(),
-        1,
+        owner_principal,
     );
     set_token(&mut svm, &pool_holding, &collateral, &pool, 0);
     let position = sub_position_pda(&pool, &depositor.pubkey());
     let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
-    deposit_data.extend_from_slice(&1u64.to_le_bytes());
+    deposit_data.extend_from_slice(&owner_principal.to_le_bytes());
     send(
         &mut svm,
         &[&payer, &depositor],
@@ -342,8 +354,14 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             data: deposit_data,
         },
     )
-    .expect("owner deposits one base unit into live insurance");
-    assert_eq!(read_asset_insurance_domains(&svm, &market, 0), [0, 1]);
+    .expect("owner deposits principal into live insurance");
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &market, 0),
+        [
+            u128::from(owner_principal / 2),
+            u128::from(owner_principal - owner_principal / 2),
+        ],
+    );
     if empty_with_surplus {
         let withdraw_data = subledger_insurance_withdraw_data(&svm, &position, 1, 0);
         send(
@@ -418,7 +436,11 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     .expect("pool hands funded custody to TWAP");
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
-        if empty_with_surplus { 0 } else { 1 },
+        if empty_with_surplus {
+            0
+        } else {
+            owner_principal as u128
+        },
     );
 
     let owner_exit_witness = subledger_full_exit_witness(&svm, &position);
@@ -738,7 +760,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         twap_authority,
         perc_vault: vault,
         vault_authority,
-        principal: 1,
+        principal: owner_principal,
         surplus: 0,
     };
     let book = setup_auction(&mut svm, &payer, &handoff_env, 10, 0, None, 0);
@@ -925,7 +947,10 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         token_amount(&svm, &depositor_token),
         owner_balance_before_exposed_exit
     );
-    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &market, 0),
+        owner_principal as u128,
+    );
 
     for _ in 0..5 {
         send(
@@ -945,7 +970,10 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         )
         .expect("settle and liquidate the long");
     }
-    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &market, 0),
+        surviving_owner_claim as u128,
+    );
     let protected_loser = percolator_prog::state::read_portfolio(
         &svm.get_account(&traders[0].1.pubkey()).unwrap().data,
     )
@@ -985,11 +1013,15 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario,
         PoolRestartScenario::RestartAfterLoss
             | PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
+            | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
             | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
     ) {
         let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
-        let absent_owner_buyback =
-            scenario == PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback;
+        let absent_owner_buyback = matches!(
+            scenario,
+            PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
+                | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+        );
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
             &squads_vault,
@@ -1165,7 +1197,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         );
         assert_eq!(
             read_pool_restart_checkpoints(&svm, &pool),
-            (0, 1),
+            (0, owner_principal),
             "the old loss is still generation-local immediately before restart",
         );
         if legacy_pool {
@@ -1230,8 +1262,9 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         );
 
         if absent_owner_buyback {
+            let protected_floor = u128::from(owner_principal) + 1;
             let protect_retained_buffer =
-                build_set_reserved_floor_message(&squads_vault, &twap_cfg, 2);
+                build_set_reserved_floor_message(&squads_vault, &twap_cfg, protected_floor);
             let protect_remaining = vec![
                 AccountMeta::new_readonly(squads_vault, false),
                 AccountMeta::new(twap_cfg, false),
@@ -1248,7 +1281,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 &protect_remaining,
             )
             .expect("futarchy protects one retained protocol atom above pool principal");
-            assert_eq!(read_reserved_floor(&svm, &twap_cfg), 2);
+            assert_eq!(read_reserved_floor(&svm, &twap_cfg), protected_floor);
         }
 
         let restart = build_twap_restart_asset0_message(
@@ -1310,7 +1343,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         .expect("futarchy restarts asset 0 after the loss is fully settled");
         assert_eq!(
             read_pool_restart_checkpoints(&svm, &pool),
-            (0, 0),
+            (0, surviving_owner_claim),
             "the old-generation loss is durably charged exactly once",
         );
         assert_eq!(
@@ -1358,13 +1391,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         .expect("a public donor adds fresh-generation insurance");
         assert_eq!(
             read_asset_insurance_remaining(&svm, &market, 0),
-            donation as u128,
+            u128::from(surviving_owner_claim) + u128::from(donation),
         );
         if absent_owner_buyback {
             assert_eq!(
                 read_reserved_floor(&svm, &twap_cfg),
-                1,
-                "restart removes only the impaired pool component and preserves the retained buffer",
+                u128::from(surviving_owner_claim) + 1,
+                "restart replaces only the impaired pool component and preserves the retained buffer",
             );
             let supply_before = mint_supply(&svm, &coin_mint);
             let round_end = u64::from_le_bytes(
@@ -1391,8 +1424,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             assert_eq!(token_amount(&svm, &book.settlement_usd), 1);
             assert_eq!(
                 read_asset_insurance_remaining(&svm, &market, 0),
-                1,
-                "the retained protocol atom remains protected after buyback",
+                u128::from(surviving_owner_claim) + 1,
+                "the surviving owner claim and retained protocol atom remain protected after buyback",
             );
             assert_eq!(mint_supply(&svm, &coin_mint), supply_before - 1);
             assert_eq!(token_amount(&svm, &book.coin_escrow), 0);
@@ -1419,9 +1452,42 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                         .try_into()
                         .unwrap(),
                 ),
-                1,
+                owner_principal,
                 "buyback progress does not depend on or retire the absent owner",
             );
+            if partial_owner_buyback {
+                send(&mut svm, &[&payer, &depositor], owner_exit_ix())
+                    .expect("the owner recovers its complete surviving claim after buyback");
+                assert_eq!(token_amount(&svm, &depositor_token), surviving_owner_claim);
+                assert_eq!(
+                    read_asset_insurance_remaining(&svm, &market, 0),
+                    1,
+                    "owner exit cannot consume the retained protocol atom",
+                );
+                send(
+                    &mut svm,
+                    &[&payer],
+                    Instruction {
+                        program_id: sub_id(),
+                        accounts: vec![
+                            AccountMeta::new_readonly(squads_vault, false),
+                            AccountMeta::new_readonly(pool, false),
+                            AccountMeta::new(twap_cfg, false),
+                            AccountMeta::new_readonly(twap_authority, false),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new_readonly(perc_id(), false),
+                            AccountMeta::new_readonly(twap_id(), false),
+                        ],
+                        data: vec![8u8], // IX_HANDOFF_TO_TWAP
+                    },
+                )
+                .expect("a public cranker re-hands the empty pool to TWAP");
+                assert_eq!(
+                    read_reserved_floor(&svm, &twap_cfg),
+                    1,
+                    "re-handoff removes only the recovered owner claim",
+                );
+            }
             return;
         }
 
