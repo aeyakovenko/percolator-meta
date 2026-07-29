@@ -34,6 +34,7 @@ enum PoolRestartScenario {
     EmptyWithSurplusPoolRestart,
     RestartAfterLossAbsentOwnerBuyback,
     RestartAfterPartialLossAbsentOwnerBuyback,
+    RestartAfterPartialLossBackingWithdrawal,
 }
 
 #[test]
@@ -82,12 +83,25 @@ fn e2e_asset0_partial_loss_restart_preserves_owner_claim_through_buyback() {
     );
 }
 
+// BLOCKER DOS: a fresh external backing deposit is admitted after bankruptcy restart, but the
+// provider cannot withdraw even unused principal while the fresh asset remains live.
+#[test]
+#[ignore = "expected RED until percolator-prog permits fresh-generation backing withdrawal"]
+fn e2e_post_bankruptcy_restart_backer_can_withdraw_fresh_principal() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::RestartAfterPartialLossBackingWithdrawal);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
-    let partial_owner_buyback =
-        scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
+    let partial_owner_buyback = matches!(
+        scenario,
+        PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+            | PoolRestartScenario::RestartAfterPartialLossBackingWithdrawal
+    );
+    let probe_fresh_backing_withdrawal =
+        scenario == PoolRestartScenario::RestartAfterPartialLossBackingWithdrawal;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
     let surviving_owner_claim = if partial_owner_buyback { 1u64 } else { 0 };
     let pool_policy = if empty_with_surplus {
@@ -1014,6 +1028,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         PoolRestartScenario::RestartAfterLoss
             | PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
             | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+            | PoolRestartScenario::RestartAfterPartialLossBackingWithdrawal
             | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
     ) {
         let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
@@ -1021,6 +1036,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             scenario,
             PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
                 | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+                | PoolRestartScenario::RestartAfterPartialLossBackingWithdrawal
         );
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
@@ -1355,6 +1371,64 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             [0, 0],
             "the public restart begins a fresh cumulative-loss generation",
         );
+        if probe_fresh_backing_withdrawal {
+            let provider_before = token_amount(&svm, &backing_provider_destination);
+            send(
+                &mut svm,
+                &[&payer, &admin],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(admin.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(backing_provider_destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::TopUpBackingBucket {
+                        domain: 0,
+                        amount: 1,
+                        expiry_slot: restart_slot + 10_000,
+                    },
+                ),
+            )
+            .expect("the recorded external provider deposits fresh post-restart backing");
+            assert_eq!(
+                token_amount(&svm, &backing_provider_destination),
+                provider_before - 1,
+            );
+            assert_eq!(
+                percolator_accounting::read_asset_backing_balances(
+                    &svm.get_account(&market).unwrap().data,
+                    0,
+                )
+                .unwrap()[0]
+                    .principal_atoms,
+                1,
+            );
+            send(
+                &mut svm,
+                &[&payer, &admin],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(admin.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(backing_provider_destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::WithdrawBackingBucket {
+                        domain: 0,
+                        amount: 1,
+                    },
+                ),
+            )
+            .expect("the external provider withdraws its unused fresh-generation backing");
+            assert_eq!(
+                token_amount(&svm, &backing_provider_destination),
+                provider_before,
+            );
+        }
 
         let donor = Keypair::new();
         svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
