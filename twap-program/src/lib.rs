@@ -21,7 +21,7 @@ use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
-    program::{invoke, invoke_signed},
+    program::{get_return_data, invoke, invoke_signed},
     program_error::ProgramError,
     program_pack::Pack,
     pubkey::Pubkey,
@@ -112,6 +112,8 @@ const SUBLEDGER_IX_ACCEPT_OPERATOR: u8 = 7;
 const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 const SUBLEDGER_IX_ASSERT_PRINCIPAL: u8 = 11;
 const SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
+const SUBLEDGER_IX_PREPARE_ASSET0_RESTART: u8 = 16;
+const RESTART_CHECKPOINT_RETURN_DISC: [u8; 8] = *b"RSTFLR01";
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 const MARKET_CONTROLLER_SEED: &[u8] = b"market-controller";
@@ -2194,13 +2196,16 @@ fn process_set_market_fees(
 }
 
 // restart_asset0 accounts:
-// [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program]
+// [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program,
+//  custody_pool(w), subledger_program] for a pool-bound config. Pool-less
+// compatibility configs retain the original five-account shape.
 // data: now_slot(u64) || initial_price(u64) || expected_market_id(u64)
 //
 // Once custody is handed off, Percolator recognizes only the TWAP PDA as asset_admin.
 // This fixed wrapper keeps restart reachable without exposing a generic admin proxy or any
-// value-bearing account. Percolator enforces Recovery, empty positions/backing, the real Clock,
-// and preservation of the existing insurance and authority fields.
+// token/value account. The bound pool stores only owner claim accounting. Percolator enforces
+// Recovery, empty positions/backing, the real Clock, and preservation of the existing insurance
+// and authority fields.
 fn process_restart_asset0(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2218,13 +2223,28 @@ fn process_restart_asset0(
     let twap_authority = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
-    if iter.next().is_some() {
-        return Err(ProgramError::InvalidAccountData);
-    }
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
-    let config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
+    let pool_checkpoint_accounts = if config.custody_pool != Pubkey::default() {
+        if (config_account.data_len() >= PROVENANCE_CONFIG_SIZE
+            && config.custody_mode != CUSTODY_MODE_POOL_BOUND)
+            || (config_account.data_len() >= PROVENANCE_CONFIG_SIZE
+                && !config_account.is_writable)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Some((next_account_info(iter)?, next_account_info(iter)?))
+    } else {
+        if config.custody_mode == CUSTODY_MODE_POOL_BOUND {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        None
+    };
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidAccountData);
+    }
     require_squads_vault(squads_vault, &config)?;
     if *market_slab.key != config.market_slab
         || market_slab.owner != percolator_program.key
@@ -2247,6 +2267,50 @@ fn process_restart_asset0(
         return Err(ProgramError::InvalidSeeds);
     }
 
+    let pool_bound = pool_checkpoint_accounts.is_some();
+    let mut checkpointed_pool_principal = None;
+    if let Some((custody_pool, subledger_program)) = pool_checkpoint_accounts {
+        if *custody_pool.key != config.custody_pool
+            || !custody_pool.is_writable
+            || *subledger_program.key != SUBLEDGER_PROGRAM_ID
+            || !subledger_program.executable
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        invoke_signed(
+            &Instruction {
+                program_id: *subledger_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*twap_authority.key, true),
+                    AccountMeta::new_readonly(*config_account.key, false),
+                    AccountMeta::new(*custody_pool.key, false),
+                    AccountMeta::new_readonly(*market_slab.key, false),
+                    AccountMeta::new_readonly(*percolator_program.key, false),
+                ],
+                data: vec![SUBLEDGER_IX_PREPARE_ASSET0_RESTART],
+            },
+            &[
+                twap_authority.clone(),
+                config_account.clone(),
+                custody_pool.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
+                subledger_program.clone(),
+            ],
+            &[&auth_seeds],
+        )?;
+        let (return_program, return_data) =
+            get_return_data().ok_or(ProgramError::InvalidAccountData)?;
+        if return_program != SUBLEDGER_PROGRAM_ID
+            || return_data.len() != 24
+            || return_data[..8] != RESTART_CHECKPOINT_RETURN_DISC
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        checkpointed_pool_principal =
+            Some(u128::from_le_bytes(return_data[8..24].try_into().unwrap()));
+    }
+
     let mut ix_data = vec![PERC_IX_RESTART_ASSET_ORACLE];
     ix_data.extend_from_slice(&0u16.to_le_bytes());
     ix_data.extend_from_slice(&now_slot.to_le_bytes());
@@ -2266,7 +2330,30 @@ fn process_restart_asset0(
             percolator_program.clone(),
         ],
         &[&auth_seeds],
-    )
+    )?;
+    if pool_bound && config_account.data_len() >= PROVENANCE_CONFIG_SIZE {
+        let checkpointed_pool_principal =
+            checkpointed_pool_principal.ok_or(ProgramError::InvalidAccountData)?;
+        let old_pool_principal = u128::from(config.custody_principal);
+        let new_pool_principal = u64::try_from(checkpointed_pool_principal)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if checkpointed_pool_principal > old_pool_principal
+            || config.reserved_floor < old_pool_principal
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        config.reserved_floor = config
+            .reserved_floor
+            .checked_sub(old_pool_principal)
+            .and_then(|retained| retained.checked_add(checkpointed_pool_principal))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        config.custody_principal = new_pool_principal;
+        if config_account.data_len() >= CONFIG_SIZE {
+            config.custody_insurance_spent = 0;
+        }
+        config.serialize(&mut config_account.try_borrow_mut_data()?)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
