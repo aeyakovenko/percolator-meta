@@ -34,6 +34,7 @@ enum PoolRestartScenario {
     EmptyWithSurplusPoolRestart,
     RestartAfterLossAbsentOwnerBuyback,
     RestartAfterPartialLossAbsentOwnerBuyback,
+    RestartAfterPartialLossOracleReconfiguration,
 }
 
 #[test]
@@ -82,12 +83,28 @@ fn e2e_asset0_partial_loss_restart_preserves_owner_claim_through_buyback() {
     );
 }
 
+// BLOCKER DOS: a publicly reachable bankruptcy leaves the market-wide historical lock set.
+// After complete asset-local cleanup and restart, the fresh generation must be able to restore
+// a moving oracle; otherwise its manual restart price is frozen forever.
+#[test]
+#[ignore = "expected RED until percolator-prog permits safe post-bankruptcy oracle reconfiguration"]
+fn e2e_post_bankruptcy_restart_can_restore_governed_oracle() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::RestartAfterPartialLossOracleReconfiguration,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
-    let partial_owner_buyback =
-        scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
+    let partial_owner_buyback = matches!(
+        scenario,
+        PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+            | PoolRestartScenario::RestartAfterPartialLossOracleReconfiguration
+    );
+    let probe_restarted_oracle =
+        scenario == PoolRestartScenario::RestartAfterPartialLossOracleReconfiguration;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
     let surviving_owner_claim = if partial_owner_buyback { 1u64 } else { 0 };
     let pool_policy = if empty_with_surplus {
@@ -1014,6 +1031,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         PoolRestartScenario::RestartAfterLoss
             | PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
             | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+            | PoolRestartScenario::RestartAfterPartialLossOracleReconfiguration
             | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
     ) {
         let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
@@ -1021,6 +1039,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             scenario,
             PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
                 | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
+                | PoolRestartScenario::RestartAfterPartialLossOracleReconfiguration
         );
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
@@ -1456,6 +1475,83 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 "buyback progress does not depend on or retire the absent owner",
             );
             if partial_owner_buyback {
+                if probe_restarted_oracle {
+                    let restarted_market = svm.get_account(&market).unwrap();
+                    let (_, restarted_group) =
+                        percolator_prog::state::read_market(&restarted_market.data).unwrap();
+                    assert_eq!(
+                        restarted_group.assets[0].lifecycle,
+                        percolator::AssetLifecycleV16::Active,
+                    );
+                    assert!(
+                        !percolator_accounting::asset_has_position_or_loss_state(
+                            &restarted_market.data,
+                            0,
+                        )
+                        .unwrap(),
+                        "the restarted asset has no remaining position or loss state",
+                    );
+                    assert_eq!(read_asset0_oi(&svm, &market), (0, 0));
+                    assert_eq!(restarted_group.pnl_pos_tot, 0);
+                    assert_eq!(restarted_group.stale_certificate_count, 0);
+                    assert_eq!(restarted_group.b_stale_account_count, 0);
+                    assert_eq!(restarted_group.negative_pnl_account_count, 0);
+                    assert!(restarted_group.bankruptcy_hlock_active);
+                    assert!(!restarted_group.threshold_stress_active);
+                    assert!(!restarted_group.loss_stale_active);
+                    assert_eq!(restarted_group.recovery_reason, None);
+
+                    let configure_slot = svm.get_sysvar::<Clock>().slot;
+                    let push_mark = build_push_auth_mark_message(
+                        &squads_vault,
+                        &market,
+                        &perc_id(),
+                        configure_slot,
+                        1_001,
+                    );
+                    let oracle_remaining = vec![
+                        AccountMeta::new_readonly(squads_vault, false),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new_readonly(perc_id(), false),
+                    ];
+                    let push_err = squads_execute(
+                        &mut svm,
+                        &squads,
+                        &multisig,
+                        &dao,
+                        &payer,
+                        12,
+                        &push_mark,
+                        &oracle_remaining,
+                    )
+                    .expect_err("the restart's manual oracle does not accept authenticated marks");
+                    assert!(
+                        push_err.contains("Custom(8)"),
+                        "manual mode rejects authenticated marks before the governed profile can be restored: {push_err}",
+                    );
+
+                    let configure_mark = build_configure_ewma_mark_message(
+                        &squads_vault,
+                        &market,
+                        &perc_id(),
+                        configure_slot,
+                        1_000,
+                        10,
+                        0,
+                    );
+                    squads_execute(
+                        &mut svm,
+                        &squads,
+                        &multisig,
+                        &dao,
+                        &payer,
+                        13,
+                        &configure_mark,
+                        &oracle_remaining,
+                    )
+                    .expect("configure the restarted asset's governed oracle");
+                }
+
                 send(&mut svm, &[&payer, &depositor], owner_exit_ix())
                     .expect("the owner recovers its complete surviving claim after buyback");
                 assert_eq!(token_amount(&svm, &depositor_token), surviving_owner_claim);
