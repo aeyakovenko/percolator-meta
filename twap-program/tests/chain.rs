@@ -20213,6 +20213,58 @@ fn build_twap_restart_asset0_message(
     m
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_cross_backing_twap_restart_asset0_message(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    custody_pool: &Pubkey,
+    pool_holding: &Pubkey,
+    percolator_vault: &Pubkey,
+    vault_authority: &Pubkey,
+    long_backing_ledger: &Pubkey,
+    short_backing_ledger: &Pubkey,
+    now_slot: u64,
+    initial_price: u64,
+    expected_market_id: u64,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(7); // market, pool, config, holding, vault, and both ledgers
+    m.push(14);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(custody_pool.as_ref()); // 2 writable
+    m.extend_from_slice(config.as_ref()); // 3 writable
+    m.extend_from_slice(pool_holding.as_ref()); // 4 writable
+    m.extend_from_slice(percolator_vault.as_ref()); // 5 writable
+    m.extend_from_slice(long_backing_ledger.as_ref()); // 6 writable
+    m.extend_from_slice(short_backing_ledger.as_ref()); // 7 writable
+    m.extend_from_slice(twap_authority.as_ref()); // 8
+    m.extend_from_slice(percolator_program.as_ref()); // 9
+    m.extend_from_slice(sub_id().as_ref()); // 10
+    m.extend_from_slice(vault_authority.as_ref()); // 11
+    m.extend_from_slice(spl_token::ID.as_ref()); // 12
+    m.extend_from_slice(twap_id().as_ref()); // 13 program
+    m.push(1);
+    m.push(13);
+    m.push(13);
+    for index in [0u8, 3, 8, 1, 9, 2, 10, 4, 5, 11, 6, 7, 12] {
+        m.push(index);
+    }
+    let mut data = vec![21u8];
+    data.extend_from_slice(&now_slot.to_le_bytes());
+    data.extend_from_slice(&initial_price.to_le_bytes());
+    data.extend_from_slice(&expected_market_id.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
 // IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
 // accounts: [squads_vault(signer), config(w), savings_account(ro)]; data: savings_bps(u16)||buyback_bps(u16)
 fn build_set_economics_message(
@@ -55345,6 +55397,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
     predecessor_config_size: Option<usize>,
     opening_fee_bps: u64,
     direct_exit_before_handoff: bool,
+    restart_with_live_owner_claims: bool,
 ) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -55597,6 +55650,515 @@ fn run_cross_backing_haircut_and_protocol_donation(
         let mut predecessor = svm.get_account(&twap_cfg).unwrap();
         predecessor.data.truncate(264);
         svm.set_account(twap_cfg, predecessor).unwrap();
+    }
+
+    if restart_with_live_owner_claims {
+        assert!(handoff_before_loss);
+        assert_eq!(predecessor_config_size, None);
+        assert_eq!(opening_fee_bps, 0);
+        assert!(!direct_exit_before_handoff);
+
+        let old_market_id = read_asset0_market_id(&svm, &env.slab);
+        let (_, active_group) =
+            percolator_prog::state::read_market(&svm.get_account(&env.slab).unwrap().data)
+                .unwrap();
+        assert_eq!(
+            active_group.assets[0].lifecycle,
+            percolator::AssetLifecycleV16::Active,
+            "the probe starts from a healthy live asset",
+        );
+        assert_eq!(
+            active_group.materialized_portfolio_count, 0,
+            "only backing owners remain; no trader can block lifecycle progress",
+        );
+
+        let pool_before_restart = svm.get_account(&env.pool).unwrap();
+        let owner_positions = [positions[0], positions[1], sync_position];
+        let positions_before_restart =
+            owner_positions.map(|position| svm.get_account(&position).unwrap());
+        let indexed_owner_claim = u128::from_le_bytes(
+            pool_before_restart.data[192..208].try_into().unwrap(),
+        )
+        .checked_mul(u128::from_le_bytes(
+            pool_before_restart.data[289..305].try_into().unwrap(),
+        ))
+        .unwrap()
+            / u128::from_le_bytes(
+                pool_before_restart.data[305..321].try_into().unwrap(),
+            );
+        assert_eq!(indexed_owner_claim, u128::from(2 * principal + 1));
+        let market_before_restart = svm.get_account(&env.slab).unwrap();
+        let backing_balances =
+            percolator_accounting::read_asset_backing_balances(&market_before_restart.data, 0)
+                .unwrap();
+        let backing_sources =
+            percolator_accounting::read_asset_backing_source_credits(&market_before_restart.data, 0)
+                .unwrap();
+        let backing_principals =
+            [env.long_backing_ledger, env.short_backing_ledger].map(|ledger| {
+                percolator_prog::state::read_backing_domain_ledger(
+                    &svm.get_account(&ledger).unwrap().data,
+                )
+                .unwrap()
+                .total_principal_atoms
+            });
+        let owner_backing_before = backing_balances
+            .into_iter()
+            .zip(backing_sources)
+            .zip(backing_principals)
+            .map(|((balance, source), provider_principal)| {
+                balance
+                    .provider_protected_principal_atoms(provider_principal, source)
+                    .unwrap()
+            })
+            .sum::<u128>();
+        let owner_insurance_before = read_reserved_floor(&svm, &twap_cfg);
+        assert_eq!(
+            owner_insurance_before + owner_backing_before,
+            indexed_owner_claim,
+            "the complete owner claim is segregated across insurance and live backing",
+        );
+        let collateral_before_restart =
+            token_amount(&svm, &env.perc_vault) + token_amount(&svm, &pool_holding);
+
+        let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+        let shutdown = build_controller_proxy_message(
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &perc_id(),
+            &PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: shutdown_slot,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            }
+            .encode(),
+        );
+        let shutdown_remaining = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            4,
+            &shutdown,
+            &shutdown_remaining,
+        )
+        .expect("futarchy shuts down the healthy empty generation");
+
+        let (_, force_close_delay_slots) =
+            percolator_accounting::read_permissionless_resolve_policy(
+                &svm.get_account(&env.slab).unwrap().data,
+            )
+            .unwrap();
+        warp_to(
+            &mut svm,
+            shutdown_slot.checked_add(force_close_delay_slots).unwrap(),
+        );
+        let restart_slot = svm.get_sysvar::<Clock>().slot;
+        let vault_authority = perc_vault_authority(&env.slab, &perc_id());
+        let restart = build_cross_backing_twap_restart_asset0_message(
+            &env.squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &env.slab,
+            &perc_id(),
+            &env.pool,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            restart_slot,
+            1_000_001,
+            old_market_id,
+        );
+        let restart_remaining = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new(pool_holding, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new(env.long_backing_ledger, false),
+            AccountMeta::new(env.short_backing_ledger, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        let restart_state = |svm: &LiteSVM| {
+            [
+                env.slab,
+                env.pool,
+                twap_cfg,
+                pool_holding,
+                env.perc_vault,
+                env.long_backing_ledger,
+                env.short_backing_ledger,
+            ]
+            .map(|address| svm.get_account(&address).unwrap())
+        };
+
+        let before_missing_accounts = restart_state(&svm);
+        let missing_accounts_restart = build_twap_restart_asset0_message(
+            &env.squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &env.slab,
+            &perc_id(),
+            Some(&env.pool),
+            restart_slot,
+            1_000_001,
+            old_market_id,
+        );
+        let missing_accounts_remaining = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        assert!(
+            squads_execute(
+                &mut svm,
+                &env.squads,
+                &env.multisig,
+                &env.dao,
+                &payer,
+                5,
+                &missing_accounts_restart,
+                &missing_accounts_remaining,
+            )
+            .is_err(),
+            "a cross-backed restart cannot omit its canonical staging accounts",
+        );
+        assert_eq!(
+            restart_state(&svm),
+            before_missing_accounts,
+            "missing accounts cannot mutate any custody or claim state",
+        );
+
+        let substituted_holding = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &substituted_holding,
+            &env.collateral_mint,
+            &env.pool,
+            0,
+        );
+        let before_substituted_holding = restart_state(&svm);
+        let substituted_holding_before = svm.get_account(&substituted_holding).unwrap();
+        let substituted_holding_restart = build_cross_backing_twap_restart_asset0_message(
+            &env.squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &env.slab,
+            &perc_id(),
+            &env.pool,
+            &substituted_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            restart_slot,
+            1_000_001,
+            old_market_id,
+        );
+        let mut substituted_holding_remaining = restart_remaining.clone();
+        substituted_holding_remaining[4] = AccountMeta::new(substituted_holding, false);
+        assert!(
+            squads_execute(
+                &mut svm,
+                &env.squads,
+                &env.multisig,
+                &env.dao,
+                &payer,
+                6,
+                &substituted_holding_restart,
+                &substituted_holding_remaining,
+            )
+            .is_err(),
+            "governance cannot redirect staged backing to another pool-owned token account",
+        );
+        assert_eq!(
+            restart_state(&svm),
+            before_substituted_holding,
+            "a substituted holding cannot mutate canonical custody or claims",
+        );
+        assert_eq!(
+            svm.get_account(&substituted_holding).unwrap(),
+            substituted_holding_before,
+            "the substituted token account receives no owner funds",
+        );
+
+        let before_swapped_ledgers = restart_state(&svm);
+        let swapped_ledgers_restart = build_cross_backing_twap_restart_asset0_message(
+            &env.squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &env.slab,
+            &perc_id(),
+            &env.pool,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.short_backing_ledger,
+            &env.long_backing_ledger,
+            restart_slot,
+            1_000_001,
+            old_market_id,
+        );
+        let mut swapped_ledgers_remaining = restart_remaining.clone();
+        swapped_ledgers_remaining.swap(6, 7);
+        assert!(
+            squads_execute(
+                &mut svm,
+                &env.squads,
+                &env.multisig,
+                &env.dao,
+                &payer,
+                7,
+                &swapped_ledgers_restart,
+                &swapped_ledgers_remaining,
+            )
+            .is_err(),
+            "governance cannot swap the canonical long and short backing ledgers",
+        );
+        assert_eq!(
+            restart_state(&svm),
+            before_swapped_ledgers,
+            "swapped ledgers cannot mutate any custody or claim state",
+        );
+
+        let before_atomic_rollback = restart_state(&svm);
+        let invalid_final_restart = build_cross_backing_twap_restart_asset0_message(
+            &env.squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &env.slab,
+            &perc_id(),
+            &env.pool,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            restart_slot,
+            0,
+            old_market_id,
+        );
+        let invalid_final_error = squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            8,
+            &invalid_final_restart,
+            &restart_remaining,
+        )
+        .expect_err("a rejected final restart must roll back successful backing staging");
+        assert!(
+            invalid_final_error.contains(&format!("Program {} success", sub_id())),
+            "the rollback probe must complete the Subledger staging CPI before failing",
+        );
+        assert_eq!(
+            restart_state(&svm),
+            before_atomic_rollback,
+            "the outer transaction atomically restores every staged token and counter",
+        );
+
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            9,
+            &restart,
+            &restart_remaining,
+        )
+        .expect("an absent backing owner cannot veto the fixed restart");
+
+        assert!(
+            read_asset0_market_id(&svm, &env.slab) > old_market_id,
+            "the probe reaches a fresh live market generation",
+        );
+        assert_eq!(
+            owner_positions.map(|position| svm.get_account(&position).unwrap()),
+            positions_before_restart,
+            "restart cannot mutate any owner-bound position",
+        );
+        let pool_after_restart = svm.get_account(&env.pool).unwrap();
+        assert_eq!(
+            &pool_after_restart.data[80..88],
+            &pool_before_restart.data[80..88],
+            "restart cannot lower aggregate owner principal",
+        );
+        assert_eq!(
+            &pool_after_restart.data[192..208],
+            &pool_before_restart.data[192..208],
+            "restart cannot alter aggregate owner shares",
+        );
+        assert_eq!(
+            &pool_after_restart.data[289..321],
+            &pool_before_restart.data[289..321],
+            "a healthy restart cannot alter the owner share rate",
+        );
+        let pending_backing = u128::from(u64::from_le_bytes(
+            pool_after_restart.data[273..281].try_into().unwrap(),
+        )) + u128::from(u64::from_le_bytes(
+            pool_after_restart.data[281..289].try_into().unwrap(),
+        ));
+        assert_eq!(
+            pending_backing, owner_backing_before,
+            "all live owner backing moves to the same canonical segregated escrow",
+        );
+        assert_eq!(
+            read_reserved_floor(&svm, &twap_cfg) + pending_backing,
+            indexed_owner_claim,
+            "the restart preserves the complete owner claim by construction",
+        );
+        assert!(
+            percolator_accounting::read_asset_backing_balances(
+                &svm.get_account(&env.slab).unwrap().data,
+                0,
+            )
+            .unwrap()
+            .into_iter()
+            .all(|balance| !balance.has_any_state()),
+            "the fresh market generation starts with empty backing buckets",
+        );
+        assert_eq!(
+            token_amount(&svm, &env.perc_vault) + token_amount(&svm, &pool_holding),
+            collateral_before_restart,
+            "restart cannot move owner collateral outside the two canonical vaults",
+        );
+
+        let permissionless_rehandoff = Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(env.squads_vault, false),
+                AccountMeta::new_readonly(env.pool, false),
+                AccountMeta::new(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(env.long_backing_ledger, false),
+                AccountMeta::new_readonly(env.short_backing_ledger, false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ],
+            data: vec![8u8], // IX_HANDOFF_TO_TWAP
+        };
+        let mut recovered_owner_principal = 0u64;
+        for (owner, position, destination, amount) in [
+            (&owners[0], positions[0], destinations[0], principal),
+            (&owners[1], positions[1], destinations[1], principal),
+            (&sync_owner, sync_position, sync_destination, 1),
+        ] {
+            let mut owner_exit = twap_return_to_subledger_ix(
+                &env.squads_vault,
+                &env.pool,
+                &env.slab,
+                &twap_cfg,
+                &twap_authority,
+                &perc_id(),
+            );
+            owner_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
+            owner_exit
+                .accounts
+                .push(AccountMeta::new_readonly(owner.pubkey(), true));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new(position, false));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new(destination, false));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new(pool_holding, false));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new(env.perc_vault, false));
+            owner_exit.accounts.push(AccountMeta::new_readonly(
+                vault_authority,
+                false,
+            ));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new(env.long_backing_ledger, false));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new(env.short_backing_ledger, false));
+            owner_exit
+                .accounts
+                .push(AccountMeta::new_readonly(spl_token::ID, false));
+            bind_subledger_full_exit_witness(&svm, &mut owner_exit, &position);
+            for (index, account) in owner_exit.accounts.iter().enumerate() {
+                assert!(
+                    !owner_exit.accounts[..index]
+                        .iter()
+                        .any(|prior| prior.pubkey == account.pubkey),
+                    "owner-exit account {} is unexpectedly aliased",
+                    account.pubkey,
+                );
+            }
+            svm.expire_blockhash();
+            let blockhash = svm.latest_blockhash();
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                &[owner_exit],
+                Some(&payer.pubkey()),
+                &[&payer, owner],
+                blockhash,
+            ))
+            .expect("each owner can atomically recover its full healthy claim after restart");
+            assert_eq!(
+                token_amount(&svm, &destination),
+                amount,
+                "restart staging cannot strand or dilute an owner's deposit",
+            );
+            recovered_owner_principal = recovered_owner_principal.checked_add(amount).unwrap();
+
+            send(&mut svm, &[&payer], permissionless_rehandoff.clone())
+                .expect("any cranker restores the established TWAP custody after an owner exit");
+            let pool_data = svm.get_account(&env.pool).unwrap().data;
+            let pending = u128::from(u64::from_le_bytes(
+                pool_data[273..281].try_into().unwrap(),
+            )) + u128::from(u64::from_le_bytes(
+                pool_data[281..289].try_into().unwrap(),
+            ));
+            let outstanding =
+                u64::from_le_bytes(pool_data[80..88].try_into().unwrap()) as u128;
+            assert_eq!(
+                read_reserved_floor(&svm, &twap_cfg) + pending,
+                outstanding,
+                "every re-handoff protects exactly the surviving owner principal",
+            );
+        }
+        assert_eq!(
+            recovered_owner_principal,
+            2 * principal + 1,
+            "all owner deposits remain fully recoverable without governance cooperation",
+        );
+        return;
     }
 
     let long = Keypair::new();
@@ -56249,32 +56811,37 @@ fn run_cross_backing_haircut_and_protocol_donation(
 
 #[test]
 fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false);
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, false);
 }
 
 #[test]
 fn e2e_cross_backing_haircut_before_twap_handoff_survives_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false, false);
 }
 
 #[test]
 fn e2e_pre_handoff_trade_fees_cannot_erase_a_cross_backing_owner_loss() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false, false);
 }
 
 #[test]
 fn e2e_pre_handoff_trade_fees_cannot_restore_a_direct_owner_exit() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true, false);
 }
 
 #[test]
 fn e2e_predecessor_cross_backing_config_can_finish_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false);
+    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false, false);
 }
 
 #[test]
 fn e2e_legacy_custody_config_can_finish_cross_backing_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false);
+    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false, false);
+}
+
+#[test]
+fn e2e_absent_cross_backing_owner_cannot_veto_asset0_restart() {
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, true);
 }
 
 #[derive(Clone, Copy, Debug)]
