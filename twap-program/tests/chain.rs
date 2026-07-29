@@ -62490,6 +62490,456 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         .map_or(true, |account| account.lamports == 0));
 }
 
+// PUBLIC DOS PROBE: a finite backing bucket can lapse while an account still has
+// source-backed positive PnL that a later mark reversal must settle. Resolved
+// settlement must prepare that bucket before any valuation which rejects stale
+// Fresh backing, or every public continuation rolls back without progress.
+#[test]
+fn probe_resolved_settlement_prepares_lapsed_backing_before_mark_debit() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const START_SLOT: u64 = 40;
+    const START_PRICE: u64 = 1_000;
+    const HIGH_PRICE: u64 = 1_010;
+    const USER_CAPITAL: u64 = 50_000_000;
+    const POSITION_Q: i128 = 50_000 * percolator::POS_SCALE as i128;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    let oracle = Keypair::new();
+    let provider = Keypair::new();
+    for signer in [&payer, &creator, &governance, &oracle, &provider] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT,
+        unix_timestamp: START_SLOT as i64,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    svm.airdrop(&mint_authority.pubkey(), 1_000_000_000)
+        .unwrap();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate a public market slab");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: START_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 100,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize the market through Percolator");
+    for (kind, role) in [(4u8, &oracle), (3u8, &provider)] {
+        send(
+            &mut svm,
+            &[&payer, &creator, role],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(role.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: role.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("assign an independent public market role");
+    }
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: START_SLOT,
+                initial_mark_e6: START_PRICE,
+            },
+        ),
+    )
+    .expect("configure the authenticated mark");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: vec![3u8],
+        },
+    )
+    .expect("donate lifecycle control to the constrained controller");
+
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let create_portfolio =
+        |svm: &mut LiteSVM, owner: &Keypair, capital: u64| -> Pubkey {
+            let portfolio = Pubkey::new_unique();
+            svm.set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; portfolio_len],
+                    owner: perc_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+            send(
+                svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("initialize a public portfolio");
+            if capital != 0 {
+                let source = Pubkey::new_unique();
+                set_token(
+                    svm,
+                    &source,
+                    &collateral_mint,
+                    &owner.pubkey(),
+                    capital,
+                );
+                send(
+                    svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new_readonly(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio, false),
+                            AccountMeta::new(source, false),
+                            AccountMeta::new(percolator_vault, false),
+                            AccountMeta::new_readonly(spl_token::ID, false),
+                        ],
+                        PIx::Deposit {
+                            amount: u128::from(capital),
+                        },
+                    ),
+                )
+                .expect("deposit public collateral");
+            }
+            portfolio
+        };
+    let observer = Keypair::new();
+    let long = Keypair::new();
+    let short = Keypair::new();
+    for owner in [&observer, &long, &short] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let observer_portfolio = create_portfolio(&mut svm, &observer, 0);
+    let long_portfolio = create_portfolio(&mut svm, &long, USER_CAPITAL);
+    let short_portfolio = create_portfolio(&mut svm, &short, USER_CAPITAL);
+    send(
+        &mut svm,
+        &[&payer, &long, &short],
+        pix(
+            vec![
+                AccountMeta::new_readonly(long.pubkey(), true),
+                AccountMeta::new_readonly(short.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: POSITION_Q,
+                exec_price: START_PRICE,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("open balanced public exposure");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64, observe: bool| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: if observe {
+                        vec![percolator_prog::ix::CrankObservationHint {
+                            asset_index: 0,
+                            oracle_accounts: 0,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                },
+            ),
+        )
+    };
+    warp_to(&mut svm, START_SLOT + 1);
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: START_SLOT + 1,
+                mark_e6: HIGH_PRICE,
+            },
+        ),
+    )
+    .expect("publish the gain");
+    crank(&mut svm, observer_portfolio, START_SLOT + 1, true)
+        .expect("advance the market to the gain");
+    warp_to(&mut svm, START_SLOT + 2);
+    crank(&mut svm, long_portfolio, START_SLOT + 2, false)
+        .expect("materialize positive source-backed PnL");
+    let positive_pnl = percolator_prog::state::read_portfolio(
+        &svm.get_account(&long_portfolio).unwrap().data,
+    )
+    .unwrap()
+    .pnl
+    .get();
+    assert!(positive_pnl > 0, "the probe requires positive PnL");
+
+    let provider_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_source,
+        &collateral_mint,
+        &provider.pubkey(),
+        17,
+    );
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(provider_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: 1,
+                amount: 17,
+                expiry_slot: START_SLOT + 4,
+            },
+        ),
+    )
+    .expect("supply finite-lived backing");
+
+    warp_to(&mut svm, START_SLOT + 3);
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: START_SLOT + 3,
+                mark_e6: START_PRICE,
+            },
+        ),
+    )
+    .expect("publish the honest reversal");
+    crank(&mut svm, observer_portfolio, START_SLOT + 3, true)
+        .expect("activate the reversal");
+    warp_to(&mut svm, START_SLOT + 4);
+    crank(&mut svm, observer_portfolio, START_SLOT + 4, true)
+        .expect("commit the reversal at backing expiry");
+
+    let resolve_witness = controller_market_generation_witness(&svm, &market);
+    let mut resolve_data = vec![0u8];
+    resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(resolve_witness, false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("resolve through constrained governance");
+
+    let long_destination = Pubkey::new_unique();
+    let short_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &long_destination,
+        &collateral_mint,
+        &long.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &short_destination,
+        &collateral_mint,
+        &short.pubkey(),
+        0,
+    );
+    let close =
+        |svm: &mut LiteSVM, owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
+            send(
+                svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner, false),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(percolator_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    },
+                ),
+            )
+        };
+    let mut last_long = None;
+    for _ in 0..20 {
+        let _ = crank(&mut svm, long_portfolio, START_SLOT + 4, false);
+        last_long = Some(close(
+            &mut svm,
+            long.pubkey(),
+            long_portfolio,
+            long_destination,
+        ));
+        let _ = crank(&mut svm, short_portfolio, START_SLOT + 4, false);
+        let _ = close(
+            &mut svm,
+            short.pubkey(),
+            short_portfolio,
+            short_destination,
+        );
+    }
+
+    let long_after = percolator_prog::state::read_portfolio(
+        &svm.get_account(&long_portfolio).unwrap().data,
+    )
+    .unwrap();
+    let short_after = percolator_prog::state::read_portfolio(
+        &svm.get_account(&short_portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(
+        percolator::active_bitmap_is_empty(
+            long_after.active_bitmap.map(percolator::V16PodU64::get)
+        ) && percolator::active_bitmap_is_empty(
+            short_after.active_bitmap.map(percolator::V16PodU64::get)
+        ) && long_after.capital.get() == 0
+            && short_after.capital.get() == 0,
+        "bounded public continuation failed: long capital={} pnl={} result={last_long:?}; short capital={} pnl={}",
+        long_after.capital.get(),
+        long_after.pnl.get(),
+        short_after.capital.get(),
+        short_after.pnl.get(),
+    );
+}
+
 // PUBLIC DOS/LOF: ordinary funding settlement can leave fresh backing principal above the amount
 // attributed to the Genesis provider ledger. The final owner exit must sweep that protocol surplus
 // separately instead of debiting it as provider principal and underflowing the pinned ledger.
