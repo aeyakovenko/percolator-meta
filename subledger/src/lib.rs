@@ -2179,7 +2179,11 @@ fn process_init_pool(
 
 // deposit accounts: [owner(s,w), pool(w), position(w,pda), owner_ata(w), vault(w),
 //                    token_program, system_program]
-// data: amount (u64)
+// data: amount(u64) [| expected_principal(u64) | expected_start_slot(u64) |
+//   expected_action_nonce(u64)]
+//
+// The legacy amount-only wire is accepted only while creating the position.
+// Every top-up is snapshot-bound so separately signed retry variants are one-shot.
 fn process_deposit(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -2195,7 +2199,8 @@ fn process_deposit(
     let system_program = next_account_info(iter)?;
 
     let amount = read_u64(data)?;
-    if amount == 0 || !data.is_empty() {
+    let expected_snapshot = read_deposit_position_snapshot(data)?;
+    if amount == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
     if !owner.is_signer {
@@ -2233,7 +2238,8 @@ fn process_deposit(
     if *position_account.key != expected_pos {
         return Err(ProgramError::InvalidSeeds);
     }
-    let mut position = if position_account.data_len() == 0 {
+    let position_was_created = position_account.data_len() == 0;
+    let mut position = if position_was_created {
         let bump_arr = [pos_bump];
         let seeds: [&[u8]; 4] = [
             b"subledger_position",
@@ -2278,6 +2284,7 @@ fn process_deposit(
         }
         p
     };
+    require_deposit_position_snapshot(expected_snapshot, &position, position_was_created)?;
 
     // Tenure-fair shares (POLICY_WITH_SURPLUS, finding HT): price this deposit by the LIVE vault
     // balance BEFORE the pull, so a late depositor can only ever redeem surplus accrued during its own
@@ -3016,7 +3023,8 @@ fn process_init_insurance_pool(
 //   holding(w, pool-PDA-owned token acct), market_slab(w), percolator_vault(w),
 //   [long_backing_ledger(w), short_backing_ledger(w) for cross-backing pools],
 //   percolator_program, token_program, system_program]
-// data: amount (u64)
+// data: amount(u64) [| expected_principal(u64) | expected_start_slot(u64) |
+//   expected_action_nonce(u64)]
 //
 // User -> holding (user-signed). Then the pool PDA (asset-0 insurance authority)
 // tops up the two Percolator domains against the pool-wide 50/50 live protection target.
@@ -3052,7 +3060,8 @@ fn process_insurance_deposit(
     }
 
     let amount = read_u64(data)?;
-    if amount == 0 || !data.is_empty() {
+    let expected_snapshot = read_deposit_position_snapshot(data)?;
+    if amount == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
     if !owner.is_signer {
@@ -3290,7 +3299,8 @@ fn process_insurance_deposit(
     if *position_account.key != expected_pos {
         return Err(ProgramError::InvalidSeeds);
     }
-    let mut position = if position_account.data_len() == 0 {
+    let position_was_created = position_account.data_len() == 0;
+    let mut position = if position_was_created {
         let pbump = [pos_bump];
         let seeds: [&[u8]; 4] = [
             b"subledger_position",
@@ -3333,6 +3343,7 @@ fn process_insurance_deposit(
         p
     };
     move_position_to_current_share_generation(&mut position, &pool)?;
+    require_deposit_position_snapshot(expected_snapshot, &position, position_was_created)?;
 
     // 1) User -> holding (user-signed; the user is moving their own funds).
     invoke(
@@ -3557,6 +3568,40 @@ fn require_position_snapshot(data: &mut &[u8], position: &Position) -> ProgramRe
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(())
+}
+
+fn read_deposit_position_snapshot(
+    data: &mut &[u8],
+) -> Result<Option<(u64, u64, u64)>, ProgramError> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data.len() != 3 * core::mem::size_of::<u64>() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(Some((
+        read_u64(data)?,
+        read_u64(data)?,
+        read_u64(data)?,
+    )))
+}
+
+fn require_deposit_position_snapshot(
+    expected: Option<(u64, u64, u64)>,
+    position: &Position,
+    position_was_created: bool,
+) -> ProgramResult {
+    match expected {
+        None if position_was_created => Ok(()),
+        Some((principal, start_slot, action_nonce))
+            if principal == position.principal
+                && start_slot == position.start_slot
+                && action_nonce == position.withdrawn_amount =>
+        {
+            Ok(())
+        }
+        _ => Err(ProgramError::InvalidAccountData),
+    }
 }
 
 fn advance_position_nonce(position: &mut Position) {

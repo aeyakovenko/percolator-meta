@@ -242,7 +242,9 @@ slot-only wire remains valid only for predecessor books that are exit-only under
    expiry, that domain's new backing stays under a per-domain counter in the canonical pool ATA. It
    remains protected owner principal for pricing, TWAP floors, and withdrawals, and the amountless
    earnings route cannot send it to governance. Topping up resets reward tenure but does not alter
-   the Genesis rule that each live principal base unit contributes one vote.
+   the Genesis rule that each live principal base unit contributes one vote. The legacy amount-only
+   deposit wire is creation-only; every top-up commits to the position's exact principal, start slot,
+   and monotonic action nonce, so separately signed retry variants cannot expose another tranche.
 3. **Bootstrap vote.** The default bootstrap delay is six 30-day months and is configurable in the
    pool/config PDA. A voter can vote immediately after depositing, and must retract before changing
    proposals or withdrawing. Quorum and the winning strict majority are computed from live,

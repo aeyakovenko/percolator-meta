@@ -408,6 +408,19 @@ impl Env {
         .0
     }
 
+    fn append_deposit_position_snapshot(&self, data: &mut Vec<u8>, owner: &Pubkey) {
+        let position = self.svm.get_account(&self.position_pda(owner));
+        if let Some(position) = position.filter(|account| {
+            account.owner == sub_id() && account.data.len() >= 97
+        }) {
+            data.extend_from_slice(&position.data[72..80]);
+            data.extend_from_slice(&position.data[89..97]);
+            data.extend_from_slice(&position.data[80..88]);
+        } else {
+            data.extend_from_slice(&[0u8; 24]);
+        }
+    }
+
     // ---- subledger ----
 
     fn init_insurance_pool(&mut self) {
@@ -539,6 +552,7 @@ impl Env {
     ) -> Result<(), String> {
         let mut data = vec![4u8]; // IX_INSURANCE_DEPOSIT
         data.extend_from_slice(&amount.to_le_bytes());
+        self.append_deposit_position_snapshot(&mut data, &owner.pubkey());
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -604,6 +618,7 @@ impl Env {
     ) -> Result<(), String> {
         let mut data = vec![4u8]; // IX_INSURANCE_DEPOSIT
         data.extend_from_slice(&amount.to_le_bytes());
+        self.append_deposit_position_snapshot(&mut data, &owner.pubkey());
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -3492,6 +3507,172 @@ fn public_trade_fees_cannot_erase_an_ordinary_principal_pool_loss() {
         "protocol trade fees cannot erase the independent owner's venue loss",
     );
     assert!(with_fees.protocol_reserve > control.protocol_reserve);
+}
+
+// PUBLIC LOF: wallet retries may carry distinct transaction signatures for one
+// intended deposit. The Subledger action itself must bind the position snapshot,
+// or every retry can expose another tranche of the owner's tokens to market loss.
+#[test]
+fn presigned_insurance_deposit_retry_cannot_double_expose_principal() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = Env::new();
+    let oracle = Keypair::new();
+    let observer = Keypair::new();
+    for actor in [&oracle, &observer] {
+        env.svm.airdrop(&actor.pubkey(), 1_000_000_000).unwrap();
+    }
+    install_public_loss_fixture(&mut env, &oracle.pubkey());
+    env.init_insurance_pool();
+
+    let tranche = 30u64;
+    let (owner, owner_ata) = new_depositor(&mut env, 2 * tranche);
+    let pool = env.pool;
+    let holding = create_holding(&mut env, &pool);
+    let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+    deposit_data.extend_from_slice(&tranche.to_le_bytes());
+    let deposit = Instruction {
+        program_id: sub_id(),
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(env.position_pda(&owner.pubkey()), false),
+            AccountMeta::new(owner_ata, false),
+            AccountMeta::new(holding, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: deposit_data,
+    };
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let first = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            deposit.clone(),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        held_blockhash,
+    );
+    let retry = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            deposit,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        held_blockhash,
+    );
+    env.svm
+        .send_transaction(first)
+        .expect("the intended deposit executes");
+    let retry_result = env.svm.send_transaction(retry);
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 100,
+            }
+            .encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("configure the authenticated public-loss mark");
+
+    let live_principal = env.read_position(&owner.pubkey()).0;
+    let domain_tranche = live_principal / 2;
+    let observer_portfolio = create_percolator_portfolio(&mut env, &observer, 0);
+    let mut slot = 100u64;
+    let (low_long, low_long_portfolio, low_short, low_short_portfolio) =
+        open_public_pair_with_capitals(
+            &mut env,
+            percolator::POS_SCALE as i128,
+            100,
+            1_000_000,
+            200,
+        );
+    advance_public_mark(
+        &mut env,
+        &oracle,
+        observer_portfolio,
+        &mut slot,
+        300 + domain_tranche,
+        100,
+    );
+    liquidate_stale_public_loser(&mut env, low_short_portfolio, slot);
+    clear_stale_public_winner(&mut env, &low_long, low_long_portfolio, slot);
+    assert_eq!(
+        asset_insurance_remaining(&env, 0),
+        u128::from(domain_tranche),
+        "the first public bankruptcy consumes one insurance domain",
+    );
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&oracle],
+    )
+    .expect("resolve after the public loss");
+    close_resolved_portfolios(
+        &mut env,
+        &[
+            (&low_long, low_long_portfolio),
+            (&low_short, low_short_portfolio),
+            (&observer, observer_portfolio),
+        ],
+    );
+
+    let market = env.svm.get_account(&env.slab).unwrap();
+    let insurance_spent = percolator_accounting::read_asset_insurance_spent(&market.data, 0)
+        .unwrap()
+        .into_iter()
+        .sum::<u128>();
+    assert_eq!(
+        insurance_spent,
+        u128::from(domain_tranche),
+        "the public loss consumes half of every accepted deposit",
+    );
+    env.insurance_withdraw(
+        &owner,
+        &owner_ata,
+        &holding,
+        &owner,
+        live_principal,
+    )
+    .expect("the owner retires the fully impaired position");
+
+    assert_eq!(
+        env.token_amount(&owner_ata),
+        tranche + tranche / 2,
+        "only the intended tranche can enter the market-loss waterfall",
+    );
+    assert_eq!(
+        live_principal, tranche,
+        "one intended deposit creates one loss-bearing claim",
+    );
+    assert!(
+        retry_result.is_err(),
+        "a distinct signed retry cannot expose a second tranche",
+    );
 }
 
 #[test]
@@ -7833,6 +8014,7 @@ fn presigned_retract_cannot_cross_a_later_position_top_up() {
 
     let mut top_up_data = vec![4u8];
     top_up_data.extend_from_slice(&1u64.to_le_bytes());
+    env.append_deposit_position_snapshot(&mut top_up_data, &alice.pubkey());
     let top_up = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8028,6 +8210,7 @@ fn presigned_back_cannot_count_a_later_top_up_at_the_bootstrap_deadline() {
     // are still open in this final slot, but depositing is deliberately not voting.
     let mut top_up_data = vec![4u8];
     top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    env.append_deposit_position_snapshot(&mut top_up_data, &alice.pubkey());
     let top_up = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8203,6 +8386,7 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
 
     let mut top_up_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    env.append_deposit_position_snapshot(&mut top_up_data, &alice.pubkey());
     let top_up = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8254,6 +8438,9 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     };
     let mut bob_redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     bob_redeposit_data.extend_from_slice(&1u64.to_le_bytes());
+    bob_redeposit_data.extend_from_slice(&(bob_snapshot.0 - 1).to_le_bytes());
+    bob_redeposit_data.extend_from_slice(&bob_snapshot.1.to_le_bytes());
+    bob_redeposit_data.extend_from_slice(&(bob_action_nonce + 1).to_le_bytes());
     let bob_redeposit = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8500,6 +8687,9 @@ fn same_slot_round_trip_cannot_restore_a_stale_withdrawal_snapshot() {
 
     let mut redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     redeposit_data.extend_from_slice(&5u64.to_le_bytes());
+    redeposit_data.extend_from_slice(&(initial_snapshot.0 - 5).to_le_bytes());
+    redeposit_data.extend_from_slice(&initial_snapshot.1.to_le_bytes());
+    redeposit_data.extend_from_slice(&(initial_action_nonce + 1).to_le_bytes());
     let redeposit = Instruction {
         program_id: sub_id(),
         accounts: vec![
