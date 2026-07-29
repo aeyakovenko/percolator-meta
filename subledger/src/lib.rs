@@ -4546,7 +4546,7 @@ fn process_prepare_asset0_restart(
 
     let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
     if !pool.is_insurance()
-        || pool.policy != POLICY_PRINCIPAL
+        || (pool.policy == POLICY_WITH_SURPLUS && !pool.owner_claims_cleared())
         || !pool.custody_granted
         || custody_grant_slot_offset(pool_account.data_len()).is_none()
         || *market_slab.key != pool.market_slab

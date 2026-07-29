@@ -31,6 +31,7 @@ enum PoolRestartScenario {
     HealthyRestart,
     HealthyLegacyPoolRestart,
     LegacyPoolRestartAfterLossRejected,
+    EmptyWithSurplusPoolRestart,
 }
 
 #[test]
@@ -62,9 +63,20 @@ fn e2e_asset0_legacy_pool_with_uncheckpointed_loss_cannot_restart() {
     run_pool_restart_claim_scenario(PoolRestartScenario::LegacyPoolRestartAfterLossRejected);
 }
 
+#[test]
+fn e2e_asset0_empty_with_surplus_pool_can_restart() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::EmptyWithSurplusPoolRestart);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
+    let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
+    let pool_policy = if empty_with_surplus {
+        POLICY_WITH_SURPLUS
+    } else {
+        POLICY_PRINCIPAL
+    };
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -236,13 +248,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         &market,
         &perc_id(),
         &coin_mint,
-        POLICY_PRINCIPAL,
+        pool_policy,
         DOMAIN_INSURANCE,
     );
     let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
     let mut pool_data = vec![3u8]; // IX_INIT_INSURANCE_POOL
     pool_data.extend_from_slice(&0u64.to_le_bytes());
-    pool_data.push(POLICY_PRINCIPAL);
+    pool_data.push(pool_policy);
     append_test_genesis_schedule(&mut pool_data);
     send(
         &mut svm,
@@ -326,6 +338,32 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     )
     .expect("owner deposits one base unit into live insurance");
     assert_eq!(read_asset_insurance_domains(&svm, &market, 0), [0, 1]);
+    if empty_with_surplus {
+        let withdraw_data = subledger_insurance_withdraw_data(&svm, &position, 1, 0);
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(depositor.pubkey(), true),
+                    AccountMeta::new(pool, false),
+                    AccountMeta::new(position, false),
+                    AccountMeta::new(depositor_token, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: withdraw_data,
+            },
+        )
+        .expect("the sole with-surplus owner exits before protocol custody begins");
+        assert_eq!(token_amount(&svm, &depositor_token), 1);
+        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+    }
 
     send(
         &mut svm,
@@ -372,7 +410,10 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         &handoff_remaining,
     )
     .expect("pool hands funded custody to TWAP");
-    assert_eq!(read_reserved_floor(&svm, &twap_cfg), 1);
+    assert_eq!(
+        read_reserved_floor(&svm, &twap_cfg),
+        if empty_with_surplus { 0 } else { 1 },
+    );
 
     let owner_exit_witness = subledger_full_exit_witness(&svm, &position);
     let owner_exit_ix = || {
@@ -402,7 +443,9 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
 
     if matches!(
         scenario,
-        PoolRestartScenario::HealthyRestart | PoolRestartScenario::HealthyLegacyPoolRestart
+        PoolRestartScenario::HealthyRestart
+            | PoolRestartScenario::HealthyLegacyPoolRestart
+            | PoolRestartScenario::EmptyWithSurplusPoolRestart
     ) {
         let legacy_pool = scenario == PoolRestartScenario::HealthyLegacyPoolRestart;
         if legacy_pool {
@@ -415,7 +458,10 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             predecessor.data.truncate(329);
             svm.set_account(pool, predecessor).unwrap();
         } else {
-            assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+            assert_eq!(
+                read_pool_restart_checkpoints(&svm, &pool),
+                (0, if empty_with_surplus { 0 } else { 1 }),
+            );
         }
 
         let pool_before_public_checkpoint = svm.get_account(&pool).unwrap();
@@ -614,7 +660,10 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         .expect("futarchy restarts the empty healthy generation");
 
         if !legacy_pool {
-            assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+            assert_eq!(
+                read_pool_restart_checkpoints(&svm, &pool),
+                (0, if empty_with_surplus { 0 } else { 1 }),
+            );
         }
         assert_eq!(
             percolator_accounting::read_asset_insurance_spent(
@@ -624,12 +673,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             .unwrap(),
             [0, 0],
         );
-        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            if empty_with_surplus { 0 } else { 1 },
+        );
 
-        send(&mut svm, &[&payer, &depositor], owner_exit_ix())
-            .expect("the healthy old-generation owner retains its full claim");
-        assert_eq!(token_amount(&svm, &depositor_token), 1);
-        assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+        if !empty_with_surplus {
+            send(&mut svm, &[&payer, &depositor], owner_exit_ix())
+                .expect("the healthy old-generation owner retains its full claim");
+            assert_eq!(token_amount(&svm, &depositor_token), 1);
+            assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
+        }
         assert_eq!(
             u64::from_le_bytes(
                 svm.get_account(&pool).unwrap().data[80..88]
