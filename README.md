@@ -131,11 +131,16 @@ principal from both protection classes, subject to losses incurred during their 
   A positive live payout additionally requires asset 0 to have no open position accounting or
   unresolved loss state. This prevents a stale losing portfolio from realizing its loss only after
   the reserve has left; a fully impaired zero-payout position can still retire.
-  A pool-bound TWAP restart first invokes Subledger's fixed, value-free checkpoint for that exact
-  pool. It charges the completed generation's cumulative insurance loss to owner claims before
-  Percolator clears its counters, then starts fresh pool and TWAP counter generations only if the
-  restart succeeds. The checkpoint accepts no token account, recipient, or amount, and a rejected
-  restart rolls every checkpoint change back atomically. For provenance-aware TWAP configs, its
+  A pool-bound TWAP restart first invokes Subledger's fixed checkpoint for that exact pool. It
+  charges the completed generation's cumulative insurance loss to owner claims before Percolator
+  clears its counters, then starts fresh pool and TWAP counter generations only if the restart
+  succeeds. The ordinary-pool shape remains value-free. For a cross-backed pool, the only extended
+  shape supplies its canonical holding, Percolator vault, vault authority, and long/short ledgers;
+  Subledger stages all fresh backing and earnings there, classifies only the loss-adjusted owner
+  portion as pending principal, and leaves protocol surplus unclaimable by owners. No caller selects
+  an amount or recipient, and a rejected restart rolls every token and checkpoint change back
+  atomically. Owners can recover the staged portion through the existing signed exit while any
+  cranker restores the same TWAP custody between exits. For provenance-aware TWAP configs, its
   fixed return also replaces only the recorded pool component of the reserved floor with the
   loss-adjusted claim; retained protocol and DAO-raised buffer is unchanged. Historical custody
   layouts without a cumulative-loss checkpoint may cross restart with live claims only when

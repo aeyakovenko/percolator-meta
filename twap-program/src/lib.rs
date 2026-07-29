@@ -189,6 +189,8 @@ const IX_RESTART_ASSET0: u8 = 21;
 // signs and supplies the exact amount; this program fixes the recipient owner to
 // the config's Squads vault and never accepts backing principal directly.
 const IX_ACCEPT_CROSS_BACKING_EARNINGS: u8 = 22;
+const SUBLEDGER_POOL_FLAGS_OFF: usize = 272;
+const SUBLEDGER_POOL_FLAG_CROSS_BACKING: u8 = 1 << 0;
 
 // spl-token instruction tags used in CPIs we build by hand (avoids pulling spl's ix builders
 // into the BPF object, and keeps the data shape explicit).
@@ -2197,13 +2199,16 @@ fn process_set_market_fees(
 
 // restart_asset0 accounts:
 // [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program,
-//  custody_pool(w), subledger_program] for a pool-bound config. Pool-less
-// compatibility configs retain the original five-account shape.
+//  custody_pool(w), subledger_program, pool_holding(w), percolator_vault(w),
+//  vault_authority, long_backing_ledger(w), short_backing_ledger(w), token_program]
+// for a cross-backed pool. Ordinary pool-bound configs stop after subledger_program;
+// pool-less compatibility configs retain the original five-account shape.
 // data: now_slot(u64) || initial_price(u64) || expected_market_id(u64)
 //
 // Once custody is handed off, Percolator recognizes only the TWAP PDA as asset_admin.
-// This fixed wrapper keeps restart reachable without exposing a generic admin proxy or any
-// token/value account. The bound pool stores only owner claim accounting. Percolator enforces
+// This fixed wrapper keeps restart reachable without exposing a generic admin proxy. Cross-backed
+// pools supply only their canonical holding, Percolator vault, and canonical ledgers so Subledger
+// can stage owner backing without an amount or caller-selected destination. Percolator enforces
 // Recovery, empty positions/backing, the real Clock, and preservation of the existing insurance
 // and authority fields.
 fn process_restart_asset0(
@@ -2235,7 +2240,30 @@ fn process_restart_asset0(
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        Some((next_account_info(iter)?, next_account_info(iter)?))
+        let custody_pool = next_account_info(iter)?;
+        let subledger_program = next_account_info(iter)?;
+        if custody_pool.owner != &SUBLEDGER_PROGRAM_ID
+            || *subledger_program.key != SUBLEDGER_PROGRAM_ID
+            || !subledger_program.executable
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let cross_backing = custody_pool
+            .try_borrow_data()?
+            .get(SUBLEDGER_POOL_FLAGS_OFF)
+            .is_some_and(|flags| flags & SUBLEDGER_POOL_FLAG_CROSS_BACKING != 0);
+        let backing_accounts = if cross_backing {
+            Some((
+                next_account_info(iter)?,
+                next_account_info(iter)?,
+                next_account_info(iter)?,
+                [next_account_info(iter)?, next_account_info(iter)?],
+                next_account_info(iter)?,
+            ))
+        } else {
+            None
+        };
+        Some((custody_pool, subledger_program, backing_accounts))
     } else {
         if config.custody_mode == CUSTODY_MODE_POOL_BOUND {
             return Err(ProgramError::InvalidAccountData);
@@ -2269,34 +2297,66 @@ fn process_restart_asset0(
 
     let pool_bound = pool_checkpoint_accounts.is_some();
     let mut checkpointed_pool_principal = None;
-    if let Some((custody_pool, subledger_program)) = pool_checkpoint_accounts {
+    if let Some((custody_pool, subledger_program, backing_accounts)) = pool_checkpoint_accounts {
         if *custody_pool.key != config.custody_pool
             || !custody_pool.is_writable
-            || *subledger_program.key != SUBLEDGER_PROGRAM_ID
-            || !subledger_program.executable
         {
             return Err(ProgramError::InvalidAccountData);
         }
+        let mut checkpoint_metas = vec![
+            AccountMeta::new_readonly(*twap_authority.key, true),
+            AccountMeta::new_readonly(*config_account.key, false),
+            AccountMeta::new(*custody_pool.key, false),
+            AccountMeta::new(*market_slab.key, false),
+            AccountMeta::new_readonly(*percolator_program.key, false),
+        ];
+        let mut checkpoint_infos = vec![
+            twap_authority.clone(),
+            config_account.clone(),
+            custody_pool.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+        ];
+        if let Some((
+            pool_holding,
+            percolator_vault,
+            vault_authority,
+            backing_ledgers,
+            token_program,
+        )) = backing_accounts
+        {
+            if !pool_holding.is_writable
+                || !percolator_vault.is_writable
+                || !backing_ledgers[0].is_writable
+                || !backing_ledgers[1].is_writable
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            checkpoint_metas.extend_from_slice(&[
+                AccountMeta::new(*pool_holding.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*vault_authority.key, false),
+                AccountMeta::new(*backing_ledgers[0].key, false),
+                AccountMeta::new(*backing_ledgers[1].key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
+            ]);
+            checkpoint_infos.extend_from_slice(&[
+                pool_holding.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                backing_ledgers[0].clone(),
+                backing_ledgers[1].clone(),
+                token_program.clone(),
+            ]);
+        }
+        checkpoint_infos.push(subledger_program.clone());
         invoke_signed(
             &Instruction {
                 program_id: *subledger_program.key,
-                accounts: vec![
-                    AccountMeta::new_readonly(*twap_authority.key, true),
-                    AccountMeta::new_readonly(*config_account.key, false),
-                    AccountMeta::new(*custody_pool.key, false),
-                    AccountMeta::new_readonly(*market_slab.key, false),
-                    AccountMeta::new_readonly(*percolator_program.key, false),
-                ],
+                accounts: checkpoint_metas,
                 data: vec![SUBLEDGER_IX_PREPARE_ASSET0_RESTART],
             },
-            &[
-                twap_authority.clone(),
-                config_account.clone(),
-                custody_pool.clone(),
-                market_slab.clone(),
-                percolator_program.clone(),
-                subledger_program.clone(),
-            ],
+            &checkpoint_infos,
             &[&auth_seeds],
         )?;
         let (return_program, return_data) =

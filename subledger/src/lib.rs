@@ -2695,6 +2695,79 @@ fn withdraw_cross_backing_earnings<'a>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn withdraw_cross_backing_principal<'a>(
+    pool: &Pool,
+    pool_seed_version: PoolSeedVersion,
+    pool_account: &AccountInfo<'a>,
+    market_slab: &AccountInfo<'a>,
+    holding: &AccountInfo<'a>,
+    percolator_vault: &AccountInfo<'a>,
+    vault_authority: &AccountInfo<'a>,
+    backing_ledgers: [&AccountInfo<'a>; 2],
+    percolator_program: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+    principal: [u128; 2],
+    provider_principal: [u128; 2],
+) -> ProgramResult {
+    for (domain, amount) in principal.into_iter().enumerate() {
+        if amount == 0 {
+            continue;
+        }
+        // Provider-attributed principal updates its canonical ledger. Any
+        // additional bucket principal is protocol/source value and uses the
+        // ledgerless authority path. Both classes remain in the same fixed
+        // pool-owned escrow; callers classify only the loss-adjusted owner part.
+        let provider_debit = core::cmp::min(amount, provider_principal[domain]);
+        let protocol_debit = amount
+            .checked_sub(provider_debit)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        for (debit, ledger) in [
+            (provider_debit, Some(backing_ledgers[domain])),
+            (protocol_debit, None),
+        ] {
+            if debit == 0 {
+                continue;
+            }
+            let mut ix_data = vec![PERC_IX_WITHDRAW_BACKING_BUCKET];
+            ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
+            ix_data.extend_from_slice(&debit.to_le_bytes());
+            let mut instruction_accounts = vec![
+                AccountMeta::new_readonly(*pool_account.key, true),
+                AccountMeta::new(*market_slab.key, false),
+                AccountMeta::new(*holding.key, false),
+                AccountMeta::new(*percolator_vault.key, false),
+                AccountMeta::new_readonly(*vault_authority.key, false),
+                AccountMeta::new_readonly(*token_program.key, false),
+            ];
+            let mut account_infos = vec![
+                pool_account.clone(),
+                market_slab.clone(),
+                holding.clone(),
+                percolator_vault.clone(),
+                vault_authority.clone(),
+                token_program.clone(),
+            ];
+            if let Some(ledger) = ledger {
+                instruction_accounts.push(AccountMeta::new(*ledger.key, false));
+                account_infos.push(ledger.clone());
+            }
+            account_infos.push(percolator_program.clone());
+            invoke_signed_for_pool(
+                pool,
+                pool_seed_version,
+                &Instruction {
+                    program_id: *percolator_program.key,
+                    accounts: instruction_accounts,
+                    data: ix_data,
+                },
+                &account_infos,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 // init_insurance_pool accounts: [payer(s,w), mint, pool(w,pda), percolator_vault,
 //   market_slab, percolator_program, system_program, vote_authority, coin_mint]
 // data: asset_id (u64), policy (u8), optional deposit_window_slots (u64),
@@ -4212,65 +4285,20 @@ fn process_insurance_withdraw_impl(
         }
 
         if backing_withdrawal > 0 {
-            let ledgers = backing_ledgers.ok_or(ProgramError::NotEnoughAccountKeys)?;
-            let provider_principals =
-                backing_ledger_principals.ok_or(ProgramError::NotEnoughAccountKeys)?;
-            for (domain, amount) in backing_debit.into_iter().enumerate() {
-                if amount == 0 {
-                    continue;
-                }
-                // Funding and settlement can leave fresh whole atoms above this
-                // provider's ledger principal. Debit only attributed principal
-                // through the ledger; the excess is protocol surplus and uses
-                // Percolator's ledgerless path. Both amounts are derived from
-                // canonical state and move to the same pool-owned escrow.
-                let provider_debit = core::cmp::min(amount, provider_principals[domain]);
-                let protocol_debit = amount
-                    .checked_sub(provider_debit)
-                    .ok_or(ProgramError::InvalidAccountData)?;
-                for (debit, ledger) in [
-                    (provider_debit, Some(ledgers[domain])),
-                    (protocol_debit, None),
-                ] {
-                    if debit == 0 {
-                        continue;
-                    }
-                    let mut ix_data = vec![PERC_IX_WITHDRAW_BACKING_BUCKET];
-                    ix_data.extend_from_slice(&(domain as u16).to_le_bytes());
-                    ix_data.extend_from_slice(&debit.to_le_bytes());
-                    let mut instruction_accounts = vec![
-                        AccountMeta::new_readonly(*pool_account.key, true),
-                        AccountMeta::new(*market_slab.key, false),
-                        AccountMeta::new(*holding.key, false),
-                        AccountMeta::new(*percolator_vault.key, false),
-                        AccountMeta::new_readonly(*vault_authority.key, false),
-                        AccountMeta::new_readonly(*token_program.key, false),
-                    ];
-                    let mut account_infos = vec![
-                        pool_account.clone(),
-                        market_slab.clone(),
-                        holding.clone(),
-                        percolator_vault.clone(),
-                        vault_authority.clone(),
-                        token_program.clone(),
-                    ];
-                    if let Some(ledger) = ledger {
-                        instruction_accounts.push(AccountMeta::new(*ledger.key, false));
-                        account_infos.push(ledger.clone());
-                    }
-                    account_infos.push(percolator_program.clone());
-                    invoke_signed_for_pool(
-                        &pool,
-                        pool_seed_version,
-                        &Instruction {
-                            program_id: *percolator_program.key,
-                            accounts: instruction_accounts,
-                            data: ix_data,
-                        },
-                        &account_infos,
-                    )?;
-                }
-            }
+            withdraw_cross_backing_principal(
+                &pool,
+                pool_seed_version,
+                pool_account,
+                market_slab,
+                holding,
+                percolator_vault,
+                vault_authority,
+                backing_ledgers.ok_or(ProgramError::NotEnoughAccountKeys)?,
+                percolator_program,
+                token_program,
+                backing_debit,
+                backing_ledger_principals.ok_or(ProgramError::NotEnoughAccountKeys)?,
+            )?;
         }
 
         let escrow_after = holding_balance_before
@@ -4504,15 +4532,162 @@ fn validate_twap_recovery_grant(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn stage_cross_backing_for_restart<'a>(
+    program_id: &Pubkey,
+    pool: &Pool,
+    pool_seed_version: PoolSeedVersion,
+    pool_account: &AccountInfo<'a>,
+    market_slab: &AccountInfo<'a>,
+    holding: &AccountInfo<'a>,
+    percolator_vault: &AccountInfo<'a>,
+    vault_authority: &AccountInfo<'a>,
+    backing_ledgers: [&AccountInfo<'a>; 2],
+    percolator_program: &AccountInfo<'a>,
+    token_program: &AccountInfo<'a>,
+) -> Result<[u64; 2], ProgramError> {
+    if !holding.is_writable
+        || !percolator_vault.is_writable
+        || !backing_ledgers[0].is_writable
+        || !backing_ledgers[1].is_writable
+        || *token_program.key != spl_token::ID
+        || *percolator_vault.key != pool.vault
+        || *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key)
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let vault_state = spl_token::state::Account::unpack(&percolator_vault.try_borrow_data()?)?;
+    if percolator_vault.owner != &spl_token::ID
+        || vault_state.state != spl_token::state::AccountState::Initialized
+        || vault_state.owner != *vault_authority.key
+        || vault_state.mint != pool.mint
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let holding_before = validate_insurance_holding(pool_account, pool, holding)?;
+
+    let mut provider_principal = [0u128; 2];
+    for (domain, ledger) in backing_ledgers.into_iter().enumerate() {
+        provider_principal[domain] = validate_backing_ledger(
+            program_id,
+            pool_account.key,
+            market_slab.key,
+            percolator_program.key,
+            ledger,
+            domain as u16,
+        )?;
+    }
+    let (balances, earnings, owner_backing) = {
+        let market_data = market_slab.try_borrow_data()?;
+        if percolator_accounting::read_asset_backing_authority(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != pool_account.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let balances = percolator_accounting::read_asset_backing_balances(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if balances.iter().any(|balance| {
+            balance.valid_liened_principal_atoms != 0
+                || balance.consumed_principal_atoms != 0
+                || balance.impaired_principal_atoms != 0
+        }) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let sources = percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        let mut owner_backing = [0u64; 2];
+        for domain in 0..2 {
+            owner_backing[domain] = balances[domain]
+                .provider_protected_principal_atoms(provider_principal[domain], sources[domain])
+                .map_err(|_| ProgramError::InvalidAccountData)
+                .and_then(|value| {
+                    u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+                })?;
+        }
+        (
+            balances,
+            balances.map(|balance| balance.earnings_atoms),
+            owner_backing,
+        )
+    };
+    let principal = balances.map(|balance| balance.principal_atoms);
+    let principal_total = principal
+        .into_iter()
+        .try_fold(0u128, |total, amount| total.checked_add(amount))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let earnings_total = earnings
+        .into_iter()
+        .try_fold(0u128, |total, amount| total.checked_add(amount))
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let staged_total = principal_total
+        .checked_add(earnings_total)
+        .and_then(|amount| u64::try_from(amount).ok())
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    withdraw_cross_backing_earnings(
+        pool,
+        pool_seed_version,
+        pool_account,
+        market_slab,
+        holding,
+        percolator_vault,
+        vault_authority,
+        backing_ledgers,
+        percolator_program,
+        token_program,
+        earnings,
+    )?;
+    withdraw_cross_backing_principal(
+        pool,
+        pool_seed_version,
+        pool_account,
+        market_slab,
+        holding,
+        percolator_vault,
+        vault_authority,
+        backing_ledgers,
+        percolator_program,
+        token_program,
+        principal,
+        provider_principal,
+    )?;
+    if token_balance(holding)?
+        != holding_before
+            .checked_add(staged_total)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let market_data = market_slab.try_borrow_data()?;
+    let emptied = percolator_accounting::read_asset_backing_balances(&market_data, 0)
+        .map_err(|_| ProgramError::InvalidAccountData)?
+        .into_iter()
+        .all(|balance| {
+            !balance.has_any_state()
+                && balance.expiry_slot == 0
+                && balance.status == percolator_accounting::BackingDomainStatus::Empty
+        });
+    if !emptied {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(owner_backing)
+}
+
 // prepare_asset0_restart accounts:
-// [twap_authority(signer), twap_config, pool(w), market_slab, percolator_program]
+// [twap_authority(signer), twap_config, pool(w), market_slab(w), percolator_program,
+//  pool_holding(w), percolator_vault(w), vault_authority,
+//  long_backing_ledger(w), short_backing_ledger(w), token_program] for cross-backed
+// pools. Ordinary pools retain the original five-account shape.
 // data: none
 //
-// This instruction moves no value and accepts no token account or amount. It
-// durably prices the just-finished generation's external loss before
+// The cross-backed shape stages every empty-market backing bucket atom in the
+// canonical pool holding, then classifies only the loss-adjusted owner component
+// as pending principal. No caller controls an amount or destination. The
+// instruction durably prices the just-finished generation's external loss before
 // Percolator clears its cumulative spent counters. TWAP invokes it immediately
-// before the fixed restart CPI; transaction atomicity rolls it back if the
-// restart is premature or otherwise rejected.
+// before the fixed restart CPI; transaction atomicity rolls back every token and
+// accounting change if the restart is premature or otherwise rejected.
 #[inline(never)]
 fn process_prepare_asset0_restart(
     program_id: &Pubkey,
@@ -4528,9 +4703,6 @@ fn process_prepare_asset0_restart(
     let pool_account = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
-    if iter.next().is_some() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
     if !twap_authority.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -4546,6 +4718,20 @@ fn process_prepare_asset0_restart(
     }
 
     let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    let cross_backing_accounts = if pool.cross_backing {
+        Some((
+            next_account_info(iter)?,
+            next_account_info(iter)?,
+            next_account_info(iter)?,
+            [next_account_info(iter)?, next_account_info(iter)?],
+            next_account_info(iter)?,
+        ))
+    } else {
+        None
+    };
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if !pool.is_insurance()
         || (pool.policy == POLICY_WITH_SURPLUS && !pool.owner_claims_cleared())
         || !pool.custody_granted
@@ -4555,7 +4741,7 @@ fn process_prepare_asset0_restart(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    validate_pool_pda(program_id, pool_account, &pool)?;
+    let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
 
     {
         let config_data = twap_config.try_borrow_data()?;
@@ -4607,7 +4793,7 @@ fn process_prepare_asset0_restart(
                 });
         (insurance, insurance_spent, backing_empty)
     };
-    if !backing_empty {
+    if !pool.cross_backing && !backing_empty {
         return Err(ProgramError::InvalidAccountData);
     }
 
@@ -4616,13 +4802,44 @@ fn process_prepare_asset0_restart(
         if !uses_indexed_cross_backing(&pool, pool_account.data_len()) {
             return Err(ProgramError::InvalidAccountData);
         }
-        let pending_backing = pool.pending_backing_total()?;
-        if pending_backing > pool.outstanding_principal {
+        let (
+            holding,
+            percolator_vault,
+            vault_authority,
+            backing_ledgers,
+            token_program,
+        ) = cross_backing_accounts.ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let live_owner_backing = stage_cross_backing_for_restart(
+            program_id,
+            &pool,
+            pool_seed_version,
+            pool_account,
+            market_slab,
+            holding,
+            percolator_vault,
+            vault_authority,
+            backing_ledgers,
+            percolator_program,
+            token_program,
+        )?;
+        let observed_backing_domains = [
+            pool.pending_backing[0]
+                .checked_add(live_owner_backing[0])
+                .ok_or(ProgramError::ArithmeticOverflow)?,
+            pool.pending_backing[1]
+                .checked_add(live_owner_backing[1])
+                .ok_or(ProgramError::ArithmeticOverflow)?,
+        ];
+        let observed_backing_total = observed_backing_domains[0]
+            .checked_add(observed_backing_domains[1])
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        if observed_backing_total > pool.outstanding_principal {
             return Err(ProgramError::InvalidAccountData);
         }
-        owner_backing = owner_backing_protection(&pool, u128::from(pending_backing))?;
+        let observed_owner_backing =
+            owner_backing_protection(&pool, u128::from(observed_backing_total))?;
         let protected = u128::from(insurance)
-            .checked_add(u128::from(owner_backing))
+            .checked_add(u128::from(observed_owner_backing))
             .map(|value| value.min(u128::from(pool.outstanding_principal)))
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(ProgramError::ArithmeticOverflow)?;
@@ -4631,7 +4848,7 @@ fn process_prepare_asset0_restart(
                 &mut pool,
                 protected,
                 insurance_spent,
-                owner_backing,
+                observed_owner_backing,
             )?;
         } else {
             // The deployed 329-byte custody layout predates cumulative-loss
@@ -4642,6 +4859,26 @@ fn process_prepare_asset0_restart(
                 return Err(ProgramError::InvalidAccountData);
             }
             sync_indexed_share_rate(&mut pool, protected)?;
+        }
+        let indexed_claim = redeem_indexed_shares(
+            pool.total_shares,
+            pool.share_rate_numerator,
+            pool.share_rate_denominator,
+        )?;
+        owner_backing = core::cmp::min(observed_owner_backing, indexed_claim);
+        let pending = insurance_withdraw_domain_delta(
+            observed_backing_domains.map(u128::from),
+            owner_backing,
+        );
+        pool.pending_backing = [
+            u64::try_from(pending[0]).map_err(|_| ProgramError::ArithmeticOverflow)?,
+            u64::try_from(pending[1]).map_err(|_| ProgramError::ArithmeticOverflow)?,
+        ];
+        if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+            // Restart resets the live backing bucket to zero. The staged owner
+            // amount is the next generation's durable comparison baseline;
+            // reclassified protocol surplus must not look like a second loss.
+            pool.backing_protected_checkpoint = owner_backing;
         }
     } else {
         if uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
@@ -4728,14 +4965,18 @@ fn process_accept_operator(
         return Err(ProgramError::InvalidAccountData);
     }
     let pool_seed_version = validate_pool_pda(program_id, pool_account, &pool)?;
-    let first_grant = percolator_accounting::asset0_custody_can_be_first_granted(
-        &market_slab.try_borrow_data()?,
-    )
-    .map_err(|_| ProgramError::InvalidAccountData)?;
+    let market_accepts_first_grant =
+        percolator_accounting::asset0_custody_can_be_first_granted(
+            &market_slab.try_borrow_data()?,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    // A previously granted pool remains on the authenticated recovery path even
+    // after its last live Percolator balance is staged in the canonical holding.
+    // Otherwise the final pending-backing owner can never rotate custody back for
+    // its full exit because the now-empty market resembles a pristine first grant.
+    let first_grant = market_accepts_first_grant && !pool.custody_granted;
     if first_grant
-        && (!pool_account.is_writable
-            || pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT
-            || pool.custody_granted)
+        && (!pool_account.is_writable || pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT)
     {
         return Err(ProgramError::InvalidAccountData);
     }
