@@ -408,6 +408,19 @@ impl Env {
         .0
     }
 
+    fn append_deposit_position_snapshot(&self, data: &mut Vec<u8>, owner: &Pubkey) {
+        let position = self.svm.get_account(&self.position_pda(owner));
+        if let Some(position) = position.filter(|account| {
+            account.owner == sub_id() && account.data.len() >= 97
+        }) {
+            data.extend_from_slice(&position.data[72..80]);
+            data.extend_from_slice(&position.data[89..97]);
+            data.extend_from_slice(&position.data[80..88]);
+        } else {
+            data.extend_from_slice(&[0u8; 24]);
+        }
+    }
+
     // ---- subledger ----
 
     fn init_insurance_pool(&mut self) {
@@ -539,6 +552,7 @@ impl Env {
     ) -> Result<(), String> {
         let mut data = vec![4u8]; // IX_INSURANCE_DEPOSIT
         data.extend_from_slice(&amount.to_le_bytes());
+        self.append_deposit_position_snapshot(&mut data, &owner.pubkey());
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -604,6 +618,7 @@ impl Env {
     ) -> Result<(), String> {
         let mut data = vec![4u8]; // IX_INSURANCE_DEPOSIT
         data.extend_from_slice(&amount.to_le_bytes());
+        self.append_deposit_position_snapshot(&mut data, &owner.pubkey());
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -7999,6 +8014,7 @@ fn presigned_retract_cannot_cross_a_later_position_top_up() {
 
     let mut top_up_data = vec![4u8];
     top_up_data.extend_from_slice(&1u64.to_le_bytes());
+    env.append_deposit_position_snapshot(&mut top_up_data, &alice.pubkey());
     let top_up = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8194,6 +8210,7 @@ fn presigned_back_cannot_count_a_later_top_up_at_the_bootstrap_deadline() {
     // are still open in this final slot, but depositing is deliberately not voting.
     let mut top_up_data = vec![4u8];
     top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    env.append_deposit_position_snapshot(&mut top_up_data, &alice.pubkey());
     let top_up = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8369,6 +8386,7 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
 
     let mut top_up_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     top_up_data.extend_from_slice(&4u64.to_le_bytes());
+    env.append_deposit_position_snapshot(&mut top_up_data, &alice.pubkey());
     let top_up = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8420,6 +8438,9 @@ fn presigned_full_exit_cannot_retire_a_later_top_up_after_deposits_close() {
     };
     let mut bob_redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     bob_redeposit_data.extend_from_slice(&1u64.to_le_bytes());
+    bob_redeposit_data.extend_from_slice(&(bob_snapshot.0 - 1).to_le_bytes());
+    bob_redeposit_data.extend_from_slice(&bob_snapshot.1.to_le_bytes());
+    bob_redeposit_data.extend_from_slice(&(bob_action_nonce + 1).to_le_bytes());
     let bob_redeposit = Instruction {
         program_id: sub_id(),
         accounts: vec![
@@ -8666,6 +8687,9 @@ fn same_slot_round_trip_cannot_restore_a_stale_withdrawal_snapshot() {
 
     let mut redeposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     redeposit_data.extend_from_slice(&5u64.to_le_bytes());
+    redeposit_data.extend_from_slice(&(initial_snapshot.0 - 5).to_le_bytes());
+    redeposit_data.extend_from_slice(&initial_snapshot.1.to_le_bytes());
+    redeposit_data.extend_from_slice(&(initial_action_nonce + 1).to_le_bytes());
     let redeposit = Instruction {
         program_id: sub_id(),
         accounts: vec![

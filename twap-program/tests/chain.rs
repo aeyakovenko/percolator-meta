@@ -8932,6 +8932,22 @@ fn sub_position_pda(pool: &Pubkey, owner: &Pubkey) -> Pubkey {
     .0
 }
 
+fn append_subledger_deposit_snapshot(
+    svm: &LiteSVM,
+    data: &mut Vec<u8>,
+    position: &Pubkey,
+) {
+    if let Some(position) = svm.get_account(position).filter(|account| {
+        account.owner == sub_id() && account.data.len() >= 97
+    }) {
+        data.extend_from_slice(&position.data[72..80]);
+        data.extend_from_slice(&position.data[89..97]);
+        data.extend_from_slice(&position.data[80..88]);
+    } else {
+        data.extend_from_slice(&[0u8; 24]);
+    }
+}
+
 fn sub_cross_backing_ledger_pda(pool: &Pubkey, domain: u16) -> Pubkey {
     Pubkey::find_program_address(
         &[
@@ -27155,6 +27171,7 @@ fn e2e_dust_squat_and_late_topup_do_not_change_per_unit_vote_weight() {
         let position = sub_position_pda(&env.pool, &who.pubkey());
         let mut d = vec![4u8];
         d.extend_from_slice(&amt.to_le_bytes());
+        append_subledger_deposit_snapshot(svm, &mut d, &position);
         let ix = Instruction {
             program_id: sub_id(),
             accounts: vec![
@@ -30136,6 +30153,7 @@ fn e2e_absent_tied_genesis_voters_cannot_block_terminal_market_close() {
     );
     let mut topup_data = vec![4u8];
     topup_data.extend_from_slice(&1u64.to_le_bytes());
+    append_subledger_deposit_snapshot(&svm, &mut topup_data, &position_a);
     send(
         &mut svm,
         &[&payer, &voter_a],

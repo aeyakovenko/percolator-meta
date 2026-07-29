@@ -4,6 +4,7 @@
 
 use litesvm::LiteSVM;
 use solana_sdk::{
+    compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
     program_option::COption,
     program_pack::Pack,
@@ -332,6 +333,15 @@ fn init_pool_ix_for_domain(
 fn deposit_ix(env: &Env, pool: &Pubkey, owner: &Pubkey, owner_ata: &Pubkey, vault: &Pubkey, amount: u64) -> Instruction {
     let mut data = vec![1u8]; // IX_DEPOSIT
     data.extend_from_slice(&amount.to_le_bytes());
+    if let Some(position) = env.svm.get_account(&position_pda(pool, owner)).filter(|account| {
+        account.owner == program_id() && account.data.len() >= 97
+    }) {
+        data.extend_from_slice(&position.data[72..80]);
+        data.extend_from_slice(&position.data[89..97]);
+        data.extend_from_slice(&position.data[80..88]);
+    } else {
+        data.extend_from_slice(&[0u8; 24]);
+    }
     Instruction {
         program_id: program_id(),
         accounts: vec![
@@ -393,6 +403,68 @@ fn new_depositor(env: &mut Env, amount: u64) -> (Keypair, Pubkey) {
 
 fn clone_kp(kp: &Keypair) -> Keypair {
     Keypair::from_bytes(&kp.to_bytes()).unwrap()
+}
+
+#[test]
+fn presigned_own_vault_deposit_retry_cannot_double_move_backing() {
+    let mut env = Env::new();
+    let asset_id = 89;
+    let pool = pool_pda_for_domain(&env.mint, asset_id, 1, 1);
+    let vault =
+        create_token_account(&mut env.svm, &clone_kp(&env.payer), &env.mint, &pool);
+    env.send(
+        &[init_pool_ix_for_domain(
+            &env, &pool, &vault, asset_id, 1, 1,
+        )],
+        &[],
+    )
+    .expect("initialize the segregated backing pool");
+
+    let tranche = 30u64;
+    let (owner, owner_ata) = new_depositor(&mut env, 2 * tranche);
+    let mut legacy_deposit =
+        deposit_ix(&env, &pool, &owner.pubkey(), &owner_ata, &vault, tranche);
+    legacy_deposit.data.truncate(1 + core::mem::size_of::<u64>());
+
+    env.svm.expire_blockhash();
+    let held_blockhash = env.svm.latest_blockhash();
+    let payer = clone_kp(&env.payer);
+    let first = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            legacy_deposit.clone(),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        held_blockhash,
+    );
+    let retry = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            legacy_deposit,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &owner],
+        held_blockhash,
+    );
+
+    env.svm
+        .send_transaction(first)
+        .expect("the intended backing deposit executes");
+    assert!(
+        env.svm.send_transaction(retry).is_err(),
+        "a distinct signed retry cannot move a second backing tranche",
+    );
+    let position = env
+        .svm
+        .get_account(&position_pda(&pool, &owner.pubkey()))
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(position.data[72..80].try_into().unwrap()),
+        tranche,
+    );
+    assert_eq!(env.token_amount(&owner_ata), tranche);
+    assert_eq!(env.token_amount(&vault), tranche);
 }
 
 // STALE BACKING EXIT DOS: neither the legacy amountless wire nor an exact stale
