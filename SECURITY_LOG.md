@@ -14708,3 +14708,22 @@ proves both portfolios close, the users receive the exact resolved-accounting pa
 crystallized mark loss and all 17 backing atoms remain in the canonical Percolator vault, and all
 100,000,017 deposited atoms are conserved. No instruction, account layout, signer, authority,
 amount, destination, custody route, or administrator surface was added.
+
+## Tick - composite oracle rounding caused public false liquidation (surface B, REAL LOF)
+
+A three-leg composite rounded its E6 accumulator after every multiplication or division. A later
+divide could amplify the discarded remainder even when the configured mathematical cross-rate was
+unchanged. The retained real-SBF LiteSVM regression uses two authenticated feed tuples that both
+equal `1.002000`; the vulnerable program stored `1.000000`, within the production 24-bps per-slot
+movement cap. Two ordinary permissionless cranks reduced a healthy long's OI from 1,000,000,000 to
+961,616,179, reduced its capital from 50,100,000 to 48,080,808, credited 9,596 atoms to insurance,
+and let the cranker withdraw 9,597 atoms including its one-atom seed.
+
+FIX: the wrapper now retains one checked `u128` rational across all oracle legs. Existing per-leg
+zero and range gates inspect but never replace that rational, and inversion plus unit scaling are
+applied before the single final rounding. Fixed wrapper commit
+`557f15b63c7a5f9e058a2c384ca8728829dc2b63` produces SBF checksum
+`74ce6b85576fcbcb7596fdc7a774ff92661853d50ca9eb9475fcba7b1b7f40a4`. All 6 wrapper unit tests
+and 568 real-SBF LiteSVM tests pass, including hybrid, inversion, secondary-profile, liquidation-fee,
+and SPL-withdrawal paths. No instruction, account layout, signer, authority, amount, destination,
+custody route, or administrator surface was added.
