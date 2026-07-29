@@ -4548,7 +4548,7 @@ fn process_prepare_asset0_restart(
     if !pool.is_insurance()
         || pool.policy != POLICY_PRINCIPAL
         || !pool.custody_granted
-        || pool_account.data_len() < POOL_SIZE_CUSTODY_GRANT
+        || custody_grant_slot_offset(pool_account.data_len()).is_none()
         || *market_slab.key != pool.market_slab
         || *percolator_program.key != pool.percolator_program
     {
@@ -4624,17 +4624,34 @@ fn process_prepare_asset0_restart(
             .map(|value| value.min(u128::from(pool.outstanding_principal)))
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        sync_indexed_cross_backing_external_loss(
-            &mut pool,
-            protected,
-            insurance_spent,
-            owner_backing,
-        )?;
+        if uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+            sync_indexed_cross_backing_external_loss(
+                &mut pool,
+                protected,
+                insurance_spent,
+                owner_backing,
+            )?;
+        } else {
+            // The deployed 329-byte custody layout predates cumulative-loss
+            // checkpoints. A healthy generation can still advance without
+            // changing its loss-only share rate. Once insurance was consumed,
+            // fail closed until every historical owner claim is retired.
+            if insurance_spent != 0 && !pool.owner_claims_cleared() {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            sync_indexed_share_rate(&mut pool, protected)?;
+        }
     } else {
-        if !uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+        if uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+            sync_principal_protected_checkpoint(&mut pool, insurance, insurance_spent)?;
+        } else if !pool.owner_claims_cleared()
+            && (insurance_spent != 0 || insurance < pool.outstanding_principal)
+        {
+            // Historical ordinary pools price exits from physical insurance
+            // and cannot persist a loss generation. Permit only a provably
+            // healthy live claim; an empty historical pool may always advance.
             return Err(ProgramError::InvalidAccountData);
         }
-        sync_principal_protected_checkpoint(&mut pool, insurance, insurance_spent)?;
     }
 
     // Restart creates a fresh Percolator counter generation. Reset only after

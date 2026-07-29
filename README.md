@@ -135,7 +135,10 @@ principal from both protection classes, subject to losses incurred during their 
   pool. It charges the completed generation's cumulative insurance loss to owner claims before
   Percolator clears its counters, then starts fresh pool and TWAP counter generations only if the
   restart succeeds. The checkpoint accepts no token account, recipient, or amount, and a rejected
-  restart rolls every checkpoint change back atomically.
+  restart rolls every checkpoint change back atomically. Historical custody layouts without a
+  cumulative-loss checkpoint may cross restart with live claims only when cumulative insurance
+  spend is zero; an ordinary historical pool must also retain its full outstanding principal.
+  Otherwise restart fails closed while the existing owner-signed return-and-exit remains live.
   After the bound Percolator market is resolved and empty, anyone can crank the
   same fixed return while the pool attests that owner principal remains. Once the bootstrap deadline
   has elapsed, an absent owner also cannot veto terminal cleanup: any cranker may

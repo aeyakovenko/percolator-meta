@@ -29,6 +29,8 @@ enum PoolRestartScenario {
     NoRestartAfterLoss,
     RestartAfterLoss,
     HealthyRestart,
+    HealthyLegacyPoolRestart,
+    LegacyPoolRestartAfterLossRejected,
 }
 
 #[test]
@@ -48,6 +50,16 @@ fn e2e_asset0_restart_does_not_restore_impaired_owner_claim() {
 #[test]
 fn e2e_asset0_healthy_restart_preserves_owner_claim() {
     run_pool_restart_claim_scenario(PoolRestartScenario::HealthyRestart);
+}
+
+#[test]
+fn e2e_asset0_healthy_legacy_pool_can_restart_after_subledger_upgrade() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::HealthyLegacyPoolRestart);
+}
+
+#[test]
+fn e2e_asset0_legacy_pool_with_uncheckpointed_loss_cannot_restart() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::LegacyPoolRestartAfterLossRejected);
 }
 
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
@@ -388,8 +400,23 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         exit
     };
 
-    if scenario == PoolRestartScenario::HealthyRestart {
-        assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+    if matches!(
+        scenario,
+        PoolRestartScenario::HealthyRestart | PoolRestartScenario::HealthyLegacyPoolRestart
+    ) {
+        let legacy_pool = scenario == PoolRestartScenario::HealthyLegacyPoolRestart;
+        if legacy_pool {
+            // Model a real program-upgrade boundary. The deployed 329-byte
+            // custody layout stored the one-shot grant slot at bytes 321..329;
+            // current pools append it at 353..361.
+            let mut predecessor = svm.get_account(&pool).unwrap();
+            let grant_slot = predecessor.data[353..361].to_vec();
+            predecessor.data[321..329].copy_from_slice(&grant_slot);
+            predecessor.data.truncate(329);
+            svm.set_account(pool, predecessor).unwrap();
+        } else {
+            assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+        }
 
         let pool_before_public_checkpoint = svm.get_account(&pool).unwrap();
         assert!(
@@ -586,7 +613,9 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         )
         .expect("futarchy restarts the empty healthy generation");
 
-        assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+        if !legacy_pool {
+            assert_eq!(read_pool_restart_checkpoints(&svm, &pool), (0, 1));
+        }
         assert_eq!(
             percolator_accounting::read_asset_insurance_spent(
                 &svm.get_account(&market).unwrap().data,
@@ -887,7 +916,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before);
     assert_eq!(svm.get_account(&market).unwrap(), market_before);
 
-    if scenario == PoolRestartScenario::RestartAfterLoss {
+    if matches!(
+        scenario,
+        PoolRestartScenario::RestartAfterLoss
+            | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
+    ) {
+        let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
             &squads_vault,
@@ -1066,6 +1100,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             (0, 1),
             "the old loss is still generation-local immediately before restart",
         );
+        if legacy_pool {
+            let mut predecessor = svm.get_account(&pool).unwrap();
+            let grant_slot = predecessor.data[353..361].to_vec();
+            predecessor.data[321..329].copy_from_slice(&grant_slot);
+            predecessor.data.truncate(329);
+            svm.set_account(pool, predecessor).unwrap();
+        }
 
         let restart_slot = svm.get_sysvar::<Clock>().slot;
         let rejected_restart = build_twap_restart_asset0_message(
@@ -1126,6 +1167,41 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             1_000,
             old_market_id,
         );
+        if legacy_pool {
+            let pool_before_restart = svm.get_account(&pool).unwrap();
+            let market_before_restart = svm.get_account(&market).unwrap();
+            let config_before_restart = svm.get_account(&twap_cfg).unwrap();
+            assert!(
+                squads_execute(
+                    &mut svm,
+                    &squads,
+                    &multisig,
+                    &dao,
+                    &payer,
+                    10,
+                    &restart,
+                    &restart_remaining,
+                )
+                .is_err(),
+                "a historical pool cannot erase an uncheckpointed loss generation",
+            );
+            assert_eq!(svm.get_account(&pool).unwrap(), pool_before_restart);
+            assert_eq!(svm.get_account(&market).unwrap(), market_before_restart);
+            assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_restart);
+
+            send(&mut svm, &[&payer, &depositor], owner_exit_ix())
+                .expect("the impaired historical owner retains an atomic zero-value exit");
+            assert_eq!(token_amount(&svm, &depositor_token), 0);
+            assert_eq!(
+                u64::from_le_bytes(
+                    svm.get_account(&pool).unwrap().data[80..88]
+                        .try_into()
+                        .unwrap(),
+                ),
+                0,
+            );
+            return;
+        }
         squads_execute(
             &mut svm,
             &squads,
