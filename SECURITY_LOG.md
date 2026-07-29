@@ -14682,3 +14682,29 @@ checksum is `da618a25857381910099bfcc20a4a3d97702e1a180a2e69296da6b9c4576fdf2`.
 No account layout, signer, authority, amount, destination, transfer, withdrawal path, or new value
 surface was added; terminal close gained only conditional read-only proof accounts and a no-principal
 CPI.
+
+## Tick - lapsed source backing permanently blocked resolved settlement (surface B, REAL DOS)
+
+A public trader can materialize positive source-backed PnL, an independent backing provider can
+supply a finite-lived bucket, and an honest mark reversal can become active at the bucket's expiry
+slot. After valid controller resolution, the resolved close path attempted K/F settlement before
+materializing the lapsed backing transition. Every public crank and close retry then rolled back with
+the long portfolio still funded; the resolved lifecycle exposed no trade, withdrawal, or independent
+backing transition that could release it.
+
+The retained clean-room LiteSVM regression uses the real pinned Percolator and controller binaries
+through public market initialization, authenticated marks, balanced positions, backing top-up,
+permissionless cranks, governance resolution, and twenty bounded close retries. At RED commit
+`066966f7f9a1c36be4cf09c051a101ed9291391b`, the old SBF returned `Custom(19)` with 50,000,000
+capital permanently present. Engine RED `b4b087025bd708d012e46bbf8ddd75ff995734ff` reproduces the
+same ordering fault directly.
+
+FIX: resolved close now performs at most one bounded lapsed-source transition before K/F settlement,
+returning progress so callers can continue safely. The fixed engine commit is
+`e3ea7251ed75f0111ba3cf5a4b87961f6c7cca63`; wrapper pin
+`a232b13e3924aa2271f153e06f50a8051920ff15` produces SBF checksum
+`ba6b50a9b56a7ff678e05473ebf8ed4c01dc9c84cb541342d534e70ccb2c8fb6`. The LiteSVM regression
+proves both portfolios close, the users receive the exact resolved-accounting payouts, the
+crystallized mark loss and all 17 backing atoms remain in the canonical Percolator vault, and all
+100,000,017 deposited atoms are conserved. No instruction, account layout, signer, authority,
+amount, destination, custody route, or administrator surface was added.

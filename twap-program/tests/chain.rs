@@ -62495,7 +62495,7 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
 // settlement must prepare that bucket before any valuation which rejects stale
 // Fresh backing, or every public continuation rolls back without progress.
 #[test]
-fn probe_resolved_settlement_prepares_lapsed_backing_before_mark_debit() {
+fn e2e_resolved_settlement_prepares_lapsed_backing_before_mark_debit() {
     use percolator_prog::ix::Instruction as PIx;
 
     const START_SLOT: u64 = 40;
@@ -62937,6 +62937,22 @@ fn probe_resolved_settlement_prepares_lapsed_backing_before_mark_debit() {
         long_after.pnl.get(),
         short_after.capital.get(),
         short_after.pnl.get(),
+    );
+    let long_paid = token_amount(&svm, &long_destination);
+    let short_paid = token_amount(&svm, &short_destination);
+    let vault_after = token_amount(&svm, &percolator_vault);
+    let crystallized_loss = u64::try_from(positive_pnl).unwrap();
+    assert_eq!(long_paid, USER_CAPITAL - crystallized_loss);
+    assert_eq!(short_paid, USER_CAPITAL);
+    assert_eq!(
+        vault_after,
+        crystallized_loss + 17,
+        "the crystallized mark loss and backing must remain in the market vault",
+    );
+    assert_eq!(
+        long_paid + short_paid + vault_after,
+        USER_CAPITAL * 2 + 17,
+        "resolved continuation must conserve every deposited atom",
     );
 }
 
