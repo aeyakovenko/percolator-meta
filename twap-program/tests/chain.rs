@@ -62977,8 +62977,13 @@ fn e2e_resolved_settlement_prepares_lapsed_backing_before_mark_debit() {
 // PUBLIC DOS/LOF: ordinary funding settlement can leave fresh backing principal above the amount
 // attributed to the Genesis provider ledger. The final owner exit must sweep that protocol surplus
 // separately instead of debiting it as provider principal and underflowing the pinned ledger.
-#[test]
-fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OrganicCrossBackingCleanup {
+    ResolveMarket,
+    RestartAsset,
+}
+
+fn run_organic_cross_backing_surplus_cleanup(cleanup: OrganicCrossBackingCleanup) {
     use percolator_prog::ix::Instruction as PIx;
 
     let mut svm =
@@ -63296,6 +63301,350 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         backing_after_funding > initial_backing,
         "public funding settlement must create organic backing surplus: before={initial_backing}, after={backing_after_funding}"
     );
+
+    if cleanup == OrganicCrossBackingCleanup::RestartAsset {
+        let mut trader_recovered = 0u64;
+        for (owner, portfolio) in [(&long, long_portfolio), (&short, short_portfolio)] {
+            let pnl = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio).unwrap().data,
+            )
+            .unwrap()
+            .pnl
+            .get();
+            if pnl > 0 {
+                send(
+                    &mut svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(env.slab, false),
+                            AccountMeta::new(portfolio, false),
+                        ],
+                        PIx::ConvertReleasedPnl { amount: u128::MAX },
+                    ),
+                )
+                .expect("funding receiver converts all released pnl");
+            }
+            let capital = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio).unwrap().data,
+            )
+            .unwrap()
+            .capital
+            .get();
+            let destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &destination,
+                &env.collateral_mint,
+                &owner.pubkey(),
+                0,
+            );
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(env.perc_vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Withdraw { amount: capital },
+                ),
+            )
+            .expect("flat funding trader withdraws its current capital");
+            trader_recovered = trader_recovered
+                .checked_add(token_amount(&svm, &destination))
+                .unwrap();
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::ClosePortfolio,
+                ),
+            )
+            .expect("flat funding trader removes its portfolio");
+        }
+        assert!(
+            trader_recovered > 1_900_000 && trader_recovered <= 2_000_000,
+            "the public griefing round trip has bounded ordinary trading cost: {trader_recovered}",
+        );
+
+        let market_before_restart = svm.get_account(&env.slab).unwrap();
+        assert!(
+            !percolator_accounting::asset_has_position_or_loss_state(
+                &market_before_restart.data,
+                0,
+            )
+            .unwrap(),
+            "no trader or loss claimant remains to block lifecycle progress",
+        );
+        let backing_balances =
+            percolator_accounting::read_asset_backing_balances(
+                &market_before_restart.data,
+                0,
+            )
+            .unwrap();
+        let backing_sources =
+            percolator_accounting::read_asset_backing_source_credits(
+                &market_before_restart.data,
+                0,
+            )
+            .unwrap();
+        let consumed = backing_balances
+            .into_iter()
+            .map(|balance| balance.consumed_principal_atoms)
+            .sum::<u128>();
+        assert!(consumed > 0, "the public round trip leaves consumed history");
+        assert_eq!(
+            backing_sources
+                .into_iter()
+                .map(|source| source.provider_receivable_num)
+                .sum::<u128>(),
+            consumed * percolator::BOUND_SCALE,
+            "only matched consumed/receivable history remains",
+        );
+        assert_eq!(
+            backing_sources
+                .into_iter()
+                .map(|source| source.spent_backing_num)
+                .sum::<u128>(),
+            consumed * percolator::BOUND_SCALE,
+            "the only source-spent history is the matched consumed principal",
+        );
+        assert!(
+            backing_balances.into_iter().all(|balance| {
+                balance.valid_liened_principal_atoms == 0
+                    && balance.impaired_principal_atoms == 0
+            }),
+            "no live or impaired backing lien remains",
+        );
+
+        let backing_principals =
+            [env.long_backing_ledger, env.short_backing_ledger].map(|ledger| {
+                percolator_prog::state::read_backing_domain_ledger(
+                    &svm.get_account(&ledger).unwrap().data,
+                )
+                .unwrap()
+                .total_principal_atoms
+            });
+        let owner_backing_before = backing_balances
+            .into_iter()
+            .zip(backing_sources)
+            .zip(backing_principals)
+            .map(|((balance, source), provider_principal)| {
+                balance
+                    .provider_protected_principal_atoms(provider_principal, source)
+                    .unwrap()
+            })
+            .sum::<u128>();
+        let total_backing_before = backing_balances
+            .into_iter()
+            .map(|balance| balance.principal_atoms + balance.earnings_atoms)
+            .sum::<u128>();
+        let protocol_backing_surplus = total_backing_before
+            .checked_sub(owner_backing_before)
+            .unwrap();
+        let owner_insurance_before = read_reserved_floor(&svm, &twap_cfg);
+        assert_eq!(
+            owner_insurance_before + owner_backing_before,
+            u128::from(principal),
+            "funding history cannot change the segregated owner claim",
+        );
+        let collateral_before_restart =
+            token_amount(&svm, &env.perc_vault) + token_amount(&svm, &pool_holding);
+        let position_before_restart = svm.get_account(&position).unwrap();
+        let old_market_id = read_asset0_market_id(&svm, &env.slab);
+
+        let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+        let shutdown = build_controller_proxy_message(
+            &env.squads_vault,
+            &controller,
+            &env.slab,
+            &perc_id(),
+            &PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: shutdown_slot,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            }
+            .encode(),
+        );
+        let shutdown_remaining = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            6,
+            &shutdown,
+            &shutdown_remaining,
+        )
+        .expect("futarchy shuts down the empty funding generation");
+        for side in [0u8, 1] {
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![AccountMeta::new(env.slab, false)],
+                    PIx::FinalizeResetSide {
+                        asset_index: 0,
+                        side,
+                    },
+                ),
+            )
+            .expect("an honest cranker exhausts each side-reset continuation");
+        }
+        let (_, force_close_delay_slots) =
+            percolator_accounting::read_permissionless_resolve_policy(
+                &svm.get_account(&env.slab).unwrap().data,
+            )
+            .unwrap();
+        warp_to(
+            &mut svm,
+            shutdown_slot.checked_add(force_close_delay_slots).unwrap(),
+        );
+        let restart_slot = svm.get_sysvar::<Clock>().slot;
+        let restart = build_cross_backing_twap_restart_asset0_message(
+            &env.squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &env.slab,
+            &perc_id(),
+            &env.pool,
+            &pool_holding,
+            &env.perc_vault,
+            &vault_authority,
+            &env.long_backing_ledger,
+            &env.short_backing_ledger,
+            restart_slot,
+            1_000_001,
+            old_market_id,
+        );
+        let restart_remaining = vec![
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.pool, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new(pool_holding, false),
+            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new(env.long_backing_ledger, false),
+            AccountMeta::new(env.short_backing_ledger, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &env.squads,
+            &env.multisig,
+            &env.dao,
+            &payer,
+            7,
+            &restart,
+            &restart_remaining,
+        )
+        .expect("an absent backing owner cannot let spent history veto restart");
+
+        assert!(read_asset0_market_id(&svm, &env.slab) > old_market_id);
+        assert_eq!(
+            svm.get_account(&position).unwrap(),
+            position_before_restart,
+            "restart cannot mutate the absent owner's claim",
+        );
+        let pool_after_restart = svm.get_account(&env.pool).unwrap();
+        let pending_backing = u128::from(u64::from_le_bytes(
+            pool_after_restart.data[273..281].try_into().unwrap(),
+        )) + u128::from(u64::from_le_bytes(
+            pool_after_restart.data[281..289].try_into().unwrap(),
+        ));
+        assert_eq!(pending_backing, owner_backing_before);
+        assert_eq!(
+            read_reserved_floor(&svm, &twap_cfg) + pending_backing,
+            u128::from(principal),
+            "restart preserves exactly the owner claim",
+        );
+        assert_eq!(
+            u128::from(token_amount(&svm, &pool_holding)),
+            pending_backing + protocol_backing_surplus,
+            "protocol backing surplus remains outside pending owner principal",
+        );
+        assert_eq!(
+            token_amount(&svm, &env.perc_vault) + token_amount(&svm, &pool_holding),
+            collateral_before_restart,
+            "restart conserves every collateral atom",
+        );
+
+        let mut owner_exit = twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        );
+        owner_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
+        owner_exit
+            .accounts
+            .push(AccountMeta::new_readonly(depositor.pubkey(), true));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(position, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(depositor_ata, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(pool_holding, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(env.perc_vault, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new_readonly(vault_authority, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(env.long_backing_ledger, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(env.short_backing_ledger, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new_readonly(spl_token::ID, false));
+        bind_subledger_full_exit_witness(&svm, &mut owner_exit, &position);
+        send(&mut svm, &[&payer, &depositor], owner_exit)
+            .expect("the owner reclaims its complete deposit after restart");
+        assert_eq!(token_amount(&svm, &depositor_ata), principal);
+        assert_eq!(
+            u128::from(token_amount(&svm, &pool_holding)),
+            protocol_backing_surplus,
+            "the owner cannot claim organic protocol backing surplus",
+        );
+        return;
+    }
 
     let resolve_witness = controller_market_generation_witness(&svm, &env.slab);
     let resolve = build_controller_generation_proxy_message(
@@ -63656,4 +64005,15 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
     assert!(svm
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
+}
+
+#[test]
+fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
+    run_organic_cross_backing_surplus_cleanup(OrganicCrossBackingCleanup::ResolveMarket);
+}
+
+#[test]
+#[ignore = "expected RED until Percolator can retire spent-only source history"]
+fn e2e_source_spent_history_cannot_veto_asset0_restart() {
+    run_organic_cross_backing_surplus_cleanup(OrganicCrossBackingCleanup::RestartAsset);
 }
