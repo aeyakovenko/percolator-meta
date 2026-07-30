@@ -3089,6 +3089,8 @@ fn public_zero_payout_identity_splitting_cannot_grief_a_codepositor() {
 // loss without restoring the loss-only share rate. A zero-value public exit must
 // not let a later zero-value exit checkpoint that recovery so its subsequent
 // consumption charges the same backing atom to an independent owner twice.
+// The same loss must remain fixed when the recovery arrives before any owner
+// action has observed the transient backing low.
 #[test]
 fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
     use percolator_prog::ix::Instruction as PIx;
@@ -3096,12 +3098,15 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
     #[derive(Clone, Copy, Debug)]
     struct Outcome {
         victim_payout: u64,
+        first_sync_payout: u64,
+        recovery_sync_payout: u64,
         backing_after_first_loss: u128,
         backing_after_recovery: u128,
         backing_after_second_loss: u128,
     }
 
-    let run = |sync_recovery_before_second_loss: bool| {
+    let run =
+        |sync_first_loss_before_recovery: bool, sync_recovery_before_second_loss: bool| {
         let mut env = Env::new_cross_backing();
         let oracle = Keypair::new();
         let observer = Keypair::new();
@@ -3205,10 +3210,13 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
         };
         let backing_after_first_loss = backing_protection(&env);
         assert!(backing_after_first_loss < 15);
-        env.cross_backing_withdraw(&first_sync, &first_sync_ata, &pool_holding, 1)
-            .expect("zero-value exit records the first real owner loss");
-        assert_eq!(env.token_amount(&first_sync_ata), 0);
+        if sync_first_loss_before_recovery {
+            env.cross_backing_withdraw(&first_sync, &first_sync_ata, &pool_holding, 1)
+                .expect("zero-value exit records the first real owner loss");
+            assert_eq!(env.token_amount(&first_sync_ata), 0);
+        }
         if !sync_recovery_before_second_loss {
+            assert!(sync_first_loss_before_recovery);
             env.cross_backing_withdraw(
                 &recovery_sync,
                 &recovery_sync_ata,
@@ -3270,6 +3278,15 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
         );
 
         if sync_recovery_before_second_loss {
+            if !sync_first_loss_before_recovery {
+                env.cross_backing_withdraw(
+                    &first_sync,
+                    &first_sync_ata,
+                    &pool_holding,
+                    1,
+                )
+                .expect("first owner action records the loss after protocol recovery");
+            }
             env.cross_backing_withdraw(
                 &recovery_sync,
                 &recovery_sync_ata,
@@ -3344,14 +3361,16 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
 
         Outcome {
             victim_payout: env.token_amount(&victim_ata),
+            first_sync_payout: env.token_amount(&first_sync_ata),
+            recovery_sync_payout: env.token_amount(&recovery_sync_ata),
             backing_after_first_loss,
             backing_after_recovery,
             backing_after_second_loss,
         }
     };
 
-    let control = run(false);
-    let checkpointed_recovery = run(true);
+    let control = run(true, false);
+    let checkpointed_recovery = run(true, true);
     assert_eq!(
         checkpointed_recovery.backing_after_first_loss,
         control.backing_after_first_loss,
@@ -3367,6 +3386,35 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
     assert_eq!(
         checkpointed_recovery.victim_payout, control.victim_payout,
         "a zero-value checkpoint cannot charge protocol recovery to the victim twice",
+    );
+    assert_eq!(checkpointed_recovery.first_sync_payout, 0);
+    assert_eq!(checkpointed_recovery.recovery_sync_payout, 0);
+
+    let delayed_first_observation = run(false, true);
+    assert_eq!(
+        delayed_first_observation.backing_after_first_loss,
+        control.backing_after_first_loss,
+    );
+    assert_eq!(
+        delayed_first_observation.backing_after_recovery,
+        control.backing_after_recovery,
+    );
+    assert_eq!(
+        delayed_first_observation.backing_after_second_loss,
+        control.backing_after_second_loss,
+    );
+    assert_eq!(
+        (
+            delayed_first_observation.first_sync_payout,
+            delayed_first_observation.recovery_sync_payout,
+            delayed_first_observation.victim_payout,
+        ),
+        (
+            control.first_sync_payout,
+            control.recovery_sync_payout,
+            control.victim_payout,
+        ),
+        "protocol-funded recovery before the first Subledger action cannot restore an owner loss",
     );
 }
 
