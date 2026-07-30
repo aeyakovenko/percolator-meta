@@ -206,8 +206,8 @@ principal from both protection classes, subject to losses incurred during their 
 | `setup/` | Host helper for creating the fixed COIN supply and revoking mint authority. |
 
 The workspace pins `percolator-prog` to commit
-`541ea56419081fe63120db45563e7bf3e47938bc` and its engine layout dependency to
-`5d608a8653a4d2535b3ff7d3a011ccc8f4accc23`.
+`557f15b63c7a5f9e058a2c384ca8728829dc2b63` and its engine layout dependency to
+`e3ea7251ed75f0111ba3cf5a4b87961f6c7cca63`.
 
 That Percolator revision reserves sparse source-domain capacity before admitting exposure, so every
 accepted leg retains room for its first favorable settlement. It also rejects every atomic batch while
