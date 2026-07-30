@@ -3192,6 +3192,16 @@ fn public_zero_payout_identity_splitting_cannot_grief_a_codepositor() {
 fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
     use percolator_prog::ix::Instruction as PIx;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SourceTotals {
+        positive_claim_bound_num: u128,
+        exact_positive_claim_num: u128,
+        spent_backing_num: u128,
+        provider_receivable_num: u128,
+        cumulative_loss_atoms: u128,
+        cumulative_recovery_atoms: u128,
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct Outcome {
         victim_payout: u64,
@@ -3201,6 +3211,9 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
         backing_after_first_loss: u128,
         backing_after_recovery: u128,
         backing_after_second_loss: u128,
+        source_after_first_loss: SourceTotals,
+        source_after_recovery: SourceTotals,
+        source_after_second_loss: SourceTotals,
     }
 
     let run =
@@ -3306,7 +3319,37 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
                 .unwrap();
             provider_backing + u128::from(pending)
         };
+        let source_totals = |env: &Env| {
+            let market = env.svm.get_account(&env.slab).unwrap();
+            let sources =
+                percolator_accounting::read_asset_backing_source_credits(&market.data, 0)
+                    .unwrap();
+            let mut totals = SourceTotals {
+                positive_claim_bound_num: 0,
+                exact_positive_claim_num: 0,
+                spent_backing_num: 0,
+                provider_receivable_num: 0,
+                cumulative_loss_atoms: 0,
+                cumulative_recovery_atoms: 0,
+            };
+            for (domain, source) in sources.into_iter().enumerate() {
+                totals.positive_claim_bound_num += source.positive_claim_bound_num;
+                totals.exact_positive_claim_num += source.exact_positive_claim_num;
+                totals.spent_backing_num += source.spent_backing_num;
+                totals.provider_receivable_num += source.provider_receivable_num;
+                let ledger = env
+                    .svm
+                    .get_account(&cross_backing_ledger_pda(&env.pool, domain as u16))
+                    .unwrap();
+                let ledger =
+                    percolator_prog::state::read_backing_domain_ledger(&ledger.data).unwrap();
+                totals.cumulative_loss_atoms += ledger.cumulative_loss_atoms;
+                totals.cumulative_recovery_atoms += ledger.cumulative_recovery_atoms;
+            }
+            totals
+        };
         let backing_after_first_loss = backing_protection(&env);
+        let source_after_first_loss = source_totals(&env);
         assert!(backing_after_first_loss < 15);
         if sync_first_loss_before_recovery {
             env.cross_backing_withdraw(&first_sync, &first_sync_ata, &pool_holding, 1)
@@ -3424,6 +3467,7 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
             }
         }
         let backing_after_recovery = backing_protection(&env);
+        let source_after_recovery = source_totals(&env);
         assert!(
             backing_after_recovery > backing_after_first_loss,
             "organic funding must refill at least one previously lost backing atom: first={backing_after_first_loss}, recovery={backing_after_recovery}",
@@ -3475,6 +3519,7 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
             slot,
         );
         let backing_after_second_loss = backing_protection(&env);
+        let source_after_second_loss = source_totals(&env);
         assert!(
             backing_after_second_loss >= backing_after_first_loss,
             "the second loss must consume only intervening protocol-funded recovery: first={backing_after_first_loss}, second={backing_after_second_loss}",
@@ -3525,6 +3570,9 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
             backing_after_first_loss,
             backing_after_recovery,
             backing_after_second_loss,
+            source_after_first_loss,
+            source_after_recovery,
+            source_after_second_loss,
         }
     };
 
@@ -3554,6 +3602,38 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
     assert_eq!(checkpointed_recovery.recovery_sync_payout, 0);
 
     let delayed_first_observation = run(false, true);
+    for observed in [
+        control.source_after_first_loss,
+        control.source_after_recovery,
+        control.source_after_second_loss,
+        delayed_first_observation.source_after_first_loss,
+        delayed_first_observation.source_after_recovery,
+        delayed_first_observation.source_after_second_loss,
+    ] {
+        assert_eq!(
+            (
+                observed.spent_backing_num,
+                observed.provider_receivable_num,
+                observed.cumulative_loss_atoms,
+                observed.cumulative_recovery_atoms,
+            ),
+            (0, 0, 0, 0),
+            "the exposed monotonic backing counters do not observe exact source-claim loss",
+        );
+    }
+    assert_eq!(
+        (
+            delayed_first_observation.source_after_first_loss,
+            delayed_first_observation.source_after_recovery,
+            delayed_first_observation.source_after_second_loss,
+        ),
+        (
+            control.source_after_first_loss,
+            control.source_after_recovery,
+            control.source_after_second_loss,
+        ),
+        "current source-credit state cannot distinguish the safe and leaking histories",
+    );
     assert_eq!(
         delayed_first_observation.backing_after_first_loss,
         control.backing_after_first_loss,
@@ -3585,7 +3665,7 @@ fn recovered_protocol_backing_cannot_be_charged_as_a_second_owner_loss() {
             control.victim_payout,
             control.protocol_value_after_exit,
         ),
-        "a delayed checkpoint cannot move protocol recovery into an owner payout",
+        "a delayed checkpoint cannot move protocol recovery into an owner payout: control={control:?}, delayed={delayed_first_observation:?}",
     );
 }
 
