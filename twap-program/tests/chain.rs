@@ -11221,8 +11221,8 @@ fn e2e_source_capacity_is_reserved_before_new_exposure() {
     );
 }
 
-#[test]
-fn probe_controller_resolve_cannot_skip_committed_funding() {
+mod committed_accrual_resolution {
+    use super::*;
     use percolator_prog::ix::Instruction as PIx;
 
     #[derive(Clone, Copy)]
@@ -11239,7 +11239,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         short_payout: u64,
     }
 
-    fn run(segment: Segment, crank_before_resolve: bool) -> Outcome {
+    fn run(segment: Segment, crank_before_resolve: bool, direct_stale: bool) -> Outcome {
         const OPEN_SLOT: u64 = 1;
         const PRIME_SLOT: u64 = 2;
         const DEPOSIT: u128 = 100_000_000;
@@ -11251,7 +11251,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                     1,
                     100_000 * percolator::POS_SCALE as i128,
                     true,
-                    3,
+                    if direct_stale { 4 } else { 3 },
                 ),
                 Segment::PendingPrice => (
                     10_000,
@@ -11259,7 +11259,7 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                     100,
                     1_000 * percolator::POS_SCALE as i128,
                     false,
-                    PRIME_SLOT,
+                    if direct_stale { 4 } else { PRIME_SLOT },
                 ),
             };
 
@@ -11402,6 +11402,33 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             },
         )
         .expect("donate bounded lifecycle authority before public portfolio admission");
+        if direct_stale {
+            let witness = controller_market_generation_witness(&svm, &market);
+            let mut data = vec![0u8];
+            data.extend_from_slice(
+                &PIx::ConfigurePermissionlessResolve {
+                    stale_slots: 2,
+                    force_close_delay_slots: 1,
+                }
+                .encode(),
+            );
+            send(
+                &mut svm,
+                &[&payer, &governance],
+                Instruction {
+                    program_id: controller_id(),
+                    accounts: vec![
+                        AccountMeta::new_readonly(governance.pubkey(), true),
+                        AccountMeta::new_readonly(controller, false),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new_readonly(perc_id(), false),
+                        AccountMeta::new_readonly(witness, false),
+                    ],
+                    data,
+                },
+            )
+            .expect("configure the direct public stale-resolution path");
+        }
 
         let vault_authority = perc_vault_authority(&market, &perc_id());
         let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -11530,10 +11557,17 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
             crank(&mut svm, PRIME_SLOT).expect("activate the honest checkpoint");
         }
 
+        if direct_stale && crank_before_resolve {
+            let pre_resolve_slot = resolve_slot - 1;
+            clock.slot = pre_resolve_slot;
+            clock.unix_timestamp = pre_resolve_slot as i64;
+            svm.set_sysvar(&clock);
+            crank(&mut svm, pre_resolve_slot).expect("commit before stale resolution matures");
+        }
         clock.slot = resolve_slot;
         clock.unix_timestamp = resolve_slot as i64;
         svm.set_sysvar(&clock);
-        if crank_before_resolve {
+        if crank_before_resolve && !direct_stale {
             crank(&mut svm, resolve_slot).expect("commit the deterministic market segment");
         }
         let resolve = |svm: &LiteSVM| {
@@ -11552,20 +11586,41 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
                 data,
             }
         };
-        let first_resolve_ix = resolve(&svm);
-        let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
-        if crank_before_resolve {
-            first_resolve.expect("settled controller resolve remains live");
-        } else if first_resolve.is_err() {
-            crank(&mut svm, resolve_slot).expect("public crank catches up committed value");
-            let retry_resolve_ix = resolve(&svm);
-            send(&mut svm, &[&payer, &governance], retry_resolve_ix)
-                .expect("controller resolve succeeds after bounded catch-up");
+        if direct_stale {
+            send(
+                &mut svm,
+                &[&payer],
+                Instruction {
+                    program_id: perc_id(),
+                    accounts: vec![AccountMeta::new(market, false)],
+                    data: PIx::ResolveStalePermissionless {
+                        now_slot: resolve_slot,
+                    }
+                    .encode(),
+                },
+            )
+            .expect("an unaffiliated cranker resolves the stale market directly");
+        } else {
+            let first_resolve_ix = resolve(&svm);
+            let first_resolve = send(&mut svm, &[&payer, &governance], first_resolve_ix);
+            if crank_before_resolve {
+                first_resolve.expect("settled controller resolve remains live");
+            } else if first_resolve.is_err() {
+                crank(&mut svm, resolve_slot).expect("public crank catches up committed value");
+                let retry_resolve_ix = resolve(&svm);
+                send(&mut svm, &[&payer, &governance], retry_resolve_ix)
+                    .expect("controller resolve succeeds after bounded catch-up");
+            }
         }
 
         let resolved = percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
             .unwrap()
             .1;
+        if direct_stale {
+            clock.slot = resolve_slot + 1;
+            clock.unix_timestamp = (resolve_slot + 1) as i64;
+            svm.set_sysvar(&clock);
+        }
         let close = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey| {
             pix(
                 vec![
@@ -11626,22 +11681,88 @@ fn probe_controller_resolve_cannot_skip_committed_funding() {
         }
     }
 
-    let control = run(Segment::ActiveFunding, true);
-    let attack = run(Segment::ActiveFunding, false);
-    assert!(control.f_long_num > 0 && control.f_short_num < 0);
-    assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
-    assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
-    assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
-    assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+    #[test]
+    fn probe_controller_resolve_cannot_skip_committed_funding() {
+        let control = run(Segment::ActiveFunding, true, false);
+        let attack = run(Segment::ActiveFunding, false, false);
+        assert!(control.f_long_num > 0 && control.f_short_num < 0);
+        assert_eq!(attack.f_long_num, control.f_long_num, "{attack:?} != {control:?}");
+        assert_eq!(attack.f_short_num, control.f_short_num, "{attack:?} != {control:?}");
+        assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
+        assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
 
-    let control = run(Segment::PendingPrice, true);
-    let attack = run(Segment::PendingPrice, false);
-    assert_eq!(control.f_long_num, 0);
-    assert_eq!(control.f_short_num, 0);
-    assert!(control.long_payout > 100_000_000, "{control:?}");
-    assert!(control.short_payout < 100_000_000, "{control:?}");
-    assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
-    assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+        let control = run(Segment::PendingPrice, true, false);
+        let attack = run(Segment::PendingPrice, false, false);
+        assert_eq!(control.f_long_num, 0);
+        assert_eq!(control.f_short_num, 0);
+        assert!(control.long_payout > 100_000_000, "{control:?}");
+        assert!(control.short_payout < 100_000_000, "{control:?}");
+        assert_eq!(attack.long_payout, control.long_payout, "{attack:?} != {control:?}");
+        assert_eq!(attack.short_payout, control.short_payout, "{attack:?} != {control:?}");
+    }
+
+    // REAL PUBLIC LoF: at the stale deadline, a payer can resolve directly before a committed
+    // funding or target-price segment is cranked. The current pinned binary freezes the old
+    // accumulators/effective price, letting the payer retain value owed to the independent receiver.
+    #[test]
+    #[ignore = "upstream percolator-prog#385: stale resolution erases committed accrual"]
+    fn e2e_direct_stale_resolution_cannot_erase_committed_accrual() {
+        let funding_control = run(Segment::ActiveFunding, true, true);
+        let funding_attack = run(Segment::ActiveFunding, false, true);
+        assert!(funding_control.f_long_num > 0 && funding_control.f_short_num < 0);
+        assert_eq!(funding_attack.f_long_num, 0, "{funding_attack:?}");
+        assert_eq!(funding_attack.f_short_num, 0, "{funding_attack:?}");
+        assert!(
+            funding_attack.long_payout < funding_control.long_payout,
+            "{funding_attack:?} vs {funding_control:?}",
+        );
+        assert!(
+            funding_attack.short_payout > funding_control.short_payout,
+            "{funding_attack:?} vs {funding_control:?}",
+        );
+
+        let price_control = run(Segment::PendingPrice, true, true);
+        let price_attack = run(Segment::PendingPrice, false, true);
+        assert!(
+            price_attack.long_payout < price_control.long_payout,
+            "{price_attack:?} vs {price_control:?}",
+        );
+        assert!(
+            price_attack.short_payout > price_control.short_payout,
+            "{price_attack:?} vs {price_control:?}",
+        );
+
+        assert_eq!(
+            price_attack.long_payout,
+            price_control.long_payout,
+            "{price_attack:?} != {price_control:?}",
+        );
+        assert_eq!(
+            price_attack.short_payout,
+            price_control.short_payout,
+            "{price_attack:?} != {price_control:?}",
+        );
+        assert_eq!(
+            funding_attack.f_long_num,
+            funding_control.f_long_num,
+            "{funding_attack:?} != {funding_control:?}",
+        );
+        assert_eq!(
+            funding_attack.f_short_num,
+            funding_control.f_short_num,
+            "{funding_attack:?} != {funding_control:?}",
+        );
+        assert_eq!(
+            funding_attack.long_payout,
+            funding_control.long_payout,
+            "{funding_attack:?} != {funding_control:?}",
+        );
+        assert_eq!(
+            funding_attack.short_payout,
+            funding_control.short_payout,
+            "{funding_attack:?} != {funding_control:?}",
+        );
+    }
 }
 
 #[test]
