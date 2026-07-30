@@ -55416,6 +55416,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
     opening_fee_bps: u64,
     direct_exit_before_handoff: bool,
     restart_with_live_owner_claims: bool,
+    live_survivor_exit: bool,
 ) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -56337,6 +56338,200 @@ fn run_cross_backing_haircut_and_protocol_donation(
         .expect("any cranker finalizes the public loss side");
     }
 
+    if live_survivor_exit {
+        assert!(handoff_before_loss);
+        assert_eq!(predecessor_config_size, None);
+        assert_eq!(opening_fee_bps, 0);
+        assert!(!direct_exit_before_handoff);
+        assert!(!restart_with_live_owner_claims);
+
+        let mut blocked_empty_closes = 0u64;
+        for (owner, portfolio) in [
+            (&long, long_portfolio),
+            (&short, short_portfolio),
+        ] {
+            let destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &destination,
+                &env.collateral_mint,
+                &owner.pubkey(),
+                0,
+            );
+            let _ = send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::ConvertReleasedPnl { amount: u128::MAX },
+                ),
+            );
+            let capital = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio).unwrap().data,
+            )
+            .unwrap()
+            .capital
+            .get();
+            if capital != 0 {
+                send(
+                    &mut svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(env.slab, false),
+                            AccountMeta::new(portfolio, false),
+                            AccountMeta::new(destination, false),
+                            AccountMeta::new(env.perc_vault, false),
+                            AccountMeta::new_readonly(
+                                perc_vault_authority(&env.slab, &perc_id()),
+                                false,
+                            ),
+                            AccountMeta::new_readonly(spl_token::ID, false),
+                        ],
+                        PIx::Withdraw { amount: capital },
+                    ),
+                )
+                .expect("each public trader withdraws all remaining collateral");
+            }
+            let empty_state = percolator_prog::state::read_portfolio(
+                &svm.get_account(&portfolio).unwrap().data,
+            )
+            .unwrap();
+            assert_eq!(empty_state.capital.get(), 0);
+            assert!(percolator::active_bitmap_is_empty(
+                empty_state.active_bitmap.map(percolator::V16PodU64::get),
+            ));
+            let close_result = send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::ClosePortfolio,
+                ),
+            );
+            if let Err(close_error) = close_result {
+                assert!(
+                    close_error.contains("Custom(21)"),
+                    "the empty portfolio is blocked only by the engine hard lock: {close_error}",
+                );
+                blocked_empty_closes += 1;
+            }
+        }
+        assert!(blocked_empty_closes > 0);
+        assert_eq!(
+            percolator_prog::state::read_market(
+                &svm.get_account(&env.slab).unwrap().data,
+            )
+            .unwrap()
+            .1
+            .materialized_portfolio_count,
+            blocked_empty_closes,
+            "only zero-capital, zero-position witnesses remain materialized",
+        );
+        assert!(
+            !percolator_accounting::asset_has_position_or_loss_state(
+                &svm.get_account(&env.slab).unwrap().data,
+                0,
+            )
+            .unwrap(),
+            "all bounded public loss work is complete before the owner exit",
+        );
+        let (_, post_loss_group) =
+            percolator_prog::state::read_market(&svm.get_account(&env.slab).unwrap().data)
+                .unwrap();
+        assert!(post_loss_group.bankruptcy_hlock_active);
+        assert!(!post_loss_group.threshold_stress_active);
+        assert!(!post_loss_group.loss_stale_active);
+        assert_eq!(post_loss_group.assets[0].oi_eff_long_q, 0);
+        assert_eq!(post_loss_group.assets[0].oi_eff_short_q, 0);
+        let protected_backing = percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&env.slab).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .zip(
+            percolator_accounting::read_asset_backing_source_credits(
+                &svm.get_account(&env.slab).unwrap().data,
+                0,
+            )
+            .unwrap(),
+        )
+        .zip([env.long_backing_ledger, env.short_backing_ledger])
+        .map(|((balance, source), ledger)| {
+            let principal = percolator_prog::state::read_backing_domain_ledger(
+                &svm.get_account(&ledger).unwrap().data,
+            )
+            .unwrap()
+            .total_principal_atoms;
+            balance
+                .provider_protected_principal_atoms(principal, source)
+                .unwrap()
+        })
+        .sum::<u128>();
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &env.slab, 0) + protected_backing,
+            27,
+            "two loss atoms are consumed while 27 owner-protected atoms remain",
+        );
+
+        let mut owner_exit = twap_return_to_subledger_ix(
+            &env.squads_vault,
+            &env.pool,
+            &env.slab,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        );
+        owner_exit.accounts[1] = AccountMeta::new(twap_cfg, false);
+        owner_exit
+            .accounts
+            .push(AccountMeta::new_readonly(owners[0].pubkey(), true));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(positions[0], false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(destinations[0], false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(pool_holding, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(env.perc_vault, false));
+        owner_exit.accounts.push(AccountMeta::new_readonly(
+            perc_vault_authority(&env.slab, &perc_id()),
+            false,
+        ));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(env.long_backing_ledger, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new(env.short_backing_ledger, false));
+        owner_exit
+            .accounts
+            .push(AccountMeta::new_readonly(spl_token::ID, false));
+        bind_subledger_full_exit_witness(&svm, &mut owner_exit, &positions[0]);
+        send(&mut svm, &[&payer, &owners[0]], owner_exit)
+            .expect("a surviving owner claim must return without governance");
+        assert_eq!(
+            token_amount(&svm, &destinations[0]),
+            13,
+            "the owner receives only its loss-adjusted share",
+        );
+        return;
+    }
+
     if !handoff_before_loss && !direct_exit_before_handoff {
         squads_execute(
             &mut svm,
@@ -56829,37 +57024,46 @@ fn run_cross_backing_haircut_and_protocol_donation(
 
 #[test]
 fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, false, false);
 }
 
 #[test]
 fn e2e_cross_backing_haircut_before_twap_handoff_survives_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false, false, false);
 }
 
 #[test]
 fn e2e_pre_handoff_trade_fees_cannot_erase_a_cross_backing_owner_loss() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false, false, false);
 }
 
 #[test]
 fn e2e_pre_handoff_trade_fees_cannot_restore_a_direct_owner_exit() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true, false, false);
 }
 
 #[test]
 fn e2e_predecessor_cross_backing_config_can_finish_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false, false, false);
 }
 
 #[test]
 fn e2e_legacy_custody_config_can_finish_cross_backing_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false, false, false);
 }
 
 #[test]
 fn e2e_absent_cross_backing_owner_cannot_veto_asset0_restart() {
-    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, true);
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, true, false);
+}
+
+// BLOCKER DOS: one public bankruptcy consumes two protection atoms, then every bounded loss
+// action completes and both traders withdraw all remaining collateral. The durable same-asset
+// h-lock must not make the surviving depositor depend on governance resolving a live market.
+#[test]
+#[ignore = "expected RED until percolator-prog permits empty post-loss owner withdrawals"]
+fn e2e_public_partial_loss_cannot_lock_surviving_cross_backing_claims() {
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, false, true);
 }
 
 #[derive(Clone, Copy, Debug)]
