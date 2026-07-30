@@ -63524,6 +63524,465 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         .map_or(true, |account| account.lamports == 0));
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PublicExpiredBackingOutcome {
+    topup_accepted: bool,
+    provider_source: u64,
+    provider_recovery: u64,
+    provider_withdraw_succeeded: bool,
+    winner_payout: u64,
+    loser_payout: u64,
+    winner_terminal: bool,
+    loser_terminal: bool,
+}
+
+fn run_public_expired_backing_topup_case(
+    submit_retained: bool,
+) -> PublicExpiredBackingOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const BACKING: u64 = 500;
+    const DEPOSIT: u64 = 1_000;
+    const POSITION_Q: i128 = 10 * percolator::POS_SCALE as i128;
+    const EXPIRY_SLOT: u64 = 6;
+    const LANDING_SLOT: u64 = 7;
+    const RESOLVE_SLOT: u64 = 13;
+    const BACKING_AUTHORITY: u8 = 3;
+    const ORACLE_AUTHORITY: u8 = 4;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let oracle = Keypair::new();
+    let provider = Keypair::new();
+    let winner = Keypair::new();
+    let loser = Keypair::new();
+    let publisher = Keypair::new();
+    for signer in [
+        &payer,
+        &creator,
+        &oracle,
+        &provider,
+        &winner,
+        &loser,
+        &publisher,
+    ] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 0,
+        unix_timestamp: 0,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    svm.airdrop(&mint_authority.pubkey(), 1_000_000_000)
+        .unwrap();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("system-allocate the public market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 100,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("publicly initialize the market");
+    for (kind, authority) in [
+        (ORACLE_AUTHORITY, &oracle),
+        (BACKING_AUTHORITY, &provider),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, &creator, authority],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(authority.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: authority.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("delegate the independent asset authority");
+    }
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 0,
+                initial_mark_e6: 100,
+            },
+        ),
+    )
+    .expect("configure the honest authenticated mark");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let create_portfolio =
+        |svm: &mut LiteSVM, owner: &Keypair, capital: u64| -> Pubkey {
+            let portfolio = Keypair::new();
+            let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+            send(
+                svm,
+                &[&payer, &portfolio],
+                solana_sdk::system_instruction::create_account(
+                    &payer.pubkey(),
+                    &portfolio.pubkey(),
+                    portfolio_rent,
+                    portfolio_len as u64,
+                    &perc_id(),
+                ),
+            )
+            .expect("system-allocate a public portfolio");
+            let portfolio = portfolio.pubkey();
+            send(
+                svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("publicly initialize a portfolio");
+            if capital != 0 {
+                let source = Pubkey::new_unique();
+                set_token(svm, &source, &collateral, &owner.pubkey(), capital);
+                send(
+                    svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new_readonly(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio, false),
+                            AccountMeta::new(source, false),
+                            AccountMeta::new(vault, false),
+                            AccountMeta::new_readonly(spl_token::ID, false),
+                        ],
+                        PIx::Deposit {
+                            amount: u128::from(capital),
+                        },
+                    ),
+                )
+                .expect("deposit public trader capital");
+            }
+            portfolio
+        };
+    let winner_portfolio = create_portfolio(&mut svm, &winner, DEPOSIT);
+    let loser_portfolio = create_portfolio(&mut svm, &loser, DEPOSIT);
+    let publisher_portfolio = create_portfolio(&mut svm, &publisher, 0);
+    send(
+        &mut svm,
+        &[&payer, &winner, &loser],
+        pix(
+            vec![
+                AccountMeta::new_readonly(winner.pubkey(), true),
+                AccountMeta::new_readonly(loser.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(winner_portfolio, false),
+                AccountMeta::new(loser_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: POSITION_Q,
+                exec_price: 100,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("open the independent public positions");
+
+    for (slot, mark) in [(2, 200), (3, 350)] {
+        warp_to(&mut svm, slot);
+        send(
+            &mut svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: slot,
+                    mark_e6: mark,
+                },
+            ),
+        )
+        .expect("publish the honest adverse mark");
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(publisher_portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("commit the public mark without refreshing the profitable account");
+    }
+    assert_eq!(read_asset0_effective_price(&svm, &market), 350);
+
+    let provider_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_source,
+        &collateral,
+        &provider.pubkey(),
+        BACKING,
+    );
+    svm.expire_blockhash();
+    let retained_blockhash = svm.latest_blockhash();
+    let retained = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            pix(
+                vec![
+                    AccountMeta::new_readonly(provider.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(provider_source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::TopUpBackingBucket {
+                    domain: 1,
+                    amount: u128::from(BACKING),
+                    expiry_slot: EXPIRY_SLOT,
+                },
+            ),
+        ],
+        Some(&winner.pubkey()),
+        &[&winner, &provider],
+        retained_blockhash,
+    );
+    warp_to(&mut svm, LANDING_SLOT);
+    let topup_accepted = submit_retained && svm.send_transaction(retained).is_ok();
+    assert_eq!(svm.get_sysvar::<Clock>().slot, LANDING_SLOT);
+
+    warp_to(&mut svm, RESOLVE_SLOT);
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ResolveMarket,
+        ),
+    )
+    .expect("honest governance resolves the public market");
+    warp_to(&mut svm, RESOLVE_SLOT + 1);
+
+    let winner_destination = Pubkey::new_unique();
+    let loser_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &winner_destination,
+        &collateral,
+        &winner.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &loser_destination,
+        &collateral,
+        &loser.pubkey(),
+        0,
+    );
+    let is_terminal = |svm: &LiteSVM, portfolio: Pubkey| {
+        let state =
+            percolator_prog::state::read_portfolio(&svm.get_account(&portfolio).unwrap().data)
+                .unwrap();
+        state.capital.get() == 0
+            && state.pnl.get() == 0
+            && percolator::active_bitmap_is_empty(
+                state.active_bitmap.map(percolator::V16PodU64::get),
+            )
+            && state
+                .source_domains
+                .iter()
+                .all(|source| source.source_claim_bound_num.get() == 0)
+    };
+    for _ in 0..64 {
+        for (owner, portfolio, destination) in [
+            (&loser, loser_portfolio, loser_destination),
+            (&winner, winner_portfolio, winner_destination),
+        ] {
+            if is_terminal(&svm, portfolio) {
+                continue;
+            }
+            let _ = send(
+                &mut svm,
+                &[owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    },
+                ),
+            );
+        }
+        if is_terminal(&svm, winner_portfolio) && is_terminal(&svm, loser_portfolio) {
+            break;
+        }
+    }
+
+    let provider_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &provider_destination,
+        &collateral,
+        &provider.pubkey(),
+        0,
+    );
+    let provider_withdraw_succeeded = topup_accepted
+        && send(
+            &mut svm,
+            &[&provider],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(provider.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(provider_destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::WithdrawBackingBucket {
+                    domain: 1,
+                    amount: u128::from(BACKING),
+                },
+            ),
+        )
+        .is_ok();
+
+    PublicExpiredBackingOutcome {
+        topup_accepted,
+        provider_source: token_amount(&svm, &provider_source),
+        provider_recovery: token_amount(&svm, &provider_destination),
+        provider_withdraw_succeeded,
+        winner_payout: token_amount(&svm, &winner_destination),
+        loser_payout: token_amount(&svm, &loser_destination),
+        winner_terminal: is_terminal(&svm, winner_portfolio),
+        loser_terminal: is_terminal(&svm, loser_portfolio),
+    }
+}
+
+// Current-pin verification for percolator-prog PR #361. The attacker/winner is
+// only the retained top-up relayer; every Percolator state account is
+// system-allocated and initialized through the public API.
+#[test]
+#[ignore = "RED: blocked on percolator-prog PR #361"]
+fn probe_public_expired_backing_topup_cannot_transfer_provider_funds() {
+    let control = run_public_expired_backing_topup_case(false);
+    let delayed = run_public_expired_backing_topup_case(true);
+
+    assert_eq!(
+        control,
+        PublicExpiredBackingOutcome {
+            topup_accepted: false,
+            provider_source: 500,
+            provider_recovery: 0,
+            provider_withdraw_succeeded: false,
+            winner_payout: 2_000,
+            loser_payout: 0,
+            winner_terminal: true,
+            loser_terminal: true,
+        },
+    );
+    assert_eq!(
+        delayed, control,
+        "an expired backing signature cannot fund its relayer's existing payout",
+    );
+}
+
 // PUBLIC DOS PROBE: a finite backing bucket can lapse while an account still has
 // source-backed positive PnL that a later mark reversal must settle. Resolved
 // settlement must prepare that bucket before any valuation which rejects stale
