@@ -31545,6 +31545,14 @@ impl TestInstruction for Instruction {
 
 impl TestInstruction for PlaceBidInstruction {
     fn build(mut self, svm: &LiteSVM) -> Instruction {
+        const BOOK_HEADER: usize = 300;
+        const SLOT_SIZE: usize = 178;
+        const MAX_BIDS: usize = 32;
+        const SL_OCCUPIED: usize = 0;
+        const SL_BIDDER: usize = 2;
+        const SL_COIN: usize = 98;
+        const SL_USDC: usize = 114;
+
         let book = svm
             .get_account(&self.book)
             .expect("place_bid book must exist");
@@ -31552,6 +31560,49 @@ impl TestInstruction for PlaceBidInstruction {
         self.instruction
             .data
             .extend_from_slice(&round_end.to_le_bytes());
+
+        let slot_off = |index: usize| BOOK_HEADER + index * SLOT_SIZE;
+        let read_u128 = |offset: usize| {
+            u128::from_le_bytes(book.data[offset..offset + 16].try_into().unwrap())
+        };
+        let weakest = if (0..MAX_BIDS)
+            .any(|index| book.data[slot_off(index) + SL_OCCUPIED] == 0)
+        {
+            None
+        } else {
+            let mut weakest = 0usize;
+            for index in 1..MAX_BIDS {
+                let candidate = slot_off(index);
+                let incumbent = slot_off(weakest);
+                let candidate_coin =
+                    u64::try_from(read_u128(candidate + SL_COIN)).expect("bounded bid coin");
+                let candidate_usdc =
+                    u64::try_from(read_u128(candidate + SL_USDC)).expect("bounded bid USD");
+                let incumbent_coin =
+                    u64::try_from(read_u128(incumbent + SL_COIN)).expect("bounded bid coin");
+                let incumbent_usdc =
+                    u64::try_from(read_u128(incumbent + SL_USDC)).expect("bounded bid USD");
+                if u128::from(candidate_coin) * u128::from(incumbent_usdc)
+                    < u128::from(incumbent_coin) * u128::from(candidate_usdc)
+                {
+                    weakest = index;
+                }
+            }
+            Some(slot_off(weakest))
+        };
+        if let Some(offset) = weakest {
+            self.instruction
+                .data
+                .extend_from_slice(&book.data[offset + SL_BIDDER..offset + SL_BIDDER + 32]);
+            self.instruction
+                .data
+                .extend_from_slice(&book.data[offset + SL_COIN..offset + SL_COIN + 16]);
+            self.instruction
+                .data
+                .extend_from_slice(&book.data[offset + SL_USDC..offset + SL_USDC + 16]);
+        } else {
+            self.instruction.data.extend_from_slice(&[0u8; 64]);
+        }
         self.instruction
     }
 }

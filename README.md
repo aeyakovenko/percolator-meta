@@ -219,9 +219,11 @@ increases require an upstream max-fee field and a new pin. Backing fees can be r
 batch-safe accounting is merged on top of this exact security line.
 
 The auction's flat bid fee follows the same rule: book initialization selects its maximum and later
-Squads actions may keep or lower it. The bid wire commits to its amounts and exact round end but has no
-maximum-fee field, so it cannot cross a permissionless round roll and allowing a fee increase could
-burn unrelated COIN from an already-signed bidder transaction.
+Squads actions may keep or lower it. The bid wire commits to its amounts, exact round end, and either a
+free slot or the exact weakest bidder and bid legs it may evict. It therefore cannot cross a
+permissionless round roll or become admissible again after a later replacement is evicted. The wire has
+no maximum-fee field, so allowing a fee increase could burn unrelated COIN from an already-signed bidder
+transaction.
 Current cancellation wires commit to the reusable slot's placement clocks and both bid legs. The old
 slot-only wire remains valid only for predecessor books that are exit-only under the upgraded binary.
 
