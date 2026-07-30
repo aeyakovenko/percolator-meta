@@ -31142,6 +31142,9 @@ fn place_bid_ix(
         AccountMeta::new(*coin_mint, false), // writable: place_bid burns the anti-spam fee from it
         AccountMeta::new_readonly(*collateral_mint, false),
         AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(*bidder, true), // nonce rent payer; may differ in production clients
+        AccountMeta::new(twap_program::bid_nonce_address(book, bidder).0, false),
+        AccountMeta::new_readonly(system_program::ID, false),
     ];
     if let Some(e) = evict {
         accounts.push(AccountMeta::new(e, false));
@@ -31151,6 +31154,7 @@ fn place_bid_ix(
     data.extend_from_slice(&usdc_atoms.to_le_bytes());
     PlaceBidInstruction {
         book: *book,
+        bidder: *bidder,
         instruction: Instruction {
             program_id: twap_id(),
             accounts,
@@ -31161,6 +31165,7 @@ fn place_bid_ix(
 
 struct PlaceBidInstruction {
     book: Pubkey,
+    bidder: Pubkey,
     instruction: Instruction,
 }
 
@@ -31666,6 +31671,21 @@ impl TestInstruction for PlaceBidInstruction {
         } else {
             self.instruction.data.extend_from_slice(&[0u8; 64]);
         }
+        let nonce_address = twap_program::bid_nonce_address(&self.book, &self.bidder).0;
+        let expected_nonce = match svm.get_account(&nonce_address) {
+            Some(account) if !account.data.is_empty() => {
+                assert_eq!(account.owner, twap_id());
+                assert_eq!(account.data.len(), 80);
+                assert_eq!(&account.data[..8], b"BIDNONC1");
+                assert_eq!(&account.data[8..40], self.book.as_ref());
+                assert_eq!(&account.data[40..72], self.bidder.as_ref());
+                u64::from_le_bytes(account.data[72..80].try_into().unwrap())
+            }
+            _ => 0,
+        };
+        self.instruction
+            .data
+            .extend_from_slice(&expected_nonce.to_le_bytes());
         self.instruction
     }
 }
@@ -33073,6 +33093,17 @@ fn place_bid_rejects_an_older_retry_after_cancellation_reopens_a_free_slot() {
     warp_to(&mut svm, 112);
     let (victim, victim_coin, victim_usd) =
         new_bidder(&mut svm, &payer, &env, bid_coin + 2 * bid_fee);
+    let victim_nonce = twap_program::bid_nonce_address(&bk.book, &victim.pubkey()).0;
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &victim_nonce, 1),
+    )
+    .expect("an unaffiliated caller prefunds the deterministic bidder nonce");
+    let prefunded_nonce = svm.get_account(&victim_nonce).unwrap();
+    assert_eq!(prefunded_nonce.owner, system_program::ID);
+    assert!(prefunded_nonce.data.is_empty());
+
     svm.expire_blockhash();
     let shared_blockhash = svm.latest_blockhash();
     let victim_bid = place_bid_ix(
@@ -33109,6 +33140,14 @@ fn place_bid_rejects_an_older_retry_after_cancellation_reopens_a_free_slot() {
     svm.send_transaction(newer_retry)
         .expect("the newer victim retry fills the final free slot");
     assert_eq!(token_amount(&svm, &victim_coin), bid_fee);
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&victim_nonce).unwrap().data[72..80]
+                .try_into()
+                .unwrap()
+        ),
+        1,
+    );
 
     let (evictor, evictor_coin, evictor_usd) =
         new_bidder(&mut svm, &payer, &env, 3 + bid_fee);
@@ -33183,6 +33222,15 @@ fn place_bid_rejects_an_older_retry_after_cancellation_reopens_a_free_slot() {
         token_amount(&svm, &victim_coin),
         bid_coin + bid_fee,
         "only the fee from the landed placement may be burned",
+    );
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&victim_nonce).unwrap().data[72..80]
+                .try_into()
+                .unwrap()
+        ),
+        1,
+        "the rejected retry must not advance the bidder's next nonce",
     );
 }
 
@@ -44560,6 +44608,7 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
         "weakest bidder's COIN is escrowed before eviction"
     );
     let (better, bt_s, bt_u) = new_bidder(&mut svm, &payer, &env, 50);
+    let better_nonce = twap_program::bid_nonce_address(&bk.book, &better.pubkey()).0;
 
     // ATTACK (eviction-refund theft): the incoming bidder tries to redirect the evicted bidder's
     // escrowed COIN to an account they control. The destination must instead be clean and owned
@@ -44608,6 +44657,10 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
         50,
         "the attacker's own bid COIN was not escrowed (tx reverted)"
     );
+    assert!(
+        svm.get_account(&better_nonce).is_none(),
+        "the failed eviction must roll back creation and consumption of nonce zero",
+    );
 
     // The HONEST eviction (correct canonical refund target) succeeds.
     send(
@@ -44629,6 +44682,15 @@ fn e2e_full_book_evicts_only_for_a_strictly_better_bid() {
         ),
     )
     .expect("strictly-better bid evicts the weakest");
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&better_nonce).unwrap().data[72..80]
+                .try_into()
+                .unwrap()
+        ),
+        1,
+        "the successful retry consumes nonce zero exactly once",
+    );
     assert_eq!(
         token_amount(&svm, &weakest_ata),
         1,
