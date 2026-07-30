@@ -3562,6 +3562,8 @@ fn process_set_bid_fee(
 // place_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
 //   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_dest(w)?]
 // data: coin_atoms (u128) || usdc_atoms (u128) || expected_round_end (u64)
+//   || expected_evicted_bidder (pubkey) || expected_evicted_coin (u128)
+//   || expected_evicted_usdc (u128)
 //
 // PERMISSIONLESS. The bidder escrows `coin_atoms` COIN, offering it for `usdc_atoms` USD (limit
 // rate coin/usdc). The bid CANNOT be cancelled afterwards (anti-spoofing) — it only leaves the
@@ -3580,12 +3582,26 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let collateral_mint = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
 
-    if data.len() != 40 {
+    if data.len() != 104 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let coin_atoms = u128::from_le_bytes(data[..16].try_into().unwrap());
     let usdc_atoms = u128::from_le_bytes(data[16..32].try_into().unwrap());
     let expected_round_end = u64::from_le_bytes(data[32..40].try_into().unwrap());
+    let expected_evicted_bidder = Pubkey::new_from_array(data[40..72].try_into().unwrap());
+    let expected_evicted_coin = u128::from_le_bytes(data[72..88].try_into().unwrap());
+    let expected_evicted_usdc = u128::from_le_bytes(data[88..104].try_into().unwrap());
+    let expected_eviction = match (
+        expected_evicted_bidder == Pubkey::default(),
+        expected_evicted_coin,
+        expected_evicted_usdc,
+    ) {
+        (true, 0, 0) => None,
+        (false, coin, usdc) if coin > 0 && usdc > 0 => {
+            Some((expected_evicted_bidder, coin, usdc))
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
     if coin_atoms == 0 || usdc_atoms == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -3675,7 +3691,12 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
             }
         }
         match free {
-            Some(i) => i,
+            Some(i) => {
+                if expected_eviction.is_some() {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+                i
+            }
             None => {
                 // Book full: find the weakest (lowest-rate) bid; evict it only if the incoming bid
                 // is STRICTLY better. (Linear worst-scan — the heap's extract-min at N=32.)
@@ -3694,19 +3715,28 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
                     }
                 }
                 let ow = slot_off(weakest);
+                let live_eviction = (
+                    book_rd_key(&d, ow + SL_BIDDER),
+                    book_rd_u128(&d, ow + SL_COIN),
+                    book_rd_u128(&d, ow + SL_USDC),
+                );
+                // A full-book placement must commit to the exact bid it is authorized to replace.
+                // Since every replacement is strictly rate-improving, that bid cannot leave and
+                // later become the weakest with the same legs in this round. This prevents an older
+                // signed placement from becoming admissible again after a newer retry is evicted.
+                if expected_eviction != Some(live_eviction) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 if cmp_bid(
                     coin_atoms,
                     usdc_atoms,
-                    book_rd_u128(&d, ow + SL_COIN),
-                    book_rd_u128(&d, ow + SL_USDC),
+                    live_eviction.1,
+                    live_eviction.2,
                 ) != Ordering::Greater
                 {
                     return Err(ProgramError::InsufficientFunds); // book full and incoming not better
                 }
-                evicted = Some((
-                    book_rd_u128(&d, ow + SL_COIN),
-                    book_rd_key(&d, ow + SL_BIDDER),
-                ));
+                evicted = Some((live_eviction.1, live_eviction.0));
                 weakest
             }
         }

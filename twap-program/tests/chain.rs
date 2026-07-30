@@ -31545,6 +31545,14 @@ impl TestInstruction for Instruction {
 
 impl TestInstruction for PlaceBidInstruction {
     fn build(mut self, svm: &LiteSVM) -> Instruction {
+        const BOOK_HEADER: usize = 300;
+        const SLOT_SIZE: usize = 178;
+        const MAX_BIDS: usize = 32;
+        const SL_OCCUPIED: usize = 0;
+        const SL_BIDDER: usize = 2;
+        const SL_COIN: usize = 98;
+        const SL_USDC: usize = 114;
+
         let book = svm
             .get_account(&self.book)
             .expect("place_bid book must exist");
@@ -31552,6 +31560,49 @@ impl TestInstruction for PlaceBidInstruction {
         self.instruction
             .data
             .extend_from_slice(&round_end.to_le_bytes());
+
+        let slot_off = |index: usize| BOOK_HEADER + index * SLOT_SIZE;
+        let read_u128 = |offset: usize| {
+            u128::from_le_bytes(book.data[offset..offset + 16].try_into().unwrap())
+        };
+        let weakest = if (0..MAX_BIDS)
+            .any(|index| book.data[slot_off(index) + SL_OCCUPIED] == 0)
+        {
+            None
+        } else {
+            let mut weakest = 0usize;
+            for index in 1..MAX_BIDS {
+                let candidate = slot_off(index);
+                let incumbent = slot_off(weakest);
+                let candidate_coin =
+                    u64::try_from(read_u128(candidate + SL_COIN)).expect("bounded bid coin");
+                let candidate_usdc =
+                    u64::try_from(read_u128(candidate + SL_USDC)).expect("bounded bid USD");
+                let incumbent_coin =
+                    u64::try_from(read_u128(incumbent + SL_COIN)).expect("bounded bid coin");
+                let incumbent_usdc =
+                    u64::try_from(read_u128(incumbent + SL_USDC)).expect("bounded bid USD");
+                if u128::from(candidate_coin) * u128::from(incumbent_usdc)
+                    < u128::from(incumbent_coin) * u128::from(candidate_usdc)
+                {
+                    weakest = index;
+                }
+            }
+            Some(slot_off(weakest))
+        };
+        if let Some(offset) = weakest {
+            self.instruction
+                .data
+                .extend_from_slice(&book.data[offset + SL_BIDDER..offset + SL_BIDDER + 32]);
+            self.instruction
+                .data
+                .extend_from_slice(&book.data[offset + SL_COIN..offset + SL_COIN + 16]);
+            self.instruction
+                .data
+                .extend_from_slice(&book.data[offset + SL_USDC..offset + SL_USDC + 16]);
+        } else {
+            self.instruction.data.extend_from_slice(&[0u8; 64]);
+        }
         self.instruction
     }
 }
@@ -32211,6 +32262,353 @@ fn place_bid_rejects_a_signed_authorization_after_the_round_changes() {
         "a stale authorization must not burn the fee or escrow COIN"
     );
     assert_eq!(token_amount(&svm, &bk.coin_escrow), 0);
+}
+
+fn build_percolator_init_market_message(
+    squads_vault: &Pubkey,
+    market_slab: &Pubkey,
+    collateral_mint: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<u8> {
+    let mut message = Vec::new();
+    message.push(1); // num_signers
+    message.push(0); // num_writable_signers
+    message.push(1); // num_writable_non_signers
+    message.push(4); // account_keys count
+    message.extend_from_slice(squads_vault.as_ref()); // 0
+    message.extend_from_slice(market_slab.as_ref()); // 1
+    message.extend_from_slice(collateral_mint.as_ref()); // 2
+    message.extend_from_slice(percolator_program.as_ref()); // 3
+    message.push(1); // instructions count
+    message.push(3); // program_id_index
+    message.push(3); // account_indexes count
+    message.push(0);
+    message.push(1);
+    message.push(2);
+    let data = controller_init_market_data(1);
+    message.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    message.extend_from_slice(&data);
+    message.push(0); // address_table_lookups
+    message
+}
+
+fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> HandoffEnv {
+    let squads = squads_id();
+    let treasury = install_squads(svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    send(
+        svm,
+        &[payer, &create_key],
+        multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&dao.pubkey()),
+            1,
+            &[(dao.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        ),
+    )
+    .expect("create the governance multisig");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let coin_mint_authority = Keypair::new();
+    let coin_mint = create_real_mint(svm, payer, &coin_mint_authority.pubkey());
+    let collateral_mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(svm, payer, &collateral_mint_authority.pubkey());
+    let slab_signer = Keypair::new();
+    let slab = slab_signer.pubkey();
+    let slab_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let slab_rent = svm.minimum_balance_for_rent_exemption(slab_len);
+    send(
+        svm,
+        &[payer, &slab_signer],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &slab,
+            slab_rent,
+            slab_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public caller allocates a zeroed Percolator slab");
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let init_market = build_percolator_init_market_message(
+        &squads_vault,
+        &slab,
+        &collateral_mint,
+        &perc_id(),
+    );
+    squads_execute(
+        svm,
+        &squads,
+        &multisig,
+        &dao,
+        payer,
+        1,
+        &init_market,
+        &[
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(collateral_mint, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ],
+    )
+    .expect("governance initializes the market through the public Percolator instruction");
+
+    send(
+        svm,
+        &[payer],
+        init_config_ix(
+            &payer.pubkey(),
+            &coin_mint,
+            &slab,
+            &multisig,
+            &dao.pubkey(),
+            &perc_id(),
+        ),
+    )
+    .expect("initialize the TWAP config");
+    let twap_cfg = twap_config_pda(&slab, &multisig, &coin_mint, &perc_id());
+    let twap_authority =
+        Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
+    let accept = build_accept_operator_message(
+        &squads_vault,
+        &slab,
+        &twap_cfg,
+        &twap_authority,
+        &perc_id(),
+        &twap_id(),
+    );
+    squads_execute(
+        svm,
+        &squads,
+        &multisig,
+        &dao,
+        payer,
+        2,
+        &accept,
+        &[
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(slab, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("governance hands the live market to TWAP");
+
+    for transaction_index in 3..=4 {
+        let message =
+            build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+        squads_execute(
+            svm,
+            &squads,
+            &multisig,
+            &dao,
+            payer,
+            transaction_index,
+            &message,
+            &[
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(twap_cfg, false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ],
+        )
+        .expect("advance the governance transaction sequence");
+    }
+
+    let vault_authority = perc_vault_authority(&slab, &perc_id());
+    HandoffEnv {
+        squads,
+        multisig,
+        dao,
+        squads_vault,
+        slab,
+        collateral_mint,
+        coin_mint,
+        coin_mint_authority,
+        twap_cfg,
+        twap_authority,
+        perc_vault: canonical_insurance_vault(&vault_authority, &collateral_mint),
+        vault_authority,
+        principal: 0,
+        surplus: 0,
+    }
+}
+
+// PUBLIC LOF PROBE: a bidder can retry an uncertain placement with different terms while both
+// transactions remain valid in the same round. If the replacement is later evicted, the older,
+// stronger bid must not become admissible again and burn a second fee from the bidder's account.
+#[test]
+fn place_bid_rejects_an_older_retry_after_same_round_eviction() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+    let bid_fee = 7u64;
+    let bid_coin = 100u64;
+    let bk = setup_auction(&mut svm, &payer, &env, 1_000, 0, None, bid_fee);
+
+    // Every honest incumbent offers 2 COIN/USD. The attacker fills the last slot at 1/2, so both
+    // victim retries naturally name the attacker's refund account while the book is full.
+    let mut incumbents = Vec::new();
+    for _ in 0..31 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 2 + bid_fee);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                2,
+                1,
+                None,
+            ),
+        )
+        .expect("fill one incumbent bid slot");
+        incumbents.push((bidder, coin, usd));
+    }
+
+    let (evictor, evictor_coin, evictor_usd) =
+        new_bidder(&mut svm, &payer, &env, 3 + 2 * bid_fee);
+    send(
+        &mut svm,
+        &[&evictor],
+        place_bid_ix(
+            &evictor.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &evictor_coin,
+            &evictor_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            1,
+            2,
+            None,
+        ),
+    )
+    .expect("the attacker fills the last slot with the weakest bid");
+    let (victim, victim_coin, victim_usd) =
+        new_bidder(&mut svm, &payer, &env, bid_coin + 2 * bid_fee);
+
+    // The victim first signs a 10 COIN/USD placement through an untrusted fee payer, but it is
+    // withheld. The book is full, so the trailing account is the current weakest bidder's required
+    // refund destination, not an attacker-chosen account that the intended execution would ignore.
+    let shared_blockhash = svm.latest_blockhash();
+    let older_retry = Transaction::new_signed_with_payer(
+        &[place_bid_ix(
+            &victim.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &victim_coin,
+            &victim_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            bid_coin as u128,
+            10,
+            Some(evictor_coin),
+        )
+        .build(&svm)],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        shared_blockhash,
+    );
+
+    // A newer retry with less aggressive terms evicts the same weakest bid and burns one fee.
+    let replacement = Transaction::new_signed_with_payer(
+        &[place_bid_ix(
+            &victim.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &victim_coin,
+            &victim_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            bid_coin as u128,
+            100,
+            Some(evictor_coin),
+        )
+        .build(&svm)],
+        Some(&victim.pubkey()),
+        &[&victim],
+        shared_blockhash,
+    );
+    svm.send_transaction(replacement)
+        .expect("the victim's newer retry evicts the attacker's weakest bid");
+    assert_eq!(token_amount(&svm, &victim_coin), bid_fee);
+
+    // The attacker re-enters above the replacement's 1 COIN/USD rate. The victim receives the
+    // escrowed principal back, but the first fee remains burned.
+    let evict_replacement = Transaction::new_signed_with_payer(
+        &[place_bid_ix(
+            &evictor.pubkey(),
+            &env.twap_cfg,
+            &bk.book,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            &evictor_coin,
+            &evictor_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            3,
+            2,
+            Some(victim_coin),
+        )
+        .build(&svm)],
+        Some(&evictor.pubkey()),
+        &[&evictor],
+        shared_blockhash,
+    );
+    svm.send_transaction(evict_replacement)
+        .expect("the attacker evicts the victim's replacement bid");
+    assert_eq!(
+        token_amount(&svm, &victim_coin),
+        bid_coin + bid_fee,
+        "eviction returns principal but not the first burned fee",
+    );
+
+    let replay = svm.send_transaction(older_retry);
+    assert!(
+        replay.is_err(),
+        "the older retry became valid after eviction, burned a second fee, and re-escrowed the victim's COIN: source={}, escrow={}",
+        token_amount(&svm, &victim_coin),
+        token_amount(&svm, &bk.coin_escrow),
+    );
+    assert_eq!(token_amount(&svm, &victim_coin), bid_coin + bid_fee);
+    drop(incumbents);
 }
 
 // HEADLINE: a full buy/burn — three bids at different rates clear at ONE marginal uniform price,
