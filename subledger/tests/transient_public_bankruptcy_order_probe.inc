@@ -260,7 +260,22 @@ struct PublicBankruptcyOrderOutcome {
     escrow_remainder: u64,
 }
 
-fn run_public_bankruptcy_order(order: [usize; 5]) -> PublicBankruptcyOrderOutcome {
+impl PublicBankruptcyOrderOutcome {
+    fn total_collateral(self) -> u64 {
+        self.trader_payouts
+            .into_iter()
+            .sum::<u64>()
+            .checked_add(self.provider_payout)
+            .and_then(|value| value.checked_add(self.vault_remainder))
+            .and_then(|value| value.checked_add(self.escrow_remainder))
+            .unwrap()
+    }
+}
+
+fn run_public_bankruptcy_order(
+    order: [usize; 5],
+    live_bankruptcy_order: Option<[usize; 2]>,
+) -> PublicBankruptcyOrderOutcome {
     use percolator_prog::ix::Instruction as PIx;
 
     let mut env = fresh_public_cross_backing_market();
@@ -323,6 +338,12 @@ fn run_public_bankruptcy_order(order: [usize; 5]) -> PublicBankruptcyOrderOutcom
         301,
         8,
     );
+    if let Some(live_order) = live_bankruptcy_order {
+        let bankrupt_portfolios = [short_a_portfolio, short_b_portfolio];
+        for index in live_order {
+            liquidate_stale_public_loser(&mut env, bankrupt_portfolios[index], slot);
+        }
+    }
     env.send(
         &[Instruction {
             program_id: perc_id(),
@@ -379,8 +400,8 @@ fn run_public_bankruptcy_order(order: [usize; 5]) -> PublicBankruptcyOrderOutcom
 
 #[test]
 fn public_bankruptcy_order_cannot_shift_loss_into_cross_backing_provider() {
-    let first_loser_first = run_public_bankruptcy_order([1, 3, 0, 2, 4]);
-    let second_loser_first = run_public_bankruptcy_order([3, 1, 2, 0, 4]);
+    let first_loser_first = run_public_bankruptcy_order([1, 3, 0, 2, 4], None);
+    let second_loser_first = run_public_bankruptcy_order([3, 1, 2, 0, 4], None);
 
     assert_eq!(
         first_loser_first, second_loser_first,
@@ -391,15 +412,30 @@ fn public_bankruptcy_order_cannot_shift_loss_into_cross_backing_provider() {
         "the provider must absorb a real non-vacuous market loss",
     );
     assert_eq!(
-        first_loser_first
-            .trader_payouts
-            .into_iter()
-            .sum::<u64>()
-            .checked_add(first_loser_first.provider_payout)
-            .and_then(|value| value.checked_add(first_loser_first.vault_remainder))
-            .and_then(|value| value.checked_add(first_loser_first.escrow_remainder))
-            .unwrap(),
+        first_loser_first.total_collateral(),
         2_000_501,
         "all deposited collateral remains accounted for after terminal cleanup",
+    );
+}
+
+#[test]
+fn public_live_bankruptcy_crank_order_cannot_redistribute_provider_loss() {
+    let first_loser_first =
+        run_public_bankruptcy_order([1, 3, 0, 2, 4], Some([0, 1]));
+    let second_loser_first =
+        run_public_bankruptcy_order([1, 3, 0, 2, 4], Some([1, 0]));
+
+    assert_eq!(
+        first_loser_first, second_loser_first,
+        "public liquidation order redistributed trader payouts or provider loss",
+    );
+    assert!(
+        first_loser_first.provider_payout < 201,
+        "the public liquidations must consume real provider protection",
+    );
+    assert_eq!(
+        first_loser_first.total_collateral(),
+        2_000_501,
+        "live bankruptcy processing must conserve all deposited collateral",
     );
 }
