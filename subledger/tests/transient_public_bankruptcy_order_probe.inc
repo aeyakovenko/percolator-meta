@@ -439,3 +439,201 @@ fn public_live_bankruptcy_crank_order_cannot_redistribute_provider_loss() {
         "live bankruptcy processing must conserve all deposited collateral",
     );
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublicCodepositorExitOutcome {
+    trader_payouts: [u64; 4],
+    provider_payouts: [u64; 2],
+    vault_remainder: u64,
+    escrow_remainder: u64,
+}
+
+impl PublicCodepositorExitOutcome {
+    fn total_collateral(self) -> u64 {
+        self.trader_payouts
+            .into_iter()
+            .chain(self.provider_payouts)
+            .sum::<u64>()
+            .checked_add(self.vault_remainder)
+            .and_then(|value| value.checked_add(self.escrow_remainder))
+            .unwrap()
+    }
+}
+
+fn run_public_codepositor_exit_order(
+    exit_order: [usize; 2],
+    first_provider_chunks: &[u64],
+) -> PublicCodepositorExitOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut env = fresh_public_cross_backing_market();
+    let provider_principals = [199u64, 2u64];
+    let (first_provider, first_provider_ata) =
+        new_depositor(&mut env, provider_principals[0]);
+    let (second_provider, second_provider_ata) =
+        new_depositor(&mut env, provider_principals[1]);
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    for (provider, destination, principal) in [
+        (
+            &first_provider,
+            &first_provider_ata,
+            provider_principals[0],
+        ),
+        (
+            &second_provider,
+            &second_provider_ata,
+            provider_principals[1],
+        ),
+    ] {
+        env.cross_backing_deposit(provider, destination, &pool_holding, principal)
+            .expect("fund one independently attributed backing position");
+    }
+
+    let long_a = Keypair::new();
+    let short_a = Keypair::new();
+    let long_b = Keypair::new();
+    let short_b = Keypair::new();
+    let observer = Keypair::new();
+    let long_a_portfolio = create_fully_public_portfolio(&mut env, &long_a, 1_000_000);
+    let short_a_portfolio = create_fully_public_portfolio(&mut env, &short_a, 120);
+    let long_b_portfolio = create_fully_public_portfolio(&mut env, &long_b, 1_000_000);
+    let short_b_portfolio = create_fully_public_portfolio(&mut env, &short_b, 180);
+    let observer_portfolio = create_fully_public_portfolio(&mut env, &observer, 0);
+    for (long, long_portfolio, short, short_portfolio) in [
+        (&long_a, long_a_portfolio, &short_a, short_a_portfolio),
+        (&long_b, long_b_portfolio, &short_b, short_b_portfolio),
+    ] {
+        env.send(
+            &[Instruction {
+                program_id: perc_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(long.pubkey(), true),
+                    AccountMeta::new_readonly(short.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(long_portfolio, false),
+                    AccountMeta::new(short_portfolio, false),
+                ],
+                data: PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: percolator::POS_SCALE as i128,
+                    exec_price: 100,
+                    fee_bps: 0,
+                }
+                .encode(),
+            }],
+            &[long, short],
+        )
+        .expect("open an independent public long/short pair");
+    }
+
+    let market_admin = clone_kp(&env.market_admin);
+    let mut slot = env.svm.get_sysvar::<Clock>().slot;
+    advance_public_mark(
+        &mut env,
+        &market_admin,
+        observer_portfolio,
+        &mut slot,
+        301,
+        8,
+    );
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(market_admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&market_admin],
+    )
+    .expect("resolve the fresh market at the reached mark");
+
+    let payer = clone_kp(&env.payer);
+    let actors_and_portfolios = [
+        (&long_a, long_a_portfolio),
+        (&short_a, short_a_portfolio),
+        (&long_b, long_b_portfolio),
+        (&short_b, short_b_portfolio),
+        (&observer, observer_portfolio),
+    ];
+    let destinations = actors_and_portfolios.map(|(owner, _)| {
+        create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey())
+    });
+    let actors = [
+        (&long_a, long_a_portfolio, destinations[0]),
+        (&short_a, short_a_portfolio, destinations[1]),
+        (&long_b, long_b_portfolio, destinations[2]),
+        (&short_b, short_b_portfolio, destinations[3]),
+        (&observer, observer_portfolio, destinations[4]),
+    ];
+    close_resolved_in_order(&mut env, &actors, &[1, 3, 0, 2, 4]);
+
+    assert_eq!(
+        first_provider_chunks.iter().sum::<u64>(),
+        provider_principals[0],
+    );
+    for provider_index in exit_order {
+        if provider_index == 0 {
+            for amount in first_provider_chunks {
+                env.cross_backing_withdraw(
+                    &first_provider,
+                    &first_provider_ata,
+                    &pool_holding,
+                    *amount,
+                )
+                .expect("first provider makes bounded withdrawal progress");
+            }
+        } else {
+            env.cross_backing_withdraw(
+                &second_provider,
+                &second_provider_ata,
+                &pool_holding,
+                provider_principals[1],
+            )
+            .expect("second provider makes bounded withdrawal progress");
+        }
+    }
+
+    PublicCodepositorExitOutcome {
+        trader_payouts: [
+            env.token_amount(&destinations[0]),
+            env.token_amount(&destinations[1]),
+            env.token_amount(&destinations[2]),
+            env.token_amount(&destinations[3]),
+        ],
+        provider_payouts: [
+            env.token_amount(&first_provider_ata),
+            env.token_amount(&second_provider_ata),
+        ],
+        vault_remainder: env.token_amount(&env.perc_vault),
+        escrow_remainder: env.token_amount(&pool_holding),
+    }
+}
+
+#[test]
+fn public_cross_backing_codepositor_exit_order_cannot_transfer_the_victims_claim() {
+    let control = run_public_codepositor_exit_order([0, 1], &[199]);
+    let victim_first = run_public_codepositor_exit_order([1, 0], &[199]);
+    let split = run_public_codepositor_exit_order([0, 1], &[1, 198]);
+
+    assert_eq!(
+        control, victim_first,
+        "full-exit ordering redistributed an independent backing claim",
+    );
+    assert!(
+        split.provider_payouts[0] <= control.provider_payouts[0],
+        "splitting extracted backing from the common waterfall",
+    );
+    assert!(
+        split.provider_payouts[1] >= control.provider_payouts[1],
+        "splitting reduced the independent provider's backing payout",
+    );
+    for outcome in [control, victim_first, split] {
+        assert_eq!(
+            outcome.total_collateral(),
+            2_000_501,
+            "all public deposits remain accounted for after owner exits",
+        );
+    }
+}
