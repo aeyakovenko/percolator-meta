@@ -35,6 +35,7 @@ enum PoolRestartScenario {
     RestartAfterLossAbsentOwnerBuyback,
     RestartAfterPartialLossAbsentOwnerBuyback,
     CrossBackingRestartAfterLoss,
+    CrossBackingRepeatRestartAfterLoss,
 }
 
 #[test]
@@ -88,11 +89,22 @@ fn e2e_cross_backing_loss_is_checkpointed_before_asset0_restart() {
     run_pool_restart_claim_scenario(PoolRestartScenario::CrossBackingRestartAfterLoss);
 }
 
+#[test]
+fn e2e_staged_cross_backing_survives_a_second_asset0_restart() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::CrossBackingRepeatRestartAfterLoss);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
-    let cross_backing = scenario == PoolRestartScenario::CrossBackingRestartAfterLoss;
+    let cross_backing = matches!(
+        scenario,
+        PoolRestartScenario::CrossBackingRestartAfterLoss
+            | PoolRestartScenario::CrossBackingRepeatRestartAfterLoss
+    );
+    let repeat_cross_backing_restart =
+        scenario == PoolRestartScenario::CrossBackingRepeatRestartAfterLoss;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback || cross_backing {
@@ -1131,6 +1143,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
             | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
             | PoolRestartScenario::CrossBackingRestartAfterLoss
+            | PoolRestartScenario::CrossBackingRepeatRestartAfterLoss
     ) {
         let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
         let absent_owner_buyback = matches!(
@@ -1600,6 +1613,208 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             [0, 0],
             "the public restart begins a fresh cumulative-loss generation",
         );
+
+        if repeat_cross_backing_restart {
+            let first_restart_market_id = read_asset0_market_id(&svm, &market);
+            let pool_before_second_restart = svm.get_account(&pool).unwrap();
+            let position_before_second_restart = svm.get_account(&position).unwrap();
+            let ledgers_before_second_restart = [long_backing_ledger, short_backing_ledger]
+                .map(|ledger| svm.get_account(&ledger).unwrap());
+            let holding_before_second_restart = token_amount(&svm, &pool_holding);
+            let vault_before_second_restart = token_amount(&svm, &vault);
+            let floor_before_second_restart = read_reserved_floor(&svm, &twap_cfg);
+            let pending_before_second_restart = u128::from(u64::from_le_bytes(
+                pool_before_second_restart.data[273..281]
+                    .try_into()
+                    .unwrap(),
+            )) + u128::from(u64::from_le_bytes(
+                pool_before_second_restart.data[281..289]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let indexed_claim_before_second_restart = u128::from_le_bytes(
+                pool_before_second_restart.data[192..208]
+                    .try_into()
+                    .unwrap(),
+            )
+            .checked_mul(u128::from_le_bytes(
+                pool_before_second_restart.data[289..305]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .unwrap()
+                / u128::from_le_bytes(
+                    pool_before_second_restart.data[305..321]
+                        .try_into()
+                        .unwrap(),
+                );
+            assert_eq!(
+                floor_before_second_restart + pending_before_second_restart,
+                indexed_claim_before_second_restart,
+                "the second generation begins with the complete impaired claim segregated",
+            );
+
+            let second_shutdown_slot = svm.get_sysvar::<Clock>().slot;
+            let second_generation_witness =
+                market_controller_program::asset_generation_witness_address(
+                    &market,
+                    0,
+                    first_restart_market_id,
+                )
+                .0;
+            let second_shutdown = build_controller_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market,
+                &perc_id(),
+                &[],
+                &second_generation_witness,
+                &PIx::UpdateAssetLifecycle {
+                    action: 3,
+                    asset_index: 0,
+                    now_slot: second_shutdown_slot,
+                    initial_price: 0,
+                    insurance_authority: [0; 32],
+                    insurance_operator: [0; 32],
+                    backing_bucket_authority: [0; 32],
+                    oracle_authority: [0; 32],
+                }
+                .encode(),
+            );
+            let second_shutdown_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(second_generation_witness, false),
+                AccountMeta::new_readonly(controller_id(), false),
+            ];
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                11,
+                &second_shutdown,
+                &second_shutdown_remaining,
+            )
+            .expect("futarchy shuts down the empty replacement generation");
+
+            warp_to(&mut svm, second_shutdown_slot + 1);
+            let second_restart_slot = svm.get_sysvar::<Clock>().slot;
+            let second_restart = build_cross_backing_twap_restart_asset0_message(
+                &squads_vault,
+                &twap_cfg,
+                &twap_authority,
+                &market,
+                &perc_id(),
+                &pool,
+                &pool_holding,
+                &vault,
+                &vault_authority,
+                &long_backing_ledger,
+                &short_backing_ledger,
+                second_restart_slot,
+                1_000,
+                first_restart_market_id,
+            );
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                12,
+                &second_restart,
+                &restart_remaining,
+            )
+            .expect("futarchy restarts again while the impaired owner remains absent");
+
+            let pool_after_second_restart = svm.get_account(&pool).unwrap();
+            let pending_after_second_restart = u128::from(u64::from_le_bytes(
+                pool_after_second_restart.data[273..281]
+                    .try_into()
+                    .unwrap(),
+            )) + u128::from(u64::from_le_bytes(
+                pool_after_second_restart.data[281..289]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let indexed_claim_after_second_restart = u128::from_le_bytes(
+                pool_after_second_restart.data[192..208]
+                    .try_into()
+                    .unwrap(),
+            )
+            .checked_mul(u128::from_le_bytes(
+                pool_after_second_restart.data[289..305]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .unwrap()
+                / u128::from_le_bytes(
+                    pool_after_second_restart.data[305..321]
+                        .try_into()
+                        .unwrap(),
+                );
+            assert!(
+                read_asset0_market_id(&svm, &market) > first_restart_market_id,
+                "the probe reaches a second fresh market generation",
+            );
+            assert_eq!(
+                indexed_claim_after_second_restart, indexed_claim_before_second_restart,
+                "an empty generation cannot charge the old backing loss twice",
+            );
+            assert_eq!(
+                pending_after_second_restart, pending_before_second_restart,
+                "already-staged owner backing remains in the same segregated escrow",
+            );
+            assert_eq!(
+                read_reserved_floor(&svm, &twap_cfg) + pending_after_second_restart,
+                indexed_claim_after_second_restart,
+                "the second restart preserves the complete impaired owner claim",
+            );
+            assert_eq!(
+                svm.get_account(&position).unwrap(),
+                position_before_second_restart,
+                "a repeated restart cannot mutate the owner-bound position",
+            );
+            assert_eq!(
+                [long_backing_ledger, short_backing_ledger]
+                    .map(|ledger| svm.get_account(&ledger).unwrap()),
+                ledgers_before_second_restart,
+                "an empty generation cannot debit the already-empty live backing ledgers",
+            );
+            assert_eq!(
+                token_amount(&svm, &pool_holding),
+                holding_before_second_restart,
+                "staged owner backing cannot leave the canonical pool escrow",
+            );
+            assert_eq!(
+                token_amount(&svm, &vault),
+                vault_before_second_restart,
+                "a repeated restart cannot move insurance outside Percolator's vault",
+            );
+            assert_eq!(
+                percolator_accounting::read_asset_insurance_spent(
+                    &svm.get_account(&market).unwrap().data,
+                    0,
+                )
+                .unwrap(),
+                [0, 0],
+                "the second fresh generation also starts with zero cumulative loss",
+            );
+            assert!(
+                percolator_accounting::read_asset_backing_balances(
+                    &svm.get_account(&market).unwrap().data,
+                    0,
+                )
+                .unwrap()
+                .into_iter()
+                .all(|balance| !balance.has_any_state()),
+                "the second replacement generation also starts with empty backing buckets",
+            );
+        }
 
         let donor = Keypair::new();
         svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
