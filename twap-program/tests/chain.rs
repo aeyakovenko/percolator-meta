@@ -34,6 +34,7 @@ enum PoolRestartScenario {
     EmptyWithSurplusPoolRestart,
     RestartAfterLossAbsentOwnerBuyback,
     RestartAfterPartialLossAbsentOwnerBuyback,
+    CrossBackingRestartAfterLoss,
 }
 
 #[test]
@@ -82,14 +83,28 @@ fn e2e_asset0_partial_loss_restart_preserves_owner_claim_through_buyback() {
     );
 }
 
+#[test]
+fn e2e_cross_backing_loss_is_checkpointed_before_asset0_restart() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::CrossBackingRestartAfterLoss);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
+    let cross_backing = scenario == PoolRestartScenario::CrossBackingRestartAfterLoss;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
-    let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
-    let surviving_owner_claim = if partial_owner_buyback { 1u64 } else { 0 };
+    let owner_principal = if partial_owner_buyback || cross_backing {
+        2u64
+    } else {
+        1
+    };
+    let surviving_owner_claim = if partial_owner_buyback || cross_backing {
+        1u64
+    } else {
+        0
+    };
     let pool_policy = if empty_with_surplus {
         POLICY_WITH_SURPLUS
     } else {
@@ -260,36 +275,57 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
 
     let coin_mint_authority = Keypair::new();
     let coin_mint = create_real_mint(&mut svm, &payer, &coin_mint_authority.pubkey());
-    let pool = sub_pool_pda(
-        &collateral,
-        0,
-        &market,
-        &perc_id(),
-        &coin_mint,
-        pool_policy,
-        DOMAIN_INSURANCE,
-    );
+    let pool = if cross_backing {
+        sub_cross_backing_pool_pda(
+            &collateral,
+            0,
+            &market,
+            &perc_id(),
+            &coin_mint,
+            pool_policy,
+            DOMAIN_INSURANCE,
+        )
+    } else {
+        sub_pool_pda(
+            &collateral,
+            0,
+            &market,
+            &perc_id(),
+            &coin_mint,
+            pool_policy,
+            DOMAIN_INSURANCE,
+        )
+    };
+    let long_backing_ledger = sub_cross_backing_ledger_pda(&pool, 0);
+    let short_backing_ledger = sub_cross_backing_ledger_pda(&pool, 1);
     let vote_authority = gv_config_pda_e2e(&coin_mint, &pool);
-    let mut pool_data = vec![3u8]; // IX_INIT_INSURANCE_POOL
+    let mut pool_data = vec![if cross_backing { 14u8 } else { 3u8 }];
     pool_data.extend_from_slice(&0u64.to_le_bytes());
     pool_data.push(pool_policy);
     append_test_genesis_schedule(&mut pool_data);
+    let mut pool_accounts = vec![
+        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new_readonly(collateral, false),
+        AccountMeta::new(pool, false),
+        AccountMeta::new_readonly(vault, false),
+        AccountMeta::new_readonly(market, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(vote_authority, false),
+        AccountMeta::new_readonly(coin_mint, false),
+    ];
+    if cross_backing {
+        pool_accounts.extend_from_slice(&[
+            AccountMeta::new(long_backing_ledger, false),
+            AccountMeta::new(short_backing_ledger, false),
+        ]);
+    }
     send(
         &mut svm,
         &[&payer],
         Instruction {
             program_id: sub_id(),
-            accounts: vec![
-                AccountMeta::new(payer.pubkey(), true),
-                AccountMeta::new_readonly(collateral, false),
-                AccountMeta::new(pool, false),
-                AccountMeta::new_readonly(vault, false),
-                AccountMeta::new_readonly(market, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(system_program::ID, false),
-                AccountMeta::new_readonly(vote_authority, false),
-                AccountMeta::new_readonly(coin_mint, false),
-            ],
+            accounts: pool_accounts,
             data: pool_data,
         },
     )
@@ -322,7 +358,11 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     let depositor = Keypair::new();
     svm.airdrop(&depositor.pubkey(), 1_000_000_000).unwrap();
     let depositor_token = Pubkey::new_unique();
-    let pool_holding = Pubkey::new_unique();
+    let pool_holding = if cross_backing {
+        canonical_insurance_vault(&pool, &collateral)
+    } else {
+        Pubkey::new_unique()
+    };
     set_token(
         &mut svm,
         &depositor_token,
@@ -334,34 +374,45 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     let position = sub_position_pda(&pool, &depositor.pubkey());
     let mut deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
     deposit_data.extend_from_slice(&owner_principal.to_le_bytes());
+    let mut deposit_accounts = vec![
+        AccountMeta::new(depositor.pubkey(), true),
+        AccountMeta::new(pool, false),
+        AccountMeta::new(position, false),
+        AccountMeta::new(depositor_token, false),
+        AccountMeta::new(pool_holding, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new(vault, false),
+    ];
+    if cross_backing {
+        deposit_accounts.extend_from_slice(&[
+            AccountMeta::new(long_backing_ledger, false),
+            AccountMeta::new(short_backing_ledger, false),
+        ]);
+    }
+    deposit_accounts.extend_from_slice(&[
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+    ]);
     send(
         &mut svm,
         &[&payer, &depositor],
         Instruction {
             program_id: sub_id(),
-            accounts: vec![
-                AccountMeta::new(depositor.pubkey(), true),
-                AccountMeta::new(pool, false),
-                AccountMeta::new(position, false),
-                AccountMeta::new(depositor_token, false),
-                AccountMeta::new(pool_holding, false),
-                AccountMeta::new(market, false),
-                AccountMeta::new(vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new_readonly(system_program::ID, false),
-            ],
+            accounts: deposit_accounts,
             data: deposit_data,
         },
     )
     .expect("owner deposits principal into live insurance");
-    assert_eq!(
-        read_asset_insurance_domains(&svm, &market, 0),
-        [
-            u128::from(owner_principal / 2),
-            u128::from(owner_principal - owner_principal / 2),
-        ],
-    );
+    if !cross_backing {
+        assert_eq!(
+            read_asset_insurance_domains(&svm, &market, 0),
+            [
+                u128::from(owner_principal / 2),
+                u128::from(owner_principal - owner_principal / 2),
+            ],
+        );
+    }
     if empty_with_surplus {
         let withdraw_data = subledger_insurance_withdraw_data(&svm, &position, 1, 0);
         send(
@@ -405,15 +456,28 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     let twap_cfg = twap_config_pda(&market, &multisig, &coin_mint, &perc_id());
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
-    let handoff = build_subledger_handoff_to_twap_message(
-        &squads_vault,
-        &pool,
-        &market,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-    );
-    let handoff_remaining = vec![
+    let handoff = if cross_backing {
+        build_cross_backing_subledger_handoff_to_twap_message(
+            &squads_vault,
+            &pool,
+            &market,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+            &long_backing_ledger,
+            &short_backing_ledger,
+        )
+    } else {
+        build_subledger_handoff_to_twap_message(
+            &squads_vault,
+            &pool,
+            &market,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        )
+    };
+    let mut handoff_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
         AccountMeta::new(twap_cfg, false),
@@ -423,6 +487,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         AccountMeta::new_readonly(twap_id(), false),
         AccountMeta::new_readonly(sub_id(), false),
     ];
+    if cross_backing {
+        handoff_remaining.extend_from_slice(&[
+            AccountMeta::new_readonly(long_backing_ledger, false),
+            AccountMeta::new_readonly(short_backing_ledger, false),
+        ]);
+    }
     squads_execute(
         &mut svm,
         &squads,
@@ -434,10 +504,41 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         &handoff_remaining,
     )
     .expect("pool hands funded custody to TWAP");
+    let protected_pool_value = |svm: &LiteSVM| -> u128 {
+        let mut protected = read_asset_insurance_remaining(svm, &market, 0);
+        if cross_backing {
+            let market_data = svm.get_account(&market).unwrap().data;
+            let balances =
+                percolator_accounting::read_asset_backing_balances(&market_data, 0).unwrap();
+            let sources =
+                percolator_accounting::read_asset_backing_source_credits(&market_data, 0).unwrap();
+            for (domain, ledger) in [long_backing_ledger, short_backing_ledger]
+                .into_iter()
+                .enumerate()
+            {
+                let principal = percolator_prog::state::read_backing_domain_ledger(
+                    &svm.get_account(&ledger).unwrap().data,
+                )
+                .unwrap()
+                .total_principal_atoms;
+                protected = protected
+                    .checked_add(
+                        balances[domain]
+                            .provider_protected_principal_atoms(principal, sources[domain])
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        protected
+    };
+    assert_eq!(protected_pool_value(&svm), u128::from(owner_principal));
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
         if empty_with_surplus {
             0
+        } else if cross_backing {
+            u128::from(owner_principal / 2)
         } else {
             owner_principal as u128
         },
@@ -463,6 +564,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         exit.accounts.push(AccountMeta::new(vault, false));
         exit.accounts
             .push(AccountMeta::new_readonly(vault_authority, false));
+        if cross_backing {
+            exit.accounts
+                .push(AccountMeta::new(long_backing_ledger, false));
+            exit.accounts
+                .push(AccountMeta::new(short_backing_ledger, false));
+        }
         exit.accounts
             .push(AccountMeta::new_readonly(spl_token::ID, false));
         exit.data.extend_from_slice(&owner_exit_witness);
@@ -765,25 +872,27 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     };
     let book = setup_auction(&mut svm, &payer, &handoff_env, 10, 0, None, 0);
     let (bidder, bidder_coin, bidder_usd) = new_bidder(&mut svm, &payer, &handoff_env, 1);
-    send(
-        &mut svm,
-        &[&payer, &bidder],
-        place_bid_ix(
-            &bidder.pubkey(),
-            &twap_cfg,
-            &book.book,
-            &book.book_escrow,
-            &book.coin_escrow,
-            &bidder_coin,
-            &bidder_usd,
-            &coin_mint,
-            &collateral,
-            1,
-            1,
-            None,
-        ),
-    )
-    .expect("public bidder escrows one COIN for the next buyback round");
+    if !cross_backing {
+        send(
+            &mut svm,
+            &[&payer, &bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &bidder_coin,
+                &bidder_usd,
+                &coin_mint,
+                &collateral,
+                1,
+                1,
+                None,
+            ),
+        )
+        .expect("public bidder escrows one COIN for the next buyback round");
+    }
 
     let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
     let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
@@ -948,8 +1057,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         owner_balance_before_exposed_exit
     );
     assert_eq!(
-        read_asset_insurance_remaining(&svm, &market, 0),
-        owner_principal as u128,
+        protected_pool_value(&svm),
+        u128::from(owner_principal),
     );
 
     for _ in 0..5 {
@@ -970,30 +1079,36 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         )
         .expect("settle and liquidate the long");
     }
-    assert_eq!(
-        read_asset_insurance_remaining(&svm, &market, 0),
-        surviving_owner_claim as u128,
-    );
+    assert_eq!(protected_pool_value(&svm), u128::from(surviving_owner_claim));
     let protected_loser = percolator_prog::state::read_portfolio(
         &svm.get_account(&traders[0].1.pubkey()).unwrap().data,
     )
     .unwrap();
     assert_eq!(protected_loser.close_progress.insurance_spent.get(), 1);
 
+    let mut direct_exit_accounts = vec![
+        AccountMeta::new(depositor.pubkey(), true),
+        AccountMeta::new(pool, false),
+        AccountMeta::new(position, false),
+        AccountMeta::new(depositor_token, false),
+        AccountMeta::new(pool_holding, false),
+        AccountMeta::new(market, false),
+        AccountMeta::new(vault, false),
+        AccountMeta::new_readonly(vault_authority, false),
+    ];
+    if cross_backing {
+        direct_exit_accounts.extend_from_slice(&[
+            AccountMeta::new(long_backing_ledger, false),
+            AccountMeta::new(short_backing_ledger, false),
+        ]);
+    }
+    direct_exit_accounts.extend_from_slice(&[
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ]);
     let direct_exit = Instruction {
         program_id: sub_id(),
-        accounts: vec![
-            AccountMeta::new(depositor.pubkey(), true),
-            AccountMeta::new(pool, false),
-            AccountMeta::new(position, false),
-            AccountMeta::new(depositor_token, false),
-            AccountMeta::new(pool_holding, false),
-            AccountMeta::new(market, false),
-            AccountMeta::new(vault, false),
-            AccountMeta::new_readonly(vault_authority, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
+        accounts: direct_exit_accounts,
         data: subledger_insurance_withdraw_data(&svm, &position, 1, 0),
     };
     let pool_before = svm.get_account(&pool).unwrap();
@@ -1015,6 +1130,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             | PoolRestartScenario::RestartAfterLossAbsentOwnerBuyback
             | PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback
             | PoolRestartScenario::LegacyPoolRestartAfterLossRejected
+            | PoolRestartScenario::CrossBackingRestartAfterLoss
     ) {
         let legacy_pool = scenario == PoolRestartScenario::LegacyPoolRestartAfterLossRejected;
         let absent_owner_buyback = matches!(
@@ -1153,53 +1269,71 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         let backing_provider = Pubkey::new_from_array(
             percolator_accounting::read_asset_backing_authority(&market_account.data, 0).unwrap(),
         );
-        assert_eq!(backing_provider, admin.pubkey());
         let backing =
             percolator_accounting::read_asset_backing_balances(&market_account.data, 0).unwrap();
-        assert!(
-            backing[0].principal_atoms > 0,
-            "the real bankruptcy must recover controller-owned backing",
-        );
-        assert_eq!(
-            backing[1].principal_atoms + backing[1].earnings_atoms,
-            0,
-        );
-        let backing_provider_destination = Pubkey::new_unique();
-        set_token(
-            &mut svm,
-            &backing_provider_destination,
-            &collateral,
-            &backing_provider,
-            0,
-        );
-        send(
-            &mut svm,
-            &[&payer, &admin],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(admin.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(backing_provider_destination, false),
-                    AccountMeta::new(vault, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                PIx::WithdrawBackingBucket {
-                    domain: 0,
-                    amount: backing[0].principal_atoms,
-                },
-            ),
-        )
-        .expect("the segregated backing provider withdraws its old-generation principal");
-        assert_eq!(
-            token_amount(&svm, &backing_provider_destination) as u128,
-            backing[0].principal_atoms + backing[0].earnings_atoms,
-        );
-        assert_eq!(
-            read_pool_restart_checkpoints(&svm, &pool),
-            (0, owner_principal),
-            "the old loss is still generation-local immediately before restart",
-        );
+        if cross_backing {
+            assert_eq!(
+                backing_provider, pool,
+                "owner backing remains segregated under the canonical pool PDA",
+            );
+            assert_eq!(
+                protected_pool_value(&svm),
+                u128::from(surviving_owner_claim),
+                "the organic loss impairs the aggregate owner claim before restart",
+            );
+            let pool_data = svm.get_account(&pool).unwrap().data;
+            assert_eq!(
+                u64::from_le_bytes(pool_data[337..345].try_into().unwrap()),
+                owner_principal / 2,
+                "the live-generation backing checkpoint has not yet absorbed the loss",
+            );
+        } else {
+            assert_eq!(backing_provider, admin.pubkey());
+            assert!(
+                backing[0].principal_atoms > 0,
+                "the real bankruptcy must recover controller-owned backing",
+            );
+            assert_eq!(
+                backing[1].principal_atoms + backing[1].earnings_atoms,
+                0,
+            );
+            let backing_provider_destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &backing_provider_destination,
+                &collateral,
+                &backing_provider,
+                0,
+            );
+            send(
+                &mut svm,
+                &[&payer, &admin],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(admin.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(backing_provider_destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::WithdrawBackingBucket {
+                        domain: 0,
+                        amount: backing[0].principal_atoms,
+                    },
+                ),
+            )
+            .expect("the segregated backing provider withdraws its old-generation principal");
+            assert_eq!(
+                token_amount(&svm, &backing_provider_destination) as u128,
+                backing[0].principal_atoms + backing[0].earnings_atoms,
+            );
+            assert_eq!(
+                read_pool_restart_checkpoints(&svm, &pool),
+                (0, owner_principal),
+                "the old loss is still generation-local immediately before restart",
+            );
+        }
         if legacy_pool {
             let mut predecessor = svm.get_account(&pool).unwrap();
             let grant_slot = predecessor.data[353..361].to_vec();
@@ -1209,30 +1343,74 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         }
 
         let restart_slot = svm.get_sysvar::<Clock>().slot;
-        let rejected_restart = build_twap_restart_asset0_message(
-            &squads_vault,
-            &twap_cfg,
-            &twap_authority,
-            &market,
-            &perc_id(),
-            Some(&pool),
-            restart_slot,
-            0,
-            old_market_id,
-        );
-        let restart_remaining = vec![
+        let rejected_restart = if cross_backing {
+            build_cross_backing_twap_restart_asset0_message(
+                &squads_vault,
+                &twap_cfg,
+                &twap_authority,
+                &market,
+                &perc_id(),
+                &pool,
+                &pool_holding,
+                &vault,
+                &vault_authority,
+                &long_backing_ledger,
+                &short_backing_ledger,
+                restart_slot,
+                0,
+                old_market_id,
+            )
+        } else {
+            build_twap_restart_asset0_message(
+                &squads_vault,
+                &twap_cfg,
+                &twap_authority,
+                &market,
+                &perc_id(),
+                Some(&pool),
+                restart_slot,
+                0,
+                old_market_id,
+            )
+        };
+        let mut restart_remaining = vec![
             AccountMeta::new_readonly(squads_vault, false),
             AccountMeta::new(market, false),
             AccountMeta::new(pool, false),
             AccountMeta::new(twap_cfg, false),
+        ];
+        if cross_backing {
+            restart_remaining.extend_from_slice(&[
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new(long_backing_ledger, false),
+                AccountMeta::new(short_backing_ledger, false),
+            ]);
+        }
+        restart_remaining.extend_from_slice(&[
             AccountMeta::new_readonly(twap_authority, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(sub_id(), false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ];
+        ]);
+        if cross_backing {
+            restart_remaining.extend_from_slice(&[
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ]);
+        }
+        restart_remaining.push(AccountMeta::new_readonly(twap_id(), false));
         let pool_before_rejected_restart = svm.get_account(&pool).unwrap();
         let market_before_rejected_restart = svm.get_account(&market).unwrap();
         let config_before_rejected_restart = svm.get_account(&twap_cfg).unwrap();
+        let cross_backing_before_rejected_restart = cross_backing.then(|| {
+            [
+                pool_holding,
+                vault,
+                long_backing_ledger,
+                short_backing_ledger,
+            ]
+            .map(|address| svm.get_account(&address).unwrap())
+        });
         assert!(
             squads_execute(
                 &mut svm,
@@ -1260,6 +1438,19 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             svm.get_account(&twap_cfg).unwrap(),
             config_before_rejected_restart,
         );
+        if let Some(before) = cross_backing_before_rejected_restart {
+            assert_eq!(
+                [
+                    pool_holding,
+                    vault,
+                    long_backing_ledger,
+                    short_backing_ledger,
+                ]
+                .map(|address| svm.get_account(&address).unwrap()),
+                before,
+                "a rejected restart rolls back staged tokens and both canonical ledgers",
+            );
+        }
 
         if absent_owner_buyback {
             let protected_floor = u128::from(owner_principal) + 1;
@@ -1284,17 +1475,36 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             assert_eq!(read_reserved_floor(&svm, &twap_cfg), protected_floor);
         }
 
-        let restart = build_twap_restart_asset0_message(
-            &squads_vault,
-            &twap_cfg,
-            &twap_authority,
-            &market,
-            &perc_id(),
-            Some(&pool),
-            restart_slot,
-            1_000,
-            old_market_id,
-        );
+        let restart = if cross_backing {
+            build_cross_backing_twap_restart_asset0_message(
+                &squads_vault,
+                &twap_cfg,
+                &twap_authority,
+                &market,
+                &perc_id(),
+                &pool,
+                &pool_holding,
+                &vault,
+                &vault_authority,
+                &long_backing_ledger,
+                &short_backing_ledger,
+                restart_slot,
+                1_000,
+                old_market_id,
+            )
+        } else {
+            build_twap_restart_asset0_message(
+                &squads_vault,
+                &twap_cfg,
+                &twap_authority,
+                &market,
+                &perc_id(),
+                Some(&pool),
+                restart_slot,
+                1_000,
+                old_market_id,
+            )
+        };
         if legacy_pool {
             let pool_before_restart = svm.get_account(&pool).unwrap();
             let market_before_restart = svm.get_account(&market).unwrap();
@@ -1341,11 +1551,46 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &restart_remaining,
         )
         .expect("futarchy restarts asset 0 after the loss is fully settled");
-        assert_eq!(
-            read_pool_restart_checkpoints(&svm, &pool),
-            (0, surviving_owner_claim),
-            "the old-generation loss is durably charged exactly once",
-        );
+        if cross_backing {
+            let pool_data = svm.get_account(&pool).unwrap().data;
+            let indexed_claim = u128::from_le_bytes(pool_data[192..208].try_into().unwrap())
+                .checked_mul(u128::from_le_bytes(
+                    pool_data[289..305].try_into().unwrap(),
+                ))
+                .unwrap()
+                / u128::from_le_bytes(pool_data[305..321].try_into().unwrap());
+            let pending_backing =
+                u128::from(u64::from_le_bytes(pool_data[273..281].try_into().unwrap()))
+                    + u128::from(u64::from_le_bytes(
+                        pool_data[281..289].try_into().unwrap(),
+                    ));
+            assert_eq!(
+                indexed_claim,
+                u128::from(surviving_owner_claim),
+                "the old-generation loss is charged exactly once to indexed owner shares",
+            );
+            assert_eq!(
+                read_reserved_floor(&svm, &twap_cfg) + pending_backing,
+                indexed_claim,
+                "restart segregates the complete impaired claim across insurance and staged backing",
+            );
+            assert!(
+                percolator_accounting::read_asset_backing_balances(
+                    &svm.get_account(&market).unwrap().data,
+                    0,
+                )
+                .unwrap()
+                .into_iter()
+                .all(|balance| !balance.has_any_state()),
+                "the replacement generation starts with empty backing buckets",
+            );
+        } else {
+            assert_eq!(
+                read_pool_restart_checkpoints(&svm, &pool),
+                (0, surviving_owner_claim),
+                "the old-generation loss is durably charged exactly once",
+            );
+        }
         assert_eq!(
             percolator_accounting::read_asset_insurance_spent(
                 &svm.get_account(&market).unwrap().data,
@@ -1375,6 +1620,21 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &twap_authority,
             0,
         );
+        let restarted_profile = percolator_prog::state::read_asset_oracle_profile(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            restarted_profile.insurance_authority,
+            twap_authority.to_bytes(),
+            "restart preserves TWAP's constrained inbound insurance authority",
+        );
+        assert_eq!(
+            restarted_profile.insurance_operator,
+            twap_authority.to_bytes(),
+            "restart preserves TWAP's constrained insurance operator",
+        );
         let donation_market_id = read_asset0_market_id(&svm, &market);
         send(
             &mut svm,
@@ -1389,6 +1649,41 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             ),
         )
         .expect("a public donor adds fresh-generation insurance");
+        if cross_backing {
+            let pool_data = svm.get_account(&pool).unwrap().data;
+            let pending_backing =
+                u128::from(u64::from_le_bytes(pool_data[273..281].try_into().unwrap()))
+                    + u128::from(u64::from_le_bytes(
+                        pool_data[281..289].try_into().unwrap(),
+                    ));
+            assert_eq!(
+                read_asset_insurance_remaining(&svm, &market, 0) + pending_backing,
+                u128::from(surviving_owner_claim) + u128::from(donation),
+                "fresh protocol insurance cannot restore the staged old-generation claim",
+            );
+            send(&mut svm, &[&payer, &depositor], owner_exit_ix())
+                .expect("the impaired backing owner exits after the public restart");
+            assert_eq!(
+                token_amount(&svm, &depositor_token),
+                surviving_owner_claim,
+                "the old owner receives only the loss-adjusted claim",
+            );
+            assert_eq!(
+                read_asset_insurance_remaining(&svm, &market, 0),
+                u128::from(donation),
+                "the old owner cannot withdraw fresh-generation protocol insurance",
+            );
+            assert_eq!(
+                u64::from_le_bytes(
+                    svm.get_account(&pool).unwrap().data[80..88]
+                        .try_into()
+                        .unwrap(),
+                ),
+                0,
+                "the bounded owner exit retires the old claim",
+            );
+            return;
+        }
         assert_eq!(
             read_asset_insurance_remaining(&svm, &market, 0),
             u128::from(surviving_owner_claim) + u128::from(donation),
