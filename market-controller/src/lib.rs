@@ -37,6 +37,9 @@ const CONTROLLER_SEED: &[u8] = b"market-controller";
 const ASSET_GENERATION_SEED: &[u8] = b"asset-generation";
 const MARKET_GENERATION_SEED: &[u8] = b"market-generation";
 const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
+const DONATION_NONCE_SEED: &[u8] = b"donation-nonce";
+const DONATION_NONCE_DISC: [u8; 8] = *b"DONNONC1";
+const DONATION_NONCE_SIZE: usize = 80;
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
 pub const RETIRED_MARKET_SIZE: usize = 72;
@@ -134,6 +137,13 @@ pub fn controller_address(
             market.as_ref(),
             percolator_program.as_ref(),
         ],
+        &id(),
+    )
+}
+
+pub fn donation_nonce_address(controller: &Pubkey, donor: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[DONATION_NONCE_SEED, controller.as_ref(), donor.as_ref()],
         &id(),
     )
 }
@@ -262,6 +272,101 @@ fn create_pda<'a>(
         &[target.clone(), system_program.clone()],
         &[seeds],
     )
+}
+
+fn create_signer_funded_pda<'a>(
+    payer: &AccountInfo<'a>,
+    target: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    program_id: &Pubkey,
+    seeds: &[&[u8]],
+    size: usize,
+) -> ProgramResult {
+    if !payer.is_signer
+        || !payer.is_writable
+        || !target.is_writable
+        || *system_program.key != solana_program::system_program::ID
+        || target.owner != system_program.key
+        || target.data_len() != 0
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let rent = Rent::get()?.minimum_balance(size);
+    let current = target.lamports();
+    if current < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, rent - current),
+            &[payer.clone(), target.clone(), system_program.clone()],
+        )?;
+    }
+    invoke_signed(
+        &system_instruction::allocate(target.key, size as u64),
+        &[target.clone(), system_program.clone()],
+        &[seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, program_id),
+        &[target.clone(), system_program.clone()],
+        &[seeds],
+    )
+}
+
+fn consume_donation_nonce<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    controller: &AccountInfo<'a>,
+    donor: &AccountInfo<'a>,
+    nonce_account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    expected_nonce: u64,
+) -> ProgramResult {
+    let (expected_address, bump) = donation_nonce_address(controller.key, donor.key);
+    if *nonce_account.key != expected_address {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if nonce_account.data_len() == 0 {
+        if nonce_account.owner != system_program.key || expected_nonce != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let bump_seed = [bump];
+        let seeds = [
+            DONATION_NONCE_SEED,
+            controller.key.as_ref(),
+            donor.key.as_ref(),
+            &bump_seed,
+        ];
+        create_signer_funded_pda(
+            payer,
+            nonce_account,
+            system_program,
+            program_id,
+            &seeds,
+            DONATION_NONCE_SIZE,
+        )?;
+        let data = &mut nonce_account.try_borrow_mut_data()?;
+        data[..8].copy_from_slice(&DONATION_NONCE_DISC);
+        data[8..40].copy_from_slice(controller.key.as_ref());
+        data[40..72].copy_from_slice(donor.key.as_ref());
+        data[72..80].copy_from_slice(&0u64.to_le_bytes());
+    } else if nonce_account.owner != program_id
+        || nonce_account.data_len() != DONATION_NONCE_SIZE
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let next_nonce = expected_nonce
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let mut data = nonce_account.try_borrow_mut_data()?;
+    if data[..8] != DONATION_NONCE_DISC
+        || data[8..40] != controller.key.to_bytes()
+        || data[40..72] != donor.key.to_bytes()
+        || u64::from_le_bytes(data[72..80].try_into().unwrap()) != expected_nonce
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    data[72..80].copy_from_slice(&next_nonce.to_le_bytes());
+    Ok(())
 }
 
 fn controller_bump(
@@ -2991,36 +3096,45 @@ fn process_accept_market_authority<'a>(
 }
 
 // donate_insurance accounts:
-// [donor(s), governance, controller_pda, market(w), donor_source(w),
-//  controller_holding(w), percolator_vault(w), percolator_program, token_program]
-// data: amount (u64) || expected_market_id (u64)
+// [donor(s), nonce_payer(s,w), governance, controller_pda, market(w),
+//  donation_nonce(w,pda), donor_source(w), controller_holding(w),
+//  percolator_vault(w), percolator_program, token_program, system_program]
+// data: amount (u64) || expected_market_id (u64) || expected_nonce (u64)
 //
 // Permissionless and inbound-only. This lets a new market receive bootstrap
 // surplus before custody moves to the genesis pool without exposing TopUpInsurance
-// through the generic governance proxy.
+// through the generic governance proxy. The per-donor nonce makes separately
+// signed retry variants one-shot.
 fn process_donate_insurance<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 16 {
+    if data.len() != 24 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let expected_market_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let expected_nonce = u64::from_le_bytes(data[16..24].try_into().unwrap());
     if amount == 0 || expected_market_id == 0 {
         return Err(ProgramError::InvalidArgument);
     }
     let iter = &mut accounts.iter();
     let donor = next_account_info(iter)?;
+    let nonce_payer = next_account_info(iter)?;
     let governance = next_account_info(iter)?;
     let controller = next_account_info(iter)?;
     let market = next_account_info(iter)?;
+    let donation_nonce = next_account_info(iter)?;
     let donor_source = next_account_info(iter)?;
     let controller_holding = next_account_info(iter)?;
     let percolator_vault = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if !donor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -3065,6 +3179,16 @@ fn process_donate_insurance<'a>(
     {
         return Err(ProgramError::InvalidAccountData);
     }
+
+    consume_donation_nonce(
+        program_id,
+        nonce_payer,
+        controller,
+        donor,
+        donation_nonce,
+        system_program,
+        expected_nonce,
+    )?;
 
     invoke(
         &spl_token::instruction::transfer(

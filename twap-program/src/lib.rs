@@ -73,6 +73,9 @@ fn bidder_coin_ata(bidder: &Pubkey, coin_mint: &Pubkey) -> Pubkey {
 // authority address is the canonical market-0 TWAP authority.
 const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
 const CONFIG_SEED: &[u8] = b"twap_config";
+const DONATION_NONCE_SEED: &[u8] = b"donation-nonce";
+const DONATION_NONCE_DISC: [u8; 8] = *b"DONNONC1";
+const DONATION_NONCE_SIZE: usize = 80;
 
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
 const INITIAL_CONFIG_SIZE: usize = 200;
@@ -256,6 +259,13 @@ fn authority_seeds<'a>(config: &'a Pubkey) -> [&'a [u8]; 2] {
     [TWAP_AUTHORITY_SEED, config.as_ref()]
 }
 
+pub fn donation_nonce_address(config: &Pubkey, donor: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[DONATION_NONCE_SEED, config.as_ref(), donor.as_ref()],
+        &id(),
+    )
+}
+
 // The Squads multisig's default (index 0) vault PDA — the address that signs the
 // inner instructions of an executed multisig vault-transaction.
 fn squads_default_vault(multisig: &Pubkey) -> Pubkey {
@@ -304,6 +314,71 @@ fn create_pda_robust<'a>(
         &[account.clone(), system_program.clone()],
         &[seeds],
     )?;
+    Ok(())
+}
+
+fn consume_donation_nonce<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    config: &AccountInfo<'a>,
+    donor: &AccountInfo<'a>,
+    nonce_account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    expected_nonce: u64,
+) -> ProgramResult {
+    if !payer.is_signer
+        || !payer.is_writable
+        || !nonce_account.is_writable
+        || *system_program.key != solana_program::system_program::ID
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let (expected_address, bump) = donation_nonce_address(config.key, donor.key);
+    if *nonce_account.key != expected_address {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if nonce_account.data_len() == 0 {
+        if nonce_account.owner != system_program.key || expected_nonce != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let bump_seed = [bump];
+        let seeds = [
+            DONATION_NONCE_SEED,
+            config.key.as_ref(),
+            donor.key.as_ref(),
+            &bump_seed,
+        ];
+        create_pda_robust(
+            payer,
+            nonce_account,
+            system_program,
+            program_id,
+            &seeds,
+            DONATION_NONCE_SIZE,
+        )?;
+        let data = &mut nonce_account.try_borrow_mut_data()?;
+        data[..8].copy_from_slice(&DONATION_NONCE_DISC);
+        data[8..40].copy_from_slice(config.key.as_ref());
+        data[40..72].copy_from_slice(donor.key.as_ref());
+        data[72..80].copy_from_slice(&0u64.to_le_bytes());
+    } else if nonce_account.owner != program_id
+        || nonce_account.data_len() != DONATION_NONCE_SIZE
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let next_nonce = expected_nonce
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let mut data = nonce_account.try_borrow_mut_data()?;
+    if data[..8] != DONATION_NONCE_DISC
+        || data[8..40] != config.key.to_bytes()
+        || data[40..72] != donor.key.to_bytes()
+        || u64::from_le_bytes(data[72..80].try_into().unwrap()) != expected_nonce
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    data[72..80].copy_from_slice(&next_nonce.to_le_bytes());
     Ok(())
 }
 
@@ -1985,38 +2060,46 @@ fn process_accept_cross_backing_earnings(
     Ok(())
 }
 
-// donate_insurance accounts: [donor(s), config, twap_authority,
-//   donor_source(w), twap_holding(w), market_slab(w), percolator_vault(w),
-//   percolator_program, token_program]
-// data: amount (u64) || expected_market_id (u64)
+// donate_insurance accounts: [donor(s), nonce_payer(s,w), config, twap_authority,
+//   donation_nonce(w,pda), donor_source(w), twap_holding(w), market_slab(w),
+//   percolator_vault(w), percolator_program, token_program, system_program]
+// data: amount (u64) || expected_market_id (u64) || expected_nonce (u64)
 //
 // This replaces the unsafe pattern of leaving insurance_authority on governance.
 // It can only move donor-owned collateral inward: donor -> a TWAP-owned holding ->
-// the config-bound Percolator market. Any downstream failure rolls back both CPIs.
+// the config-bound Percolator market. The per-donor nonce makes separately signed
+// retry variants one-shot. Any downstream failure rolls back the nonce and both CPIs.
 fn process_donate_insurance(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 16 {
+    if data.len() != 24 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let amount = u64::from_le_bytes(data[0..8].try_into().unwrap());
     let expected_market_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let expected_nonce = u64::from_le_bytes(data[16..24].try_into().unwrap());
     if amount == 0 || expected_market_id == 0 {
         return Err(ProgramError::InvalidArgument);
     }
     let iter = &mut accounts.iter();
     let donor = next_account_info(iter)?;
+    let nonce_payer = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let twap_authority = next_account_info(iter)?;
+    let donation_nonce = next_account_info(iter)?;
     let donor_source = next_account_info(iter)?;
     let twap_holding = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_vault = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if !donor.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -2057,6 +2140,16 @@ fn process_donate_insurance(
     {
         return Err(ProgramError::InvalidAccountData);
     }
+
+    consume_donation_nonce(
+        program_id,
+        nonce_payer,
+        config_account,
+        donor,
+        donation_nonce,
+        system_program,
+        expected_nonce,
+    )?;
 
     invoke(
         &spl_token::instruction::transfer(

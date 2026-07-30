@@ -5035,27 +5035,21 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
         &controller,
         0,
     );
-    let mut donation_data = vec![4u8]; // IX_DONATE_INSURANCE
-    donation_data.extend_from_slice(&insurance_amount.to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &market).to_le_bytes());
+    let market_id = read_asset0_market_id(&svm, &market);
     send(
         &mut svm,
         &[&payer],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new_readonly(governance.pubkey(), false),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market, false),
-                AccountMeta::new(donor_source, false),
-                AccountMeta::new(controller_holding, false),
-                AccountMeta::new(percolator_vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: donation_data,
-        },
+        controller_donate_insurance_ix(
+            &payer.pubkey(),
+            &governance.pubkey(),
+            &controller,
+            &market,
+            &donor_source,
+            &controller_holding,
+            &percolator_vault,
+            insurance_amount,
+            market_id,
+        ),
     )
     .expect("fund controller-owned insurance before shutdown");
     assert_eq!(token_amount(&svm, &percolator_vault), insurance_amount);
@@ -5576,27 +5570,21 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         &controller,
         0,
     );
-    let mut donation_data = vec![4u8]; // IX_DONATE_INSURANCE
-    donation_data.extend_from_slice(&insurance_amount.to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &market.pubkey()).to_le_bytes());
+    let market_id = read_asset0_market_id(&svm, &market.pubkey());
     send(
         &mut svm,
         &[&payer],
-        Instruction {
-            program_id: controller_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new_readonly(squads_vault, false),
-                AccountMeta::new_readonly(controller, false),
-                AccountMeta::new(market.pubkey(), false),
-                AccountMeta::new(donor_source, false),
-                AccountMeta::new(controller_holding, false),
-                AccountMeta::new(percolator_vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: donation_data,
-        },
+        controller_donate_insurance_ix(
+            &payer.pubkey(),
+            &squads_vault,
+            &controller,
+            &market.pubkey(),
+            &donor_source,
+            &controller_holding,
+            &percolator_vault,
+            insurance_amount,
+            market_id,
+        ),
     )
     .expect("fund controller-owned insurance before the lifecycle change");
 
@@ -9680,21 +9668,54 @@ fn controller_donate_insurance_ix(
     amount: u64,
     expected_market_id: u64,
 ) -> Instruction {
+    controller_donate_insurance_ix_with_nonce(
+        donor,
+        governance,
+        controller,
+        market,
+        donor_source,
+        controller_holding,
+        percolator_vault,
+        amount,
+        expected_market_id,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn controller_donate_insurance_ix_with_nonce(
+    donor: &Pubkey,
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    donor_source: &Pubkey,
+    controller_holding: &Pubkey,
+    percolator_vault: &Pubkey,
+    amount: u64,
+    expected_market_id: u64,
+    expected_nonce: u64,
+) -> Instruction {
     let mut data = vec![4u8];
     data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(&expected_market_id.to_le_bytes());
+    data.extend_from_slice(&expected_nonce.to_le_bytes());
+    let donation_nonce =
+        market_controller_program::donation_nonce_address(controller, donor).0;
     Instruction {
         program_id: controller_id(),
         accounts: vec![
-            AccountMeta::new_readonly(*donor, true),
+            AccountMeta::new(*donor, true),
+            AccountMeta::new(*donor, true),
             AccountMeta::new_readonly(*governance, false),
             AccountMeta::new_readonly(*controller, false),
             AccountMeta::new(*market, false),
+            AccountMeta::new(donation_nonce, false),
             AccountMeta::new(*donor_source, false),
             AccountMeta::new(*controller_holding, false),
             AccountMeta::new(*percolator_vault, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data,
     }
@@ -21063,24 +21084,19 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
         &twap_authority,
         0,
     );
-    let mut donation_data = vec![17u8];
-    donation_data.extend_from_slice(&fee_surplus.to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &slab).to_le_bytes());
-    let donation = Instruction {
-        program_id: twap_id(),
-        accounts: vec![
-            AccountMeta::new_readonly(donor.pubkey(), true),
-            AccountMeta::new_readonly(twap_cfg, false),
-            AccountMeta::new_readonly(twap_authority, false),
-            AccountMeta::new(donor_source, false),
-            AccountMeta::new(donation_holding, false),
-            AccountMeta::new(slab, false),
-            AccountMeta::new(perc_vault, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-        ],
-        data: donation_data,
-    };
+    let market_id = read_asset0_market_id(&svm, &slab);
+    let donation = twap_donate_insurance_ix_with_nonce(
+        &donor.pubkey(),
+        &twap_cfg,
+        &twap_authority,
+        &donor_source,
+        &donation_holding,
+        &slab,
+        &perc_vault,
+        fee_surplus,
+        market_id,
+        0,
+    );
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
     svm.send_transaction(Transaction::new_signed_with_payer(
@@ -22267,27 +22283,22 @@ fn setup_handoff_with_mint_mode(
         &twap_authority,
         0,
     );
-    let mut donation_data = vec![17u8];
-    donation_data.extend_from_slice(&(principal + surplus).to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(svm, &slab).to_le_bytes());
+    let market_id = read_asset0_market_id(svm, &slab);
     send(
         svm,
         &[&donor],
-        Instruction {
-            program_id: twap_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(donor.pubkey(), true),
-                AccountMeta::new_readonly(twap_cfg, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(donor_source, false),
-                AccountMeta::new(donation_holding, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new(perc_vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: donation_data,
-        },
+        twap_donate_insurance_ix_with_nonce(
+            &donor.pubkey(),
+            &twap_cfg,
+            &twap_authority,
+            &donor_source,
+            &donation_holding,
+            &slab,
+            &perc_vault,
+            principal + surplus,
+            market_id,
+            0,
+        ),
     )
     .expect("fund constrained TWAP insurance through inbound donation");
     let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
@@ -31161,21 +31172,73 @@ fn donate_insurance_ix(
     amount: u64,
     expected_market_id: u64,
 ) -> Instruction {
+    donate_insurance_ix_with_nonce(
+        donor,
+        env,
+        donor_source,
+        holding,
+        amount,
+        expected_market_id,
+        0,
+    )
+}
+
+fn donate_insurance_ix_with_nonce(
+    donor: &Pubkey,
+    env: &HandoffEnv,
+    donor_source: &Pubkey,
+    holding: &Pubkey,
+    amount: u64,
+    expected_market_id: u64,
+    expected_nonce: u64,
+) -> Instruction {
+    twap_donate_insurance_ix_with_nonce(
+        donor,
+        &env.twap_cfg,
+        &env.twap_authority,
+        donor_source,
+        holding,
+        &env.slab,
+        &env.perc_vault,
+        amount,
+        expected_market_id,
+        expected_nonce,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn twap_donate_insurance_ix_with_nonce(
+    donor: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    donor_source: &Pubkey,
+    holding: &Pubkey,
+    market: &Pubkey,
+    percolator_vault: &Pubkey,
+    amount: u64,
+    expected_market_id: u64,
+    expected_nonce: u64,
+) -> Instruction {
     let mut data = vec![17u8];
     data.extend_from_slice(&amount.to_le_bytes());
     data.extend_from_slice(&expected_market_id.to_le_bytes());
+    data.extend_from_slice(&expected_nonce.to_le_bytes());
+    let donation_nonce = twap_program::donation_nonce_address(config, donor).0;
     Instruction {
         program_id: twap_id(),
         accounts: vec![
-            AccountMeta::new_readonly(*donor, true),
-            AccountMeta::new_readonly(env.twap_cfg, false),
-            AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new(*donor, true),
+            AccountMeta::new(*donor, true),
+            AccountMeta::new_readonly(*config, false),
+            AccountMeta::new_readonly(*twap_authority, false),
+            AccountMeta::new(donation_nonce, false),
             AccountMeta::new(*donor_source, false),
             AccountMeta::new(*holding, false),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new(env.perc_vault, false),
+            AccountMeta::new(*market, false),
+            AccountMeta::new(*percolator_vault, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data,
     }
@@ -32446,6 +32509,320 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
         principal: 0,
         surplus: 0,
     }
+}
+
+// PUBLIC LOF PROBE: DonateInsurance is an owner-signed value mover. Two retry variants signed
+// against the same live market must represent one donation intent, even when an untrusted payer
+// keeps both transactions valid under one recent blockhash. Without a donor action nonce, both
+// variants pull collateral and the second tranche becomes protocol insurance the donor cannot
+// recover.
+#[test]
+fn donate_insurance_rejects_an_older_retry_after_the_newer_variant_lands() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let amount = 123u64;
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        amount * 2,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &env.slab);
+    let donation_nonce =
+        twap_program::donation_nonce_address(&env.twap_cfg, &donor.pubkey()).0;
+    let wrong_percolator_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &wrong_percolator_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+    let failed_first = twap_donate_insurance_ix_with_nonce(
+        &donor.pubkey(),
+        &env.twap_cfg,
+        &env.twap_authority,
+        &donor_source,
+        &donation_holding,
+        &env.slab,
+        &wrong_percolator_vault,
+        amount,
+        market_id,
+        0,
+    );
+    assert!(
+        send(&mut svm, &[&donor], failed_first).is_err(),
+        "a donation through a substituted Percolator vault must fail after consuming nonce zero",
+    );
+    assert!(
+        svm.get_account(&donation_nonce).is_none(),
+        "a downstream Percolator failure must roll back nonce creation",
+    );
+    assert_eq!(token_amount(&svm, &donor_source), amount * 2);
+    assert_eq!(token_amount(&svm, &donation_holding), 0);
+
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let donation = donate_insurance_ix(
+        &donor.pubkey(),
+        &env,
+        &donor_source,
+        &donation_holding,
+        amount,
+        market_id,
+    );
+    let older_retry = Transaction::new_signed_with_payer(
+        &[donation.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &donor],
+        shared_blockhash,
+    );
+    let newer_retry = Transaction::new_signed_with_payer(
+        &[donation],
+        Some(&donor.pubkey()),
+        &[&donor],
+        shared_blockhash,
+    );
+    assert_ne!(
+        older_retry.signatures[0], newer_retry.signatures[0],
+        "the two valid retry variants must have distinct transaction signatures",
+    );
+
+    svm.send_transaction(newer_retry)
+        .expect("the newer donation retry lands");
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), amount as u128);
+    let nonce_account = svm.get_account(&donation_nonce).unwrap();
+    assert_eq!(nonce_account.owner, twap_id());
+    assert_eq!(
+        u64::from_le_bytes(nonce_account.data[72..80].try_into().unwrap()),
+        1,
+    );
+
+    let replay = svm.send_transaction(older_retry);
+    assert!(
+        replay.is_err(),
+        "the retained older retry pulled a second donor tranche: source={}, insurance={}",
+        token_amount(&svm, &donor_source),
+        read_asset0_insurance(&svm, &env.slab),
+    );
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), amount as u128);
+    let nonce_account = svm.get_account(&donation_nonce).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(nonce_account.data[72..80].try_into().unwrap()),
+        1,
+    );
+}
+
+#[test]
+fn controller_donate_insurance_rejects_an_older_retry_after_the_newer_variant_lands() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let donor = Keypair::new();
+    for account in [&payer, &governance, &donor] {
+        svm.airdrop(&account.pubkey(), 1_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public caller allocates a zeroed Percolator slab");
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionlessly initialize a controller-owned market");
+
+    let amount = 123u64;
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let donor_source = Pubkey::new_unique();
+    let controller_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        amount * 2,
+    );
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &market);
+    let donation_nonce =
+        market_controller_program::donation_nonce_address(&controller, &donor.pubkey()).0;
+    let wrong_percolator_vault = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &wrong_percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let failed_first = controller_donate_insurance_ix(
+        &donor.pubkey(),
+        &governance.pubkey(),
+        &controller,
+        &market,
+        &donor_source,
+        &controller_holding,
+        &wrong_percolator_vault,
+        amount,
+        market_id,
+    );
+    assert!(
+        send(&mut svm, &[&donor], failed_first).is_err(),
+        "a controller donation through a substituted vault must fail after consuming nonce zero",
+    );
+    assert!(
+        svm.get_account(&donation_nonce).is_none(),
+        "a downstream Percolator failure must roll back controller nonce creation",
+    );
+    assert_eq!(token_amount(&svm, &donor_source), amount * 2);
+    assert_eq!(token_amount(&svm, &controller_holding), 0);
+
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let donation = controller_donate_insurance_ix(
+        &donor.pubkey(),
+        &governance.pubkey(),
+        &controller,
+        &market,
+        &donor_source,
+        &controller_holding,
+        &percolator_vault,
+        amount,
+        market_id,
+    );
+    let older_retry = Transaction::new_signed_with_payer(
+        &[donation.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &donor],
+        shared_blockhash,
+    );
+    let newer_retry = Transaction::new_signed_with_payer(
+        &[donation],
+        Some(&donor.pubkey()),
+        &[&donor],
+        shared_blockhash,
+    );
+    assert_ne!(
+        older_retry.signatures[0], newer_retry.signatures[0],
+        "the two controller retry variants must have distinct transaction signatures",
+    );
+
+    svm.send_transaction(newer_retry)
+        .expect("the newer controller donation retry lands");
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &market), amount as u128);
+    let nonce_account = svm.get_account(&donation_nonce).unwrap();
+    assert_eq!(nonce_account.owner, controller_id());
+    assert_eq!(
+        u64::from_le_bytes(nonce_account.data[72..80].try_into().unwrap()),
+        1,
+    );
+
+    let replay = svm.send_transaction(older_retry);
+    assert!(
+        replay.is_err(),
+        "the retained controller retry pulled a second donor tranche: source={}, insurance={}",
+        token_amount(&svm, &donor_source),
+        read_asset0_insurance(&svm, &market),
+    );
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &market), amount as u128);
+    let nonce_account = svm.get_account(&donation_nonce).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(nonce_account.data[72..80].try_into().unwrap()),
+        1,
+    );
 }
 
 // PUBLIC LOF PROBE: a bidder can retry an uncertain placement with different terms while both
@@ -35505,27 +35882,22 @@ fn e2e_full_genesis_to_buy_burn() {
         &twap_authority,
         0,
     );
-    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
-    donation_data.extend_from_slice(&surplus.to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &slab).to_le_bytes());
+    let market_id = read_asset0_market_id(&svm, &slab);
     send(
         &mut svm,
         &[&payer],
-        Instruction {
-            program_id: twap_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(payer.pubkey(), true),
-                AccountMeta::new_readonly(twap_cfg, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(surplus_source, false),
-                AccountMeta::new(surplus_holding, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new(perc_vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: donation_data,
-        },
+        twap_donate_insurance_ix_with_nonce(
+            &payer.pubkey(),
+            &twap_cfg,
+            &twap_authority,
+            &surplus_source,
+            &surplus_holding,
+            &slab,
+            &perc_vault,
+            surplus,
+            market_id,
+            0,
+        ),
     )
     .expect("public donor adds protocol surplus after constrained custody");
     assert_eq!(token_amount(&svm, &perc_vault), principal + surplus);
@@ -43833,17 +44205,18 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         2,
     );
     let donation_market_id = read_asset0_market_id(&svm, &env.slab);
-    for round in 0..2 {
+    for nonce in 1..=2u64 {
         send(
             &mut svm,
             &[&donor],
-            donate_insurance_ix(
+            donate_insurance_ix_with_nonce(
                 &donor.pubkey(),
                 &env,
                 &route_source,
                 &bk.holding,
                 1,
                 donation_market_id,
+                nonce,
             ),
         )
         .expect("inject one atom for route apportionment");
@@ -43870,7 +44243,7 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         .expect("execute one-atom route-apportionment round");
         assert_eq!(
             read_split_remainders_bps(&svm, &env.twap_cfg)[2],
-            if round == 0 { 5_000 } else { 0 },
+            if nonce == 1 { 5_000 } else { 0 },
             "the half-atom route carry alternates savings then auction",
         );
     }
@@ -50101,28 +50474,23 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &twap_authority,
         0,
     );
-    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
-    donation_data.extend_from_slice(&surplus.to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &slab).to_le_bytes());
+    let market_id = read_asset0_market_id(&svm, &slab);
     let vault_before_surplus = token_amount(&svm, &perc_vault);
     send(
         &mut svm,
         &[&surplus_donor],
-        Instruction {
-            program_id: twap_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(surplus_donor.pubkey(), true),
-                AccountMeta::new_readonly(twap_cfg, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(surplus_src, false),
-                AccountMeta::new(surplus_holding, false),
-                AccountMeta::new(slab, false),
-                AccountMeta::new(perc_vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: donation_data,
-        },
+        twap_donate_insurance_ix_with_nonce(
+            &surplus_donor.pubkey(),
+            &twap_cfg,
+            &twap_authority,
+            &surplus_src,
+            &surplus_holding,
+            &slab,
+            &perc_vault,
+            surplus,
+            market_id,
+            0,
+        ),
     )
     .expect("public donor adds protocol surplus after constrained custody");
     assert_eq!(
@@ -56811,27 +57179,22 @@ fn run_cross_backing_haircut_and_protocol_donation(
             &twap_authority,
             0,
         );
-        let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
-        donation_data.extend_from_slice(&donation.to_le_bytes());
-        donation_data.extend_from_slice(&read_asset0_market_id(&svm, &env.slab).to_le_bytes());
+        let market_id = read_asset0_market_id(&svm, &env.slab);
         send(
             &mut svm,
             &[&payer, &donor],
-            Instruction {
-                program_id: twap_id(),
-                accounts: vec![
-                    AccountMeta::new_readonly(donor.pubkey(), true),
-                    AccountMeta::new_readonly(twap_cfg, false),
-                    AccountMeta::new_readonly(twap_authority, false),
-                    AccountMeta::new(donor_source, false),
-                    AccountMeta::new(donation_holding, false),
-                    AccountMeta::new(env.slab, false),
-                    AccountMeta::new(env.perc_vault, false),
-                    AccountMeta::new_readonly(perc_id(), false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                data: donation_data,
-            },
+            twap_donate_insurance_ix_with_nonce(
+                &donor.pubkey(),
+                &twap_cfg,
+                &twap_authority,
+                &donor_source,
+                &donation_holding,
+                &env.slab,
+                &env.perc_vault,
+                donation,
+                market_id,
+                0,
+            ),
         )
         .expect("a public donor adds protocol insurance before Subledger observes the loss");
     }
@@ -59096,27 +59459,22 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
         &twap_authority,
         0,
     );
-    let mut donation_data = vec![17u8]; // IX_DONATE_INSURANCE
-    donation_data.extend_from_slice(&round_surplus.to_le_bytes());
-    donation_data.extend_from_slice(&read_asset0_market_id(&svm, &env.slab).to_le_bytes());
+    let market_id = read_asset0_market_id(&svm, &env.slab);
     send(
         &mut svm,
         &[&payer, &donor],
-        Instruction {
-            program_id: twap_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(donor.pubkey(), true),
-                AccountMeta::new_readonly(twap_cfg, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(donor_source, false),
-                AccountMeta::new(donation_holding, false),
-                AccountMeta::new(env.slab, false),
-                AccountMeta::new(env.perc_vault, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-            ],
-            data: donation_data,
-        },
+        twap_donate_insurance_ix_with_nonce(
+            &donor.pubkey(),
+            &twap_cfg,
+            &twap_authority,
+            &donor_source,
+            &donation_holding,
+            &env.slab,
+            &env.perc_vault,
+            round_surplus,
+            market_id,
+            0,
+        ),
     )
     .expect("public donor adds protocol insurance while TWAP holds custody");
 
