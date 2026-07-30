@@ -75,7 +75,9 @@ const TWAP_AUTHORITY_SEED: &[u8] = b"market-0-twap";
 const CONFIG_SEED: &[u8] = b"twap_config";
 const DONATION_NONCE_SEED: &[u8] = b"donation-nonce";
 const DONATION_NONCE_DISC: [u8; 8] = *b"DONNONC1";
-const DONATION_NONCE_SIZE: usize = 80;
+const BID_NONCE_SEED: &[u8] = b"bid-nonce";
+const BID_NONCE_DISC: [u8; 8] = *b"BIDNONC1";
+const ACTION_NONCE_SIZE: usize = 80;
 
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
 const INITIAL_CONFIG_SIZE: usize = 200;
@@ -266,6 +268,13 @@ pub fn donation_nonce_address(config: &Pubkey, donor: &Pubkey) -> (Pubkey, u8) {
     )
 }
 
+pub fn bid_nonce_address(book: &Pubkey, bidder: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[BID_NONCE_SEED, book.as_ref(), bidder.as_ref()],
+        &id(),
+    )
+}
+
 // The Squads multisig's default (index 0) vault PDA — the address that signs the
 // inner instructions of an executed multisig vault-transaction.
 fn squads_default_vault(multisig: &Pubkey) -> Pubkey {
@@ -317,14 +326,17 @@ fn create_pda_robust<'a>(
     Ok(())
 }
 
-fn consume_donation_nonce<'a>(
+#[allow(clippy::too_many_arguments)]
+fn consume_action_nonce<'a>(
     program_id: &Pubkey,
     payer: &AccountInfo<'a>,
-    config: &AccountInfo<'a>,
-    donor: &AccountInfo<'a>,
+    context: &AccountInfo<'a>,
+    actor: &AccountInfo<'a>,
     nonce_account: &AccountInfo<'a>,
     system_program: &AccountInfo<'a>,
     expected_nonce: u64,
+    nonce_seed: &[u8],
+    discriminator: &[u8; 8],
 ) -> ProgramResult {
     if !payer.is_signer
         || !payer.is_writable
@@ -333,7 +345,10 @@ fn consume_donation_nonce<'a>(
     {
         return Err(ProgramError::InvalidAccountData);
     }
-    let (expected_address, bump) = donation_nonce_address(config.key, donor.key);
+    let (expected_address, bump) = Pubkey::find_program_address(
+        &[nonce_seed, context.key.as_ref(), actor.key.as_ref()],
+        program_id,
+    );
     if *nonce_account.key != expected_address {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -343,9 +358,9 @@ fn consume_donation_nonce<'a>(
         }
         let bump_seed = [bump];
         let seeds = [
-            DONATION_NONCE_SEED,
-            config.key.as_ref(),
-            donor.key.as_ref(),
+            nonce_seed,
+            context.key.as_ref(),
+            actor.key.as_ref(),
             &bump_seed,
         ];
         create_pda_robust(
@@ -354,15 +369,15 @@ fn consume_donation_nonce<'a>(
             system_program,
             program_id,
             &seeds,
-            DONATION_NONCE_SIZE,
+            ACTION_NONCE_SIZE,
         )?;
         let data = &mut nonce_account.try_borrow_mut_data()?;
-        data[..8].copy_from_slice(&DONATION_NONCE_DISC);
-        data[8..40].copy_from_slice(config.key.as_ref());
-        data[40..72].copy_from_slice(donor.key.as_ref());
+        data[..8].copy_from_slice(discriminator);
+        data[8..40].copy_from_slice(context.key.as_ref());
+        data[40..72].copy_from_slice(actor.key.as_ref());
         data[72..80].copy_from_slice(&0u64.to_le_bytes());
     } else if nonce_account.owner != program_id
-        || nonce_account.data_len() != DONATION_NONCE_SIZE
+        || nonce_account.data_len() != ACTION_NONCE_SIZE
     {
         return Err(ProgramError::InvalidAccountData);
     }
@@ -371,15 +386,37 @@ fn consume_donation_nonce<'a>(
         .checked_add(1)
         .ok_or(ProgramError::ArithmeticOverflow)?;
     let mut data = nonce_account.try_borrow_mut_data()?;
-    if data[..8] != DONATION_NONCE_DISC
-        || data[8..40] != config.key.to_bytes()
-        || data[40..72] != donor.key.to_bytes()
+    if data[..8] != *discriminator
+        || data[8..40] != context.key.to_bytes()
+        || data[40..72] != actor.key.to_bytes()
         || u64::from_le_bytes(data[72..80].try_into().unwrap()) != expected_nonce
     {
         return Err(ProgramError::InvalidAccountData);
     }
     data[72..80].copy_from_slice(&next_nonce.to_le_bytes());
     Ok(())
+}
+
+fn consume_donation_nonce<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    config: &AccountInfo<'a>,
+    donor: &AccountInfo<'a>,
+    nonce_account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    expected_nonce: u64,
+) -> ProgramResult {
+    consume_action_nonce(
+        program_id,
+        payer,
+        config,
+        donor,
+        nonce_account,
+        system_program,
+        expected_nonce,
+        DONATION_NONCE_SEED,
+        &DONATION_NONCE_DISC,
+    )
 }
 
 // Parse the stable Squads v4 Multisig prefix plus its Borsh Option<Pubkey> and member vector.
@@ -3653,14 +3690,18 @@ fn process_set_bid_fee(
 }
 
 // place_bid accounts: [bidder(signer), config, book(w), book_escrow(pda), coin_escrow(w),
-//   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program, evict_coin_dest(w)?]
+//   bidder_coin_src(w), usd_dest, coin_mint, collateral_mint, token_program,
+//   nonce_payer(s,w), bid_nonce(w,pda), system_program, evict_coin_dest(w)?]
 // data: coin_atoms (u128) || usdc_atoms (u128) || expected_round_end (u64)
 //   || expected_evicted_bidder (pubkey) || expected_evicted_coin (u128)
-//   || expected_evicted_usdc (u128)
+//   || expected_evicted_usdc (u128) || expected_nonce (u64)
 //
 // PERMISSIONLESS. The bidder escrows `coin_atoms` COIN, offering it for `usdc_atoms` USD (limit
-// rate coin/usdc). The bid CANNOT be cancelled afterwards (anti-spoofing) — it only leaves the
-// book early by being evicted by a STRICTLY better bid, which immediately refunds the evictee.
+// rate coin/usdc). The bid can leave early only by a STRICTLY better bid, which immediately refunds
+// the evictee; owner cancellation remains unavailable until the anti-spoof cooldown expires. Each
+// successful placement consumes the bidder's book-local nonce, so independently signed retry
+// variants cannot charge the fee or escrow COIN twice even if public book actions recreate a prior
+// round/eviction shape.
 fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     use core::cmp::Ordering;
     let iter = &mut accounts.iter();
@@ -3674,8 +3715,11 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let coin_mint = next_account_info(iter)?;
     let collateral_mint = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let nonce_payer = next_account_info(iter)?;
+    let bid_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
-    if data.len() != 104 {
+    if data.len() != 112 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let coin_atoms = u128::from_le_bytes(data[..16].try_into().unwrap());
@@ -3684,6 +3728,7 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     let expected_evicted_bidder = Pubkey::new_from_array(data[40..72].try_into().unwrap());
     let expected_evicted_coin = u128::from_le_bytes(data[72..88].try_into().unwrap());
     let expected_evicted_usdc = u128::from_le_bytes(data[88..104].try_into().unwrap());
+    let expected_nonce = u64::from_le_bytes(data[104..112].try_into().unwrap());
     let expected_eviction = match (
         expected_evicted_bidder == Pubkey::default(),
         expected_evicted_coin,
@@ -3813,10 +3858,9 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
                     book_rd_u128(&d, ow + SL_COIN),
                     book_rd_u128(&d, ow + SL_USDC),
                 );
-                // A full-book placement must commit to the exact bid it is authorized to replace.
-                // Since every replacement is strictly rate-improving, that bid cannot leave and
-                // later become the weakest with the same legs in this round. This prevents an older
-                // signed placement from becoming admissible again after a newer retry is evicted.
+                // A full-book placement commits to the exact bid it is authorized to replace. The
+                // bidder nonce below additionally makes that authorization one-shot across public
+                // eviction and cancellation sequences that can recreate the same book shape.
                 if expected_eviction != Some(live_eviction) {
                     return Err(ProgramError::InvalidAccountData);
                 }
@@ -3834,6 +3878,20 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
             }
         }
     };
+
+    // Consume before token movement. Solana transaction atomicity rolls this write and any new PDA
+    // back if the eviction refund, fee burn, or escrow transfer fails later in the instruction.
+    consume_action_nonce(
+        program_id,
+        nonce_payer,
+        book_account,
+        bidder,
+        bid_nonce,
+        system_program,
+        expected_nonce,
+        BID_NONCE_SEED,
+        &BID_NONCE_DISC,
+    )?;
 
     // Refund only to a clean account solely owned by the recorded evictee. The canonical ATA's
     // authority state can change after placement, so pinning its key would either expose the refund
