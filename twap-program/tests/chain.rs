@@ -32448,6 +32448,231 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
     }
 }
 
+// PUBLIC LOF PROBE: DonateInsurance is an owner-signed value mover. Two retry variants signed
+// against the same live market must represent one donation intent, even when an untrusted payer
+// keeps both transactions valid under one recent blockhash. Without a donor action nonce, both
+// variants pull collateral and the second tranche becomes protocol insurance the donor cannot
+// recover.
+#[test]
+fn donate_insurance_rejects_an_older_retry_after_the_newer_variant_lands() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let amount = 123u64;
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        amount * 2,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &env.slab);
+
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let donation = donate_insurance_ix(
+        &donor.pubkey(),
+        &env,
+        &donor_source,
+        &donation_holding,
+        amount,
+        market_id,
+    );
+    let older_retry = Transaction::new_signed_with_payer(
+        &[donation.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &donor],
+        shared_blockhash,
+    );
+    let newer_retry = Transaction::new_signed_with_payer(
+        &[donation],
+        Some(&donor.pubkey()),
+        &[&donor],
+        shared_blockhash,
+    );
+    assert_ne!(
+        older_retry.signatures[0], newer_retry.signatures[0],
+        "the two valid retry variants must have distinct transaction signatures",
+    );
+
+    svm.send_transaction(newer_retry)
+        .expect("the newer donation retry lands");
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), amount as u128);
+
+    let replay = svm.send_transaction(older_retry);
+    assert!(
+        replay.is_err(),
+        "the retained older retry pulled a second donor tranche: source={}, insurance={}",
+        token_amount(&svm, &donor_source),
+        read_asset0_insurance(&svm, &env.slab),
+    );
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), amount as u128);
+}
+
+#[test]
+fn controller_donate_insurance_rejects_an_older_retry_after_the_newer_variant_lands() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    let governance = Keypair::new();
+    let donor = Keypair::new();
+    for account in [&payer, &governance, &donor] {
+        svm.airdrop(&account.pubkey(), 1_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_signer = Keypair::new();
+    let market = market_signer.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public caller allocates a zeroed Percolator slab");
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    let mut init_data = vec![1u8]; // IX_INIT_MARKET
+    init_data.extend_from_slice(&controller_init_market_data(1));
+    send(
+        &mut svm,
+        &[&payer, &market_signer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionlessly initialize a controller-owned market");
+
+    let amount = 123u64;
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let donor_source = Pubkey::new_unique();
+    let controller_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &donor_source,
+        &collateral_mint,
+        &donor.pubkey(),
+        amount * 2,
+    );
+    set_token(
+        &mut svm,
+        &controller_holding,
+        &collateral_mint,
+        &controller,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &market);
+
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let donation = controller_donate_insurance_ix(
+        &donor.pubkey(),
+        &governance.pubkey(),
+        &controller,
+        &market,
+        &donor_source,
+        &controller_holding,
+        &percolator_vault,
+        amount,
+        market_id,
+    );
+    let older_retry = Transaction::new_signed_with_payer(
+        &[donation.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &donor],
+        shared_blockhash,
+    );
+    let newer_retry = Transaction::new_signed_with_payer(
+        &[donation],
+        Some(&donor.pubkey()),
+        &[&donor],
+        shared_blockhash,
+    );
+
+    svm.send_transaction(newer_retry)
+        .expect("the newer controller donation retry lands");
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &market), amount as u128);
+
+    let replay = svm.send_transaction(older_retry);
+    assert!(
+        replay.is_err(),
+        "the retained controller retry pulled a second donor tranche: source={}, insurance={}",
+        token_amount(&svm, &donor_source),
+        read_asset0_insurance(&svm, &market),
+    );
+    assert_eq!(token_amount(&svm, &donor_source), amount);
+    assert_eq!(read_asset0_insurance(&svm, &market), amount as u128);
+}
+
 // PUBLIC LOF PROBE: a bidder can retry an uncertain placement with different terms while both
 // transactions remain valid in the same round. If the replacement is later evicted, the older,
 // stronger bid must not become admissible again and burn a second fee from the bidder's account.
