@@ -32988,6 +32988,204 @@ fn place_bid_rejects_an_older_retry_after_same_round_eviction() {
     drop(incumbents);
 }
 
+// PUBLIC LOF PROBE: binding a placement to the current round and weakest bid is insufficient when
+// an old incumbent can age across a no-op roll. After a newer retry is evicted and refunded, that
+// incumbent can cancel in the same current round and recreate the free-slot state authorized by an
+// older signed retry. The stale retry must not burn a second fee from the independent bidder.
+#[test]
+fn place_bid_rejects_an_older_retry_after_cancellation_reopens_a_free_slot() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+    let round_length = 10u64;
+    let bid_fee = 7u64;
+    let bid_coin = 100u64;
+    let bk = setup_auction(
+        &mut svm,
+        &payer,
+        &env,
+        round_length,
+        0,
+        None,
+        bid_fee,
+    );
+
+    // Leave one free slot. These bids are old enough to cancel at slot 120, but a no-op roll at
+    // slot 111 first advances the live round_end to 121 without settling or removing them.
+    let mut incumbents = Vec::new();
+    for _ in 0..31 {
+        let (bidder, coin, usd) = new_bidder(&mut svm, &payer, &env, 2 + bid_fee);
+        send(
+            &mut svm,
+            &[&bidder],
+            place_bid_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &bk.book,
+                &bk.book_escrow,
+                &bk.coin_escrow,
+                &coin,
+                &usd,
+                &env.coin_mint,
+                &env.collateral_mint,
+                2,
+                1,
+                None,
+            ),
+        )
+        .expect("fill one old incumbent slot");
+        incumbents.push((bidder, coin, usd));
+    }
+
+    warp_to(&mut svm, 111);
+    send(
+        &mut svm,
+        &[&payer],
+        execute_ix(
+            &payer.pubkey(),
+            &env,
+            &bk.book,
+            &bk.holding,
+            &bk.settlement_usd,
+            &bk.book_escrow,
+            &bk.coin_escrow,
+            None,
+        ),
+    )
+    .expect("permissionless zero-surplus crank rolls the occupied book");
+    let rolled_round_end = u64::from_le_bytes(
+        svm.get_account(&bk.book).unwrap().data[240..248]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(rolled_round_end, 121);
+    assert_eq!(token_amount(&svm, &bk.coin_escrow), 31 * 2);
+
+    warp_to(&mut svm, 112);
+    let (victim, victim_coin, victim_usd) =
+        new_bidder(&mut svm, &payer, &env, bid_coin + 2 * bid_fee);
+    svm.expire_blockhash();
+    let shared_blockhash = svm.latest_blockhash();
+    let victim_bid = place_bid_ix(
+        &victim.pubkey(),
+        &env.twap_cfg,
+        &bk.book,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        &victim_coin,
+        &victim_usd,
+        &env.coin_mint,
+        &env.collateral_mint,
+        bid_coin as u128,
+        bid_coin as u128,
+        None,
+    )
+    .build(&svm);
+    let older_retry = Transaction::new_signed_with_payer(
+        &[victim_bid.clone()],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        shared_blockhash,
+    );
+    let newer_retry = Transaction::new_signed_with_payer(
+        &[victim_bid],
+        Some(&victim.pubkey()),
+        &[&victim],
+        shared_blockhash,
+    );
+    assert_ne!(
+        older_retry.signatures[0], newer_retry.signatures[0],
+        "the victim retry variants must have distinct transaction signatures",
+    );
+    svm.send_transaction(newer_retry)
+        .expect("the newer victim retry fills the final free slot");
+    assert_eq!(token_amount(&svm, &victim_coin), bid_fee);
+
+    let (evictor, evictor_coin, evictor_usd) =
+        new_bidder(&mut svm, &payer, &env, 3 + bid_fee);
+    let evict_victim = place_bid_ix(
+        &evictor.pubkey(),
+        &env.twap_cfg,
+        &bk.book,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        &evictor_coin,
+        &evictor_usd,
+        &env.coin_mint,
+        &env.collateral_mint,
+        3,
+        1,
+        Some(victim_coin),
+    )
+    .build(&svm);
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[evict_victim],
+        Some(&evictor.pubkey()),
+        &[&evictor],
+        shared_blockhash,
+    ))
+    .expect("a stronger public bid evicts and refunds the victim");
+    assert_eq!(
+        token_amount(&svm, &victim_coin),
+        bid_coin + bid_fee,
+        "the first fee remains burned while eviction returns the victim's principal",
+    );
+
+    // The first incumbent was placed at slot 100. At slot 120 its public owner cancellation is
+    // mature, yet the rolled round is still active. That cancellation recreates the exact free-slot
+    // shape to which the victim's retained transaction committed.
+    warp_to(&mut svm, 120);
+    let (canceller, canceller_coin, _) = &incumbents[0];
+    let cancel = cancel_ix(
+        &canceller.pubkey(),
+        &env.twap_cfg,
+        &bk.book,
+        &bk.book_escrow,
+        &bk.coin_escrow,
+        canceller_coin,
+        0,
+    )
+    .build(&svm);
+    svm.send_transaction(Transaction::new_signed_with_payer(
+        &[cancel],
+        Some(&canceller.pubkey()),
+        &[canceller],
+        shared_blockhash,
+    ))
+    .expect("the aged incumbent publicly reopens one slot in the same round");
+    assert_eq!(
+        u64::from_le_bytes(
+            svm.get_account(&bk.book).unwrap().data[240..248]
+                .try_into()
+                .unwrap()
+        ),
+        rolled_round_end,
+        "cancellation must not change the placement's round binding",
+    );
+
+    let replay = svm.send_transaction(older_retry);
+    assert!(
+        replay.is_err(),
+        "the retained retry became valid after cancellation, burned a second fee, and re-escrowed the victim's COIN: source={}, escrow={}",
+        token_amount(&svm, &victim_coin),
+        token_amount(&svm, &bk.coin_escrow),
+    );
+    assert_eq!(
+        token_amount(&svm, &victim_coin),
+        bid_coin + bid_fee,
+        "only the fee from the landed placement may be burned",
+    );
+}
+
 // HEADLINE: a full buy/burn — three bids at different rates clear at ONE marginal uniform price,
 // the bought COIN is really burned (mint supply drops), winners' USD is parked and claimed, and
 // surplus COIN is refunded. All against the real percolator + Squads + twap binaries.
