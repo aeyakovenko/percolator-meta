@@ -55416,6 +55416,7 @@ fn run_cross_backing_haircut_and_protocol_donation(
     opening_fee_bps: u64,
     direct_exit_before_handoff: bool,
     restart_with_live_owner_claims: bool,
+    late_round_trip_after_loss: bool,
 ) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -56337,6 +56338,103 @@ fn run_cross_backing_haircut_and_protocol_donation(
         .expect("any cranker finalizes the public loss side");
     }
 
+    let mut late_round_trip = None;
+    if late_round_trip_after_loss {
+        assert!(!handoff_before_loss);
+        assert_eq!(predecessor_config_size, None);
+        assert_eq!(opening_fee_bps, 0);
+        assert!(!direct_exit_before_handoff);
+        assert!(!restart_with_live_owner_claims);
+
+        let late_owner = Keypair::new();
+        svm.airdrop(&late_owner.pubkey(), 1_000_000_000).unwrap();
+        let late_amount = 1u64;
+        let late_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &late_destination,
+            &env.collateral_mint,
+            &late_owner.pubkey(),
+            late_amount,
+        );
+        let late_position = sub_position_pda(&env.pool, &late_owner.pubkey());
+        let mut late_deposit_data = vec![4u8]; // IX_INSURANCE_DEPOSIT
+        late_deposit_data.extend_from_slice(&late_amount.to_le_bytes());
+        send(
+            &mut svm,
+            &[&payer, &late_owner],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(late_owner.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(late_position, false),
+                    AccountMeta::new(late_destination, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new(env.long_backing_ledger, false),
+                    AccountMeta::new(env.short_backing_ledger, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: late_deposit_data,
+            },
+        )
+        .expect("a public account deposits after the earlier owner loss");
+        let indexed_claim = |svm: &LiteSVM| {
+            let pool = svm.get_account(&env.pool).unwrap();
+            u128::from_le_bytes(pool.data[192..208].try_into().unwrap())
+                .checked_mul(u128::from_le_bytes(
+                    pool.data[289..305].try_into().unwrap(),
+                ))
+                .unwrap()
+                / u128::from_le_bytes(pool.data[305..321].try_into().unwrap())
+        };
+        assert_eq!(
+            indexed_claim(&svm),
+            28,
+            "the minimum deposit adds one new atom without restoring the earlier 2-atom loss",
+        );
+        let late_withdraw_data =
+            subledger_insurance_withdraw_data(&svm, &late_position, late_amount, 0);
+        let late_exit = Instruction {
+            program_id: sub_id(),
+            accounts: vec![
+                AccountMeta::new(late_owner.pubkey(), true),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new(late_position, false),
+                AccountMeta::new(late_destination, false),
+                AccountMeta::new(pool_holding, false),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(env.perc_vault, false),
+                AccountMeta::new_readonly(
+                    perc_vault_authority(&env.slab, &perc_id()),
+                    false,
+                ),
+                AccountMeta::new(env.long_backing_ledger, false),
+                AccountMeta::new(env.short_backing_ledger, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: late_withdraw_data,
+        };
+        send(
+            &mut svm,
+            &[&payer, &late_owner],
+            late_exit,
+        )
+        .expect_err("live loss-generating portfolios keep every depositor at market risk");
+        assert_eq!(token_amount(&svm, &late_destination), 0);
+        assert_eq!(
+            indexed_claim(&svm),
+            28,
+            "a rejected early exit cannot mutate either cohort's indexed claim",
+        );
+        late_round_trip = Some((late_owner, late_position, late_destination, late_amount));
+    }
+
     if !handoff_before_loss && !direct_exit_before_handoff {
         squads_execute(
             &mut svm,
@@ -56351,7 +56449,8 @@ fn run_cross_backing_haircut_and_protocol_donation(
         .expect("Genesis hands the already-impaired cross-backing pool to TWAP");
         assert_eq!(
             read_reserved_floor(&svm, &twap_cfg),
-            (principal - 1) as u128,
+            (principal - 1) as u128
+                + if late_round_trip_after_loss { 1 } else { 0 },
             "the first handoff cannot expose loss-adjusted owner insurance",
         );
     }
@@ -56384,7 +56483,8 @@ fn run_cross_backing_haircut_and_protocol_donation(
     let protected_after_public_loss = protected_balance(&svm);
     if opening_fee_bps == 0 {
         assert_eq!(
-            protected_after_public_loss, 27,
+            protected_after_public_loss,
+            if late_round_trip_after_loss { 28 } else { 27 },
             "the public trade consumes two of the owners' 29 protection atoms",
         );
     }
@@ -56678,6 +56778,38 @@ fn run_cross_backing_haircut_and_protocol_donation(
     send(&mut svm, &[&payer], public_return.clone())
         .expect("any cranker returns resolved custody to the owner-bound pool");
 
+    if let Some((late_owner, late_position, late_destination, late_amount)) = late_round_trip {
+        let late_withdraw_data =
+            subledger_insurance_withdraw_data(&svm, &late_position, late_amount, 0);
+        send(
+            &mut svm,
+            &[&payer, &late_owner],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new(late_owner.pubkey(), true),
+                    AccountMeta::new(env.pool, false),
+                    AccountMeta::new(late_position, false),
+                    AccountMeta::new(late_destination, false),
+                    AccountMeta::new(pool_holding, false),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(env.perc_vault, false),
+                    AccountMeta::new_readonly(
+                        perc_vault_authority(&env.slab, &perc_id()),
+                        false,
+                    ),
+                    AccountMeta::new(env.long_backing_ledger, false),
+                    AccountMeta::new(env.short_backing_ledger, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                data: late_withdraw_data,
+            },
+        )
+        .expect("the late owner exits after bounded public settlement");
+        assert_eq!(token_amount(&svm, &late_destination), late_amount);
+    }
+
     let recovered_pool = svm.get_account(&env.pool).unwrap().data;
     let recovered_shares =
         u128::from_le_bytes(recovered_pool[192..208].try_into().unwrap());
@@ -56829,37 +56961,42 @@ fn run_cross_backing_haircut_and_protocol_donation(
 
 #[test]
 fn e2e_cross_backing_haircut_survives_rehandoff_and_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, false, false);
 }
 
 #[test]
 fn e2e_cross_backing_haircut_before_twap_handoff_survives_protocol_donation() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false, false, false);
 }
 
 #[test]
 fn e2e_pre_handoff_trade_fees_cannot_erase_a_cross_backing_owner_loss() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 100, false, false, false);
 }
 
 #[test]
 fn e2e_pre_handoff_trade_fees_cannot_restore_a_direct_owner_exit() {
-    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true, false);
+    run_cross_backing_haircut_and_protocol_donation(false, None, 1_000, true, false, false);
 }
 
 #[test]
 fn e2e_predecessor_cross_backing_config_can_finish_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(true, Some(272), 0, false, false, false);
 }
 
 #[test]
 fn e2e_legacy_custody_config_can_finish_cross_backing_owner_recovery_after_upgrade() {
-    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false, false);
+    run_cross_backing_haircut_and_protocol_donation(true, Some(264), 0, false, false, false);
 }
 
 #[test]
 fn e2e_absent_cross_backing_owner_cannot_veto_asset0_restart() {
-    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, true);
+    run_cross_backing_haircut_and_protocol_donation(true, None, 0, false, true, false);
+}
+
+#[test]
+fn e2e_minimum_deposit_remains_live_after_public_backing_loss() {
+    run_cross_backing_haircut_and_protocol_donation(false, None, 0, false, false, true);
 }
 
 #[derive(Clone, Copy, Debug)]
