@@ -10892,3 +10892,5 @@ fn large_cumulative_withdrawals_cannot_exhaust_the_position_action_nonce() {
     assert_eq!(env.token_amount(&env.perc_vault), 0);
     assert_eq!(env.token_amount(&alice_ata), live_limit);
 }
+
+include!("transient_public_bankruptcy_order_probe.inc");
