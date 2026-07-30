@@ -64673,3 +64673,427 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
 }
+
+// PUBLIC LOF: SyncMaintenanceFee is permissionless, but the pinned wrapper rounds every call's
+// side-neutral fee independently. Ten one-atom calls therefore credit [0, 10] across asset 0's
+// long/short domains while one ten-atom call credits [5, 5]. A short winner can carry that
+// attacker-selected skew through normal oracle settlement, permissionless stale resolution, and
+// CloseResolved: it withdraws five extra collateral atoms from real insurance. Both paths below
+// use public InitMarket/InitPortfolio instructions, an oracle independent from the attacker, an
+// independent losing trader, and an independent fee payer; no initialized Percolator state is
+// injected.
+#[derive(Debug)]
+struct MaintenanceCadenceOutcome {
+    domains_after_fees: [u128; 2],
+    attacker_withdrawal: u64,
+    insurance_remaining: u128,
+}
+
+fn run_maintenance_fee_cadence_payout(frequent_sync: bool) -> MaintenanceCadenceOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INITIAL_SLOT: u64 = 100;
+    const INITIAL_PRICE: u64 = 1_000;
+    const FINAL_PRICE: u64 = 380;
+    const TRADER_CAPITAL: u64 = 600;
+    const INSURANCE_PER_DOMAIN: u64 = 10;
+    const MAINTENANCE_TOTAL: u64 = 10;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let provider = Keypair::new();
+    let oracle = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = Keypair::new();
+    let fee_owner = Keypair::new();
+    for signer in [&payer, &provider, &oracle, &attacker, &victim, &fee_owner] {
+        svm.airdrop(&signer.pubkey(), 1_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: INITIAL_SLOT,
+        unix_timestamp: INITIAL_SLOT as i64,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("publicly allocate market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: INITIAL_PRICE,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 5_000,
+                initial_margin_bps: 5_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 4_900,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 1,
+            },
+        ),
+    )
+    .expect("publicly initialize live market");
+    send(
+        &mut svm,
+        &[&payer, &provider, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("bind an oracle independent from the attacker");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: INITIAL_SLOT,
+                initial_mark_e6: INITIAL_PRICE,
+            },
+        ),
+    )
+    .expect("configure honest initial mark");
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    let insurance_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &insurance_source,
+        &collateral,
+        &provider.pubkey(),
+        INSURANCE_PER_DOMAIN * 2,
+    );
+    for domain in 0..2 {
+        send(
+            &mut svm,
+            &[&payer, &provider],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(provider.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(insurance_source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::TopUpInsuranceDomain {
+                    domain,
+                    amount: INSURANCE_PER_DOMAIN as u128,
+                },
+            ),
+        )
+        .expect("independent provider funds both insurance domains");
+    }
+
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let attacker_portfolio = Keypair::new();
+    let victim_portfolio = Keypair::new();
+    let fee_portfolio = Keypair::new();
+    for (owner, portfolio, amount) in [
+        (&attacker, &attacker_portfolio, TRADER_CAPITAL),
+        (&victim, &victim_portfolio, TRADER_CAPITAL),
+        (&fee_owner, &fee_portfolio, MAINTENANCE_TOTAL),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("publicly allocate portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("publicly initialize portfolio");
+        let source = Pubkey::new_unique();
+        set_token(&mut svm, &source, &collateral, &owner.pubkey(), amount);
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: amount as u128,
+                },
+            ),
+        )
+        .expect("deposit independent collateral");
+    }
+
+    let sync_fee = |svm: &mut LiteSVM, slot: u64| {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(fee_portfolio.pubkey(), false),
+                ],
+                PIx::SyncMaintenanceFee { now_slot: slot },
+            ),
+        )
+    };
+    if frequent_sync {
+        for slot in (INITIAL_SLOT + 1)..=(INITIAL_SLOT + MAINTENANCE_TOTAL) {
+            sync_fee(&mut svm, slot).expect("public attacker syncs one fee atom");
+        }
+    } else {
+        sync_fee(&mut svm, INITIAL_SLOT + MAINTENANCE_TOTAL)
+            .expect("honest cranker batches the same elapsed fee");
+    }
+    let domains_after_fees = read_asset_insurance_domains(&svm, &market, 0);
+
+    send(
+        &mut svm,
+        &[&payer, &attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -(percolator::POS_SCALE as i128),
+                exec_price: INITIAL_PRICE,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("attacker opens a short against an independent long");
+
+    let target_slot = INITIAL_SLOT + MAINTENANCE_TOTAL + 1;
+    svm.set_sysvar(&Clock {
+        slot: target_slot,
+        unix_timestamp: target_slot as i64,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: target_slot,
+                mark_e6: FINAL_PRICE,
+            },
+        ),
+    )
+    .expect("independent oracle moves the mark");
+
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+    for slot in [target_slot, target_slot + 1] {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+        for _ in 0..2 {
+            crank(&mut svm, victim_portfolio.pubkey(), slot)
+                .expect("public cranker realizes the long loss");
+        }
+        for _ in 0..2 {
+            crank(&mut svm, attacker_portfolio.pubkey(), slot)
+                .expect("public cranker realizes the short claim");
+        }
+    }
+    assert_eq!(read_asset0_effective_price(&svm, &market), FINAL_PRICE);
+
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 2,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure the normal public terminal lifecycle");
+    let resolve_slot = target_slot + 2;
+    svm.set_sysvar(&Clock {
+        slot: resolve_slot,
+        unix_timestamp: resolve_slot as i64,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![AccountMeta::new(market, false)],
+            PIx::ResolveStalePermissionless {
+                now_slot: resolve_slot,
+            },
+        ),
+    )
+    .expect("an unaffiliated cranker resolves the fully committed stale market");
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral,
+        &attacker.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+        ),
+    )
+    .expect("attacker extracts the terminal payout as real collateral");
+
+    MaintenanceCadenceOutcome {
+        domains_after_fees,
+        attacker_withdrawal: token_amount(&svm, &attacker_destination),
+        insurance_remaining: read_asset0_insurance(&svm, &market),
+    }
+}
+
+#[test]
+#[ignore = "RED on pinned percolator-prog: per-call fee splitting redirects real insurance"]
+fn e2e_public_maintenance_fee_cadence_cannot_redirect_real_insurance_payouts() {
+    let delayed = run_maintenance_fee_cadence_payout(false);
+    let frequent = run_maintenance_fee_cadence_payout(true);
+
+    assert_eq!(delayed.domains_after_fees, [15, 15]);
+    assert_eq!(delayed.attacker_withdrawal, 1_201);
+    assert_eq!(delayed.insurance_remaining, 28);
+
+    // Current pin: frequent withdrawal = 1_206 and insurance remaining = 23. A cumulative
+    // one-bit split carry makes both values cadence-independent without changing total fees.
+    assert_eq!(frequent.attacker_withdrawal, delayed.attacker_withdrawal);
+    assert_eq!(frequent.insurance_remaining, delayed.insurance_remaining);
+    assert_eq!(
+        frequent.domains_after_fees,
+        delayed.domains_after_fees,
+        "splitting the same total fee across calls cannot choose an insurance side"
+    );
+}
