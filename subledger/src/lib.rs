@@ -1627,12 +1627,30 @@ fn mint_indexed_shares_with_capacity(
     if pool.share_rate_numerator == 0 || pool.share_rate_denominator == 0 {
         return Err(ProgramError::InvalidAccountData);
     }
-    let shares = wide_mul_div_floor(
+    let floor_shares = wide_mul_div_floor(
         amount as u128,
         pool.share_rate_denominator,
         pool.share_rate_numerator,
     )
     .ok_or(ProgramError::ArithmeticOverflow)?;
+    // Preserve the pool-wide floor remainder unless it would make the minimum
+    // one-atom genesis deposit worthless after a loss. In that one case the
+    // ceiling redeems to the deposited atom without changing prior claims.
+    let shares = if redeem_indexed_shares(
+        floor_shares,
+        pool.share_rate_numerator,
+        pool.share_rate_denominator,
+    )? == 0
+    {
+        wide_mul_div_ceil(
+            amount as u128,
+            pool.share_rate_denominator,
+            pool.share_rate_numerator,
+        )
+        .ok_or(ProgramError::ArithmeticOverflow)?
+    } else {
+        floor_shares
+    };
     let virtual_shares = insurance_virtual_shares(pool.share_generation)?;
     // Never rescale live owner shares to admit a deposit: any lazy integer
     // rescale can erase an independent holder's whole-atom claim. Capacity
@@ -6575,6 +6593,54 @@ mod tests {
             .unwrap(),
             24,
             "only newly observed owner loss lowers the surviving claim",
+        );
+    }
+
+    #[test]
+    fn indexed_minimum_deposit_after_loss_is_fully_backed() {
+        let mut pool = historical_pool_fixture();
+        pool.cross_backing = true;
+        pool.policy = POLICY_PRINCIPAL;
+        pool.domain = DOMAIN_INSURANCE;
+        pool.outstanding_principal = 29;
+        pool.total_shares = 29 * VIRTUAL_SHARES;
+        pool.share_rate_numerator = 28;
+        pool.share_rate_denominator = 30 * VIRTUAL_SHARES;
+
+        let prior_claim = redeem_indexed_shares(
+            pool.total_shares,
+            pool.share_rate_numerator,
+            pool.share_rate_denominator,
+        )
+        .unwrap();
+        assert_eq!(prior_claim, 27);
+
+        let minted = mint_indexed_shares_with_capacity(&mut pool, 1).unwrap();
+        require_bounded_indexed_rounding(
+            1,
+            minted,
+            pool.share_rate_numerator,
+            pool.share_rate_denominator,
+        )
+        .unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                minted,
+                pool.share_rate_numerator,
+                pool.share_rate_denominator,
+            )
+            .unwrap(),
+            1,
+        );
+        assert_eq!(
+            redeem_indexed_shares(
+                pool.total_shares + minted,
+                pool.share_rate_numerator,
+                pool.share_rate_denominator,
+            )
+            .unwrap(),
+            prior_claim + 1,
+            "rounding up cannot create an unfunded aggregate claim",
         );
     }
 
