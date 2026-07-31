@@ -92,6 +92,7 @@ const PERC_IX_RESOLVE_MARKET: u8 = 19;
 const PERC_IX_UPDATE_AUTHORITY: u8 = 32;
 const PERC_IX_CONFIGURE_HYBRID_ORACLE: u8 = 34;
 const PERC_IX_CONFIGURE_EWMA_MARK: u8 = 35;
+const PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY: u8 = 37;
 const PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE: u8 = 38;
 const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
@@ -717,7 +718,7 @@ fn admin_tag_allowed(tag: u8) -> bool {
         19 // ResolveMarket
             | 34 // ConfigureHybridOracle
             | 35 // ConfigureEwmaMark
-            | 37 // UpdateLiquidationFeePolicy
+            | PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY
             | 38 // ConfigurePermissionlessResolve
             | 40 // UpdateAssetLifecycle (activate/retire/shutdown; DrainOnly rejected below)
             | 49 // UpdateMaintenanceFeePolicy
@@ -844,7 +845,9 @@ fn restart_asset_index(data: &[u8]) -> Result<Option<usize>, ProgramError> {
 fn generation_bound_market(data: &[u8]) -> bool {
     matches!(
         data.first().copied(),
-        Some(PERC_IX_RESOLVE_MARKET) | Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE)
+        Some(PERC_IX_RESOLVE_MARKET)
+            | Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY)
+            | Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE)
     )
 }
 
@@ -3507,8 +3510,11 @@ mod tests {
     }
 
     #[test]
-    fn market_generation_binding_covers_both_terminal_resolution_controls() {
+    fn market_generation_binding_covers_resolution_and_liquidation_policy() {
         assert!(generation_bound_market(&[PERC_IX_RESOLVE_MARKET]));
+        assert!(generation_bound_market(&[
+            PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY
+        ]));
         assert!(generation_bound_market(&[
             PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE
         ]));

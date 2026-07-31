@@ -34,6 +34,7 @@ enum PoolRestartScenario {
     EmptyWithSurplusPoolRestart,
     RestartAfterLossAbsentOwnerBuyback,
     RestartAfterPartialLossAbsentOwnerBuyback,
+    StaleLiquidationPolicyAfterRestart,
 }
 
 #[test]
@@ -82,10 +83,17 @@ fn e2e_asset0_partial_loss_restart_preserves_owner_claim_through_buyback() {
     );
 }
 
+#[test]
+fn e2e_stale_liquidation_policy_cannot_cross_asset_generations() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::StaleLiquidationPolicyAfterRestart);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
+    let stale_liquidation_policy =
+        scenario == PoolRestartScenario::StaleLiquidationPolicyAfterRestart;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -185,8 +193,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 initial_margin_bps: 5_000,
                 max_trading_fee_bps: 10_000,
                 trade_fee_base_bps: 0,
-                liquidation_fee_bps: 0,
-                liquidation_fee_cap: 0,
+                liquidation_fee_bps: if stale_liquidation_policy { 100 } else { 0 },
+                liquidation_fee_cap: if stale_liquidation_policy { 2 } else { 0 },
                 min_liquidation_abs: 0,
                 max_price_move_bps_per_slot: 4_900,
                 max_accrual_dt_slots: 1,
@@ -474,6 +482,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         PoolRestartScenario::HealthyRestart
             | PoolRestartScenario::HealthyLegacyPoolRestart
             | PoolRestartScenario::EmptyWithSurplusPoolRestart
+            | PoolRestartScenario::StaleLiquidationPolicyAfterRestart
     ) {
         let legacy_pool = scenario == PoolRestartScenario::HealthyLegacyPoolRestart;
         if legacy_pool {
@@ -517,6 +526,55 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             pool_before_public_checkpoint,
         );
 
+        // Queue and approve a generation-A policy without executing it. The witness is part of
+        // the immutable Squads message, so the later executor can choose timing but cannot replace
+        // the generation that governance approved.
+        let stale_liquidation_action = if stale_liquidation_policy {
+            let transaction_index = 3u64;
+            let transaction = transaction_pda(&squads, &multisig, transaction_index);
+            let proposal = proposal_pda(&squads, &multisig, transaction_index);
+            let witness = controller_market_generation_witness(&svm, &market);
+            let message = build_controller_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market,
+                &perc_id(),
+                &[],
+                &witness,
+                &PIx::UpdateLiquidationFeePolicy {
+                    cranker_share_bps: 10_000,
+                }
+                .encode(),
+            );
+            for instruction in [
+                vault_transaction_create_ix(
+                    &squads,
+                    &multisig,
+                    &transaction,
+                    &dao.pubkey(),
+                    &message,
+                ),
+                proposal_create_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &dao.pubkey(),
+                    transaction_index,
+                ),
+                proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey()),
+            ] {
+                send(&mut svm, &[&dao], instruction)
+                    .expect("prepare the generation-A liquidation policy");
+            }
+            let mut clock = svm.get_sysvar::<Clock>();
+            clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+            svm.set_sysvar(&clock);
+            Some((transaction, proposal, witness))
+        } else {
+            None
+        };
+        let governance_index_offset = u64::from(stale_liquidation_policy);
+
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
             &squads_vault,
@@ -545,7 +603,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &multisig,
             &dao,
             &payer,
-            3,
+            3 + governance_index_offset,
             &configure_resolution,
             &configure_remaining,
         )
@@ -593,7 +651,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &multisig,
             &dao,
             &payer,
-            4,
+            4 + governance_index_offset,
             &shutdown,
             &shutdown_remaining,
         )
@@ -633,7 +691,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 &multisig,
                 &dao,
                 &payer,
-                5,
+                5 + governance_index_offset,
                 &substituted_pool_restart,
                 &substituted_pool_remaining,
             )
@@ -681,7 +739,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &multisig,
             &dao,
             &payer,
-            6,
+            6 + governance_index_offset,
             &restart,
             &restart_remaining,
         )
@@ -710,6 +768,286 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             read_asset_insurance_remaining(&svm, &market, 0),
             if empty_with_surplus { 0 } else { 1 },
         );
+
+        if let Some((transaction, proposal, stale_witness)) = stale_liquidation_action {
+            let current_witness = controller_market_generation_witness(&svm, &market);
+            assert_ne!(
+                stale_witness, current_witness,
+                "the public restart must advance the market-generation witness",
+            );
+            let stale_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(stale_witness, false),
+                AccountMeta::new_readonly(controller_id(), false),
+            ];
+            let market_before_replay = svm.get_account(&market).unwrap();
+            let replay = send(
+                &mut svm,
+                &[&dao],
+                vault_transaction_execute_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &transaction,
+                    &dao.pubkey(),
+                    &stale_remaining,
+                ),
+            );
+            let replay_succeeded = replay.is_ok();
+            if !replay_succeeded {
+                assert_eq!(
+                    svm.get_account(&market).unwrap(),
+                    market_before_replay,
+                    "a rejected stale policy must leave the replacement market byte-identical",
+                );
+            }
+
+            let configure_mark_slot = svm.get_sysvar::<Clock>().slot + 1;
+            warp_to(&mut svm, configure_mark_slot);
+            let configure_mark = build_configure_auth_mark_message(
+                &squads_vault,
+                &market,
+                &perc_id(),
+                configure_mark_slot,
+                1_000,
+            );
+            let mark_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ];
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                7 + governance_index_offset,
+                &configure_mark,
+                &mark_remaining,
+            )
+            .expect("futarchy re-enables the replacement-generation authenticated mark");
+
+            let portfolio_len =
+                percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+            let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+            let mut traders = Vec::new();
+            for deposit in [600u64, 600, 1] {
+                let owner = Keypair::new();
+                let portfolio = Keypair::new();
+                svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+                send(
+                    &mut svm,
+                    &[&payer, &portfolio],
+                    solana_sdk::system_instruction::create_account(
+                        &payer.pubkey(),
+                        &portfolio.pubkey(),
+                        portfolio_rent,
+                        portfolio_len as u64,
+                        &perc_id(),
+                    ),
+                )
+                .expect("allocate a replacement-generation portfolio");
+                send(
+                    &mut svm,
+                    &[&payer, &owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio.pubkey(), false),
+                        ],
+                        PIx::InitPortfolio,
+                    ),
+                )
+                .expect("initialize a replacement-generation portfolio");
+                let source = Pubkey::new_unique();
+                set_token(&mut svm, &source, &collateral, &owner.pubkey(), deposit);
+                send(
+                    &mut svm,
+                    &[&payer, &owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio.pubkey(), false),
+                            AccountMeta::new(source, false),
+                            AccountMeta::new(vault, false),
+                            AccountMeta::new_readonly(spl_token::ID, false),
+                        ],
+                        PIx::Deposit {
+                            amount: u128::from(deposit),
+                        },
+                    ),
+                )
+                .expect("fund a replacement-generation portfolio");
+                traders.push((owner, portfolio));
+            }
+
+            send(
+                &mut svm,
+                &[&payer, &traders[0].0, &traders[1].0],
+                pix(
+                    vec![
+                        AccountMeta::new(traders[0].0.pubkey(), true),
+                        AccountMeta::new(traders[1].0.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(traders[0].1.pubkey(), false),
+                        AccountMeta::new(traders[1].1.pubkey(), false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index: 0,
+                        size_q: percolator::POS_SCALE as i128,
+                        exec_price: 1_000,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+            .expect("open a replacement-generation balanced pair");
+
+            let mark_slot = svm.get_sysvar::<Clock>().slot + 1;
+            warp_to(&mut svm, mark_slot);
+            let mark_message =
+                build_push_auth_mark_message(&squads_vault, &market, &perc_id(), mark_slot, 500);
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                8 + governance_index_offset,
+                &mark_message,
+                &mark_remaining,
+            )
+            .expect("futarchy publishes the replacement-generation liquidation mark");
+            for slot in [mark_slot, mark_slot + 1] {
+                warp_to(&mut svm, slot);
+                send(
+                    &mut svm,
+                    &[&payer],
+                    pix(
+                        vec![
+                            AccountMeta::new(payer.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(traders[2].1.pubkey(), false),
+                        ],
+                        PIx::PermissionlessCrank {
+                            now_slot: slot,
+                            observations: vec![percolator_prog::ix::CrankObservationHint {
+                                asset_index: 0,
+                                oracle_accounts: 0,
+                            }],
+                        },
+                    ),
+                )
+                .expect("advance the replacement-generation bounded mark");
+            }
+            assert_eq!(read_asset0_effective_price(&svm, &market), 500);
+
+            let capital = |svm: &LiteSVM, portfolio: &Pubkey| {
+                percolator_prog::state::read_portfolio(
+                    &svm.get_account(portfolio).unwrap().data,
+                )
+                .unwrap()
+                .capital
+                .get()
+            };
+            let domains_before = read_asset_insurance_domains(&svm, &market, 0);
+            let attacker_before = capital(&svm, &traders[2].1.pubkey());
+            assert_eq!(attacker_before, 1);
+            for _ in 0..5 {
+                let mut crank_accounts = vec![
+                    AccountMeta::new(
+                        if replay_succeeded {
+                            traders[2].0.pubkey()
+                        } else {
+                            payer.pubkey()
+                        },
+                        true,
+                    ),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(traders[0].1.pubkey(), false),
+                ];
+                let mut crank_signers = vec![&payer];
+                if replay_succeeded {
+                    crank_accounts.push(AccountMeta::new(traders[2].1.pubkey(), false));
+                    crank_signers.push(&traders[2].0);
+                }
+                send(
+                    &mut svm,
+                    &crank_signers,
+                    pix(
+                        crank_accounts,
+                        PIx::PermissionlessCrank {
+                            now_slot: mark_slot + 1,
+                            observations: vec![],
+                        },
+                    ),
+                )
+                .expect("settle and liquidate the replacement-generation long");
+            }
+
+            let domains_after = read_asset_insurance_domains(&svm, &market, 0);
+            let retained_for_insurance = domains_after[0]
+                .checked_add(domains_after[1])
+                .unwrap()
+                .checked_sub(domains_before[0].checked_add(domains_before[1]).unwrap())
+                .unwrap();
+            let attacker_after = capital(&svm, &traders[2].1.pubkey());
+            let attacker_destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &attacker_destination,
+                &collateral,
+                &traders[2].0.pubkey(),
+                0,
+            );
+            send(
+                &mut svm,
+                &[&payer, &traders[2].0],
+                pix(
+                    vec![
+                        AccountMeta::new(traders[2].0.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(traders[2].1.pubkey(), false),
+                        AccountMeta::new(attacker_destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Withdraw {
+                        amount: attacker_after,
+                    },
+                ),
+            )
+            .expect("the public cranker realizes its replacement-generation balance");
+            let attacker_withdrawal = token_amount(&svm, &attacker_destination);
+
+            if replay_succeeded {
+                assert_eq!(retained_for_insurance, 0);
+                assert_eq!(attacker_after, 3);
+                assert_eq!(attacker_withdrawal, 3);
+                panic!(
+                    "a generation-A liquidation policy paid two atoms of generation-B user collateral to a public cranker",
+                );
+            }
+            assert_eq!(
+                retained_for_insurance, 2,
+                "the full configured liquidation penalty accrues to canonical insurance",
+            );
+            assert_eq!(
+                attacker_after, 1,
+                "a rejected stale policy cannot credit a cranker from a new user's penalty",
+            );
+            assert_eq!(
+                attacker_withdrawal, 1,
+                "the cranker can recover only its own deposited atom",
+            );
+            return;
+        }
 
         if !empty_with_surplus {
             send(&mut svm, &[&payer, &depositor], owner_exit_ix())
@@ -20047,6 +20385,38 @@ fn build_push_auth_mark_message(
         asset_index: 0,
         now_slot,
         mark_e6,
+    }
+    .encode();
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_configure_auth_mark_message(
+    squads_vault: &Pubkey,
+    market: &Pubkey,
+    perc: &Pubkey,
+    now_slot: u64,
+    initial_mark_e6: u64,
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1);
+    m.push(0);
+    m.push(1);
+    m.push(3);
+    m.extend_from_slice(squads_vault.as_ref());
+    m.extend_from_slice(market.as_ref());
+    m.extend_from_slice(perc.as_ref());
+    m.push(1);
+    m.push(2);
+    m.push(2);
+    m.push(0);
+    m.push(1);
+    let data = percolator_prog::ix::Instruction::ConfigureAuthMark {
+        asset_index: 0,
+        now_slot,
+        initial_mark_e6,
     }
     .encode();
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
