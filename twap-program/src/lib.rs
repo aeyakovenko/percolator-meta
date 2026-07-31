@@ -897,7 +897,9 @@ fn process_init_config(
 }
 
 // reconfigure accounts: [squads_vault(signer), config(w)]
-// data: new_surplus_buy_burn_bps (u16)
+// data: new_surplus_buy_burn_bps (u16) || expected_surplus_buy_burn_bps (u16)
+//   || expected_base_unit_savings_bps (u16) || expected_buyback_bps (u16)
+//   || expected_base_unit_savings_account (Pubkey)
 //
 // Squads -> TWAP control: only the config's Squads multisig default vault PDA may
 // reconfigure, and that PDA can only sign as the executor of a multisig
@@ -911,10 +913,16 @@ fn process_reconfigure(
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
 
-    if data.len() != 2 {
+    if data.len() != 40 {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let new_bps = u16::from_le_bytes(data.try_into().unwrap());
+    let new_bps = u16::from_le_bytes(data[..2].try_into().unwrap());
+    let expected_surplus_buy_burn_bps =
+        u16::from_le_bytes(data[2..4].try_into().unwrap());
+    let expected_savings_bps = u16::from_le_bytes(data[4..6].try_into().unwrap());
+    let expected_buyback_bps = u16::from_le_bytes(data[6..8].try_into().unwrap());
+    let expected_savings_account =
+        Pubkey::new_from_array(data[8..40].try_into().unwrap());
     // 0..=100% — the DAO's burn-percentage authority. 0% burns nothing (all surplus retained for
     // insurance growth); 100% burns the entire surplus. `execute` enforces this share at pull time.
     if new_bps > BPS_DENOMINATOR {
@@ -927,6 +935,13 @@ fn process_reconfigure(
     // Canonical DAO gate (finding IE): use require_squads_vault so the burn-bps setter cannot
     // diverge from the gate every other setter uses.
     require_squads_vault(squads_vault, &config)?;
+    if config.surplus_buy_burn_bps != expected_surplus_buy_burn_bps
+        || config.base_unit_savings_bps != expected_savings_bps
+        || config.buyback_bps != expected_buyback_bps
+        || config.base_unit_savings_account != expected_savings_account
+    {
+        return Err(ProgramError::InvalidArgument);
+    }
     // The auction (surplus_buy_burn_bps) and savings (base_unit_savings_bps) pulls must never collectively
     // exceed 100% of the surplus — set_economics enforces this, but reconfigure sets surplus_buy_burn_bps
     // independently and must hold the SAME invariant (finding KN). Otherwise a valid-looking DAO reconfigure

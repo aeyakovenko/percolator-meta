@@ -378,9 +378,9 @@ redirect a user's claim, or sweep principal. After a sink epoch freezes, later r
 sink share rather than writing outside the snapshot. A closed or otherwise invalid exact-key COIN sink
 also falls back to burn instead of stalling settlement. The configured COIN sink must remain external
 to the book's COIN escrow, collateral settlement escrow, and holding account, including when COIN is
-also the collateral mint. Every delayed four-way economics update binds the exact current auction,
-savings, and buyback shares plus the savings account, so an older approved retention policy cannot
-overwrite a later burn correction or cross an intervening auction-share update.
+also the collateral mint. Both delayed four-way economics setters bind the exact current auction,
+savings, and buyback shares plus the savings account, so an older approved retention or auction-share
+policy cannot overwrite a later correction or cross an intervening coupled-policy update.
 
 Auction placement requires the bidder's canonical initialized COIN and collateral ATAs. Closed ATAs
 are permissionlessly recreatable, and an already-frozen destination is rejected before any bid fee or

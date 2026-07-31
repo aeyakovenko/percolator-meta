@@ -1924,13 +1924,23 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         return;
     }
 
-    let policy = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 10_000);
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
     for index in [3u64, 4] {
+        let expected_bps = if index == 3 { 8_000 } else { 10_000 };
+        let policy = build_twap_reconfigure_message_with_expected(
+            &squads_vault,
+            &twap_cfg,
+            &twap_id(),
+            10_000,
+            expected_bps,
+            0,
+            0,
+            &Pubkey::default(),
+        );
         squads_execute(
             &mut svm,
             &squads,
@@ -4857,6 +4867,29 @@ fn build_twap_reconfigure_message(
     twap_program: &Pubkey,
     new_bps: u16,
 ) -> Vec<u8> {
+    build_twap_reconfigure_message_with_expected(
+        vault,
+        config,
+        twap_program,
+        new_bps,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_twap_reconfigure_message_with_expected(
+    vault: &Pubkey,
+    config: &Pubkey,
+    twap_program: &Pubkey,
+    new_bps: u16,
+    expected_surplus_buy_burn_bps: u16,
+    expected_savings_bps: u16,
+    expected_buyback_bps: u16,
+    expected_savings_account: &Pubkey,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // num_signers (vault)
     m.push(0); // num_writable_signers
@@ -4873,6 +4906,10 @@ fn build_twap_reconfigure_message(
     m.push(1);
     let mut data = vec![2u8]; // IX_RECONFIGURE
     data.extend_from_slice(&new_bps.to_le_bytes());
+    data.extend_from_slice(&expected_surplus_buy_burn_bps.to_le_bytes());
+    data.extend_from_slice(&expected_savings_bps.to_le_bytes());
+    data.extend_from_slice(&expected_buyback_bps.to_le_bytes());
+    data.extend_from_slice(expected_savings_account.as_ref());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0); // address_table_lookups: empty
@@ -5847,7 +5884,16 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
 
     // (3) ATTACK/FOOTGUN: reconfigure the auction to 6000 -> 6000 + 5000 = 11000 > 100% -> rejected even
     // past the timelock, so `execute` can never be driven into an underflow-revert brick.
-    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 6_000);
+    let msg = build_twap_reconfigure_message_with_expected(
+        &vault,
+        &cfg_pda,
+        &twap_id(),
+        6_000,
+        4_000,
+        5_000,
+        0,
+        &savings_acct,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -5869,7 +5915,16 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
     );
 
     // (4) BOUNDARY: auction 5000 -> 5000 + 5000 = exactly 100% -> accepted.
-    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 5_000);
+    let msg = build_twap_reconfigure_message_with_expected(
+        &vault,
+        &cfg_pda,
+        &twap_id(),
+        5_000,
+        4_000,
+        5_000,
+        0,
+        &savings_acct,
+    );
     squads_execute(
         &mut svm,
         &squads,
@@ -67123,11 +67178,15 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
         ],
     )
     .expect("the live policy returns every bought COIN to the configured sink");
-    let initial_share = build_twap_reconfigure_message(
+    let initial_share = build_twap_reconfigure_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &twap_id(),
         5_000,
+        8_000,
+        0,
+        10_000,
+        &savings,
     );
     let reconfigure_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -67146,17 +67205,25 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
     )
     .expect("the live auction share is 50%");
 
-    let stale_message = build_twap_reconfigure_message(
+    let stale_message = build_twap_reconfigure_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &twap_id(),
         8_000,
+        5_000,
+        0,
+        10_000,
+        &savings,
     );
-    let correction_message = build_twap_reconfigure_message(
+    let correction_message = build_twap_reconfigure_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &twap_id(),
         0,
+        5_000,
+        0,
+        10_000,
+        &savings,
     );
     let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
         let transaction = transaction_pda(&env.squads, &env.multisig, index);
@@ -67269,24 +67336,24 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
         ),
     )
     .expect("a permissionless cranker settles under the surviving share");
-    send(
-        &mut svm,
-        &[&cranker],
-        claim_ix(
-            &cranker.pubkey(),
-            &env.twap_cfg,
-            &book.book,
-            &book.book_escrow,
-            &book.settlement_usd,
-            &book.coin_escrow,
-            &bidder_usd,
-            &bidder_coin,
-            0,
-        ),
-    )
-    .expect("the permissionless claim pays the recorded bidder");
 
     if replay.is_ok() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.settlement_usd,
+                &book.coin_escrow,
+                &bidder_usd,
+                &bidder_coin,
+                0,
+            ),
+        )
+        .expect("the permissionless claim pays the recorded bidder");
         assert_eq!(token_amount(&svm, &bidder_usd), stale_budget);
         assert_eq!(token_amount(&svm, &bidder_sink), stale_budget);
         panic!(
@@ -67295,6 +67362,21 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
     }
     assert_eq!(token_amount(&svm, &bidder_usd), 0);
     assert_eq!(token_amount(&svm, &bidder_sink), 0);
+    warp_to(&mut svm, round_end + 10);
+    send(
+        &mut svm,
+        &[&bidder],
+        cancel_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &bidder_coin,
+            0,
+        ),
+    )
+    .expect("the bidder recovers the unfilled bid after the bounded cooldown");
     assert_eq!(
         token_amount(&svm, &bidder_coin),
         stale_budget,
