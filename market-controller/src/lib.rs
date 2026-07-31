@@ -102,6 +102,7 @@ const PERC_IX_CONFIGURE_EWMA_MARK: u8 = 35;
 const PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY: u8 = 37;
 const PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE: u8 = 38;
 const PERC_IX_UPDATE_ASSET_LIFECYCLE: u8 = 40;
+const PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY: u8 = 49;
 const PERC_IX_WITHDRAW_BACKING: u8 = 50;
 const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
@@ -786,7 +787,7 @@ fn admin_tag_allowed(tag: u8) -> bool {
             | PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY
             | 38 // ConfigurePermissionlessResolve
             | 40 // UpdateAssetLifecycle (activate/retire/shutdown; DrainOnly rejected below)
-            | 49 // UpdateMaintenanceFeePolicy
+            | PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY
             | 51 // UpdateBackingFeePolicy
             | 55 // UpdateTradeFeePolicy
             | 58 // UpdateFeeRedirectPolicy
@@ -913,6 +914,7 @@ fn generation_bound_market(data: &[u8]) -> bool {
         Some(PERC_IX_RESOLVE_MARKET)
             | Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY)
             | Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE)
+            | Some(PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY)
     )
 }
 
@@ -3681,13 +3683,16 @@ mod tests {
     }
 
     #[test]
-    fn market_generation_binding_covers_resolution_and_liquidation_policy() {
+    fn market_generation_binding_covers_resolution_and_fee_policies() {
         assert!(generation_bound_market(&[PERC_IX_RESOLVE_MARKET]));
         assert!(generation_bound_market(&[
             PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY
         ]));
         assert!(generation_bound_market(&[
             PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE
+        ]));
+        assert!(generation_bound_market(&[
+            PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY
         ]));
         assert!(!generation_bound_market(&[
             PERC_IX_UPDATE_TRADE_FEE_POLICY

@@ -36,6 +36,7 @@ enum PoolRestartScenario {
     RestartAfterPartialLossAbsentOwnerBuyback,
     StaleLiquidationPolicyAfterRestart,
     StaleLiquidationPolicyOrder,
+    StaleMaintenancePolicyAfterRestart,
 }
 
 #[test]
@@ -94,6 +95,11 @@ fn e2e_stale_liquidation_policy_cannot_overwrite_a_later_policy() {
     run_pool_restart_claim_scenario(PoolRestartScenario::StaleLiquidationPolicyOrder);
 }
 
+#[test]
+fn e2e_stale_maintenance_policy_cannot_cross_asset_generations() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::StaleMaintenancePolicyAfterRestart);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -104,6 +110,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleLiquidationPolicyOrder;
     let stale_liquidation_policy =
         stale_liquidation_generation || stale_liquidation_order;
+    let stale_maintenance_policy =
+        scenario == PoolRestartScenario::StaleMaintenancePolicyAfterRestart;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -214,7 +222,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 max_bankrupt_close_chunks: 1,
                 max_bankrupt_close_lifetime_slots: 1,
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
-                maintenance_fee_per_slot: 0,
+                maintenance_fee_per_slot: u128::from(stale_maintenance_policy),
             },
         ),
     )
@@ -516,6 +524,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             | PoolRestartScenario::EmptyWithSurplusPoolRestart
             | PoolRestartScenario::StaleLiquidationPolicyAfterRestart
             | PoolRestartScenario::StaleLiquidationPolicyOrder
+            | PoolRestartScenario::StaleMaintenancePolicyAfterRestart
     ) {
         let legacy_pool = scenario == PoolRestartScenario::HealthyLegacyPoolRestart;
         if legacy_pool {
@@ -610,7 +619,52 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         } else {
             None
         };
-        let governance_index_offset = u64::from(stale_liquidation_generation);
+        let stale_maintenance_action = if stale_maintenance_policy {
+            let transaction_index = 3u64;
+            let transaction = transaction_pda(&squads, &multisig, transaction_index);
+            let proposal = proposal_pda(&squads, &multisig, transaction_index);
+            let witness = controller_market_generation_witness(&svm, &market);
+            let message = build_controller_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market,
+                &perc_id(),
+                &[],
+                &witness,
+                &PIx::UpdateMaintenanceFeePolicy {
+                    cranker_share_bps: 10_000,
+                }
+                .encode(),
+            );
+            for instruction in [
+                vault_transaction_create_ix(
+                    &squads,
+                    &multisig,
+                    &transaction,
+                    &dao.pubkey(),
+                    &message,
+                ),
+                proposal_create_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &dao.pubkey(),
+                    transaction_index,
+                ),
+                proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey()),
+            ] {
+                send(&mut svm, &[&dao], instruction)
+                    .expect("prepare the generation-A maintenance policy");
+            }
+            let mut clock = svm.get_sysvar::<Clock>();
+            clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+            svm.set_sysvar(&clock);
+            Some((transaction, proposal, witness))
+        } else {
+            None
+        };
+        let governance_index_offset =
+            u64::from(stale_liquidation_generation || stale_maintenance_policy);
 
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
@@ -943,6 +997,176 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         } else {
             0
         };
+
+        if let Some((transaction, proposal, stale_witness)) = stale_maintenance_action {
+            let current_witness = controller_market_generation_witness(&svm, &market);
+            assert_ne!(
+                stale_witness, current_witness,
+                "the public restart must advance the market-generation witness",
+            );
+            let stale_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(stale_witness, false),
+                AccountMeta::new_readonly(controller_id(), false),
+            ];
+            let market_before_replay = svm.get_account(&market).unwrap();
+            let replay = send(
+                &mut svm,
+                &[&dao],
+                vault_transaction_execute_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &transaction,
+                    &dao.pubkey(),
+                    &stale_remaining,
+                ),
+            );
+            if replay.is_err() {
+                assert_eq!(
+                    svm.get_account(&market).unwrap(),
+                    market_before_replay,
+                    "a rejected stale policy must leave the replacement market byte-identical",
+                );
+            }
+
+            let victim = Keypair::new();
+            let victim_portfolio = Keypair::new();
+            let attacker = Keypair::new();
+            let attacker_portfolio = Keypair::new();
+            let portfolio_len =
+                percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+            let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+            for (owner, portfolio, deposit) in [
+                (&victim, &victim_portfolio, 10u64),
+                (&attacker, &attacker_portfolio, 1u64),
+            ] {
+                send(
+                    &mut svm,
+                    &[&payer, portfolio],
+                    solana_sdk::system_instruction::create_account(
+                        &payer.pubkey(),
+                        &portfolio.pubkey(),
+                        portfolio_rent,
+                        portfolio_len as u64,
+                        &perc_id(),
+                    ),
+                )
+                .expect("allocate a replacement-generation portfolio");
+                send(
+                    &mut svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio.pubkey(), false),
+                        ],
+                        PIx::InitPortfolio,
+                    ),
+                )
+                .expect("initialize a replacement-generation portfolio");
+                let source = Pubkey::new_unique();
+                set_token(&mut svm, &source, &collateral, &owner.pubkey(), deposit);
+                send(
+                    &mut svm,
+                    &[&payer, owner],
+                    pix(
+                        vec![
+                            AccountMeta::new(owner.pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolio.pubkey(), false),
+                            AccountMeta::new(source, false),
+                            AccountMeta::new(vault, false),
+                            AccountMeta::new_readonly(spl_token::ID, false),
+                        ],
+                        PIx::Deposit {
+                            amount: u128::from(deposit),
+                        },
+                    ),
+                )
+                .expect("fund a replacement-generation portfolio");
+            }
+
+            let capital = |svm: &LiteSVM, portfolio: &Pubkey| {
+                percolator_prog::state::read_portfolio(
+                    &svm.get_account(portfolio).unwrap().data,
+                )
+                .unwrap()
+                .capital
+                .get()
+            };
+            assert_eq!(capital(&svm, &victim_portfolio.pubkey()), 10);
+            assert_eq!(capital(&svm, &attacker_portfolio.pubkey()), 1);
+            let fee_slot = svm.get_sysvar::<Clock>().slot + 1;
+            warp_to(&mut svm, fee_slot);
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(victim_portfolio.pubkey(), false),
+                        AccountMeta::new(attacker_portfolio.pubkey(), false),
+                    ],
+                    PIx::SyncMaintenanceFee { now_slot: fee_slot },
+                ),
+            )
+            .expect("an unaffiliated cranker settles the victim's due maintenance fee");
+
+            let victim_after = capital(&svm, &victim_portfolio.pubkey());
+            let attacker_after = capital(&svm, &attacker_portfolio.pubkey());
+            let attacker_destination = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &attacker_destination,
+                &collateral,
+                &attacker.pubkey(),
+                0,
+            );
+            send(
+                &mut svm,
+                &[&payer, &attacker],
+                pix(
+                    vec![
+                        AccountMeta::new(attacker.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(attacker_portfolio.pubkey(), false),
+                        AccountMeta::new(attacker_destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Withdraw {
+                        amount: attacker_after,
+                    },
+                ),
+            )
+            .expect("the cranker realizes its complete replacement-generation balance");
+            let attacker_withdrawal = token_amount(&svm, &attacker_destination);
+
+            if replay.is_ok() {
+                assert_eq!(victim_after, 9);
+                assert_eq!(attacker_after, 2);
+                assert_eq!(attacker_withdrawal, 2);
+                panic!(
+                    "a generation-A maintenance policy paid one atom of generation-B victim collateral to the stale executor",
+                );
+            }
+            assert_eq!(victim_after, 9, "the configured maintenance fee still settles");
+            assert_eq!(
+                attacker_after, 1,
+                "a rejected stale policy cannot credit the cranker from the victim's fee",
+            );
+            assert_eq!(
+                attacker_withdrawal, 1,
+                "the cranker can recover only its own deposited atom",
+            );
+            return;
+        }
 
         if let Some((transaction, proposal, stale_witness)) = stale_liquidation_action {
             let current_witness = controller_market_generation_witness(&svm, &market);
