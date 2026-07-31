@@ -49,6 +49,7 @@ const POLICY_SEQUENCE_SIZE: usize = 72;
 const LIQUIDATION_POLICY_SEQUENCE_OFFSET: usize = 40;
 const MAINTENANCE_POLICY_SEQUENCE_OFFSET: usize = 48;
 const FEE_REDIRECT_POLICY_SEQUENCE_OFFSET: usize = 56;
+const ORACLE_POLICY_SEQUENCE_OFFSET: usize = 64;
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
 pub const RETIRED_MARKET_SIZE: usize = 72;
@@ -129,11 +130,19 @@ const SEQUENCED_FEE_REDIRECT_POLICY_LEN: usize =
     UPDATE_FEE_REDIRECT_POLICY_LEN + core::mem::size_of::<u64>();
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const CONFIGURE_HYBRID_ORACLE_LEN: usize = 156;
+const SEQUENCED_CONFIGURE_HYBRID_ORACLE_LEN: usize =
+    CONFIGURE_HYBRID_ORACLE_LEN + core::mem::size_of::<u64>();
 const CONFIGURE_EWMA_MARK_LEN: usize = 35;
+const SEQUENCED_CONFIGURE_EWMA_MARK_LEN: usize =
+    CONFIGURE_EWMA_MARK_LEN + core::mem::size_of::<u64>();
 const CONFIGURE_PERMISSIONLESS_RESOLVE_LEN: usize = 17;
 const CONFIGURE_AUTH_MARK_LEN: usize = 19;
+const SEQUENCED_CONFIGURE_AUTH_MARK_LEN: usize =
+    CONFIGURE_AUTH_MARK_LEN + core::mem::size_of::<u64>();
 const UPDATE_TRADE_FEE_POLICY_LEN: usize = 9;
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
+const SEQUENCED_RESTART_ASSET_ORACLE_LEN: usize =
+    RESTART_ASSET_ORACLE_LEN + core::mem::size_of::<u64>();
 const HYBRID_ORACLE_LEG_COUNT_OFFSET: usize = 19;
 const ACTIVATE_INSURANCE_AUTHORITY_OFFSET: usize = 20;
 const ACTIVATE_INSURANCE_OPERATOR_OFFSET: usize = 52;
@@ -1018,6 +1027,26 @@ fn decode_sequenced_admin_data(
             SEQUENCED_FEE_REDIRECT_POLICY_LEN,
             FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
         ),
+        Some(PERC_IX_CONFIGURE_HYBRID_ORACLE) => (
+            CONFIGURE_HYBRID_ORACLE_LEN,
+            SEQUENCED_CONFIGURE_HYBRID_ORACLE_LEN,
+            ORACLE_POLICY_SEQUENCE_OFFSET,
+        ),
+        Some(PERC_IX_CONFIGURE_EWMA_MARK) => (
+            CONFIGURE_EWMA_MARK_LEN,
+            SEQUENCED_CONFIGURE_EWMA_MARK_LEN,
+            ORACLE_POLICY_SEQUENCE_OFFSET,
+        ),
+        Some(PERC_IX_CONFIGURE_AUTH_MARK) => (
+            CONFIGURE_AUTH_MARK_LEN,
+            SEQUENCED_CONFIGURE_AUTH_MARK_LEN,
+            ORACLE_POLICY_SEQUENCE_OFFSET,
+        ),
+        Some(PERC_IX_RESTART_ASSET_ORACLE) => (
+            RESTART_ASSET_ORACLE_LEN,
+            SEQUENCED_RESTART_ASSET_ORACLE_LEN,
+            ORACLE_POLICY_SEQUENCE_OFFSET,
+        ),
         _ => return Ok((data, None)),
     };
     if data.len() != sequenced_len {
@@ -1138,8 +1167,8 @@ fn process_init_policy_sequence(
 // proxy_admin accounts:
 // [governance(signer), controller_pda, market(w), percolator_program, tail...]
 // data: raw Percolator bytes, plus an expected u64 sequence for delayed
-// liquidation, maintenance, and fee-redirect policy updates. Controller-only
-// witnesses are removed before CPI.
+// liquidation, maintenance, fee-redirect, and oracle policy updates.
+// Controller-only sequence accounts and witnesses are removed before CPI.
 fn process_proxy_admin<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -1203,6 +1232,7 @@ fn process_proxy_admin<'a>(
         }
     }
     let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
+    let asset_generation_binding = generation_bound_asset(percolator_data)?;
     if generation_bound_market(percolator_data) {
         let next_market_id = {
             let market_data = market.try_borrow_data()?;
@@ -1225,7 +1255,7 @@ fn process_proxy_admin<'a>(
         }
     }
     if let Some((sequence_offset, expected_sequence)) = policy_sequence_update {
-        if tail.len() != 1 {
+        if asset_generation_binding.is_none() && tail.len() != 1 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let policy_sequence = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -1238,7 +1268,7 @@ fn process_proxy_admin<'a>(
         )?;
     }
     if let Some((asset_index, native_tail_len, permits_unconfigured)) =
-        generation_bound_asset(percolator_data)?
+        asset_generation_binding
     {
         let market_id = {
             let market_data = market.try_borrow_data()?;
@@ -3758,21 +3788,45 @@ mod tests {
 
     #[test]
     fn policy_sequence_envelopes_are_exact_and_stripped() {
-        for (tag, sequence_offset) in [
+        for (tag, raw_len, sequence_offset) in [
             (
                 PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY,
+                UPDATE_LIQUIDATION_FEE_POLICY_LEN,
                 LIQUIDATION_POLICY_SEQUENCE_OFFSET,
             ),
             (
                 PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY,
+                UPDATE_MAINTENANCE_FEE_POLICY_LEN,
                 MAINTENANCE_POLICY_SEQUENCE_OFFSET,
             ),
             (
                 PERC_IX_UPDATE_FEE_REDIRECT_POLICY,
+                UPDATE_FEE_REDIRECT_POLICY_LEN,
                 FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
             ),
+            (
+                PERC_IX_CONFIGURE_HYBRID_ORACLE,
+                CONFIGURE_HYBRID_ORACLE_LEN,
+                ORACLE_POLICY_SEQUENCE_OFFSET,
+            ),
+            (
+                PERC_IX_CONFIGURE_EWMA_MARK,
+                CONFIGURE_EWMA_MARK_LEN,
+                ORACLE_POLICY_SEQUENCE_OFFSET,
+            ),
+            (
+                PERC_IX_CONFIGURE_AUTH_MARK,
+                CONFIGURE_AUTH_MARK_LEN,
+                ORACLE_POLICY_SEQUENCE_OFFSET,
+            ),
+            (
+                PERC_IX_RESTART_ASSET_ORACLE,
+                RESTART_ASSET_ORACLE_LEN,
+                ORACLE_POLICY_SEQUENCE_OFFSET,
+            ),
         ] {
-            let raw = vec![tag, 7, 0];
+            let mut raw = vec![0; raw_len];
+            raw[0] = tag;
             let mut sequenced = raw.clone();
             sequenced.extend_from_slice(&9u64.to_le_bytes());
             assert_eq!(
