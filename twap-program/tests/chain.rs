@@ -18444,13 +18444,22 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     // Governance can update policy through the allowlist.
     let fee_data =
         percolator_prog::ix::Instruction::UpdateFeeRedirectPolicy { redirect_bps: 777 }.encode();
-    let fee =
-        build_controller_proxy_message(&squads_vault, &controller, &slab, &perc_id(), &fee_data);
+    let fee_witness = controller_market_generation_witness(&svm, &slab);
+    let fee = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &[],
+        &fee_witness,
+        &fee_data,
+    );
     let controller_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(fee_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -50159,16 +50168,28 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &surplus_donor.pubkey(),
         surplus,
     );
-    let bootstrap_policy = build_controller_proxy_message(
+    let bootstrap_policy_witness =
+        controller_market_generation_witness(&svm, &slab);
+    let bootstrap_policy = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &slab,
         &perc_id(),
+        &[],
+        &bootstrap_policy_witness,
         &PIx::UpdateFeeRedirectPolicy {
             redirect_bps: 2_000,
         }
         .encode(),
     );
+    let bootstrap_policy_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(bootstrap_policy_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
     squads_execute(
         &mut svm,
         &squads,
@@ -50177,7 +50198,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &payer,
         2,
         &bootstrap_policy,
-        &oracle_cfg_remaining,
+        &bootstrap_policy_remaining,
     )
     .expect("controller applies the governed bootstrap fee policy");
 
