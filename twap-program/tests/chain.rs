@@ -65272,7 +65272,7 @@ fn run_presigned_convert_retry(submit_retry: bool) -> PresignedConvertRetryOutco
 }
 
 #[test]
-#[ignore = "RED on pinned percolator-prog: signed conversion intents need a one-shot action nonce"]
+#[ignore = "upstream percolator-prog#387: conversion intents need a one-shot action nonce"]
 fn e2e_public_presigned_convert_retry_cannot_fund_a_second_cranker_reward() {
     let control = run_presigned_convert_retry(false);
     let retry = run_presigned_convert_retry(true);
