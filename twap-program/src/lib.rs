@@ -77,6 +77,8 @@ const DONATION_NONCE_SEED: &[u8] = b"donation-nonce";
 const DONATION_NONCE_DISC: [u8; 8] = *b"DONNONC1";
 const BID_NONCE_SEED: &[u8] = b"bid-nonce";
 const BID_NONCE_DISC: [u8; 8] = *b"BIDNONC1";
+const SHUTDOWN_NONCE_SEED: &[u8] = b"shutdown-nonce";
+const SHUTDOWN_NONCE_DISC: [u8; 8] = *b"SHDNONC1";
 const ACTION_NONCE_SIZE: usize = 80;
 
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
@@ -272,6 +274,13 @@ pub fn donation_nonce_address(config: &Pubkey, donor: &Pubkey) -> (Pubkey, u8) {
 pub fn bid_nonce_address(book: &Pubkey, bidder: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[BID_NONCE_SEED, book.as_ref(), bidder.as_ref()],
+        &id(),
+    )
+}
+
+pub fn shutdown_nonce_address(config: &Pubkey, holding: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[SHUTDOWN_NONCE_SEED, config.as_ref(), holding.as_ref()],
         &id(),
     )
 }
@@ -4975,24 +4984,29 @@ fn process_cancel_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]
     Ok(())
 }
 
-// shutdown accounts: [squads_vault(signer), config, twap_authority(pda), holding(w), dest(w),
-//   token_program]
+// shutdown accounts: [squads_vault(writable signer/payer), config, twap_authority(pda),
+//   shutdown_nonce(w), holding(w), dest(w), token_program, system_program]
 //
 // Squads-vault-gated wind-down: sweep ALL of the TWAP's accumulated USD (the unspent buy/burn
 // budget in the holding) to a DAO-supplied destination. The TWAP normally KEEPS its dollars and
-// adds more each round; this is the only path that takes them back out.
+// adds more each round; this is the only path that takes them back out. The per-holding nonce makes
+// independently approved delayed sweeps mutually exclusive: a correction that lands first
+// permanently invalidates an older action, even if the holding later refills to the same balance.
 fn process_shutdown(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let twap_authority = next_account_info(iter)?;
+    let shutdown_nonce = next_account_info(iter)?;
     let holding = next_account_info(iter)?;
     let dest = next_account_info(iter)?;
     let token_program = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
-    if !data.is_empty() {
+    if data.len() != 8 {
         return Err(ProgramError::InvalidInstructionData);
     }
+    let expected_nonce = u64::from_le_bytes(data.try_into().unwrap());
     if *token_program.key != spl_token::ID {
         return Err(ProgramError::IncorrectProgramId);
     }
@@ -5016,6 +5030,17 @@ fn process_shutdown(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) 
     if dd.mint != h.mint {
         return Err(ProgramError::InvalidAccountData);
     }
+    consume_action_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        holding,
+        shutdown_nonce,
+        system_program,
+        expected_nonce,
+        SHUTDOWN_NONCE_SEED,
+        &SHUTDOWN_NONCE_DISC,
+    )?;
     if h.amount > 0 {
         spl_transfer(
             token_program,

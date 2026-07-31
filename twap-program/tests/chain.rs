@@ -32380,29 +32380,72 @@ fn build_shutdown_message(
     holding: &Pubkey,
     dest: &Pubkey,
 ) -> Vec<u8> {
+    build_shutdown_message_with_nonce(
+        squads_vault,
+        config,
+        twap_authority,
+        holding,
+        dest,
+        0,
+    )
+}
+
+fn build_shutdown_message_with_nonce(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    holding: &Pubkey,
+    dest: &Pubkey,
+    expected_nonce: u64,
+) -> Vec<u8> {
+    let shutdown_nonce = twap_program::shutdown_nonce_address(config, holding).0;
     let mut m = Vec::new();
     m.push(1);
-    m.push(0);
-    m.push(2);
-    m.push(7);
-    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
-    m.extend_from_slice(holding.as_ref()); // 1 w
-    m.extend_from_slice(dest.as_ref()); // 2 w
-    m.extend_from_slice(config.as_ref()); // 3 ro
-    m.extend_from_slice(twap_authority.as_ref()); // 4 ro
-    m.extend_from_slice(spl_token::ID.as_ref()); // 5 ro token program
-    m.extend_from_slice(twap_id().as_ref()); // 6 program
     m.push(1);
-    m.push(6);
-    m.push(6);
-    for i in [0u8, 3, 4, 1, 2, 5] {
+    m.push(3);
+    m.push(9);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 writable signer/payer
+    m.extend_from_slice(shutdown_nonce.as_ref()); // 1 w
+    m.extend_from_slice(holding.as_ref()); // 2 w
+    m.extend_from_slice(dest.as_ref()); // 3 w
+    m.extend_from_slice(config.as_ref()); // 4 ro
+    m.extend_from_slice(twap_authority.as_ref()); // 5 ro
+    m.extend_from_slice(spl_token::ID.as_ref()); // 6 ro token program
+    m.extend_from_slice(system_program::ID.as_ref()); // 7 ro system program
+    m.extend_from_slice(twap_id().as_ref()); // 8 program
+    m.push(1);
+    m.push(8);
+    m.push(8);
+    for i in [0u8, 4, 5, 1, 2, 3, 6, 7] {
         m.push(i);
     }
-    let data = [11u8];
+    let mut data = vec![11u8];
+    data.extend_from_slice(&expected_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn shutdown_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    holding: &Pubkey,
+    dest: &Pubkey,
+) -> Vec<AccountMeta> {
+    let shutdown_nonce = twap_program::shutdown_nonce_address(config, holding).0;
+    vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(shutdown_nonce, false),
+        AccountMeta::new(*holding, false),
+        AccountMeta::new(*dest, false),
+        AccountMeta::new_readonly(*config, false),
+        AccountMeta::new_readonly(*twap_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
 }
 
 // A Squads vault-transaction message that flips the book to SEND (buyback) mode and pins the COIN
@@ -36524,17 +36567,23 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
     svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let dest = Pubkey::new_unique();
     set_token(&mut svm, &dest, &env.collateral_mint, &payer.pubkey(), 0);
+    let shutdown_nonce =
+        twap_program::shutdown_nonce_address(&env.twap_cfg, &bk.holding).0;
+    let mut rogue_data = vec![11u8];
+    rogue_data.extend_from_slice(&0u64.to_le_bytes());
     let rogue = Instruction {
         program_id: twap_id(),
         accounts: vec![
             AccountMeta::new(attacker.pubkey(), true),
             AccountMeta::new_readonly(env.twap_cfg, false),
             AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new(shutdown_nonce, false),
             AccountMeta::new(bk.holding, false),
             AccountMeta::new(dest, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
-        data: vec![11u8],
+        data: rogue_data,
     };
     assert!(
         send(&mut svm, &[&attacker], rogue).is_err(),
@@ -36554,15 +36603,13 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
         &bk.holding,
         &dest,
     );
-    let rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.holding, false),
-        AccountMeta::new(dest, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rem = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.holding,
+        &dest,
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36588,15 +36635,13 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
         &savings,
         &dest,
     );
-    let savings_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(savings, false),
-        AccountMeta::new(dest, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let savings_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &savings,
+        &dest,
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36693,15 +36738,13 @@ fn e2e_dao_shutdown_cannot_confiscate_winners_parked_settlement_usd() {
         &bk.settlement_usd,
         &dest,
     );
-    let rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.settlement_usd, false),
-        AccountMeta::new(dest, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rem = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.settlement_usd,
+        &dest,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -40329,15 +40372,13 @@ fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
         &bk.coin_escrow,
         &thief_coin,
     );
-    let r1 = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.coin_escrow, false),
-        AccountMeta::new(thief_coin, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let r1 = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.coin_escrow,
+        &thief_coin,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -40375,15 +40416,13 @@ fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
         &bk.settlement_usd,
         &thief_usd,
     );
-    let r2 = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.settlement_usd, false),
-        AccountMeta::new(thief_usd, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let r2 = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.settlement_usd,
+        &thief_usd,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -66251,6 +66290,358 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
         token_amount(&svm, &book.settlement_usd),
         auction_budget,
         "the fixed policy does not impede the public auction",
+    );
+}
+
+// PUBLIC LOF: shutdown sweeps are delayed Squads actions, but the swept holding can refill through
+// later permissionless auction rounds. Executing a correction first must permanently invalidate an
+// older sweep; otherwise an untrusted executor can wait for independent insurance to refill the
+// holding, then route those new dollars to the obsolete destination.
+#[test]
+fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+
+    let market_id = read_asset0_market_id(&svm, &env.slab);
+    let first_donor = Keypair::new();
+    svm.airdrop(&first_donor.pubkey(), 1_000_000_000)
+        .unwrap();
+    let first_donation = 400_000u64;
+    let first_source = Pubkey::new_unique();
+    let first_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &first_source,
+        &env.collateral_mint,
+        &first_donor.pubkey(),
+        first_donation,
+    );
+    set_token(
+        &mut svm,
+        &first_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&first_donor],
+        twap_donate_insurance_ix_with_nonce(
+            &first_donor.pubkey(),
+            &env.twap_cfg,
+            &env.twap_authority,
+            &first_source,
+            &first_holding,
+            &env.slab,
+            &env.perc_vault,
+            first_donation,
+            market_id,
+            0,
+        ),
+    )
+    .expect("the first independent donor funds canonical insurance");
+
+    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &floor,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("governance marks the donation as protocol surplus");
+    let book = setup_auction_at_index(&mut svm, &payer, &env, 6, 10, 0, None, 0);
+
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    let first_round_end = {
+        let account = svm.get_account(&book.book).unwrap();
+        u64::from_le_bytes(account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, first_round_end);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            None,
+        ),
+    )
+    .expect("the first permissionless round fills the canonical holding");
+    let first_budget = first_donation * 8 / 10;
+    assert_eq!(token_amount(&svm, &book.holding), first_budget);
+
+    let obsolete_destination = Pubkey::new_unique();
+    let corrected_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &obsolete_destination,
+        &env.collateral_mint,
+        &env.dao.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &corrected_destination,
+        &env.collateral_mint,
+        &env.squads_vault,
+        0,
+    );
+    let stale_message = build_shutdown_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &obsolete_destination,
+    );
+    let correction_message = build_shutdown_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+    );
+    let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
+        let transaction = transaction_pda(&env.squads, &env.multisig, index);
+        let proposal = proposal_pda(&env.squads, &env.multisig, index);
+        for instruction in [
+            vault_transaction_create_ix(
+                &env.squads,
+                &env.multisig,
+                &transaction,
+                &env.dao.pubkey(),
+                message,
+            ),
+            proposal_create_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+                index,
+            ),
+            proposal_approve_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+            ),
+        ] {
+            send(svm, &[&env.dao], instruction).expect("queue approved shutdown action");
+        }
+        (transaction, proposal)
+    };
+    let (stale_transaction, stale_proposal) = queue(&mut svm, 7, &stale_message);
+    let (correction_transaction, correction_proposal) =
+        queue(&mut svm, 8, &correction_message);
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar(&clock);
+
+    let correction_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+    );
+    send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &correction_proposal,
+            &correction_transaction,
+            &env.dao.pubkey(),
+            &correction_remaining,
+        ),
+    )
+    .expect("execute the corrected shutdown destination first");
+    assert_eq!(token_amount(&svm, &book.holding), 0);
+    assert_eq!(
+        token_amount(&svm, &corrected_destination),
+        first_budget,
+    );
+
+    let second_donor = Keypair::new();
+    svm.airdrop(&second_donor.pubkey(), 1_000_000_000)
+        .unwrap();
+    let second_donation = 400_000u64;
+    let second_source = Pubkey::new_unique();
+    let second_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &second_source,
+        &env.collateral_mint,
+        &second_donor.pubkey(),
+        second_donation,
+    );
+    set_token(
+        &mut svm,
+        &second_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    send(
+        &mut svm,
+        &[&second_donor],
+        twap_donate_insurance_ix_with_nonce(
+            &second_donor.pubkey(),
+            &env.twap_cfg,
+            &env.twap_authority,
+            &second_source,
+            &second_holding,
+            &env.slab,
+            &env.perc_vault,
+            second_donation,
+            market_id,
+            0,
+        ),
+    )
+    .expect("a second independent donor refills canonical insurance");
+    let second_round_end = {
+        let account = svm.get_account(&book.book).unwrap();
+        u64::from_le_bytes(account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, second_round_end);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            None,
+        ),
+    )
+    .expect("the later permissionless round refills the canonical holding");
+    let second_budget = second_donation * 8 / 10;
+    assert_eq!(token_amount(&svm, &book.holding), second_budget);
+
+    let holding_before_replay = svm.get_account(&book.holding).unwrap();
+    let stale_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &obsolete_destination,
+    );
+    let replay = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &stale_transaction,
+            &env.dao.pubkey(),
+            &stale_remaining,
+        ),
+    );
+    if replay.is_ok() {
+        assert_eq!(
+            token_amount(&svm, &obsolete_destination),
+            second_budget,
+            "the stale sweep captured only the independently funded refill",
+        );
+        panic!(
+            "an older approved shutdown swept {second_budget} newly accumulated collateral to its obsolete destination",
+        );
+    }
+    assert_eq!(
+        svm.get_account(&book.holding).unwrap(),
+        holding_before_replay,
+        "rejecting the stale sweep leaves the canonical holding byte-identical",
+    );
+    assert_eq!(token_amount(&svm, &obsolete_destination), 0);
+
+    let next_round_end = {
+        let account = svm.get_account(&book.book).unwrap();
+        u64::from_le_bytes(account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, next_round_end);
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            None,
+        ),
+    )
+    .expect("rejecting the stale sweep does not impede the next permissionless round");
+    assert_eq!(token_amount(&svm, &book.holding), second_budget);
+
+    let next_shutdown = build_shutdown_message_with_nonce(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+        1,
+    );
+    let next_shutdown_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        9,
+        &next_shutdown,
+        &next_shutdown_remaining,
+    )
+    .expect("a newly approved sweep advances through the next holding nonce");
+    assert_eq!(token_amount(&svm, &book.holding), 0);
+    assert_eq!(
+        token_amount(&svm, &corrected_destination),
+        first_budget + second_budget,
     );
 }
 
