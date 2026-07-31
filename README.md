@@ -386,6 +386,10 @@ escrow transfer can move. If a freezable collateral issuer freezes the canonical
 placement, claims, eviction refunds, and owner cancellations may instead use a clean account for the
 same mint owned solely by the recorded bidder. Delegates and close authorities are rejected at payout,
 so a cranker can recover liveness but cannot change the beneficiary or expose the refund to a spender.
+TWAP wind-down can sweep only a token account owned by the config-bound TWAP authority to a same-mint
+destination through Squads. Every `(config, holding)` sweep consumes a monotonic action nonce, so a
+later correction that executes first permanently invalidates an older approved sweep even if a public
+auction subsequently refills that holding. The sweep cannot reach book escrow or settled user payouts.
 
 ## Authority Model
 

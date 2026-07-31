@@ -32380,29 +32380,72 @@ fn build_shutdown_message(
     holding: &Pubkey,
     dest: &Pubkey,
 ) -> Vec<u8> {
+    build_shutdown_message_with_nonce(
+        squads_vault,
+        config,
+        twap_authority,
+        holding,
+        dest,
+        0,
+    )
+}
+
+fn build_shutdown_message_with_nonce(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    holding: &Pubkey,
+    dest: &Pubkey,
+    expected_nonce: u64,
+) -> Vec<u8> {
+    let shutdown_nonce = twap_program::shutdown_nonce_address(config, holding).0;
     let mut m = Vec::new();
     m.push(1);
-    m.push(0);
-    m.push(2);
-    m.push(7);
-    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
-    m.extend_from_slice(holding.as_ref()); // 1 w
-    m.extend_from_slice(dest.as_ref()); // 2 w
-    m.extend_from_slice(config.as_ref()); // 3 ro
-    m.extend_from_slice(twap_authority.as_ref()); // 4 ro
-    m.extend_from_slice(spl_token::ID.as_ref()); // 5 ro token program
-    m.extend_from_slice(twap_id().as_ref()); // 6 program
     m.push(1);
-    m.push(6);
-    m.push(6);
-    for i in [0u8, 3, 4, 1, 2, 5] {
+    m.push(3);
+    m.push(9);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 writable signer/payer
+    m.extend_from_slice(shutdown_nonce.as_ref()); // 1 w
+    m.extend_from_slice(holding.as_ref()); // 2 w
+    m.extend_from_slice(dest.as_ref()); // 3 w
+    m.extend_from_slice(config.as_ref()); // 4 ro
+    m.extend_from_slice(twap_authority.as_ref()); // 5 ro
+    m.extend_from_slice(spl_token::ID.as_ref()); // 6 ro token program
+    m.extend_from_slice(system_program::ID.as_ref()); // 7 ro system program
+    m.extend_from_slice(twap_id().as_ref()); // 8 program
+    m.push(1);
+    m.push(8);
+    m.push(8);
+    for i in [0u8, 4, 5, 1, 2, 3, 6, 7] {
         m.push(i);
     }
-    let data = [11u8];
+    let mut data = vec![11u8];
+    data.extend_from_slice(&expected_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn shutdown_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    holding: &Pubkey,
+    dest: &Pubkey,
+) -> Vec<AccountMeta> {
+    let shutdown_nonce = twap_program::shutdown_nonce_address(config, holding).0;
+    vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(shutdown_nonce, false),
+        AccountMeta::new(*holding, false),
+        AccountMeta::new(*dest, false),
+        AccountMeta::new_readonly(*config, false),
+        AccountMeta::new_readonly(*twap_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
 }
 
 // A Squads vault-transaction message that flips the book to SEND (buyback) mode and pins the COIN
@@ -36524,17 +36567,23 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
     svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let dest = Pubkey::new_unique();
     set_token(&mut svm, &dest, &env.collateral_mint, &payer.pubkey(), 0);
+    let shutdown_nonce =
+        twap_program::shutdown_nonce_address(&env.twap_cfg, &bk.holding).0;
+    let mut rogue_data = vec![11u8];
+    rogue_data.extend_from_slice(&0u64.to_le_bytes());
     let rogue = Instruction {
         program_id: twap_id(),
         accounts: vec![
             AccountMeta::new(attacker.pubkey(), true),
             AccountMeta::new_readonly(env.twap_cfg, false),
             AccountMeta::new_readonly(env.twap_authority, false),
+            AccountMeta::new(shutdown_nonce, false),
             AccountMeta::new(bk.holding, false),
             AccountMeta::new(dest, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
-        data: vec![11u8],
+        data: rogue_data,
     };
     assert!(
         send(&mut svm, &[&attacker], rogue).is_err(),
@@ -36554,15 +36603,13 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
         &bk.holding,
         &dest,
     );
-    let rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.holding, false),
-        AccountMeta::new(dest, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rem = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.holding,
+        &dest,
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36588,15 +36635,13 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
         &savings,
         &dest,
     );
-    let savings_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(savings, false),
-        AccountMeta::new(dest, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let savings_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &savings,
+        &dest,
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36693,15 +36738,13 @@ fn e2e_dao_shutdown_cannot_confiscate_winners_parked_settlement_usd() {
         &bk.settlement_usd,
         &dest,
     );
-    let rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.settlement_usd, false),
-        AccountMeta::new(dest, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rem = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.settlement_usd,
+        &dest,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -40329,15 +40372,13 @@ fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
         &bk.coin_escrow,
         &thief_coin,
     );
-    let r1 = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.coin_escrow, false),
-        AccountMeta::new(thief_coin, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let r1 = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.coin_escrow,
+        &thief_coin,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -40375,15 +40416,13 @@ fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
         &bk.settlement_usd,
         &thief_usd,
     );
-    let r2 = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.settlement_usd, false),
-        AccountMeta::new(thief_usd, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let r2 = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &bk.settlement_usd,
+        &thief_usd,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -66428,15 +66467,13 @@ fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
     clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar(&clock);
 
-    let correction_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(book.holding, false),
-        AccountMeta::new(corrected_destination, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let correction_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+    );
     send(
         &mut svm,
         &[&env.dao],
@@ -66517,15 +66554,13 @@ fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
     assert_eq!(token_amount(&svm, &book.holding), second_budget);
 
     let holding_before_replay = svm.get_account(&book.holding).unwrap();
-    let stale_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(book.holding, false),
-        AccountMeta::new(obsolete_destination, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(spl_token::ID, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let stale_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &obsolete_destination,
+    );
     let replay = send(
         &mut svm,
         &[&env.dao],
@@ -66576,6 +66611,38 @@ fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
     )
     .expect("rejecting the stale sweep does not impede the next permissionless round");
     assert_eq!(token_amount(&svm, &book.holding), second_budget);
+
+    let next_shutdown = build_shutdown_message_with_nonce(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+        1,
+    );
+    let next_shutdown_remaining = shutdown_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &book.holding,
+        &corrected_destination,
+    );
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        9,
+        &next_shutdown,
+        &next_shutdown_remaining,
+    )
+    .expect("a newly approved sweep advances through the next holding nonce");
+    assert_eq!(token_amount(&svm, &book.holding), 0);
+    assert_eq!(
+        token_amount(&svm, &corrected_destination),
+        first_budget + second_budget,
+    );
 }
 
 // PUBLIC DOS PROBE: a finite backing bucket can lapse while an account still has
