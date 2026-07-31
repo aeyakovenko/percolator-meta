@@ -18444,13 +18444,22 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     // Governance can update policy through the allowlist.
     let fee_data =
         percolator_prog::ix::Instruction::UpdateFeeRedirectPolicy { redirect_bps: 777 }.encode();
-    let fee =
-        build_controller_proxy_message(&squads_vault, &controller, &slab, &perc_id(), &fee_data);
+    let fee_witness = controller_market_generation_witness(&svm, &slab);
+    let fee = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &[],
+        &fee_witness,
+        &fee_data,
+    );
     let controller_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(fee_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
     squads_execute(
@@ -50159,16 +50168,28 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &surplus_donor.pubkey(),
         surplus,
     );
-    let bootstrap_policy = build_controller_proxy_message(
+    let bootstrap_policy_witness =
+        controller_market_generation_witness(&svm, &slab);
+    let bootstrap_policy = build_controller_generation_proxy_message(
         &squads_vault,
         &controller,
         &slab,
         &perc_id(),
+        &[],
+        &bootstrap_policy_witness,
         &PIx::UpdateFeeRedirectPolicy {
             redirect_bps: 2_000,
         }
         .encode(),
     );
+    let bootstrap_policy_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(slab, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(bootstrap_policy_witness, false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
     squads_execute(
         &mut svm,
         &squads,
@@ -50177,7 +50198,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &payer,
         2,
         &bootstrap_policy,
-        &oracle_cfg_remaining,
+        &bootstrap_policy_remaining,
     )
     .expect("controller applies the governed bootstrap fee policy");
 
@@ -63218,6 +63239,846 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         "both cleanup cycles move only fee atoms and preserve all remaining trader capital"
     );
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
+}
+
+// CROSS-GENERATION PUBLIC LOF: a Squads proposal approved for generation A must not
+// redirect generation-B user fees into source domains that an unprivileged winner
+// can consume. The controller, rather than the attacker, remains the insurance
+// operator throughout; extraction happens only through ordinary public settlement.
+#[test]
+fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const ASSET_INDEX: u16 = 1;
+    const INITIAL_PRICE: u64 = 100;
+    const VICTIM_DEPOSIT: u64 = 10_000;
+    const ROUND_TRIP_Q: i128 = 10 * percolator::POS_SCALE as i128;
+    const CYCLE_Q: i128 = 3 * percolator::POS_SCALE as i128;
+    const COALITION_DEPOSIT: u64 = 1_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000_000)
+        .unwrap();
+    let squads = squads_id();
+    let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+    let dao = Keypair::new();
+    svm.airdrop(&dao.pubkey(), 1_000_000_000_000).unwrap();
+    let create_key = Keypair::new();
+    let multisig = multisig_pda(&squads, &create_key.pubkey());
+    send(
+        &mut svm,
+        &[&payer, &create_key],
+        multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&dao.pubkey()),
+            1,
+            &[(dao.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        ),
+    )
+    .expect("initialize the real Squads governance instance");
+    let squads_vault = vault_pda(&squads, &multisig, 0);
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_key = market.pubkey();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let expanded_market_len =
+        percolator_prog::state::market_account_len_for_capacity(2).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(expanded_market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_key,
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate a production-shaped two-asset slab");
+    let controller = controller_pda(&squads_vault, &market_key, &perc_id());
+    let mut init_data = vec![1u8]; // controller IX_INIT_MARKET
+    init_data.extend_from_slice(
+        &PIx::InitMarket {
+            max_portfolio_assets: 1,
+            h_min: 0,
+            h_max: 10,
+            initial_price: INITIAL_PRICE,
+            min_nonzero_mm_req: 1,
+            min_nonzero_im_req: 2,
+            maintenance_margin_bps: 10_000,
+            initial_margin_bps: 10_000,
+            max_trading_fee_bps: 10_000,
+            trade_fee_base_bps: 10_000,
+            liquidation_fee_bps: 0,
+            liquidation_fee_cap: 0,
+            min_liquidation_abs: 0,
+            max_price_move_bps_per_slot: 10_000,
+            max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 1,
+            max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1,
+            max_bankrupt_close_lifetime_slots: 100,
+            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+            maintenance_fee_per_slot: 0,
+        }
+        .encode(),
+    );
+    send(
+        &mut svm,
+        &[&payer, &market],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(payer.pubkey(), true),
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, true),
+                AccountMeta::new_readonly(collateral_mint, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market_key, &perc_id()),
+                    false,
+                ),
+            ],
+            data: init_data,
+        },
+    )
+    .expect("permissionlessly initialize the controller-owned market");
+
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+
+    let generation_remaining = |witness: Pubkey| {
+        vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ]
+    };
+
+    let market_witness = controller_market_generation_witness(&svm, &market_key);
+    let resolve_policy = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &market_witness,
+        &PIx::ConfigurePermissionlessResolve {
+            stale_slots: 1_000,
+            force_close_delay_slots: 1,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        1,
+        &resolve_policy,
+        &generation_remaining(market_witness),
+    )
+    .expect("configure a bounded one-slot shutdown delay");
+
+    let market_witness = controller_market_generation_witness(&svm, &market_key);
+    let protected_redirect = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &market_witness,
+        &PIx::UpdateFeeRedirectPolicy {
+            redirect_bps: 10_000,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        2,
+        &protected_redirect,
+        &generation_remaining(market_witness),
+    )
+    .expect("route generation-A secondary fees to canonical market-0 insurance");
+
+    let oracle = Keypair::new();
+    svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    let empty_asset_witness =
+        market_controller_program::asset_generation_witness_address(&market_key, ASSET_INDEX, 0).0;
+    let activate = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &empty_asset_witness,
+        &PIx::UpdateAssetLifecycle {
+            action: 0,
+            asset_index: ASSET_INDEX,
+            now_slot: 100,
+            initial_price: INITIAL_PRICE,
+            insurance_authority: controller.to_bytes(),
+            insurance_operator: controller.to_bytes(),
+            backing_bucket_authority: controller.to_bytes(),
+            oracle_authority: oracle.pubkey().to_bytes(),
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        3,
+        &activate,
+        &generation_remaining(empty_asset_witness),
+    )
+    .expect("activate a controller-backed secondary asset");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: ASSET_INDEX,
+                now_slot: 100,
+                initial_mark_e6: INITIAL_PRICE,
+            },
+        ),
+    )
+    .expect("the independent oracle configures generation A");
+
+    // Queue and approve, but do not execute, a generation-A redirect to the local asset.
+    let stale_transaction_index = 4u64;
+    let stale_transaction = transaction_pda(&squads, &multisig, stale_transaction_index);
+    let stale_proposal = proposal_pda(&squads, &multisig, stale_transaction_index);
+    let stale_witness = controller_market_generation_witness(&svm, &market_key);
+    let stale_message = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &stale_witness,
+        &PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 }.encode(),
+    );
+    for instruction in [
+        vault_transaction_create_ix(
+            &squads,
+            &multisig,
+            &stale_transaction,
+            &dao.pubkey(),
+            &stale_message,
+        ),
+        proposal_create_ix(
+            &squads,
+            &multisig,
+            &stale_proposal,
+            &dao.pubkey(),
+            stale_transaction_index,
+        ),
+        proposal_approve_ix(&squads, &multisig, &stale_proposal, &dao.pubkey()),
+    ] {
+        send(&mut svm, &[&dao], instruction).expect("approve the generation-A redirect");
+    }
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar(&clock);
+
+    let generation_a_asset_id =
+        percolator_accounting::read_asset_market_id(
+            &svm.get_account(&market_key).unwrap().data,
+            ASSET_INDEX as usize,
+        )
+        .unwrap();
+    let asset_witness = market_controller_program::asset_generation_witness_address(
+        &market_key,
+        ASSET_INDEX,
+        generation_a_asset_id,
+    )
+    .0;
+    let shutdown_slot = svm.get_sysvar::<Clock>().slot;
+    let shutdown = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &asset_witness,
+        &PIx::UpdateAssetLifecycle {
+            action: 3,
+            asset_index: ASSET_INDEX,
+            now_slot: shutdown_slot,
+            initial_price: 0,
+            insurance_authority: [0; 32],
+            insurance_operator: [0; 32],
+            backing_bucket_authority: [0; 32],
+            oracle_authority: [0; 32],
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        5,
+        &shutdown,
+        &generation_remaining(asset_witness),
+    )
+    .expect("shut down the empty generation-A asset");
+
+    warp_to(&mut svm, shutdown_slot + 1);
+    let restart_slot = svm.get_sysvar::<Clock>().slot;
+    let restart = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &asset_witness,
+        &PIx::RestartAssetOracle {
+            asset_index: ASSET_INDEX,
+            now_slot: restart_slot,
+            initial_price: INITIAL_PRICE,
+        }
+        .encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        6,
+        &restart,
+        &generation_remaining(asset_witness),
+    )
+    .expect("restart the empty asset as generation B");
+    let current_witness = controller_market_generation_witness(&svm, &market_key);
+    assert_ne!(stale_witness, current_witness);
+
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: ASSET_INDEX,
+                now_slot: restart_slot,
+                initial_mark_e6: INITIAL_PRICE,
+            },
+        ),
+    )
+    .expect("the independent oracle configures generation B");
+
+    let market_before_replay = svm.get_account(&market_key).unwrap();
+    let replay = send(
+        &mut svm,
+        &[&dao],
+        vault_transaction_execute_ix(
+            &squads,
+            &multisig,
+            &stale_proposal,
+            &stale_transaction,
+            &dao.pubkey(),
+            &generation_remaining(stale_witness),
+        ),
+    );
+    let replay_succeeded = replay.is_ok();
+    if !replay_succeeded {
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_before_replay,
+            "a rejected stale redirect leaves generation B byte-identical",
+        );
+    }
+
+    let victim = Keypair::new();
+    let flat_counterparty = Keypair::new();
+    let long_winner = Keypair::new();
+    let short_loser = Keypair::new();
+    for owner in [
+        &victim,
+        &flat_counterparty,
+        &long_winner,
+        &short_loser,
+    ] {
+        svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    }
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let mut create_portfolio = |owner: &Keypair, deposit: u64| {
+        let portfolio = Keypair::new();
+        send(
+            &mut svm,
+            &[&payer, &portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate a generation-B portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a generation-B portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            deposit,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(deposit),
+                },
+            ),
+        )
+        .expect("deposit real collateral");
+        portfolio.pubkey()
+    };
+    let victim_portfolio = create_portfolio(&victim, VICTIM_DEPOSIT);
+    let flat_counterparty_portfolio =
+        create_portfolio(&flat_counterparty, VICTIM_DEPOSIT);
+    let long_winner_portfolio = create_portfolio(&long_winner, VICTIM_DEPOSIT);
+    let short_loser_portfolio = create_portfolio(&short_loser, COALITION_DEPOSIT);
+    let cranker_portfolio = create_portfolio(&payer, 1);
+
+    let trade = |svm: &mut LiteSVM,
+                 owner_a: &Keypair,
+                 portfolio_a: Pubkey,
+                 owner_b: &Keypair,
+                 portfolio_b: Pubkey,
+                 size_q: i128,
+                 price: u64| {
+        send(
+            svm,
+            &[&payer, owner_a, owner_b],
+            pix(
+                vec![
+                    AccountMeta::new(owner_a.pubkey(), true),
+                    AccountMeta::new(owner_b.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio_a, false),
+                    AccountMeta::new(portfolio_b, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: ASSET_INDEX,
+                    size_q,
+                    exec_price: price,
+                    fee_bps: 0,
+                },
+            ),
+        )
+    };
+    trade(
+        &mut svm,
+        &flat_counterparty,
+        flat_counterparty_portfolio,
+        &victim,
+        victim_portfolio,
+        ROUND_TRIP_Q,
+        INITIAL_PRICE,
+    )
+    .expect("the independent victim opens at the fair mark");
+    trade(
+        &mut svm,
+        &flat_counterparty,
+        flat_counterparty_portfolio,
+        &victim,
+        victim_portfolio,
+        -ROUND_TRIP_Q,
+        INITIAL_PRICE,
+    )
+    .expect("the independent victim closes flat at the same mark");
+    let capital = |svm: &LiteSVM, portfolio: Pubkey| {
+        percolator_prog::state::read_portfolio(&svm.get_account(&portfolio).unwrap().data)
+            .unwrap()
+            .capital
+            .get() as u64
+    };
+    assert_eq!(capital(&svm, victim_portfolio), 8_000);
+    assert_eq!(capital(&svm, flat_counterparty_portfolio), 8_000);
+    assert_eq!(capital(&svm, long_winner_portfolio), 10_000);
+    let routed_asset = if replay_succeeded { 1 } else { 0 };
+    assert_eq!(
+        read_asset_insurance_domains(&svm, &market_key, routed_asset),
+        [2_000, 2_000],
+        "the two flat trades charge each user exactly one fee on each side",
+    );
+    assert_eq!(
+        read_asset_insurance_remaining(&svm, &market_key, 1 - routed_asset),
+        0,
+    );
+
+    let mut withdraw_flat_user = |owner: &Keypair, portfolio: Pubkey| {
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount: 8_000 },
+            ),
+        )
+        .expect("a flat user recovers everything except the two charged fees");
+        destination
+    };
+    let victim_destination = withdraw_flat_user(&victim, victim_portfolio);
+    let flat_counterparty_destination =
+        withdraw_flat_user(&flat_counterparty, flat_counterparty_portfolio);
+
+    let zero_trade_fee = build_controller_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &PIx::UpdateTradeFeePolicy {
+            trade_fee_base_bps: 0,
+        }
+        .encode(),
+    );
+    let ordinary_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(market_key, false),
+        AccountMeta::new_readonly(controller, false),
+        AccountMeta::new_readonly(perc_id(), false),
+        AccountMeta::new_readonly(controller_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        7,
+        &zero_trade_fee,
+        &ordinary_remaining,
+    )
+    .expect("governance lowers the generation-B trade fee before the extraction probes");
+
+    trade(
+        &mut svm,
+        &long_winner,
+        long_winner_portfolio,
+        &short_loser,
+        short_loser_portfolio,
+        CYCLE_Q,
+        INITIAL_PRICE,
+    )
+    .expect("the first coalition opens a long winner against its own short loser");
+
+    let mut slot = svm.get_sysvar::<Clock>().slot + 1;
+    warp_to(&mut svm, slot);
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: ASSET_INDEX,
+                now_slot: slot,
+                mark_e6: 1_100,
+            },
+        ),
+    )
+    .expect("publish the first bounded adverse mark");
+    let effective_price = |svm: &LiteSVM| {
+        percolator_prog::state::read_market(&svm.get_account(&market_key).unwrap().data)
+            .unwrap()
+            .1
+            .assets[ASSET_INDEX as usize]
+            .effective_price
+    };
+    for _ in 0..8 {
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(cranker_portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: ASSET_INDEX,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("advance the first bounded mark");
+        if effective_price(&svm) == 1_100 {
+            break;
+        }
+        slot += 1;
+        warp_to(&mut svm, slot);
+    }
+    assert_eq!(effective_price(&svm), 1_100);
+    for _ in 0..8 {
+        for portfolio in [short_loser_portfolio, long_winner_portfolio] {
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new(market_key, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: slot,
+                        observations: vec![],
+                    },
+                ),
+            );
+        }
+    }
+    let active_bitmap_is_empty = |svm: &LiteSVM, portfolio: Pubkey| {
+        let state =
+            percolator_prog::state::read_portfolio(&svm.get_account(&portfolio).unwrap().data)
+                .unwrap();
+        percolator::active_bitmap_is_empty(
+            state.active_bitmap.map(percolator::V16PodU64::get),
+        )
+    };
+    for _ in 0..256 {
+        if active_bitmap_is_empty(&svm, long_winner_portfolio) {
+            break;
+        }
+        send(
+            &mut svm,
+            &[&payer, &long_winner],
+            pix(
+                vec![
+                    AccountMeta::new(long_winner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(long_winner_portfolio, false),
+                ],
+                PIx::ForfeitRecoveryLeg {
+                    asset_index: ASSET_INDEX,
+                    b_delta_budget: percolator::MAX_VAULT_TVL,
+                },
+            ),
+        )
+        .expect("the attacker advances its bounded recovery leg");
+    }
+    assert!(active_bitmap_is_empty(&svm, long_winner_portfolio));
+
+    let resolve_witness = controller_market_generation_witness(&svm, &market_key);
+    let resolve = build_controller_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market_key,
+        &perc_id(),
+        &[],
+        &resolve_witness,
+        &PIx::ResolveMarket.encode(),
+    );
+    squads_execute(
+        &mut svm,
+        &squads,
+        &multisig,
+        &dao,
+        &payer,
+        8,
+        &resolve,
+        &generation_remaining(resolve_witness),
+    )
+    .expect("resolve after every deterministic mark segment is committed");
+    let payout_slot = svm.get_sysvar::<Clock>().slot + 1;
+    warp_to(&mut svm, payout_slot);
+
+    let payout_actors = [
+        (&victim, victim_portfolio),
+        (&flat_counterparty, flat_counterparty_portfolio),
+        (&long_winner, long_winner_portfolio),
+        (&short_loser, short_loser_portfolio),
+        (&payer, cranker_portfolio),
+    ];
+    let mut destinations = Vec::new();
+    for (owner, _) in payout_actors {
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &owner.pubkey(),
+            0,
+        );
+        destinations.push(destination);
+    }
+    let payout = |owner: Pubkey, portfolio: Pubkey, destination: Pubkey, topup: bool| {
+        pix(
+            vec![
+                AccountMeta::new_readonly(owner, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            if topup {
+                PIx::ClaimResolvedPayoutTopup
+            } else {
+                PIx::CloseResolved {
+                    fee_rate_per_slot: 0,
+                }
+            },
+        )
+    };
+    for ((owner, portfolio), destination) in payout_actors.iter().zip(destinations.iter()) {
+        send(
+            &mut svm,
+            &[&payer],
+            payout(owner.pubkey(), *portfolio, *destination, false),
+        )
+        .expect("a public caller starts every resolved payout");
+    }
+    for _ in 0..16 {
+        for ((owner, portfolio), destination) in payout_actors.iter().zip(destinations.iter()) {
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                payout(owner.pubkey(), *portfolio, *destination, false),
+            );
+            let _ = send(
+                &mut svm,
+                &[&payer],
+                payout(owner.pubkey(), *portfolio, *destination, true),
+            );
+        }
+    }
+
+    assert_eq!(token_amount(&svm, &victim_destination), 8_000);
+    assert_eq!(
+        token_amount(&svm, &flat_counterparty_destination),
+        8_000
+    );
+    let attacker_payout = destinations[2..4]
+        .iter()
+        .map(|destination| u128::from(token_amount(&svm, destination)))
+        .sum::<u128>();
+    let resolved_payouts = destinations
+        .iter()
+        .map(|destination| token_amount(&svm, destination))
+        .collect::<Vec<_>>();
+    let asset_0_insurance = read_asset_insurance_remaining(&svm, &market_key, 0);
+    let asset_1_insurance = read_asset_insurance_remaining(&svm, &market_key, 1);
+    let vault_remaining = token_amount(&svm, &percolator_vault);
+    assert_eq!(token_amount(&svm, &destinations[4]), 1);
+    if replay_succeeded {
+        assert_eq!(attacker_payout, 12_999);
+        assert_eq!(asset_0_insurance, 0);
+        assert_eq!(asset_1_insurance, 2_000);
+        assert_eq!(vault_remaining, 2_001);
+        panic!(
+            "a generation-A redirect let a public winner extract 1,999 independent generation-B fee atoms",
+        );
+    }
+    assert_eq!(
+        attacker_payout, 10_999,
+        "without local fee insurance, the attacker can only recycle its own loser capital minus settlement dust: payouts={resolved_payouts:?}, asset0_insurance={asset_0_insurance}, asset1_insurance={asset_1_insurance}, vault={vault_remaining}",
+    );
+    assert_eq!(asset_0_insurance, 4_000);
+    assert_eq!(asset_1_insurance, 0);
+    assert_eq!(vault_remaining, 4_001);
 }
 
 #[derive(Clone, Copy, Debug)]
