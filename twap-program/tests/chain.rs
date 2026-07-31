@@ -36,6 +36,7 @@ enum PoolRestartScenario {
     RestartAfterPartialLossAbsentOwnerBuyback,
     CrossBackingRestartAfterLoss,
     CrossBackingRepeatRestartAfterLoss,
+    LiquidationRewardCannotConsumePrincipal,
 }
 
 #[test]
@@ -94,6 +95,11 @@ fn e2e_staged_cross_backing_survives_a_second_asset0_restart() {
     run_pool_restart_claim_scenario(PoolRestartScenario::CrossBackingRepeatRestartAfterLoss);
 }
 
+#[test]
+fn e2e_liquidation_cranker_reward_cannot_consume_owner_bound_insurance() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::LiquidationRewardCannotConsumePrincipal);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -107,13 +113,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::CrossBackingRepeatRestartAfterLoss;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
-    let owner_principal = if partial_owner_buyback || cross_backing {
+    let liquidation_reward =
+        scenario == PoolRestartScenario::LiquidationRewardCannotConsumePrincipal;
+    let owner_principal = if partial_owner_buyback || cross_backing || liquidation_reward {
         2u64
     } else {
         1
     };
-    let surviving_owner_claim = if partial_owner_buyback || cross_backing {
-        1u64
+    let surviving_owner_claim = if liquidation_reward {
+        owner_principal
+    } else if partial_owner_buyback || cross_backing {
+        1
     } else {
         0
     };
@@ -212,8 +222,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 initial_margin_bps: 5_000,
                 max_trading_fee_bps: 10_000,
                 trade_fee_base_bps: 0,
-                liquidation_fee_bps: 0,
-                liquidation_fee_cap: 0,
+                liquidation_fee_bps: if liquidation_reward { 100 } else { 0 },
+                liquidation_fee_cap: if liquidation_reward { 2 } else { 0 },
                 min_liquidation_abs: 0,
                 max_price_move_bps_per_slot: 4_900,
                 max_accrual_dt_slots: 1,
@@ -853,7 +863,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
-    for index in [3u64, 4] {
+    let policy_indices: &[u64] = if liquidation_reward { &[3] } else { &[3, 4] };
+    for &index in policy_indices {
         squads_execute(
             &mut svm,
             &squads,
@@ -865,6 +876,40 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &policy_remaining,
         )
         .expect("configure a full-surplus auction policy");
+    }
+    if liquidation_reward {
+        let configure_witness = controller_market_generation_witness(&svm, &market);
+        let configure_reward = build_controller_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market,
+            &perc_id(),
+            &[],
+            &configure_witness,
+            &PIx::UpdateLiquidationFeePolicy {
+                cranker_share_bps: 5_000,
+            }
+            .encode(),
+        );
+        let configure_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(configure_witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &dao,
+            &payer,
+            4,
+            &configure_reward,
+            &configure_remaining,
+        )
+        .expect("futarchy directs retained liquidation fees to the public cranker");
     }
     let handoff_env = HandoffEnv {
         squads,
@@ -996,7 +1041,14 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         "custody handoffs must preserve the authenticated-mark profile"
     );
     warp_to(&mut svm, 101);
-    let mark_message = build_push_auth_mark_message(&squads_vault, &market, &perc_id(), 101, 399);
+    let liquidation_mark = if liquidation_reward { 500 } else { 399 };
+    let mark_message = build_push_auth_mark_message(
+        &squads_vault,
+        &market,
+        &perc_id(),
+        101,
+        liquidation_mark,
+    );
     let mark_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
@@ -1035,7 +1087,10 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         )
         .expect("advance bounded mark");
     }
-    assert_eq!(read_asset0_effective_price(&svm, &market), 399);
+    assert_eq!(
+        read_asset0_effective_price(&svm, &market),
+        liquidation_mark,
+    );
 
     // PUBLIC LOF: another portfolio has fully advanced the market-level mark, but the exposed
     // loser still carries its pre-mark certificate. The pinned Percolator withdrawal gate does
@@ -1074,15 +1129,26 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     );
 
     for _ in 0..5 {
+        let crank_owner = if liquidation_reward {
+            &traders[2].0
+        } else {
+            &payer
+        };
+        let mut crank_accounts = vec![
+            AccountMeta::new(crank_owner.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(traders[0].1.pubkey(), false),
+        ];
+        let mut crank_signers = vec![&payer];
+        if liquidation_reward {
+            crank_accounts.push(AccountMeta::new(traders[2].1.pubkey(), false));
+            crank_signers.push(&traders[2].0);
+        }
         send(
             &mut svm,
-            &[&payer],
+            &crank_signers,
             pix(
-                vec![
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(traders[0].1.pubkey(), false),
-                ],
+                crank_accounts,
                 PIx::PermissionlessCrank {
                     now_slot: 102,
                     observations: vec![],
@@ -1091,12 +1157,112 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         )
         .expect("settle and liquidate the long");
     }
-    assert_eq!(protected_pool_value(&svm), u128::from(surviving_owner_claim));
+    assert_eq!(
+        protected_pool_value(&svm),
+        u128::from(surviving_owner_claim) + u128::from(liquidation_reward),
+    );
     let protected_loser = percolator_prog::state::read_portfolio(
         &svm.get_account(&traders[0].1.pubkey()).unwrap().data,
     )
     .unwrap();
-    assert_eq!(protected_loser.close_progress.insurance_spent.get(), 1);
+    assert_eq!(
+        protected_loser.close_progress.insurance_spent.get(),
+        if liquidation_reward { 0 } else { 1 },
+    );
+    if liquidation_reward {
+        let cranker = percolator_prog::state::read_portfolio(
+            &svm.get_account(&traders[2].1.pubkey()).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            cranker.capital.get(),
+            1,
+            "the 50/50 policy pays exactly one of the two retained fee atoms",
+        );
+        assert_eq!(
+            percolator_accounting::read_asset_insurance_spent(
+                &svm.get_account(&market).unwrap().data,
+                0,
+            )
+            .unwrap(),
+            [0, 0],
+            "a retained-fee payout cannot be charged to either insurance domain",
+        );
+    }
+
+    let settle_terminal = |svm: &mut LiteSVM| {
+        let resolve_witness = controller_market_generation_witness(svm, &market);
+        let resolve = build_controller_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market,
+            &perc_id(),
+            &[],
+            &resolve_witness,
+            &PIx::ResolveMarket.encode(),
+        );
+        let resolve_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(resolve_witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ];
+        squads_execute(
+            svm,
+            &squads,
+            &multisig,
+            &handoff_env.dao,
+            &payer,
+            7,
+            &resolve,
+            &resolve_remaining,
+        )
+        .expect("governance resolves through the constrained controller");
+        for (owner, portfolio) in &traders {
+            let destination = canonical_insurance_vault(&owner.pubkey(), &collateral);
+            set_token(svm, &destination, &collateral, &owner.pubkey(), 0);
+            send(
+                svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), false),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::CloseResolved {
+                        fee_rate_per_slot: 0,
+                    },
+                ),
+            )
+            .expect("any cranker settles a resolved portfolio");
+            send(
+                svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                    ],
+                    PIx::ClosePortfolio,
+                ),
+            )
+            .expect("each owner closes the fully settled portfolio");
+        }
+    };
+    let terminal_settled = if liquidation_reward {
+        settle_terminal(&mut svm);
+        true
+    } else {
+        false
+    };
 
     let mut direct_exit_accounts = vec![
         AccountMeta::new(depositor.pubkey(), true),
@@ -1120,7 +1286,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     ]);
     let direct_exit = Instruction {
         program_id: sub_id(),
-        accounts: direct_exit_accounts,
+        accounts: direct_exit_accounts.clone(),
         data: subledger_insurance_withdraw_data(&svm, &position, 1, 0),
     };
     let pool_before = svm.get_account(&pool).unwrap();
@@ -2021,12 +2187,40 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         return;
     }
 
-    send(
-        &mut svm,
-        &[&payer, &depositor],
-        owner_exit_ix(),
-    )
-        .expect("TWAP atomically returns custody and retires the fully impaired owner");
+    if terminal_settled {
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_to_subledger_ix(
+                &squads_vault,
+                &pool,
+                &market,
+                &twap_cfg,
+                &twap_authority,
+                &perc_id(),
+            ),
+        )
+        .expect("any cranker returns resolved-empty custody to the principal pool");
+        let mut finalized_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
+        finalized_exit_data.extend_from_slice(&owner_exit_witness);
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            Instruction {
+                program_id: sub_id(),
+                accounts: direct_exit_accounts,
+                data: finalized_exit_data,
+            },
+        )
+        .expect("the owner withdraws through the resolved principal-pool route");
+    } else {
+        send(
+            &mut svm,
+            &[&payer, &depositor],
+            owner_exit_ix(),
+        )
+        .expect("TWAP atomically returns custody and retires the owner claim");
+    }
     assert_eq!(
         u64::from_le_bytes(
             svm.get_account(&pool).unwrap().data[80..88]
@@ -2034,135 +2228,88 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 .unwrap()
         ),
         0,
-        "the authorized TWAP path retires the impaired principal"
+        "the authorized TWAP path retires the owner claim"
+    );
+    assert_eq!(
+        token_amount(&svm, &depositor_token),
+        surviving_owner_claim,
+        "the public cranker reward cannot reduce the owner's withdrawable claim",
     );
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
-        1,
+        u128::from(owner_principal),
         "the floor changes only when custody is publicly re-established"
     );
-    send(
-        &mut svm,
-        &[&payer],
-        Instruction {
-            program_id: sub_id(),
-            accounts: vec![
-                AccountMeta::new_readonly(squads_vault, false),
-                AccountMeta::new_readonly(pool, false),
-                AccountMeta::new(twap_cfg, false),
-                AccountMeta::new_readonly(twap_authority, false),
-                AccountMeta::new(market, false),
-                AccountMeta::new_readonly(perc_id(), false),
-                AccountMeta::new_readonly(twap_id(), false),
-            ],
-            data: vec![8u8], // IX_HANDOFF_TO_TWAP
-        },
-    )
-    .expect("any cranker re-hands the now-empty pool to TWAP");
+    if terminal_settled {
+        squads_execute(
+            &mut svm,
+            &squads,
+            &multisig,
+            &handoff_env.dao,
+            &payer,
+            8,
+            &handoff,
+            &handoff_remaining,
+        )
+        .expect("governance re-hands the resolved-empty pool to TWAP");
+    } else {
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: sub_id(),
+                accounts: vec![
+                    AccountMeta::new_readonly(squads_vault, false),
+                    AccountMeta::new_readonly(pool, false),
+                    AccountMeta::new(twap_cfg, false),
+                    AccountMeta::new_readonly(twap_authority, false),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new_readonly(twap_id(), false),
+                ],
+                data: vec![8u8], // IX_HANDOFF_TO_TWAP
+            },
+        )
+        .expect("any cranker re-hands the now-empty pool to TWAP");
+    }
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
         0,
         "re-handoff removes exactly the retired owner's floor component"
     );
 
-    let donor = Keypair::new();
-    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
-    let donor_source = Pubkey::new_unique();
-    let donation_holding = Pubkey::new_unique();
-    set_token(&mut svm, &donor_source, &collateral, &donor.pubkey(), 1);
-    set_token(
-        &mut svm,
-        &donation_holding,
-        &collateral,
-        &twap_authority,
-        0,
-    );
-    let donation_market_id = read_asset0_market_id(&svm, &market);
-    send(
-        &mut svm,
-        &[&payer, &donor],
-        donate_insurance_ix(
-            &donor.pubkey(),
-            &handoff_env,
-            &donor_source,
-            &donation_holding,
-            1,
-            donation_market_id,
-        ),
-    )
-    .expect("a public donor adds one post-loss fee-surplus atom");
-    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
-
-    let resolve_witness = controller_market_generation_witness(&svm, &market);
-    let resolve = build_controller_generation_proxy_message(
-        &squads_vault,
-        &controller,
-        &market,
-        &perc_id(),
-        &[],
-        &resolve_witness,
-        &PIx::ResolveMarket.encode(),
-    );
-    let resolve_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(market, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(resolve_witness, false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    squads_execute(
-        &mut svm,
-        &squads,
-        &multisig,
-        &handoff_env.dao,
-        &payer,
-        7,
-        &resolve,
-        &resolve_remaining,
-    )
-    .expect("governance resolves through the constrained controller after the public loss");
-    for (owner, portfolio) in &traders {
-        let destination = canonical_insurance_vault(&owner.pubkey(), &collateral);
+    if !terminal_settled {
+        let donor = Keypair::new();
+        svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+        let donor_source = Pubkey::new_unique();
+        let donation_holding = Pubkey::new_unique();
+        set_token(&mut svm, &donor_source, &collateral, &donor.pubkey(), 1);
         set_token(
             &mut svm,
-            &destination,
+            &donation_holding,
             &collateral,
-            &owner.pubkey(),
+            &twap_authority,
             0,
         );
+        let donation_market_id = read_asset0_market_id(&svm, &market);
         send(
             &mut svm,
-            &[&payer],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(owner.pubkey(), false),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(portfolio.pubkey(), false),
-                    AccountMeta::new(destination, false),
-                    AccountMeta::new(vault, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                PIx::CloseResolved {
-                    fee_rate_per_slot: 0,
-                },
+            &[&payer, &donor],
+            donate_insurance_ix(
+                &donor.pubkey(),
+                &handoff_env,
+                &donor_source,
+                &donation_holding,
+                1,
+                donation_market_id,
             ),
         )
-        .expect("any cranker settles a resolved portfolio");
-        send(
-            &mut svm,
-            &[&payer, owner],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(owner.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(portfolio.pubkey(), false),
-                ],
-                PIx::ClosePortfolio,
-            ),
-        )
-        .expect("each owner closes the fully settled portfolio");
+        .expect("a public donor adds one post-loss fee-surplus atom");
+    }
+    assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 1);
+
+    if !terminal_settled {
+        settle_terminal(&mut svm);
     }
     let (_, terminal_group) =
         percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
