@@ -213,6 +213,7 @@ const MAX_BIDS: usize = 32;
 const BOOK_STATE_OPEN: u8 = 0;
 const BOOK_STATE_SETTLED: u8 = 1;
 // COIN sink modes (what to do with the bought COIN): 0 = burn (default), 1 = send to an account.
+const SINK_BURN: u8 = 0;
 const SINK_SEND: u8 = 1;
 // Round-not-expired custom error for execute.
 const ERR_ROUND_ACTIVE: u32 = 1;
@@ -3599,10 +3600,13 @@ fn process_set_reserve(
 }
 
 // set_coin_sink accounts: [squads_vault(signer), config, book(w), coin_sink?]
-// data: sink_mode (u8) || sink_cutoff_slot? (u64; absent = no cutoff)
+// data: sink_mode (u8) || sink_cutoff_slot (u64)
+//   || expected_sink_mode (u8) || expected_coin_sink (Pubkey)
+//   || expected_sink_cutoff_slot (u64)
 //
 // Futarchy-configurable: burn the bought COIN (mode 0) or send it to an account (mode 1, e.g. a
-// DAO treasury). Squads-vault-gated.
+// DAO treasury). Squads-vault-gated. The exact-current witness makes independently approved
+// policies order-dependent: after one policy lands, a proposal based on its predecessor is stale.
 fn process_set_coin_sink(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3613,15 +3617,21 @@ fn process_set_coin_sink(
     let config_account = next_account_info(iter)?;
     let book_account = next_account_info(iter)?;
 
-    if (data.len() != 1 && data.len() != 9) || data[0] > SINK_SEND {
+    if data.len() != 50 || data[0] > SINK_SEND || data[9] > SINK_SEND {
         return Err(ProgramError::InvalidInstructionData);
     }
     let sink_mode = data[0];
-    let requested_sink_cutoff = if data.len() == 9 {
-        u64::from_le_bytes(data[1..9].try_into().unwrap())
-    } else {
-        u64::MAX
-    };
+    let requested_sink_cutoff = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    let expected_sink_mode = data[9];
+    let expected_sink_key = Pubkey::new_from_array(data[10..42].try_into().unwrap());
+    let expected_sink_cutoff = u64::from_le_bytes(data[42..50].try_into().unwrap());
+    if (sink_mode == SINK_BURN && requested_sink_cutoff != u64::MAX)
+        || (expected_sink_mode == SINK_BURN
+            && (expected_sink_key != Pubkey::default()
+                || expected_sink_cutoff != u64::MAX))
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
     if config_account.owner != program_id || book_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
@@ -3630,6 +3640,12 @@ fn process_set_coin_sink(
     let book = load_book_header(&book_account.try_borrow_data()?)?;
     if book.config != *config_account.key {
         return Err(ProgramError::InvalidAccountData);
+    }
+    if book.sink_mode != expected_sink_mode
+        || book.coin_sink != expected_sink_key
+        || book.sink_cutoff_slot != expected_sink_cutoff
+    {
+        return Err(ProgramError::InvalidArgument);
     }
     let sink_key = if sink_mode == SINK_SEND {
         let coin_sink = next_account_info(iter)?;
