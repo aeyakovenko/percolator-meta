@@ -421,14 +421,16 @@ its predecessor wire without a witness, and only while that generation remains c
 secondary and replacement generation is strict. Governance must rebuild a queued asset action after
 its target slot changes generation.
 
-Market-wide `ResolveMarket` calls append a separate read-only witness derived from
-`("market-generation", market, next_market_id)`. Percolator advances `next_market_id` whenever any
-asset is created or restarted, so an approved global resolution cannot survive into a replacement
-asset generation. The controller also rejects resolution while an exposed asset has an executable
-price step from a newly authenticated mark or deterministic price/funding accrual from an active
-mark; any public cranker can commit the segment and the same generation-bound resolution can then
-retry. The controller removes the
-witness before CPI and stores no generation state. This preflight is read-only and adds no signer,
+Market-wide `ResolveMarket` and `ConfigurePermissionlessResolve` calls append a separate read-only
+witness derived from `("market-generation", market, next_market_id)`. Percolator advances
+`next_market_id` whenever any asset is created or restarted, so an approved terminal control cannot
+survive into a replacement asset generation. Resolution-policy updates also append
+`("resolve-policy", market, current_stale_slots, current_force_close_delay_slots)`, preventing an
+older approved policy from overwriting a newer one in the same generation. The controller rejects
+resolution while an exposed asset has an executable price step from a newly authenticated mark or
+deterministic price/funding accrual from an active mark; any public cranker can commit the segment
+and the same generation-bound resolution can then retry. The controller removes both witness types
+before CPI and stores no generation state. These preflights are read-only and add no signer,
 authority, recipient, token, or collateral path.
 
 Portfolio owners normally close their own empty accounts. Once a market is resolved, an absent owner

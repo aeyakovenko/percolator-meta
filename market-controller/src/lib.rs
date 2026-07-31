@@ -36,6 +36,7 @@ declare_id!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
 const CONTROLLER_SEED: &[u8] = b"market-controller";
 const ASSET_GENERATION_SEED: &[u8] = b"asset-generation";
 const MARKET_GENERATION_SEED: &[u8] = b"market-generation";
+const RESOLVE_POLICY_SEED: &[u8] = b"resolve-policy";
 const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
 const DONATION_NONCE_SEED: &[u8] = b"donation-nonce";
 const DONATION_NONCE_DISC: [u8; 8] = *b"DONNONC1";
@@ -176,6 +177,24 @@ pub fn market_generation_witness_address(
             MARKET_GENERATION_SEED,
             market.as_ref(),
             &next_market_id.to_le_bytes(),
+        ],
+        &id(),
+    )
+}
+
+/// Stateless read-only account key that commits a delayed governance action to
+/// the exact stale-resolution policy it was approved to replace.
+pub fn permissionless_resolve_policy_witness_address(
+    market: &Pubkey,
+    stale_slots: u64,
+    force_close_delay_slots: u64,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            RESOLVE_POLICY_SEED,
+            market.as_ref(),
+            &stale_slots.to_le_bytes(),
+            &force_close_delay_slots.to_le_bytes(),
         ],
         &id(),
     )
@@ -1010,6 +1029,26 @@ fn process_proxy_admin<'a>(
         }
     }
     let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
+    if perc_tag == PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE {
+        let (current_stale_slots, current_force_close_delay_slots) = {
+            let market_data = market.try_borrow_data()?;
+            percolator_accounting::read_permissionless_resolve_policy(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+        };
+        let witness = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        if witness.is_signer
+            || witness.is_writable
+            || *witness.key
+                != permissionless_resolve_policy_witness_address(
+                    market.key,
+                    current_stale_slots,
+                    current_force_close_delay_slots,
+                )
+                .0
+        {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+    }
     if generation_bound_market(data) {
         let next_market_id = {
             let market_data = market.try_borrow_data()?;
@@ -3526,5 +3565,28 @@ mod tests {
             market_generation_witness_address(&Pubkey::new_unique(), 2).0
         );
         assert_ne!(witness, market_generation_witness_address(&market, 3).0);
+    }
+
+    #[test]
+    fn resolve_policy_witness_binds_market_and_both_current_deadlines() {
+        let market = Pubkey::new_unique();
+        let witness = permissionless_resolve_policy_witness_address(&market, 50, 20).0;
+        assert_ne!(
+            witness,
+            permissionless_resolve_policy_witness_address(
+                &Pubkey::new_unique(),
+                50,
+                20,
+            )
+            .0
+        );
+        assert_ne!(
+            witness,
+            permissionless_resolve_policy_witness_address(&market, 49, 20).0
+        );
+        assert_ne!(
+            witness,
+            permissionless_resolve_policy_witness_address(&market, 50, 19).0
+        );
     }
 }
