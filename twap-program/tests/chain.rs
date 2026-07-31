@@ -11571,6 +11571,260 @@ fn e2e_market_donation_preserves_the_outgoing_asset0_backing_provider() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
+// EXTERNAL-BACKING RESTART PROBE: lifecycle custody may move to the controller while the
+// creator remains asset 0's backing provider. A governance restart must not erase that funded
+// generation. Once the provider takes the ordinary shutdown exit, the same fixed restart is live.
+#[test]
+fn e2e_controller_restart_waits_for_external_asset0_backing_exit() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    for signer in [&payer, &creator, &governance] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate a fresh Percolator slab through the system program");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            data: controller_init_market_data(1),
+        },
+    )
+    .expect("permissionless creator initializes the market");
+
+    let vault_authority = perc_vault_authority(&market.pubkey(), &perc_id());
+    let percolator_vault =
+        canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let provider_token = Pubkey::new_unique();
+    let backing_amount = 500_000u64;
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &provider_token,
+        &collateral_mint,
+        &creator.pubkey(),
+        backing_amount,
+    );
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new(provider_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::TopUpBackingBucket {
+                domain: 0,
+                amount: backing_amount as u128,
+                expiry_slot: 10_000,
+            }
+            .encode(),
+        },
+    )
+    .expect("external provider funds asset 0");
+
+    let controller =
+        controller_pda(&governance.pubkey(), &market.pubkey(), &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market.pubkey(), &perc_id()),
+                    false,
+                ),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates lifecycle control without donating backing");
+
+    let proxy = |percolator_instruction: percolator_prog::ix::Instruction,
+                 generation_witness: Option<Pubkey>| {
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&percolator_instruction.encode());
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market.pubkey(), false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if let Some(witness) = generation_witness {
+            accounts.push(AccountMeta::new_readonly(witness, false));
+        }
+        Instruction {
+            program_id: controller_id(),
+            accounts,
+            data,
+        }
+    };
+    let market_generation_witness =
+        controller_market_generation_witness(&svm, &market.pubkey());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            percolator_prog::ix::Instruction::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 5,
+            },
+            Some(market_generation_witness),
+        ),
+    )
+    .expect("configure a bounded shutdown delay");
+
+    svm.set_sysvar(&Clock {
+        slot: 110,
+        unix_timestamp: 110,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(
+            percolator_prog::ix::Instruction::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 0,
+                now_slot: 110,
+                initial_price: 0,
+                insurance_authority: [0; 32],
+                insurance_operator: [0; 32],
+                backing_bucket_authority: [0; 32],
+                oracle_authority: [0; 32],
+            },
+            None,
+        ),
+    )
+    .expect("governance shuts down the empty asset");
+    let shutdown_market = svm.get_account(&market.pubkey()).unwrap();
+    let old_market_id =
+        percolator_accounting::read_asset_market_id(&shutdown_market.data, 0).unwrap();
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(&shutdown_market.data, 0).unwrap(),
+        creator.pubkey().to_bytes()
+    );
+
+    svm.set_sysvar(&Clock {
+        slot: 116,
+        unix_timestamp: 116,
+        ..Clock::default()
+    });
+    let restart = percolator_prog::ix::Instruction::RestartAssetOracle {
+        asset_index: 0,
+        now_slot: 116,
+        initial_price: 2_000_000,
+    };
+    assert!(
+        send(
+            &mut svm,
+            &[&payer, &governance],
+            proxy(restart.clone(), None),
+        )
+        .is_err(),
+        "governance cannot restart across funded external backing"
+    );
+    assert_eq!(svm.get_account(&market.pubkey()).unwrap(), shutdown_market);
+    assert_eq!(token_amount(&svm, &provider_token), 0);
+    assert_eq!(token_amount(&svm, &percolator_vault), backing_amount);
+
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new(provider_token, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: percolator_prog::ix::Instruction::WithdrawBackingBucket {
+                domain: 0,
+                amount: backing_amount as u128,
+            }
+            .encode(),
+        },
+    )
+    .expect("the recorded provider exits through the ordinary shutdown path");
+    assert_eq!(token_amount(&svm, &provider_token), backing_amount);
+    assert_eq!(token_amount(&svm, &percolator_vault), 0);
+
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        proxy(restart, None),
+    )
+    .expect("the same fixed restart succeeds after provider custody is empty");
+    let restarted = svm.get_account(&market.pubkey()).unwrap();
+    assert!(
+        percolator_accounting::read_asset_market_id(&restarted.data, 0).unwrap()
+            > old_market_id
+    );
+    assert_eq!(
+        percolator_accounting::read_asset_backing_authority(&restarted.data, 0).unwrap(),
+        creator.pubkey().to_bytes(),
+        "restart preserves the external provider role"
+    );
+}
+
 // PUBLIC DOS: an ordinary portfolio can retain claims in all 32 sparse source domains, then open
 // a position whose first favorable settlement needs a missing 33rd domain. Admission must reserve
 // that capacity up front; otherwise an honest mark move leaves no bounded owner or keeper action
