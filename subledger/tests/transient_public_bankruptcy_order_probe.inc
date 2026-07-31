@@ -637,3 +637,252 @@ fn public_cross_backing_codepositor_exit_order_cannot_transfer_the_victims_claim
         );
     }
 }
+
+fn open_fully_public_pair_with_capitals(
+    env: &mut Env,
+    position_q: i128,
+    price: u64,
+    long_capital: u64,
+    short_capital: u64,
+) -> (Keypair, Pubkey, Keypair, Pubkey) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let long = Keypair::new();
+    let short = Keypair::new();
+    let long_portfolio = create_fully_public_portfolio(env, &long, long_capital);
+    let short_portfolio = create_fully_public_portfolio(env, &short, short_capital);
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(long.pubkey(), true),
+                AccountMeta::new_readonly(short.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(long_portfolio, false),
+                AccountMeta::new(short_portfolio, false),
+            ],
+            data: PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: position_q,
+                exec_price: price,
+                fee_bps: 0,
+            }
+            .encode(),
+        }],
+        &[&long, &short],
+    )
+    .expect("open a fully public asymmetric-capital pair");
+    (long, long_portfolio, short, short_portfolio)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StaggeredCrossBackingOutcome {
+    trader_payouts: [u64; 4],
+    provider_payouts: [u64; 2],
+    vault_remainder: u64,
+    escrow_remainder: u64,
+}
+
+impl StaggeredCrossBackingOutcome {
+    fn total_collateral(self) -> u64 {
+        self.trader_payouts
+            .into_iter()
+            .chain(self.provider_payouts)
+            .sum::<u64>()
+            .checked_add(self.vault_remainder)
+            .and_then(|value| value.checked_add(self.escrow_remainder))
+            .unwrap()
+    }
+}
+
+fn run_staggered_cross_backing_epochs(
+    final_exit_order: [usize; 2],
+    incumbent_final_chunks: &[u64],
+) -> StaggeredCrossBackingOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INCUMBENT_PRINCIPAL: u64 = 401;
+    const INCUMBENT_PARTIAL_EXIT: u64 = 100;
+    const LATE_PRINCIPAL: u64 = 200;
+
+    let mut env = fresh_public_cross_backing_market();
+    let pool_holding = create_canonical_pool_holding(&mut env);
+    let (incumbent, incumbent_ata) = new_depositor(&mut env, INCUMBENT_PRINCIPAL);
+    env.cross_backing_deposit(
+        &incumbent,
+        &incumbent_ata,
+        &pool_holding,
+        INCUMBENT_PRINCIPAL,
+    )
+    .expect("incumbent funds both protection classes before the first loss");
+    env.cross_backing_withdraw(
+        &incumbent,
+        &incumbent_ata,
+        &pool_holding,
+        INCUMBENT_PARTIAL_EXIT,
+    )
+    .expect("incumbent partially exits before either market-loss epoch");
+
+    let observer = Keypair::new();
+    let observer_portfolio = create_fully_public_portfolio(&mut env, &observer, 0);
+    let (first_long, first_long_portfolio, first_short, first_short_portfolio) =
+        open_fully_public_pair_with_capitals(
+            &mut env,
+            percolator::POS_SCALE as i128,
+            100,
+            1_000_000,
+            120,
+        );
+    let market_admin = clone_kp(&env.market_admin);
+    let mut slot = env.svm.get_sysvar::<Clock>().slot;
+    advance_public_mark(
+        &mut env,
+        &market_admin,
+        observer_portfolio,
+        &mut slot,
+        301,
+        8,
+    );
+    liquidate_stale_public_loser(&mut env, first_short_portfolio, slot);
+    clear_stale_public_winner_with_backing(
+        &mut env,
+        &first_long,
+        first_long_portfolio,
+        slot,
+    );
+
+    let (late, late_ata) = new_depositor(&mut env, LATE_PRINCIPAL);
+    env.cross_backing_deposit(&late, &late_ata, &pool_holding, LATE_PRINCIPAL)
+        .expect("late provider enters at the first loss-adjusted share rate");
+
+    let second_entry = effective_price(&env);
+    let (second_long, second_long_portfolio, second_short, second_short_portfolio) =
+        open_fully_public_pair_with_capitals(
+            &mut env,
+            percolator::POS_SCALE as i128,
+            second_entry,
+            1_000_000,
+            500,
+        );
+    advance_public_mark(
+        &mut env,
+        &market_admin,
+        observer_portfolio,
+        &mut slot,
+        902,
+        8,
+    );
+    liquidate_stale_public_loser(&mut env, second_short_portfolio, slot);
+    clear_stale_public_winner_with_backing(
+        &mut env,
+        &second_long,
+        second_long_portfolio,
+        slot,
+    );
+
+    env.send(
+        &[Instruction {
+            program_id: perc_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(market_admin.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+            ],
+            data: PIx::ResolveMarket.encode(),
+        }],
+        &[&market_admin],
+    )
+    .expect("resolve after both independently realized public losses");
+
+    let payer = clone_kp(&env.payer);
+    let destinations = [
+        (&first_long, first_long_portfolio),
+        (&first_short, first_short_portfolio),
+        (&second_long, second_long_portfolio),
+        (&second_short, second_short_portfolio),
+        (&observer, observer_portfolio),
+    ]
+    .map(|(owner, _)| {
+        create_token_account(&mut env.svm, &payer, &env.mint, &owner.pubkey())
+    });
+    let actors = [
+        (&first_long, first_long_portfolio, destinations[0]),
+        (&first_short, first_short_portfolio, destinations[1]),
+        (&second_long, second_long_portfolio, destinations[2]),
+        (&second_short, second_short_portfolio, destinations[3]),
+        (&observer, observer_portfolio, destinations[4]),
+    ];
+    close_resolved_in_order(&mut env, &actors, &[1, 3, 0, 2, 4]);
+
+    assert_eq!(
+        incumbent_final_chunks.iter().sum::<u64>(),
+        INCUMBENT_PRINCIPAL - INCUMBENT_PARTIAL_EXIT,
+    );
+    for provider_index in final_exit_order {
+        if provider_index == 0 {
+            for amount in incumbent_final_chunks {
+                env.cross_backing_withdraw(
+                    &incumbent,
+                    &incumbent_ata,
+                    &pool_holding,
+                    *amount,
+                )
+                .expect("incumbent makes bounded final withdrawal progress");
+            }
+        } else {
+            env.cross_backing_withdraw(&late, &late_ata, &pool_holding, LATE_PRINCIPAL)
+                .expect("late provider realizes only the second-epoch impairment");
+        }
+    }
+
+    StaggeredCrossBackingOutcome {
+        trader_payouts: [
+            env.token_amount(&destinations[0]),
+            env.token_amount(&destinations[1]),
+            env.token_amount(&destinations[2]),
+            env.token_amount(&destinations[3]),
+        ],
+        provider_payouts: [
+            env.token_amount(&incumbent_ata),
+            env.token_amount(&late_ata),
+        ],
+        vault_remainder: env.token_amount(&env.perc_vault),
+        escrow_remainder: env.token_amount(&pool_holding),
+    }
+}
+
+#[test]
+fn staggered_cross_backing_epochs_preserve_each_providers_loss_tenure() {
+    let incumbent_first = run_staggered_cross_backing_epochs([0, 1], &[301]);
+    let late_first = run_staggered_cross_backing_epochs([1, 0], &[301]);
+    let incumbent_split = run_staggered_cross_backing_epochs([0, 1], &[1, 300]);
+
+    assert_eq!(
+        incumbent_first, late_first,
+        "final exit ordering transferred a historical or second-epoch loss",
+    );
+    assert!(
+        incumbent_first.provider_payouts[0] < 401
+            && incumbent_first.provider_payouts[1] < 200,
+        "both public loss epochs must impair real provider protection",
+    );
+    assert!(
+        u128::from(incumbent_first.provider_payouts[0]) * 200
+            < u128::from(incumbent_first.provider_payouts[1]) * 401,
+        "the late provider cannot inherit the incumbent's first-epoch loss",
+    );
+    assert!(
+        incumbent_split.provider_payouts[0] <= incumbent_first.provider_payouts[0],
+        "splitting cannot increase the incumbent's loss-adjusted claim",
+    );
+    assert_eq!(
+        incumbent_split.provider_payouts[1], incumbent_first.provider_payouts[1],
+        "incumbent rounding cannot reduce the late provider's claim",
+    );
+    for outcome in [incumbent_first, late_first, incumbent_split] {
+        assert_eq!(
+            outcome.total_collateral(),
+            2_001_221,
+            "both market-loss epochs and all provider exits conserve collateral",
+        );
+    }
+}
