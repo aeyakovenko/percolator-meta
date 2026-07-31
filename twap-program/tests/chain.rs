@@ -65924,6 +65924,303 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         .map_or(true, |account| account.lamports == 0));
 }
 
+// PUBLIC LOF: two independently approved Squads sink policies can remain executable together.
+// Executing the burn correction first must invalidate the older SEND policy; otherwise an
+// untrusted executor can restore an obsolete external recipient and capture the next permissionless
+// buyback. This probe allocates and initializes the Percolator market through public instructions.
+#[test]
+fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donated = 400_000u64;
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        donated,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &env.slab);
+    send(
+        &mut svm,
+        &[&donor],
+        twap_donate_insurance_ix_with_nonce(
+            &donor.pubkey(),
+            &env.twap_cfg,
+            &env.twap_authority,
+            &donor_source,
+            &donation_holding,
+            &env.slab,
+            &env.perc_vault,
+            donated,
+            market_id,
+            0,
+        ),
+    )
+    .expect("independent donor funds canonical protocol insurance");
+    assert_eq!(read_asset0_insurance(&svm, &env.slab), u128::from(donated));
+
+    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &floor,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("legacy migration marks the complete donation as protocol surplus");
+
+    let current_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &current_sink,
+        &env.coin_mint,
+        &env.squads_vault,
+        0,
+    );
+    let book =
+        setup_auction_at_index(&mut svm, &payer, &env, 6, 10, 1, Some(current_sink), 0);
+    let obsolete_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &obsolete_sink,
+        &env.coin_mint,
+        &env.dao.pubkey(),
+        0,
+    );
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &obsolete_sink, 0, 10_000);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &economics,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(obsolete_sink, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("DAO configures bought COIN for complete sink retention");
+
+    let build_burn_message = || {
+        let mut message = Vec::new();
+        message.push(1); // num_signers
+        message.push(0); // num_writable_signers
+        message.push(1); // num_writable_non_signers
+        message.push(4); // account_keys
+        message.extend_from_slice(env.squads_vault.as_ref()); // 0
+        message.extend_from_slice(book.book.as_ref()); // 1
+        message.extend_from_slice(env.twap_cfg.as_ref()); // 2
+        message.extend_from_slice(twap_id().as_ref()); // 3
+        message.push(1); // instructions
+        message.push(3); // program_id_index
+        message.push(3); // instruction accounts
+        message.extend_from_slice(&[0, 2, 1]);
+        message.extend_from_slice(&2u16.to_le_bytes());
+        message.extend_from_slice(&[10u8, 0u8]); // IX_SET_COIN_SINK, SINK_BURN
+        message.push(0); // address_table_lookups
+        message
+    };
+    let stale_message = build_set_coin_sink_send_message(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book.book,
+        &obsolete_sink,
+    );
+    let correction_message = build_burn_message();
+    let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
+        let transaction = transaction_pda(&env.squads, &env.multisig, index);
+        let proposal = proposal_pda(&env.squads, &env.multisig, index);
+        for instruction in [
+            vault_transaction_create_ix(
+                &env.squads,
+                &env.multisig,
+                &transaction,
+                &env.dao.pubkey(),
+                message,
+            ),
+            proposal_create_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+                index,
+            ),
+            proposal_approve_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+            ),
+        ] {
+            send(svm, &[&env.dao], instruction).expect("queue approved sink policy");
+        }
+        (transaction, proposal)
+    };
+    let (stale_transaction, stale_proposal) = queue(&mut svm, 8, &stale_message);
+    let (correction_transaction, correction_proposal) =
+        queue(&mut svm, 9, &correction_message);
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar(&clock);
+
+    let correction_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(book.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &correction_proposal,
+            &correction_transaction,
+            &env.dao.pubkey(),
+            &correction_remaining,
+        ),
+    )
+    .expect("execute the burn correction first");
+    let book_before_replay = svm.get_account(&book.book).unwrap();
+    let stale_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(book.book, false),
+        AccountMeta::new_readonly(env.twap_cfg, false),
+        AccountMeta::new_readonly(obsolete_sink, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    let replay = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &stale_transaction,
+            &env.dao.pubkey(),
+            &stale_remaining,
+        ),
+    );
+    if replay.is_err() {
+        assert_eq!(
+            svm.get_account(&book.book).unwrap(),
+            book_before_replay,
+            "a rejected stale sink policy leaves the auction byte-identical",
+        );
+    }
+
+    let auction_budget = donated * 8 / 10;
+    let (bidder, bidder_coin, bidder_usd) =
+        new_bidder(&mut svm, &payer, &env, auction_budget);
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &bidder_coin,
+            &bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            u128::from(auction_budget),
+            u128::from(auction_budget),
+            None,
+        ),
+    )
+    .expect("independent bidder offers COIN at the corrected reserve");
+    let round_end = {
+        let account = svm.get_account(&book.book).unwrap();
+        u64::from_le_bytes(account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            replay.is_ok().then_some(obsolete_sink),
+        ),
+    )
+    .expect("permissionless cranker settles the independently funded buyback");
+
+    if replay.is_ok() {
+        assert_eq!(
+            token_amount(&svm, &obsolete_sink),
+            auction_budget,
+            "the stale policy redirected the complete bought-COIN output",
+        );
+        panic!(
+            "an older approved sink overwrote the burn correction and transferred {auction_budget} bought COIN to its obsolete recipient",
+        );
+    }
+    assert_eq!(token_amount(&svm, &obsolete_sink), 0);
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        auction_budget,
+        "the correction burns the complete bought-COIN output",
+    );
+    assert_eq!(
+        token_amount(&svm, &book.settlement_usd),
+        auction_budget,
+        "the fixed policy does not impede the public auction",
+    );
+}
+
 // PUBLIC DOS PROBE: a finite backing bucket can lapse while an account still has
 // source-backed positive PnL that a later mark reversal must settle. Resolved
 // settlement must prepare that bucket before any valuation which rejects stale
