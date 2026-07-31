@@ -32413,6 +32413,27 @@ fn build_set_coin_sink_send_message(
     book: &Pubkey,
     coin_sink: &Pubkey,
 ) -> Vec<u8> {
+    build_set_coin_sink_send_message_from(
+        squads_vault,
+        config,
+        book,
+        coin_sink,
+        0,
+        &Pubkey::default(),
+        u64::MAX,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_set_coin_sink_send_message_from(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    coin_sink: &Pubkey,
+    expected_sink_mode: u8,
+    expected_coin_sink: &Pubkey,
+    expected_sink_cutoff_slot: u64,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
@@ -32429,7 +32450,11 @@ fn build_set_coin_sink_send_message(
     for i in [0u8, 2, 1, 3] {
         m.push(i);
     } // set_coin_sink ix order: squads_vault, config, book, coin_sink
-    let data = [10u8, 1u8]; // IX_SET_COIN_SINK, sink_mode = SINK_SEND
+    let mut data = vec![10u8, 1u8]; // IX_SET_COIN_SINK, sink_mode = SINK_SEND
+    data.extend_from_slice(&u64::MAX.to_le_bytes());
+    data.push(expected_sink_mode);
+    data.extend_from_slice(expected_coin_sink.as_ref());
+    data.extend_from_slice(&expected_sink_cutoff_slot.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -66057,16 +66082,24 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
         message.push(3); // program_id_index
         message.push(3); // instruction accounts
         message.extend_from_slice(&[0, 2, 1]);
-        message.extend_from_slice(&2u16.to_le_bytes());
-        message.extend_from_slice(&[10u8, 0u8]); // IX_SET_COIN_SINK, SINK_BURN
+        let mut data = vec![10u8, 0u8]; // IX_SET_COIN_SINK, SINK_BURN
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        data.push(1); // expected SINK_SEND
+        data.extend_from_slice(current_sink.as_ref());
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        message.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        message.extend_from_slice(&data);
         message.push(0); // address_table_lookups
         message
     };
-    let stale_message = build_set_coin_sink_send_message(
+    let stale_message = build_set_coin_sink_send_message_from(
         &env.squads_vault,
         &env.twap_cfg,
         &book.book,
         &obsolete_sink,
+        1,
+        &current_sink,
+        u64::MAX,
     );
     let correction_message = build_burn_message();
     let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
