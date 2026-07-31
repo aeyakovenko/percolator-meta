@@ -37,6 +37,7 @@ enum PoolRestartScenario {
     CrossBackingRestartAfterLoss,
     CrossBackingRepeatRestartAfterLoss,
     LiquidationRewardCannotConsumePrincipal,
+    CrossBackingLiquidationRewardCannotConsumePrincipal,
 }
 
 #[test]
@@ -100,6 +101,13 @@ fn e2e_liquidation_cranker_reward_cannot_consume_owner_bound_insurance() {
     run_pool_restart_claim_scenario(PoolRestartScenario::LiquidationRewardCannotConsumePrincipal);
 }
 
+#[test]
+fn e2e_liquidation_cranker_reward_cannot_consume_cross_backing_principal() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::CrossBackingLiquidationRewardCannotConsumePrincipal,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -108,19 +116,27 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario,
         PoolRestartScenario::CrossBackingRestartAfterLoss
             | PoolRestartScenario::CrossBackingRepeatRestartAfterLoss
+            | PoolRestartScenario::CrossBackingLiquidationRewardCannotConsumePrincipal
     );
     let repeat_cross_backing_restart =
         scenario == PoolRestartScenario::CrossBackingRepeatRestartAfterLoss;
+    let cross_backing_liquidation_reward =
+        scenario == PoolRestartScenario::CrossBackingLiquidationRewardCannotConsumePrincipal;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
-    let liquidation_reward =
-        scenario == PoolRestartScenario::LiquidationRewardCannotConsumePrincipal;
+    let liquidation_reward = matches!(
+        scenario,
+        PoolRestartScenario::LiquidationRewardCannotConsumePrincipal
+            | PoolRestartScenario::CrossBackingLiquidationRewardCannotConsumePrincipal
+    );
     let owner_principal = if partial_owner_buyback || cross_backing || liquidation_reward {
         2u64
     } else {
         1
     };
-    let surviving_owner_claim = if liquidation_reward {
+    let surviving_owner_claim = if cross_backing_liquidation_reward {
+        1
+    } else if liquidation_reward {
         owner_principal
     } else if partial_owner_buyback || cross_backing {
         1
@@ -223,7 +239,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 max_trading_fee_bps: 10_000,
                 trade_fee_base_bps: 0,
                 liquidation_fee_bps: if liquidation_reward { 100 } else { 0 },
-                liquidation_fee_cap: if liquidation_reward { 2 } else { 0 },
+                liquidation_fee_cap: if cross_backing_liquidation_reward {
+                    4
+                } else if liquidation_reward {
+                    2
+                } else {
+                    0
+                },
                 min_liquidation_abs: 0,
                 max_price_move_bps_per_slot: 4_900,
                 max_accrual_dt_slots: 1,
@@ -887,7 +909,11 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             &[],
             &configure_witness,
             &PIx::UpdateLiquidationFeePolicy {
-                cranker_share_bps: 5_000,
+                cranker_share_bps: if cross_backing_liquidation_reward {
+                    10_000
+                } else {
+                    5_000
+                },
             }
             .encode(),
         );
@@ -1041,7 +1067,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         "custody handoffs must preserve the authenticated-mark profile"
     );
     warp_to(&mut svm, 101);
-    let liquidation_mark = if liquidation_reward { 500 } else { 399 };
+    let liquidation_mark = if cross_backing_liquidation_reward {
+        399
+    } else if liquidation_reward {
+        500
+    } else {
+        399
+    };
     let mark_message = build_push_auth_mark_message(
         &squads_vault,
         &market,
@@ -1157,9 +1189,16 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         )
         .expect("settle and liquidate the long");
     }
+    let retained_protocol_after_liquidation = if liquidation_reward
+        && !cross_backing_liquidation_reward
+    {
+        1
+    } else {
+        0
+    };
     assert_eq!(
         protected_pool_value(&svm),
-        u128::from(surviving_owner_claim) + u128::from(liquidation_reward),
+        u128::from(surviving_owner_claim) + retained_protocol_after_liquidation,
     );
     let protected_loser = percolator_prog::state::read_portfolio(
         &svm.get_account(&traders[0].1.pubkey()).unwrap().data,
@@ -1167,7 +1206,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     .unwrap();
     assert_eq!(
         protected_loser.close_progress.insurance_spent.get(),
-        if liquidation_reward { 0 } else { 1 },
+        if cross_backing_liquidation_reward {
+            1
+        } else if liquidation_reward {
+            0
+        } else {
+            1
+        },
     );
     if liquidation_reward {
         let cranker = percolator_prog::state::read_portfolio(
@@ -1176,18 +1221,30 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         .unwrap();
         assert_eq!(
             cranker.capital.get(),
-            1,
-            "the 50/50 policy pays exactly one of the two retained fee atoms",
+            if cross_backing_liquidation_reward {
+                0
+            } else {
+                1
+            },
+            "the public cranker receives only a positive net retained fee",
         );
-        assert_eq!(
-            percolator_accounting::read_asset_insurance_spent(
-                &svm.get_account(&market).unwrap().data,
-                0,
-            )
-            .unwrap(),
-            [0, 0],
-            "a retained-fee payout cannot be charged to either insurance domain",
-        );
+        let insurance_spent = percolator_accounting::read_asset_insurance_spent(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        if cross_backing_liquidation_reward {
+            assert_eq!(
+                insurance_spent.into_iter().sum::<u128>(),
+                1,
+                "only the trader's uncovered loss may impair provider insurance",
+            );
+        } else {
+            assert_eq!(
+                insurance_spent, [0, 0],
+                "a retained-fee payout cannot be charged to either insurance domain",
+            );
+        }
     }
 
     let settle_terminal = |svm: &mut LiteSVM| {
@@ -1263,6 +1320,24 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     } else {
         false
     };
+    let consumed_backing_after_terminal_settlement = if cross_backing {
+        percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|balance| balance.consumed_principal_atoms)
+        .sum::<u128>()
+    } else {
+        0
+    };
+    if cross_backing_liquidation_reward {
+        assert!(
+            consumed_backing_after_terminal_settlement != 0,
+            "the probe must settle a real backing-consuming public loss",
+        );
+    }
 
     let mut direct_exit_accounts = vec![
         AccountMeta::new(depositor.pubkey(), true),
@@ -2188,9 +2263,18 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     }
 
     if terminal_settled {
-        send(
-            &mut svm,
-            &[&payer],
+        let return_to_subledger = if cross_backing {
+            twap_return_cross_backing_to_subledger_ix(
+                &squads_vault,
+                &pool,
+                &market,
+                &twap_cfg,
+                &twap_authority,
+                &perc_id(),
+                &long_backing_ledger,
+                &short_backing_ledger,
+            )
+        } else {
             twap_return_to_subledger_ix(
                 &squads_vault,
                 &pool,
@@ -2198,7 +2282,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 &twap_cfg,
                 &twap_authority,
                 &perc_id(),
-            ),
+            )
+        };
+        send(
+            &mut svm,
+            &[&payer],
+            return_to_subledger,
         )
         .expect("any cranker returns resolved-empty custody to the principal pool");
         let mut finalized_exit_data = vec![13u8]; // IX_INSURANCE_WITHDRAW_FULL
@@ -2237,8 +2326,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     );
     assert_eq!(
         read_reserved_floor(&svm, &twap_cfg),
-        u128::from(owner_principal),
-        "the floor changes only when custody is publicly re-established"
+        if cross_backing_liquidation_reward {
+            u128::from(surviving_owner_claim)
+        } else {
+            u128::from(owner_principal)
+        },
+        "custody return checkpoints any realized provider loss before withdrawal"
     );
     if terminal_settled {
         squads_execute(
@@ -2277,6 +2370,48 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         0,
         "re-handoff removes exactly the retired owner's floor component"
     );
+    if cross_backing_liquidation_reward {
+        assert_eq!(
+            token_amount(
+                &svm,
+                &canonical_insurance_vault(&traders[2].0.pubkey(), &collateral),
+            ),
+            0,
+            "a bankrupt liquidation cannot turn provider principal into a cranker reward",
+        );
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            0,
+            "the impaired provider exit and fee payout leave no hidden insurance claim",
+        );
+        let backing = percolator_accounting::read_asset_backing_balances(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            backing
+                .into_iter()
+                .map(|balance| {
+                    balance.principal_atoms
+                        + balance.valid_liened_principal_atoms
+                        + balance.impaired_principal_atoms
+                        + balance.earnings_atoms
+                })
+                .sum::<u128>(),
+            0,
+            "the provider's surviving backing leaves through its canonical subledger",
+        );
+        assert_eq!(
+            backing
+                .into_iter()
+                .map(|balance| balance.consumed_principal_atoms)
+                .sum::<u128>(),
+            consumed_backing_after_terminal_settlement,
+            "provider withdrawal cannot mutate the market's cumulative consumed-backing history",
+        );
+        return;
+    }
 
     if !terminal_settled {
         let donor = Keypair::new();
