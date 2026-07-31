@@ -35,6 +35,7 @@ enum PoolRestartScenario {
     RestartAfterLossAbsentOwnerBuyback,
     RestartAfterPartialLossAbsentOwnerBuyback,
     StaleLiquidationPolicyAfterRestart,
+    StaleLiquidationPolicyOrder,
 }
 
 #[test]
@@ -88,12 +89,21 @@ fn e2e_stale_liquidation_policy_cannot_cross_asset_generations() {
     run_pool_restart_claim_scenario(PoolRestartScenario::StaleLiquidationPolicyAfterRestart);
 }
 
+#[test]
+fn e2e_stale_liquidation_policy_cannot_overwrite_a_later_policy() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::StaleLiquidationPolicyOrder);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     let empty_with_surplus = scenario == PoolRestartScenario::EmptyWithSurplusPoolRestart;
-    let stale_liquidation_policy =
+    let stale_liquidation_generation =
         scenario == PoolRestartScenario::StaleLiquidationPolicyAfterRestart;
+    let stale_liquidation_order =
+        scenario == PoolRestartScenario::StaleLiquidationPolicyOrder;
+    let stale_liquidation_policy =
+        stale_liquidation_generation || stale_liquidation_order;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -248,6 +258,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
 
     let controller = controller_pda(&squads_vault, &market, &perc_id());
+    let policy_sequence =
+        market_controller_program::policy_sequence_address(&controller).0;
     send(
         &mut svm,
         &[&payer, &admin],
@@ -265,6 +277,26 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         },
     )
     .expect("creator donates lifecycle control to the constrained controller");
+    if stale_liquidation_policy {
+        send(
+            &mut svm,
+            &[&payer],
+            Instruction {
+                program_id: controller_id(),
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(squads_vault, false),
+                    AccountMeta::new_readonly(controller, false),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(perc_id(), false),
+                    AccountMeta::new(policy_sequence, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                ],
+                data: vec![12u8], // IX_INIT_POLICY_SEQUENCE
+            },
+        )
+        .expect("permissionlessly initialize the controller policy sequence");
+    }
 
     let coin_mint_authority = Keypair::new();
     let coin_mint = create_real_mint(&mut svm, &payer, &coin_mint_authority.pubkey());
@@ -483,6 +515,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             | PoolRestartScenario::HealthyLegacyPoolRestart
             | PoolRestartScenario::EmptyWithSurplusPoolRestart
             | PoolRestartScenario::StaleLiquidationPolicyAfterRestart
+            | PoolRestartScenario::StaleLiquidationPolicyOrder
     ) {
         let legacy_pool = scenario == PoolRestartScenario::HealthyLegacyPoolRestart;
         if legacy_pool {
@@ -529,22 +562,26 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         // Queue and approve a generation-A policy without executing it. The witness is part of
         // the immutable Squads message, so the later executor can choose timing but cannot replace
         // the generation that governance approved.
-        let stale_liquidation_action = if stale_liquidation_policy {
+        let mut stale_liquidation_action = if stale_liquidation_generation {
             let transaction_index = 3u64;
             let transaction = transaction_pda(&squads, &multisig, transaction_index);
             let proposal = proposal_pda(&squads, &multisig, transaction_index);
             let witness = controller_market_generation_witness(&svm, &market);
-            let message = build_controller_generation_proxy_message(
+            let stale_policy = sequenced_controller_policy_data(
+                PIx::UpdateLiquidationFeePolicy {
+                    cranker_share_bps: 10_000,
+                }
+                .encode(),
+                0,
+            );
+            let message = build_controller_sequenced_generation_proxy_message(
                 &squads_vault,
                 &controller,
                 &market,
                 &perc_id(),
-                &[],
+                &policy_sequence,
                 &witness,
-                &PIx::UpdateLiquidationFeePolicy {
-                    cranker_share_bps: 10_000,
-                }
-                .encode(),
+                &stale_policy,
             );
             for instruction in [
                 vault_transaction_create_ix(
@@ -573,7 +610,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         } else {
             None
         };
-        let governance_index_offset = u64::from(stale_liquidation_policy);
+        let governance_index_offset = u64::from(stale_liquidation_generation);
 
         let configure_witness = controller_market_generation_witness(&svm, &market);
         let configure_resolution = build_controller_generation_proxy_message(
@@ -769,21 +806,178 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             if empty_with_surplus { 0 } else { 1 },
         );
 
+        let policy_order_index_offset = if stale_liquidation_order {
+            let stale_index = 7 + governance_index_offset;
+            let correction_index = stale_index + 1;
+            let stale_transaction = transaction_pda(&squads, &multisig, stale_index);
+            let stale_proposal = proposal_pda(&squads, &multisig, stale_index);
+            let correction_transaction =
+                transaction_pda(&squads, &multisig, correction_index);
+            let correction_proposal = proposal_pda(&squads, &multisig, correction_index);
+            let witness = controller_market_generation_witness(&svm, &market);
+            let stale_policy = sequenced_controller_policy_data(
+                PIx::UpdateLiquidationFeePolicy {
+                    cranker_share_bps: 10_000,
+                }
+                .encode(),
+                0,
+            );
+            let correction_policy = sequenced_controller_policy_data(
+                PIx::UpdateLiquidationFeePolicy {
+                    cranker_share_bps: 1,
+                }
+                .encode(),
+                0,
+            );
+            let stale_message = build_controller_sequenced_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market,
+                &perc_id(),
+                &policy_sequence,
+                &witness,
+                &stale_policy,
+            );
+            let correction_message = build_controller_sequenced_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market,
+                &perc_id(),
+                &policy_sequence,
+                &witness,
+                &correction_policy,
+            );
+            for (transaction, proposal, index, message) in [
+                (
+                    stale_transaction,
+                    stale_proposal,
+                    stale_index,
+                    stale_message,
+                ),
+                (
+                    correction_transaction,
+                    correction_proposal,
+                    correction_index,
+                    correction_message,
+                ),
+            ] {
+                for instruction in [
+                    vault_transaction_create_ix(
+                        &squads,
+                        &multisig,
+                        &transaction,
+                        &dao.pubkey(),
+                        &message,
+                    ),
+                    proposal_create_ix(
+                        &squads,
+                        &multisig,
+                        &proposal,
+                        &dao.pubkey(),
+                        index,
+                    ),
+                    proposal_approve_ix(
+                        &squads,
+                        &multisig,
+                        &proposal,
+                        &dao.pubkey(),
+                    ),
+                ] {
+                    send(&mut svm, &[&dao], instruction)
+                        .expect("prepare same-generation liquidation policies");
+                }
+            }
+            let mut clock = svm.get_sysvar::<Clock>();
+            clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+            svm.set_sysvar(&clock);
+            let policy_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(policy_sequence, false),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(witness, false),
+                AccountMeta::new_readonly(controller_id(), false),
+            ];
+            send(
+                &mut svm,
+                &[&dao],
+                vault_transaction_execute_ix(
+                    &squads,
+                    &multisig,
+                    &correction_proposal,
+                    &correction_transaction,
+                    &dao.pubkey(),
+                    &policy_remaining,
+                ),
+            )
+            .expect("execute the later safe liquidation policy first");
+            let policy_sequence_after_correction =
+                svm.get_account(&policy_sequence).unwrap();
+            send(
+                &mut svm,
+                &[&payer],
+                Instruction {
+                    program_id: controller_id(),
+                    accounts: vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new_readonly(squads_vault, false),
+                        AccountMeta::new_readonly(controller, false),
+                        AccountMeta::new_readonly(market, false),
+                        AccountMeta::new_readonly(perc_id(), false),
+                        AccountMeta::new(policy_sequence, false),
+                        AccountMeta::new_readonly(system_program::ID, false),
+                    ],
+                    data: vec![12u8], // IX_INIT_POLICY_SEQUENCE
+                },
+            )
+            .expect("public repeat initialization is idempotent");
+            assert_eq!(
+                svm.get_account(&policy_sequence).unwrap(),
+                policy_sequence_after_correction,
+                "a public caller cannot reset the consumed policy sequence",
+            );
+            stale_liquidation_action =
+                Some((stale_transaction, stale_proposal, witness));
+            2
+        } else {
+            0
+        };
+
         if let Some((transaction, proposal, stale_witness)) = stale_liquidation_action {
             let current_witness = controller_market_generation_witness(&svm, &market);
-            assert_ne!(
-                stale_witness, current_witness,
-                "the public restart must advance the market-generation witness",
-            );
+            if stale_liquidation_generation {
+                assert_ne!(
+                    stale_witness, current_witness,
+                    "the public restart must advance the market-generation witness",
+                );
+            } else {
+                assert_eq!(
+                    stale_witness, current_witness,
+                    "both policies target the same live market generation",
+                );
+            }
             let stale_remaining = vec![
                 AccountMeta::new_readonly(squads_vault, false),
                 AccountMeta::new(market, false),
+                AccountMeta::new(policy_sequence, false),
                 AccountMeta::new_readonly(controller, false),
                 AccountMeta::new_readonly(perc_id(), false),
                 AccountMeta::new_readonly(stale_witness, false),
                 AccountMeta::new_readonly(controller_id(), false),
             ];
             let market_before_replay = svm.get_account(&market).unwrap();
+            let policy_sequence_before_replay =
+                svm.get_account(&policy_sequence).unwrap();
+            assert_eq!(
+                u64::from_le_bytes(
+                    policy_sequence_before_replay.data[40..48]
+                        .try_into()
+                        .unwrap(),
+                ),
+                u64::from(stale_liquidation_order),
+                "only the successfully executed correction advances the policy sequence",
+            );
             let replay = send(
                 &mut svm,
                 &[&dao],
@@ -802,6 +996,11 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                     svm.get_account(&market).unwrap(),
                     market_before_replay,
                     "a rejected stale policy must leave the replacement market byte-identical",
+                );
+                assert_eq!(
+                    svm.get_account(&policy_sequence).unwrap(),
+                    policy_sequence_before_replay,
+                    "a rejected stale policy must not consume the live policy sequence",
                 );
             }
 
@@ -825,7 +1024,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 &multisig,
                 &dao,
                 &payer,
-                7 + governance_index_offset,
+                7 + governance_index_offset + policy_order_index_offset,
                 &configure_mark,
                 &mark_remaining,
             )
@@ -918,7 +1117,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 &multisig,
                 &dao,
                 &payer,
-                8 + governance_index_offset,
+                8 + governance_index_offset + policy_order_index_offset,
                 &mark_message,
                 &mark_remaining,
             )
@@ -1030,8 +1229,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 assert_eq!(retained_for_insurance, 0);
                 assert_eq!(attacker_after, 3);
                 assert_eq!(attacker_withdrawal, 3);
+                if stale_liquidation_generation {
+                    panic!(
+                        "a generation-A liquidation policy paid two atoms of generation-B user collateral to a public cranker",
+                    );
+                }
                 panic!(
-                    "a generation-A liquidation policy paid two atoms of generation-B user collateral to a public cranker",
+                    "an older liquidation policy overwrote its correction and paid two atoms of independent user collateral to a public cranker",
                 );
             }
             assert_eq!(
@@ -9405,6 +9609,49 @@ fn build_controller_generation_proxy_message(
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn build_controller_sequenced_generation_proxy_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    policy_sequence: &Pubkey,
+    generation_witness: &Pubkey,
+    percolator_data: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(0);
+    m.push(2); // market and policy sequence writable
+    m.push(7);
+    m.extend_from_slice(governance.as_ref()); // 0
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(policy_sequence.as_ref()); // 2 writable
+    m.extend_from_slice(controller.as_ref()); // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    m.extend_from_slice(generation_witness.as_ref()); // 5
+    m.extend_from_slice(controller_id().as_ref()); // 6 program
+    m.push(1);
+    m.push(6);
+    m.push(6);
+    for index in [0u8, 3, 1, 4, 2, 5] {
+        m.push(index);
+    }
+    let mut data = vec![0u8]; // IX_PROXY_ADMIN
+    data.extend_from_slice(percolator_data);
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn sequenced_controller_policy_data(
+    mut percolator_data: Vec<u8>,
+    expected_sequence: u64,
+) -> Vec<u8> {
+    percolator_data.extend_from_slice(&expected_sequence.to_le_bytes());
+    percolator_data
 }
 
 fn build_controller_accept_and_top_up_asset0_backing_message(
