@@ -63241,12 +63241,25 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
     assert_eq!(token_amount(&svm, &percolator_vault), 0);
 }
 
-// CROSS-GENERATION PUBLIC LOF: a Squads proposal approved for generation A must not
-// redirect generation-B user fees into source domains that an unprivileged winner
-// can consume. The controller, rather than the attacker, remains the insurance
-// operator throughout; extraction happens only through ordinary public settlement.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StaleFeeRedirectScenario {
+    CrossGeneration,
+    SameGenerationOrder,
+}
+
 #[test]
 fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
+    run_stale_fee_redirect_scenario(StaleFeeRedirectScenario::CrossGeneration);
+}
+
+#[test]
+fn e2e_stale_fee_redirect_cannot_overwrite_a_later_policy() {
+    run_stale_fee_redirect_scenario(StaleFeeRedirectScenario::SameGenerationOrder);
+}
+
+// A delayed redirect must not route independent user fees into source domains
+// that an unprivileged winner can consume through ordinary public settlement.
+fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
     const ASSET_INDEX: u16 = 1;
@@ -63255,6 +63268,8 @@ fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
     const ROUND_TRIP_Q: i128 = 10 * percolator::POS_SCALE as i128;
     const CYCLE_Q: i128 = 3 * percolator::POS_SCALE as i128;
     const COALITION_DEPOSIT: u64 = 1_000;
+    let same_generation_order =
+        scenario == StaleFeeRedirectScenario::SameGenerationOrder;
 
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -63620,6 +63635,105 @@ fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
     )
     .expect("the independent oracle configures generation B");
 
+    let (replay_transaction, replay_proposal, replay_witness) =
+        if same_generation_order {
+            let local_index = 7u64;
+            let correction_index = local_index + 1;
+            let local_transaction = transaction_pda(&squads, &multisig, local_index);
+            let local_proposal = proposal_pda(&squads, &multisig, local_index);
+            let correction_transaction =
+                transaction_pda(&squads, &multisig, correction_index);
+            let correction_proposal =
+                proposal_pda(&squads, &multisig, correction_index);
+            let current_witness =
+                controller_market_generation_witness(&svm, &market_key);
+            let local_message = build_controller_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market_key,
+                &perc_id(),
+                &[],
+                &current_witness,
+                &PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 }.encode(),
+            );
+            let correction_message = build_controller_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market_key,
+                &perc_id(),
+                &[],
+                &current_witness,
+                &PIx::UpdateFeeRedirectPolicy {
+                    redirect_bps: 10_000,
+                }
+                .encode(),
+            );
+            for (transaction, proposal, index, message) in [
+                (
+                    local_transaction,
+                    local_proposal,
+                    local_index,
+                    local_message,
+                ),
+                (
+                    correction_transaction,
+                    correction_proposal,
+                    correction_index,
+                    correction_message,
+                ),
+            ] {
+                for instruction in [
+                    vault_transaction_create_ix(
+                        &squads,
+                        &multisig,
+                        &transaction,
+                        &dao.pubkey(),
+                        &message,
+                    ),
+                    proposal_create_ix(
+                        &squads,
+                        &multisig,
+                        &proposal,
+                        &dao.pubkey(),
+                        index,
+                    ),
+                    proposal_approve_ix(
+                        &squads,
+                        &multisig,
+                        &proposal,
+                        &dao.pubkey(),
+                    ),
+                ] {
+                    send(&mut svm, &[&dao], instruction)
+                        .expect("approve same-generation fee redirects");
+                }
+            }
+            let mut clock = svm.get_sysvar::<Clock>();
+            clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+            svm.set_sysvar(&clock);
+            send(
+                &mut svm,
+                &[&dao],
+                vault_transaction_execute_ix(
+                    &squads,
+                    &multisig,
+                    &correction_proposal,
+                    &correction_transaction,
+                    &dao.pubkey(),
+                    &generation_remaining(current_witness),
+                ),
+            )
+            .expect("execute the later canonical-insurance redirect first");
+            (
+                local_transaction,
+                local_proposal,
+                current_witness,
+            )
+        } else {
+            (stale_transaction, stale_proposal, stale_witness)
+        };
+    let governance_index_offset = 2 * u64::from(same_generation_order);
+
     let market_before_replay = svm.get_account(&market_key).unwrap();
     let replay = send(
         &mut svm,
@@ -63627,10 +63741,10 @@ fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
         vault_transaction_execute_ix(
             &squads,
             &multisig,
-            &stale_proposal,
-            &stale_transaction,
+            &replay_proposal,
+            &replay_transaction,
             &dao.pubkey(),
-            &generation_remaining(stale_witness),
+            &generation_remaining(replay_witness),
         ),
     );
     let replay_succeeded = replay.is_ok();
@@ -63841,7 +63955,7 @@ fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
         &multisig,
         &dao,
         &payer,
-        7,
+        7 + governance_index_offset,
         &zero_trade_fee,
         &ordinary_remaining,
     )
@@ -63976,7 +64090,7 @@ fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
         &multisig,
         &dao,
         &payer,
-        8,
+        8 + governance_index_offset,
         &resolve,
         &generation_remaining(resolve_witness),
     )
@@ -64068,6 +64182,11 @@ fn e2e_stale_fee_redirect_cannot_fund_generation_b_winners() {
         assert_eq!(asset_0_insurance, 0);
         assert_eq!(asset_1_insurance, 2_000);
         assert_eq!(vault_remaining, 2_001);
+        if same_generation_order {
+            panic!(
+                "an older fee redirect overwrote its correction and let a public winner extract 1,999 independent user fee atoms",
+            );
+        }
         panic!(
             "a generation-A redirect let a public winner extract 1,999 independent generation-B fee atoms",
         );
