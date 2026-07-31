@@ -80,6 +80,9 @@ const BID_NONCE_DISC: [u8; 8] = *b"BIDNONC1";
 const SHUTDOWN_NONCE_SEED: &[u8] = b"shutdown-nonce";
 const SHUTDOWN_NONCE_DISC: [u8; 8] = *b"SHDNONC1";
 const ACTION_NONCE_SIZE: usize = 80;
+const POLICY_NONCE_SEED: &[u8] = b"policy-nonce";
+const POLICY_NONCE_DISC: [u8; 8] = *b"POLNONC1";
+const POLICY_NONCE_SIZE: usize = 56;
 
 const CONFIG_DISC: [u8; 8] = *b"TWAPCFG1";
 const INITIAL_CONFIG_SIZE: usize = 200;
@@ -285,6 +288,22 @@ pub fn shutdown_nonce_address(config: &Pubkey, holding: &Pubkey) -> (Pubkey, u8)
     )
 }
 
+fn policy_nonce_group(policy_tag: u8) -> u8 {
+    match policy_tag {
+        // Both setters witness and mutate the same four-way surplus policy.
+        IX_SET_ECONOMICS => IX_RECONFIGURE,
+        _ => policy_tag,
+    }
+}
+
+pub fn policy_nonce_address(config: &Pubkey, policy_tag: u8) -> (Pubkey, u8) {
+    let policy_group = [policy_nonce_group(policy_tag)];
+    Pubkey::find_program_address(
+        &[POLICY_NONCE_SEED, config.as_ref(), &policy_group],
+        &id(),
+    )
+}
+
 // The Squads multisig's default (index 0) vault PDA — the address that signs the
 // inner instructions of an executed multisig vault-transaction.
 fn squads_default_vault(multisig: &Pubkey) -> Pubkey {
@@ -427,6 +446,77 @@ fn consume_donation_nonce<'a>(
         DONATION_NONCE_SEED,
         &DONATION_NONCE_DISC,
     )
+}
+
+fn consume_policy_nonce<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    config: &AccountInfo<'a>,
+    nonce_account: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    policy_tag: u8,
+    expected_nonce: u64,
+) -> ProgramResult {
+    if !payer.is_signer
+        || !payer.is_writable
+        || !nonce_account.is_writable
+        || *system_program.key != solana_program::system_program::ID
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let policy_group = policy_nonce_group(policy_tag);
+    let tag_seed = [policy_group];
+    let (expected_address, bump) = Pubkey::find_program_address(
+        &[POLICY_NONCE_SEED, config.key.as_ref(), &tag_seed],
+        program_id,
+    );
+    if *nonce_account.key != expected_address {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if nonce_account.data_len() == 0 {
+        if nonce_account.owner != system_program.key || expected_nonce != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let bump_seed = [bump];
+        let seeds = [
+            POLICY_NONCE_SEED,
+            config.key.as_ref(),
+            &tag_seed,
+            &bump_seed,
+        ];
+        create_pda_robust(
+            payer,
+            nonce_account,
+            system_program,
+            program_id,
+            &seeds,
+            POLICY_NONCE_SIZE,
+        )?;
+        let data = &mut nonce_account.try_borrow_mut_data()?;
+        data.fill(0);
+        data[..8].copy_from_slice(&POLICY_NONCE_DISC);
+        data[8..40].copy_from_slice(config.key.as_ref());
+        data[40] = policy_group;
+    } else if nonce_account.owner != program_id
+        || nonce_account.data_len() != POLICY_NONCE_SIZE
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    let next_nonce = expected_nonce
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let mut data = nonce_account.try_borrow_mut_data()?;
+    if data[..8] != POLICY_NONCE_DISC
+        || data[8..40] != config.key.to_bytes()
+        || data[40] != policy_group
+        || data[41..48].iter().any(|byte| *byte != 0)
+        || u64::from_le_bytes(data[48..56].try_into().unwrap()) != expected_nonce
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    data[48..56].copy_from_slice(&next_nonce.to_le_bytes());
+    Ok(())
 }
 
 // Parse the stable Squads v4 Multisig prefix plus its Borsh Option<Pubkey> and member vector.
@@ -896,10 +986,11 @@ fn process_init_config(
     Ok(())
 }
 
-// reconfigure accounts: [squads_vault(signer), config(w)]
+// reconfigure accounts: [squads_vault(signer,payer), config(w), policy_nonce(w),
+//   system_program]
 // data: new_surplus_buy_burn_bps (u16) || expected_surplus_buy_burn_bps (u16)
 //   || expected_base_unit_savings_bps (u16) || expected_buyback_bps (u16)
-//   || expected_base_unit_savings_account (Pubkey)
+//   || expected_base_unit_savings_account (Pubkey) || expected_policy_nonce (u64)
 //
 // Squads -> TWAP control: only the config's Squads multisig default vault PDA may
 // reconfigure, and that PDA can only sign as the executor of a multisig
@@ -912,8 +1003,10 @@ fn process_reconfigure(
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
+    let policy_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
-    if data.len() != 40 {
+    if data.len() != 48 || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
     let new_bps = u16::from_le_bytes(data[..2].try_into().unwrap());
@@ -923,6 +1016,7 @@ fn process_reconfigure(
     let expected_buyback_bps = u16::from_le_bytes(data[6..8].try_into().unwrap());
     let expected_savings_account =
         Pubkey::new_from_array(data[8..40].try_into().unwrap());
+    let expected_policy_nonce = u64::from_le_bytes(data[40..48].try_into().unwrap());
     // 0..=100% — the DAO's burn-percentage authority. 0% burns nothing (all surplus retained for
     // insurance growth); 100% burns the entire surplus. `execute` enforces this share at pull time.
     if new_bps > BPS_DENOMINATOR {
@@ -952,6 +1046,15 @@ fn process_reconfigure(
     if (new_bps as u32) + (config.base_unit_savings_bps as u32) > BPS_DENOMINATOR as u32 {
         return Err(ProgramError::InvalidInstructionData);
     }
+    consume_policy_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        policy_nonce,
+        system_program,
+        IX_RECONFIGURE,
+        expected_policy_nonce,
+    )?;
     // This remainder's denominator is auction+savings bps. A policy change starts a new
     // apportionment interval; resetting less than one atom cannot expose principal and avoids
     // interpreting the old ratio under a different denominator.
@@ -961,10 +1064,12 @@ fn process_reconfigure(
     Ok(())
 }
 
-// set_economics accounts: [squads_vault(signer), config(w), savings_account(ro)]
+// set_economics accounts: [squads_vault(signer,payer), config(w), savings_account(ro),
+//   policy_nonce(w), system_program]
 // data: base_unit_savings_bps (u16) || buyback_bps (u16)
 //   || expected_surplus_buy_burn_bps (u16) || expected_base_unit_savings_bps (u16)
 //   || expected_buyback_bps (u16) || expected_base_unit_savings_account (Pubkey)
+//   || expected_policy_nonce (u64)
 //
 // Squads-vault-gated (timelock'd) DAO control of the 4-way surplus split. Sets the savings share (surplus
 // withdrawn to the base-unit/collateral savings sink) and the buyback share (of the auction's bought COIN,
@@ -988,8 +1093,10 @@ fn process_set_economics(
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let savings_account = next_account_info(iter)?;
+    let policy_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
-    if data.len() != 42 {
+    if data.len() != 50 || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
     let savings_bps = u16::from_le_bytes(data[..2].try_into().unwrap());
@@ -1000,6 +1107,7 @@ fn process_set_economics(
     let expected_buyback_bps = u16::from_le_bytes(data[8..10].try_into().unwrap());
     let expected_savings_account =
         Pubkey::new_from_array(data[10..42].try_into().unwrap());
+    let expected_policy_nonce = u64::from_le_bytes(data[42..50].try_into().unwrap());
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
@@ -1052,6 +1160,15 @@ fn process_set_economics(
             return Err(ProgramError::InvalidAccountData);
         }
     }
+    consume_policy_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        policy_nonce,
+        system_program,
+        IX_SET_ECONOMICS,
+        expected_policy_nonce,
+    )?;
     // See reconfigure: the combined external carry has the fixed 10_000 denominator and remains
     // valid across policy changes, while this route-level carry uses auction+savings as denominator.
     config.auction_split_remainder_bps = 0;
@@ -3597,9 +3714,11 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
     Ok(())
 }
 
-// set_reserve accounts: [squads_vault(signer), config, book(w)]
+// set_reserve accounts: [squads_vault(signer,payer), config, book(w),
+//   policy_nonce(w), system_program]
 // data: reserve_num (u128) || reserve_den (u128)
 //       || expected_reserve_num (u128) || expected_reserve_den (u128)
+//       || expected_policy_nonce (u64)
 fn process_set_reserve(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3609,14 +3728,17 @@ fn process_set_reserve(
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
     let book_account = next_account_info(iter)?;
+    let policy_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
-    if data.len() != 64 {
+    if data.len() != 72 || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
     let reserve_num = u128::from_le_bytes(data[..16].try_into().unwrap());
     let reserve_den = u128::from_le_bytes(data[16..32].try_into().unwrap());
     let expected_reserve_num = u128::from_le_bytes(data[32..48].try_into().unwrap());
     let expected_reserve_den = u128::from_le_bytes(data[48..64].try_into().unwrap());
+    let expected_policy_nonce = u64::from_le_bytes(data[64..72].try_into().unwrap());
     if reserve_den == 0 || expected_reserve_den == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -3632,16 +3754,26 @@ fn process_set_reserve(
     if book.reserve_num != expected_reserve_num || book.reserve_den != expected_reserve_den {
         return Err(ProgramError::InvalidArgument);
     }
+    consume_policy_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        policy_nonce,
+        system_program,
+        IX_SET_RESERVE,
+        expected_policy_nonce,
+    )?;
     let mut d = book_account.try_borrow_mut_data()?;
     book_wr_u128(&mut d, BK_RESERVE_NUM, reserve_num);
     book_wr_u128(&mut d, BK_RESERVE_DEN, reserve_den);
     Ok(())
 }
 
-// set_coin_sink accounts: [squads_vault(signer), config, book(w), coin_sink?]
+// set_coin_sink accounts: [squads_vault(signer,payer), config, book(w), coin_sink?,
+//   policy_nonce(w), system_program]
 // data: sink_mode (u8) || sink_cutoff_slot (u64)
 //   || expected_sink_mode (u8) || expected_coin_sink (Pubkey)
-//   || expected_sink_cutoff_slot (u64)
+//   || expected_sink_cutoff_slot (u64) || expected_policy_nonce (u64)
 //
 // Futarchy-configurable: burn the bought COIN (mode 0) or send it to an account (mode 1, e.g. a
 // DAO treasury). Squads-vault-gated. The exact-current witness makes independently approved
@@ -3656,7 +3788,7 @@ fn process_set_coin_sink(
     let config_account = next_account_info(iter)?;
     let book_account = next_account_info(iter)?;
 
-    if data.len() != 50 || data[0] > SINK_SEND || data[9] > SINK_SEND {
+    if data.len() != 58 || data[0] > SINK_SEND || data[9] > SINK_SEND {
         return Err(ProgramError::InvalidInstructionData);
     }
     let sink_mode = data[0];
@@ -3664,6 +3796,7 @@ fn process_set_coin_sink(
     let expected_sink_mode = data[9];
     let expected_sink_key = Pubkey::new_from_array(data[10..42].try_into().unwrap());
     let expected_sink_cutoff = u64::from_le_bytes(data[42..50].try_into().unwrap());
+    let expected_policy_nonce = u64::from_le_bytes(data[50..58].try_into().unwrap());
     if (sink_mode == SINK_BURN && requested_sink_cutoff != u64::MAX)
         || (expected_sink_mode == SINK_BURN
             && (expected_sink_key != Pubkey::default()
@@ -3701,6 +3834,20 @@ fn process_set_coin_sink(
     } else {
         Pubkey::default()
     };
+    let policy_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    consume_policy_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        policy_nonce,
+        system_program,
+        IX_SET_COIN_SINK,
+        expected_policy_nonce,
+    )?;
     let mut d = book_account.try_borrow_mut_data()?;
     d[BK_SINK_MODE] = sink_mode;
     d[BK_COIN_SINK..BK_COIN_SINK + 32].copy_from_slice(sink_key.as_ref());

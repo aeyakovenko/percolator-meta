@@ -39,6 +39,7 @@ enum PoolRestartScenario {
     StaleMaintenancePolicyAfterRestart,
     StaleMaintenancePolicyOrder,
     StaleReservePolicyOrder,
+    NoopReservePolicyOrder,
 }
 
 #[test]
@@ -112,6 +113,11 @@ fn e2e_stale_reserve_cannot_overwrite_a_later_correction() {
     run_pool_restart_claim_scenario(PoolRestartScenario::StaleReservePolicyOrder);
 }
 
+#[test]
+fn e2e_noop_reserve_correction_invalidates_an_older_policy() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::NoopReservePolicyOrder);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -128,7 +134,9 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleMaintenancePolicyOrder;
     let stale_maintenance_policy =
         stale_maintenance_generation || stale_maintenance_order;
-    let stale_reserve_order = scenario == PoolRestartScenario::StaleReservePolicyOrder;
+    let noop_reserve_order = scenario == PoolRestartScenario::NoopReservePolicyOrder;
+    let stale_reserve_order =
+        scenario == PoolRestartScenario::StaleReservePolicyOrder || noop_reserve_order;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -189,6 +197,16 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     ))
     .expect("create governance multisig");
     let squads_vault = vault_pda(&squads, &multisig, 0);
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &squads_vault,
+            10_000_000,
+        ),
+    )
+    .expect("fund the governance vault's one-time policy nonce rent");
 
     let mint_authority = Keypair::new();
     let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
@@ -577,21 +595,51 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             None,
             0,
         );
-        let remaining = vec![
-            AccountMeta::new_readonly(squads_vault, false),
-            AccountMeta::new(book.book, false),
-            AccountMeta::new_readonly(twap_cfg, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ];
-        let queue = |svm: &mut LiteSVM, index: u64, reserve_num: u128, reserve_den: u128| {
+        let remaining =
+            set_reserve_remaining_accounts(&squads_vault, &twap_cfg, &book.book);
+        let first_queued_index = if noop_reserve_order {
+            let live_policy = build_set_reserve_message(
+                &squads_vault,
+                &twap_cfg,
+                &book.book,
+                1,
+                1,
+            );
+            squads_execute(
+                &mut svm,
+                &squads,
+                &multisig,
+                &dao,
+                &payer,
+                4,
+                &live_policy,
+                &remaining,
+            )
+            .expect("install the live one-coin-per-dollar reserve");
+            5
+        } else {
+            4
+        };
+        let queue = |
+            svm: &mut LiteSVM,
+            index: u64,
+            reserve_num: u128,
+            reserve_den: u128,
+            expected_reserve_num: u128,
+            expected_reserve_den: u128,
+            expected_policy_nonce: u64,
+        | {
             let transaction = transaction_pda(&squads, &multisig, index);
             let proposal = proposal_pda(&squads, &multisig, index);
-            let message = build_set_reserve_message(
+            let message = build_set_reserve_message_with_expected(
                 &squads_vault,
                 &twap_cfg,
                 &book.book,
                 reserve_num,
                 reserve_den,
+                expected_reserve_num,
+                expected_reserve_den,
+                expected_policy_nonce,
             );
             for instruction in [
                 vault_transaction_create_ix(
@@ -614,8 +662,26 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             }
             (transaction, proposal)
         };
-        let (stale_transaction, stale_proposal) = queue(&mut svm, 4, 1, 400_000);
-        let (correction_transaction, correction_proposal) = queue(&mut svm, 5, 1, 1);
+        let expected_reserve_num = u128::from(noop_reserve_order);
+        let expected_policy_nonce = u64::from(noop_reserve_order);
+        let (stale_transaction, stale_proposal) = queue(
+            &mut svm,
+            first_queued_index,
+            1,
+            400_000,
+            expected_reserve_num,
+            1,
+            expected_policy_nonce,
+        );
+        let (correction_transaction, correction_proposal) = queue(
+            &mut svm,
+            first_queued_index + 1,
+            1,
+            1,
+            expected_reserve_num,
+            1,
+            expected_policy_nonce,
+        );
         let mut clock = svm.get_sysvar::<Clock>();
         clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
         svm.set_sysvar(&clock);
@@ -1924,11 +1990,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         return;
     }
 
-    let policy_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let policy_remaining = reconfigure_remaining_accounts(&squads_vault, &twap_cfg);
     for index in [3u64, 4] {
         let expected_bps = if index == 3 { 8_000 } else { 10_000 };
         let policy = build_twap_reconfigure_message_with_expected(
@@ -1940,6 +2002,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             0,
             0,
             &Pubkey::default(),
+            index - 3,
         );
         squads_execute(
             &mut svm,
@@ -3304,12 +3367,20 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
             .0;
     let mut data = vec![2u8]; // IX_RECONFIGURE
     data.extend_from_slice(&5_000u16.to_le_bytes());
+    data.extend_from_slice(&8_000u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(Pubkey::default().as_ref());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    let policy_nonce = twap_program::policy_nonce_address(&cfg_pda, 2).0;
     let imposter = Keypair::new();
     let bad_reconfig = Instruction {
         program_id: twap_id(),
         accounts: vec![
-            AccountMeta::new_readonly(imposter.pubkey(), true), // NOT the squads vault
+            AccountMeta::new(imposter.pubkey(), true), // NOT the squads vault
             AccountMeta::new(cfg_pda, false),
+            AccountMeta::new(policy_nonce, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: data.clone(),
     };
@@ -3328,8 +3399,10 @@ fn twap_config_binds_only_to_a_real_squads_multisig_controlled_by_the_dao() {
     let unsigned = Instruction {
         program_id: twap_id(),
         accounts: vec![
-            AccountMeta::new_readonly(squads_vault, false), // correct key, not a signer
+            AccountMeta::new(squads_vault, false), // correct key, not a signer
             AccountMeta::new(cfg_pda, false),
+            AccountMeta::new(policy_nonce, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data,
     };
@@ -4177,12 +4250,8 @@ fn set_economics_rejects_a_savings_sink_with_external_close_authority() {
         1_000,
         0,
     );
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     assert!(
         squads_execute(
             &mut svm,
@@ -4363,13 +4432,12 @@ fn set_coin_sink_rejects_an_external_close_authority() {
         &book,
         &coin_sink,
     );
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(coin_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book,
+        Some(&coin_sink),
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -4409,13 +4477,12 @@ fn set_coin_sink_rejects_an_external_close_authority() {
         &book,
         &safe_sink,
     );
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(safe_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book,
+        Some(&safe_sink),
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -4461,12 +4528,8 @@ fn e2e_closed_coin_sink_falls_back_to_burn_without_stalling_the_round() {
 
     let economics =
         build_set_economics_message(&env.squads_vault, &env.twap_cfg, &coin_sink, 0, 10_000);
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(coin_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &coin_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -4573,12 +4636,8 @@ fn setters_reject_non_spl_owned_token_shaped_sinks() {
     .unwrap();
     let econ_msg =
         build_set_economics_message(&env.squads_vault, &env.twap_cfg, &fake_savings, 1_000, 0);
-    let econ_rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(fake_savings, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let econ_rem =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &fake_savings);
     assert!(
         squads_execute(
             &mut svm,
@@ -4622,13 +4681,12 @@ fn setters_reject_non_spl_owned_token_shaped_sinks() {
         &bk.book,
         &fake_coin_sink,
     );
-    let sink_rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(fake_coin_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let sink_rem = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&fake_coin_sink),
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -4654,12 +4712,8 @@ fn setters_reject_non_spl_owned_token_shaped_sinks() {
     );
     let econ_msg =
         build_set_economics_message(&env.squads_vault, &env.twap_cfg, &real_savings, 1_000, 0);
-    let econ_rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(real_savings, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let econ_rem =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &real_savings);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -4686,13 +4740,12 @@ fn setters_reject_non_spl_owned_token_shaped_sinks() {
         &bk.book,
         &real_coin_sink,
     );
-    let sink_rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(real_coin_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let sink_rem = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&real_coin_sink),
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -4859,8 +4912,7 @@ fn proposal_pda(squads: &Pubkey, multisig: &Pubkey, index: u64) -> Pubkey {
     .0
 }
 
-// TransactionMessage carrying the twap IX_RECONFIGURE: account_keys
-// [vault(readonly-signer), config(writable-non-signer), twap_program(readonly-non-signer)].
+// TransactionMessage carrying the twap IX_RECONFIGURE.
 fn build_twap_reconfigure_message(
     vault: &Pubkey,
     config: &Pubkey,
@@ -4876,6 +4928,7 @@ fn build_twap_reconfigure_message(
         0,
         0,
         &Pubkey::default(),
+        0,
     )
 }
 
@@ -4889,31 +4942,48 @@ fn build_twap_reconfigure_message_with_expected(
     expected_savings_bps: u16,
     expected_buyback_bps: u16,
     expected_savings_account: &Pubkey,
+    expected_policy_nonce: u64,
 ) -> Vec<u8> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 2).0;
     let mut m = Vec::new();
     m.push(1); // num_signers (vault)
-    m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (config)
-    m.push(3); // account_keys count
+    m.push(1); // num_writable_signers (vault pays nonce rent)
+    m.push(2); // num_writable_non_signers (config, nonce)
+    m.push(5); // account_keys count
     m.extend_from_slice(vault.as_ref());
     m.extend_from_slice(config.as_ref());
+    m.extend_from_slice(policy_nonce.as_ref());
+    m.extend_from_slice(system_program::ID.as_ref());
     m.extend_from_slice(twap_program.as_ref());
     // instructions: 1
     m.push(1);
-    m.push(2); // program_id_index -> twap_program
-    m.push(2); // account_indexes: [vault=0, config=1]
-    m.push(0);
-    m.push(1);
+    m.push(4); // program_id_index -> twap_program
+    m.push(4); // account_indexes: vault, config, nonce, system
+    for index in [0u8, 1, 2, 3] {
+        m.push(index);
+    }
     let mut data = vec![2u8]; // IX_RECONFIGURE
     data.extend_from_slice(&new_bps.to_le_bytes());
     data.extend_from_slice(&expected_surplus_buy_burn_bps.to_le_bytes());
     data.extend_from_slice(&expected_savings_bps.to_le_bytes());
     data.extend_from_slice(&expected_buyback_bps.to_le_bytes());
     data.extend_from_slice(expected_savings_account.as_ref());
+    data.extend_from_slice(&expected_policy_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0); // address_table_lookups: empty
     m
+}
+
+fn reconfigure_remaining_accounts(vault: &Pubkey, config: &Pubkey) -> Vec<AccountMeta> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 2).0;
+    vec![
+        AccountMeta::new(*vault, false),
+        AccountMeta::new(*config, false),
+        AccountMeta::new(policy_nonce, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
 }
 
 fn vault_transaction_create_ix(
@@ -5310,8 +5380,21 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
 
     // DAO proposes: the vault reconfigures the share to 5000.
     let vault = vault_pda(&squads, &multisig, 0);
+    let policy_nonce = twap_program::policy_nonce_address(&cfg_pda, 2).0;
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &policy_nonce, 1),
+    )
+    .expect("an outsider pre-funds the deterministic policy nonce address");
     let new_bps = 5_000u16;
     let message = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), new_bps);
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &vault, 10_000_000),
+    )
+    .expect("fund the governance vault's one-time policy nonce rent");
     let idx = 1u64;
     let transaction = transaction_pda(&squads, &multisig, idx);
     let proposal = proposal_pda(&squads, &multisig, idx);
@@ -5364,11 +5447,7 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
     )
     .expect("approve");
 
-    let remaining = vec![
-        AccountMeta::new_readonly(vault, false),
-        AccountMeta::new(cfg_pda, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining = reconfigure_remaining_accounts(&vault, &cfg_pda);
     let exec = vault_transaction_execute_ix(
         &squads,
         &multisig,
@@ -5400,6 +5479,13 @@ fn reconfigure_only_via_squads_vault_execute_after_timelock() {
         read_bps(&svm, &cfg_pda),
         new_bps,
         "DAO reconfigured the TWAP via Squads, only after the timelock"
+    );
+    let nonce_account = svm.get_account(&policy_nonce).unwrap();
+    assert_eq!(nonce_account.owner, twap_id());
+    assert_eq!(
+        u64::from_le_bytes(nonce_account.data[48..56].try_into().unwrap()),
+        1,
+        "pre-funding cannot brick first use or alter the consumed sequence",
     );
 
     // The operator-handoff (IX_ACCEPT_OPERATOR) is gated the SAME way: a non-vault
@@ -5553,11 +5639,7 @@ fn reconfigure_rejects_a_bps_above_the_denominator_that_would_overpull_the_floor
     let mut clock = svm.get_sysvar::<Clock>();
     clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar::<Clock>(&clock);
-    let remaining = vec![
-        AccountMeta::new_readonly(vault, false),
-        AccountMeta::new(cfg_pda, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining = reconfigure_remaining_accounts(&vault, &cfg_pda);
     let exec = vault_transaction_execute_ix(
         &squads,
         &multisig,
@@ -5671,14 +5753,8 @@ fn set_economics_rejects_an_over_allocation_that_would_overpull_the_floor() {
         &twap_authority,
         0,
     );
-    let remaining = |savings: &Pubkey| {
-        vec![
-            AccountMeta::new_readonly(vault, false),
-            AccountMeta::new(cfg_pda, false),
-            AccountMeta::new_readonly(*savings, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ]
-    };
+    let remaining =
+        |savings: &Pubkey| set_economics_remaining_accounts(&vault, &cfg_pda, savings);
 
     // (1) OVER-ALLOCATION: auction 8000 + savings 2001 = 10001 > 100% — the two pulls would exceed the
     // surplus and breach the floor. Rejected even past the timelock.
@@ -5831,17 +5907,9 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
         &twap_authority,
         0,
     );
-    let recfg_remaining = vec![
-        AccountMeta::new_readonly(vault, false),
-        AccountMeta::new(cfg_pda, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
-    let econ_remaining = vec![
-        AccountMeta::new_readonly(vault, false),
-        AccountMeta::new(cfg_pda, false),
-        AccountMeta::new_readonly(savings_acct, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let recfg_remaining = reconfigure_remaining_accounts(&vault, &cfg_pda);
+    let econ_remaining =
+        set_economics_remaining_accounts(&vault, &cfg_pda, &savings_acct);
 
     // (1) lower the auction to 4000 so we can set a large savings share.
     let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 4_000);
@@ -5868,6 +5936,7 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
         0,
         0,
         &Pubkey::default(),
+        1,
     );
     squads_execute(
         &mut svm,
@@ -5893,6 +5962,7 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
         5_000,
         0,
         &savings_acct,
+        2,
     );
     assert!(
         squads_execute(
@@ -5924,6 +5994,7 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
         5_000,
         0,
         &savings_acct,
+        2,
     );
     squads_execute(
         &mut svm,
@@ -11384,11 +11455,27 @@ fn squads_execute(
     squads: &Pubkey,
     multisig: &Pubkey,
     dao: &Keypair,
-    _payer: &Keypair,
+    payer: &Keypair,
     idx: u64,
     message: &[u8],
     remaining: &[AccountMeta],
 ) -> Result<(), String> {
+    let vault = vault_pda(squads, multisig, 0);
+    let vault_lamports = svm
+        .get_account(&vault)
+        .map_or(0, |account| account.lamports);
+    if vault_lamports < 10_000_000 {
+        send(
+            svm,
+            &[payer],
+            solana_sdk::system_instruction::transfer(
+                &payer.pubkey(),
+                &vault,
+                10_000_000 - vault_lamports,
+            ),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    }
     let transaction = transaction_pda(squads, multisig, idx);
     let proposal = proposal_pda(squads, multisig, idx);
     let mut send = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
@@ -21688,7 +21775,8 @@ fn build_cross_backing_twap_restart_asset0_message(
 }
 
 // IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
-// accounts: [squads_vault(signer), config(w), savings_account(ro)].
+// accounts: [squads_vault(signer,payer), config(w), savings_account(ro),
+// policy_nonce(w), system_program].
 fn build_set_economics_message(
     squads_vault: &Pubkey,
     config: &Pubkey,
@@ -21706,6 +21794,7 @@ fn build_set_economics_message(
         0,
         0,
         &Pubkey::default(),
+        0,
     )
 }
 
@@ -21720,22 +21809,26 @@ fn build_set_economics_message_with_expected(
     expected_savings_bps: u16,
     expected_buyback_bps: u16,
     expected_savings_account: &Pubkey,
+    expected_policy_nonce: u64,
 ) -> Vec<u8> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 14).0;
     let mut m = Vec::new();
     m.push(1); // num_signers
-    m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (config)
-    m.push(4); // account_keys
-    m.extend_from_slice(squads_vault.as_ref()); // 0 signer (ro)
+    m.push(1); // num_writable_signers (vault pays nonce rent)
+    m.push(2); // num_writable_non_signers (config, nonce)
+    m.push(6); // account_keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer (w)
     m.extend_from_slice(config.as_ref()); // 1 w
-    m.extend_from_slice(savings_account.as_ref()); // 2 ro
-    m.extend_from_slice(twap_id().as_ref()); // 3 program
+    m.extend_from_slice(policy_nonce.as_ref()); // 2 w
+    m.extend_from_slice(savings_account.as_ref()); // 3 ro
+    m.extend_from_slice(system_program::ID.as_ref()); // 4 ro
+    m.extend_from_slice(twap_id().as_ref()); // 5 program
     m.push(1); // instructions
-    m.push(3); // program_id_index -> twap
-    m.push(3); // account_indexes: squads_vault, config, savings
-    m.push(0);
-    m.push(1);
-    m.push(2);
+    m.push(5); // program_id_index -> twap
+    m.push(5); // account_indexes: vault, config, savings, nonce, system
+    for index in [0u8, 1, 3, 2, 4] {
+        m.push(index);
+    }
     let mut data = vec![14u8]; // IX_SET_ECONOMICS
     data.extend_from_slice(&savings_bps.to_le_bytes());
     data.extend_from_slice(&buyback_bps.to_le_bytes());
@@ -21743,10 +21836,27 @@ fn build_set_economics_message_with_expected(
     data.extend_from_slice(&expected_savings_bps.to_le_bytes());
     data.extend_from_slice(&expected_buyback_bps.to_le_bytes());
     data.extend_from_slice(expected_savings_account.as_ref());
+    data.extend_from_slice(&expected_policy_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn set_economics_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    savings_account: &Pubkey,
+) -> Vec<AccountMeta> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 14).0;
+    vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(*config, false),
+        AccountMeta::new(policy_nonce, false),
+        AccountMeta::new_readonly(*savings_account, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
 }
 
 // ATTACK PROBE (authority bypass): the subledger.accept_operator grant must be
@@ -23059,11 +23169,7 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
     let pol = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
-    let pr = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let pr = reconfigure_remaining_accounts(&squads_vault, &twap_cfg);
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 2, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
     let op = build_subledger_handoff_to_twap_message(
@@ -23626,11 +23732,10 @@ fn setup_handoff_with_mint_mode(
 
     let principal = 1_000_000u64;
     let surplus = 500_000u64;
-    // Preserve the historical Squads transaction indexes used by downstream auction fixtures with
-    // a harmless empty-market policy call. The pool-less custody handoff itself must happen before
-    // any insurance is funded.
+    // Preserve historical Squads transaction indexes without advancing a live policy sequence.
+    // Reaffirming the pre-handoff MAX floor is harmless because no insurance is funded yet.
     let preliminary_policy =
-        build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+        build_set_reserved_floor_message(&squads_vault, &twap_cfg, u128::MAX);
     let preliminary_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -23647,15 +23752,10 @@ fn setup_handoff_with_mint_mode(
         &preliminary_remaining,
     )
     .expect("empty-market policy setup");
-    // (Index 2 was the asset-0 tag-33 UpdateInsurancePolicy — REMOVED from the latest percolator; the
-    // policy is now baked into the slab's WrapperConfigV16 by make_live_market, and the tag-57 surplus
-    // withdraw is operator-gated, not policy-gated. Keep the index slot with a benign DAO reconfigure.)
-    let pol = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
-    let pr = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    // Index 2 was the retired Percolator insurance-policy call. Keep the slot with the same
+    // pre-handoff floor reaffirmation so downstream fixtures retain their transaction indexes.
+    let pol = build_set_reserved_floor_message(&squads_vault, &twap_cfg, u128::MAX);
+    let pr = preliminary_remaining.clone();
     squads_execute(svm, &squads, &multisig, &dao, payer, 2, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
     let op = build_accept_operator_message(
@@ -24630,17 +24730,19 @@ fn e2e_legacy_twap_config_remains_operable_after_layout_upgrade() {
     svm.set_account(env.twap_cfg, legacy).unwrap();
     let insurance_before = token_amount(&svm, &env.perc_vault);
 
-    let message = build_twap_reconfigure_message(
+    let message = build_twap_reconfigure_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &twap_id(),
         7_500,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+        0,
     );
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining =
+        reconfigure_remaining_accounts(&env.squads_vault, &env.twap_cfg);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -32558,6 +32660,7 @@ fn build_set_coin_sink_send_message(
         0,
         &Pubkey::default(),
         u64::MAX,
+        0,
     )
 }
 
@@ -32570,32 +32673,94 @@ fn build_set_coin_sink_send_message_from(
     expected_sink_mode: u8,
     expected_coin_sink: &Pubkey,
     expected_sink_cutoff_slot: u64,
+    expected_policy_nonce: u64,
 ) -> Vec<u8> {
+    build_set_coin_sink_message_from(
+        squads_vault,
+        config,
+        book,
+        1,
+        coin_sink,
+        u64::MAX,
+        expected_sink_mode,
+        expected_coin_sink,
+        expected_sink_cutoff_slot,
+        expected_policy_nonce,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_set_coin_sink_message_from(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    sink_mode: u8,
+    coin_sink: &Pubkey,
+    sink_cutoff_slot: u64,
+    expected_sink_mode: u8,
+    expected_coin_sink: &Pubkey,
+    expected_sink_cutoff_slot: u64,
+    expected_policy_nonce: u64,
+) -> Vec<u8> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 10).0;
+    let send = sink_mode == 1;
     let mut m = Vec::new();
     m.push(1);
-    m.push(0);
     m.push(1);
-    m.push(5); // signers, w-signers, w-nonsigners, keys
-    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
+    m.push(2);
+    m.push(if send { 7 } else { 6 }); // signers, w-signers, w-nonsigners, keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 writable signer
     m.extend_from_slice(book.as_ref()); // 1 w
-    m.extend_from_slice(config.as_ref()); // 2 ro
-    m.extend_from_slice(coin_sink.as_ref()); // 3 ro
-    m.extend_from_slice(twap_id().as_ref()); // 4 program
+    m.extend_from_slice(policy_nonce.as_ref()); // 2 w
+    m.extend_from_slice(config.as_ref()); // 3 ro
+    if send {
+        m.extend_from_slice(coin_sink.as_ref()); // 4 ro
+    }
+    m.extend_from_slice(system_program::ID.as_ref()); // 4/5 ro
+    m.extend_from_slice(twap_id().as_ref()); // 5/6 program
     m.push(1);
-    m.push(4);
-    m.push(4);
-    for i in [0u8, 2, 1, 3] {
+    m.push(if send { 6 } else { 5 });
+    m.push(if send { 6 } else { 5 });
+    for i in if send {
+        vec![0u8, 3, 1, 4, 2, 5]
+    } else {
+        vec![0u8, 3, 1, 2, 4]
+    } {
         m.push(i);
-    } // set_coin_sink ix order: squads_vault, config, book, coin_sink
-    let mut data = vec![10u8, 1u8]; // IX_SET_COIN_SINK, sink_mode = SINK_SEND
-    data.extend_from_slice(&u64::MAX.to_le_bytes());
+    }
+    let mut data = vec![10u8, sink_mode]; // IX_SET_COIN_SINK
+    data.extend_from_slice(&sink_cutoff_slot.to_le_bytes());
     data.push(expected_sink_mode);
     data.extend_from_slice(expected_coin_sink.as_ref());
     data.extend_from_slice(&expected_sink_cutoff_slot.to_le_bytes());
+    data.extend_from_slice(&expected_policy_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn set_coin_sink_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    coin_sink: Option<&Pubkey>,
+) -> Vec<AccountMeta> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 10).0;
+    let mut accounts = vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(*book, false),
+        AccountMeta::new(policy_nonce, false),
+        AccountMeta::new_readonly(*config, false),
+    ];
+    if let Some(coin_sink) = coin_sink {
+        accounts.push(AccountMeta::new_readonly(*coin_sink, false));
+    }
+    accounts.extend([
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]);
+    accounts
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -33904,6 +34069,16 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
     )
     .expect("create the governance multisig");
     let squads_vault = vault_pda(&squads, &multisig, 0);
+    send(
+        svm,
+        &[payer],
+        solana_sdk::system_instruction::transfer(
+            &payer.pubkey(),
+            &squads_vault,
+            10_000_000,
+        ),
+    )
+    .expect("fund the governance vault's one-time policy nonce rent");
 
     let coin_mint_authority = Keypair::new();
     let coin_mint = create_real_mint(svm, payer, &coin_mint_authority.pubkey());
@@ -33997,9 +34172,14 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
     )
     .expect("governance hands the live market to TWAP");
 
+    let floor_remaining = vec![
+        AccountMeta::new_readonly(squads_vault, false),
+        AccountMeta::new(twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
     for transaction_index in 3..=4 {
         let message =
-            build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
+            build_set_reserved_floor_message(&squads_vault, &twap_cfg, u128::MAX);
         squads_execute(
             svm,
             &squads,
@@ -34008,11 +34188,7 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
             payer,
             transaction_index,
             &message,
-            &[
-                AccountMeta::new_readonly(squads_vault, false),
-                AccountMeta::new(twap_cfg, false),
-                AccountMeta::new_readonly(twap_id(), false),
-            ],
+            &floor_remaining,
         )
         .expect("advance the governance transaction sequence");
     }
@@ -36171,12 +36347,8 @@ fn e2e_execute_splits_surplus_to_savings_sink_without_breaching_principal() {
         0,
     );
     let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
-    let er = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let er =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36307,12 +36479,8 @@ fn e2e_savings_sink_cannot_alias_holding_and_expand_the_auction_budget() {
         1_000,
         0,
     );
-    let alias_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(bk.holding, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let alias_remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.holding);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36399,13 +36567,10 @@ fn e2e_savings_sink_cannot_alias_holding_and_expand_the_auction_budget() {
         1_000,
         0,
         &bk.holding,
+        1,
     );
-    let valid_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let valid_remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36493,12 +36658,8 @@ fn e2e_execute_savings_share_cannot_be_redirected_to_a_decoy_sink() {
         0,
     );
     let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
-    let er = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let er =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -36619,12 +36780,8 @@ fn e2e_shutdown_sweeps_holding_and_savings_only_via_squads() {
     );
     let economics =
         build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings, 1_000, 0);
-    let economics_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics_remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -37569,11 +37726,8 @@ fn e2e_full_genesis_to_buy_burn() {
 
     // Configure 80% of protocol surplus for the auction.
     let policy_msg = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
-    let policy_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let policy_remaining =
+        reconfigure_remaining_accounts(&squads_vault, &twap_cfg);
     squads_execute(
         &mut svm,
         &squads,
@@ -37851,14 +38005,20 @@ fn e2e_full_genesis_to_buy_burn() {
     set_token(&mut svm, &coin_escrow, &coin_mint, &book_escrow, 0);
     set_token(&mut svm, &settlement_usd, &collateral_mint, &book_escrow, 0);
     set_token(&mut svm, &holding, &collateral_mint, &twap_authority, 0);
-    let economics =
-        build_set_economics_message(&squads_vault, &twap_cfg, &holding, 0, 5_000);
-    let economics_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(holding, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics = build_set_economics_message_with_expected(
+        &squads_vault,
+        &twap_cfg,
+        &holding,
+        0,
+        5_000,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+        1,
+    );
+    let economics_remaining =
+        set_economics_remaining_accounts(&squads_vault, &twap_cfg, &holding);
     squads_execute(
         &mut svm,
         &squads,
@@ -40111,12 +40271,8 @@ fn e2e_execute_buyback_retains_fraction_to_sink_and_burns_the_rest() {
 
     // DAO sets the buyback fraction to 30% of bought COIN (config-level, set via set_economics, idx 6).
     let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &treasury, 0, 3_000);
-    let er = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(treasury, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let er =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &treasury);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -40265,12 +40421,8 @@ fn e2e_fractional_buyback_carries_across_permissionless_rounds() {
     );
     let economics =
         build_set_economics_message(&env.squads_vault, &env.twap_cfg, &reward_vault, 0, 5_000);
-    let economics_accounts = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(reward_vault, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics_accounts =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &reward_vault);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -40544,7 +40696,7 @@ fn e2e_shutdown_cannot_drain_escrow_or_settlement() {
     let _ = (winner, loser);
 }
 
-// Squads message wrapping twap.set_reserve (tag 6). Accounts: [squads_vault(signer), config, book(w)].
+// Squads message wrapping twap.set_reserve (tag 6).
 fn build_set_reserve_message(
     squads_vault: &Pubkey,
     config: &Pubkey,
@@ -40560,9 +40712,11 @@ fn build_set_reserve_message(
         reserve_den,
         0,
         1,
+        0,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_set_reserve_message_with_expected(
     squads_vault: &Pubkey,
     config: &Pubkey,
@@ -40571,31 +40725,52 @@ fn build_set_reserve_message_with_expected(
     reserve_den: u128,
     expected_reserve_num: u128,
     expected_reserve_den: u128,
+    expected_policy_nonce: u64,
 ) -> Vec<u8> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 6).0;
     let mut m = Vec::new();
     m.push(1);
-    m.push(0);
     m.push(1);
-    m.push(4);
-    m.extend_from_slice(squads_vault.as_ref()); // 0 ro signer
+    m.push(2);
+    m.push(6);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 writable signer
     m.extend_from_slice(book.as_ref()); // 1 w
-    m.extend_from_slice(config.as_ref()); // 2 ro
-    m.extend_from_slice(twap_id().as_ref()); // 3 program
+    m.extend_from_slice(policy_nonce.as_ref()); // 2 w
+    m.extend_from_slice(config.as_ref()); // 3 ro
+    m.extend_from_slice(system_program::ID.as_ref()); // 4 ro
+    m.extend_from_slice(twap_id().as_ref()); // 5 program
     m.push(1);
-    m.push(3);
-    m.push(3);
-    for i in [0u8, 2, 1] {
+    m.push(5);
+    m.push(5);
+    for i in [0u8, 3, 1, 2, 4] {
         m.push(i);
-    } // squads_vault, config, book
+    }
     let mut data = vec![6u8];
     data.extend_from_slice(&reserve_num.to_le_bytes());
     data.extend_from_slice(&reserve_den.to_le_bytes());
     data.extend_from_slice(&expected_reserve_num.to_le_bytes());
     data.extend_from_slice(&expected_reserve_den.to_le_bytes());
+    data.extend_from_slice(&expected_policy_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn set_reserve_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+) -> Vec<AccountMeta> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 6).0;
+    vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(*book, false),
+        AccountMeta::new(policy_nonce, false),
+        AccountMeta::new_readonly(*config, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
 }
 
 fn build_set_bid_fee_message(
@@ -40649,12 +40824,8 @@ fn e2e_reserve_blocks_expensive_bid_from_draining_surplus() {
 
     // DAO sets a reserve of 1 COIN per 1 USD (a bid must give at least 1 COIN per dollar).
     let rm = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 1, 1);
-    let rr = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rr =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -40878,12 +41049,8 @@ fn e2e_integer_clearing_cannot_pay_more_than_the_reserve_for_delivered_coin() {
         reserve_num,
         reserve_den,
     );
-    let reserve_accounts = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let reserve_accounts =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -42945,12 +43112,8 @@ fn e2e_unexecutable_top_bid_cannot_starve_lower_executable_bid() {
         1,
         500,
     );
-    let reserve_accounts = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let reserve_accounts =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -44072,12 +44235,8 @@ fn e2e_set_reserve_rejects_a_zero_denominator_that_would_brick_execute() {
     // ATTACK: the DAO proposes set_reserve with reserve_den = 0 (num 1). Even fully approved + past the
     // timelock, the TWAP rejects it, so the div-by-zero can never reach execute.
     let msg = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 1, 0);
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     assert!(
         squads_execute(
             &mut svm,
@@ -44149,12 +44308,8 @@ fn e2e_attacker_cannot_lower_the_reserve_without_squads() {
 
     // DAO sets a protective reserve (2 COIN per USD) via a Squads execute (tx index 6).
     let rm = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 2, 1);
-    let rr = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rr =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -44178,12 +44333,18 @@ fn e2e_attacker_cannot_lower_the_reserve_without_squads() {
     data.extend_from_slice(&1u128.to_le_bytes()); // reserve_den
     data.extend_from_slice(&2u128.to_le_bytes()); // expected reserve_num
     data.extend_from_slice(&1u128.to_le_bytes()); // expected reserve_den
+    data.extend_from_slice(&1u64.to_le_bytes()); // expected policy nonce
     let rogue = Instruction {
         program_id: twap_id(),
         accounts: vec![
-            AccountMeta::new_readonly(attacker.pubkey(), true), // posing as the squads vault
+            AccountMeta::new(attacker.pubkey(), true), // posing as the squads vault
             AccountMeta::new_readonly(env.twap_cfg, false),
             AccountMeta::new(bk.book, false),
+            AccountMeta::new(
+                twap_program::policy_nonce_address(&env.twap_cfg, 6).0,
+                false,
+            ),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data,
     };
@@ -44235,12 +44396,8 @@ fn e2e_a_squads_action_cannot_execute_before_the_one_week_timelock() {
     // timelock.
     let idx = 6u64;
     let msg = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 7, 3);
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     let transaction = transaction_pda(&env.squads, &env.multisig, idx);
     let proposal = proposal_pda(&env.squads, &env.multisig, idx);
     let send_sq = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
@@ -44341,13 +44498,12 @@ fn e2e_a_squads_action_cannot_execute_before_the_one_week_timelock() {
 }
 
 // RECONFIGURE AUTH (missing-signer bypass): the DAO's burn-share (surplus_buy_burn_bps) is changed
-// by reconfigure, Squads-vault-gated behind the 1-week timelock. Unlike the other mutators it does
-// NOT call require_squads_vault — it inlines the gate, so it must check BOTH that the squads_vault
-// SIGNED and that its key is the config's canonical vault. The dangerous regression is dropping the
-// is_signer check: then an attacker could merely NAME the real vault as a read-only account (no
-// signature) and reconfigure the burn policy freely — bypassing the DAO + the entire 1-week timelock
+// by reconfigure, Squads-vault-gated behind the 1-week timelock. The gate must check BOTH that the
+// squads_vault SIGNED and that its key is the config's canonical vault. The dangerous regression is
+// dropping the is_signer check: then an attacker could merely name the real vault as a read-only
+// account without its signature and reconfigure the burn policy, bypassing the DAO and timelock
 // (a governance-capture DOS: force bps to 0 to kill the buyback, or 100% to drain all surplus to burn).
-// The existing reconfigure test only covers the timelock; this pins the inlined signer+key gate.
+// The existing reconfigure test only covers the timelock; this pins the signer+key gate.
 #[test]
 fn e2e_reconfigure_rejects_a_non_signing_or_forged_vault() {
     let mut svm =
@@ -44368,14 +44524,22 @@ fn e2e_reconfigure_rejects_a_non_signing_or_forged_vault() {
     svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
     let mut data = vec![2u8]; // IX_RECONFIGURE
     data.extend_from_slice(&0u16.to_le_bytes()); // new_bps = 0 -> would kill the buyback
+    data.extend_from_slice(&8_000u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(Pubkey::default().as_ref());
+    data.extend_from_slice(&0u64.to_le_bytes());
+    let policy_nonce = twap_program::policy_nonce_address(&env.twap_cfg, 2).0;
 
     // ATTACK 1 (missing-signer): reference the REAL vault but do NOT make it sign. A key-only gate
     // would accept this; the is_signer check must reject it.
     let rogue_unsigned = Instruction {
         program_id: twap_id(),
         accounts: vec![
-            AccountMeta::new_readonly(env.squads_vault, false), // real vault, NOT a signer
+            AccountMeta::new(env.squads_vault, false), // real vault, NOT a signer
             AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new(policy_nonce, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data: data.clone(),
     };
@@ -44396,6 +44560,8 @@ fn e2e_reconfigure_rejects_a_non_signing_or_forged_vault() {
         accounts: vec![
             AccountMeta::new(attacker.pubkey(), true), // attacker signs, but is not the canonical vault
             AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new(policy_nonce, false),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
         data,
     };
@@ -45431,12 +45597,8 @@ fn e2e_full_book_equal_to_worst_case_reserve_cannot_dos_execute() {
         reserve_num,
         reserve_den,
     );
-    let rr = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rr =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -45532,12 +45694,8 @@ fn e2e_full_book_of_high_iteration_reduced_lots_cannot_dos_execute() {
         coin,
         usd,
     );
-    let reserve_accounts = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let reserve_accounts =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -45741,17 +45899,19 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
     let env = setup_handoff(&mut svm, &payer);
     let bk = setup_auction(&mut svm, &payer, &env, 10, 0, None, 0);
 
-    let policy = build_twap_reconfigure_message(
+    let policy = build_twap_reconfigure_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &twap_id(),
         5_000,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+        0,
     );
-    let policy_accounts = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let policy_accounts =
+        reconfigure_remaining_accounts(&env.squads_vault, &env.twap_cfg);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -45956,13 +46116,10 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         0,
         0,
         &Pubkey::default(),
+        1,
     );
-    let economics_accounts = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics_accounts =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -47478,6 +47635,12 @@ fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
     // A non-Squads caller cannot change the sink mode: forge set_coin_sink with an attacker "vault".
     let attacker = Keypair::new();
     svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    let mut rogue_data = vec![10u8, 1u8];
+    rogue_data.extend_from_slice(&u64::MAX.to_le_bytes());
+    rogue_data.push(0);
+    rogue_data.extend_from_slice(Pubkey::default().as_ref());
+    rogue_data.extend_from_slice(&u64::MAX.to_le_bytes());
+    rogue_data.extend_from_slice(&0u64.to_le_bytes());
     let rogue = Instruction {
         program_id: twap_id(),
         accounts: vec![
@@ -47485,8 +47648,13 @@ fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
             AccountMeta::new_readonly(env.twap_cfg, false),
             AccountMeta::new(bk.book, false),
             AccountMeta::new_readonly(treasury, false),
+            AccountMeta::new(
+                twap_program::policy_nonce_address(&env.twap_cfg, 10).0,
+                false,
+            ),
+            AccountMeta::new_readonly(system_program::ID, false),
         ],
-        data: vec![10u8, 1u8],
+        data: rogue_data,
     };
     assert!(
         send(&mut svm, &[&attacker], rogue).is_err(),
@@ -47496,13 +47664,12 @@ fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
     // The DAO flips BURN -> SEND(buyback) via a timelock'd Squads execute (next tx idx = 6).
     let msg =
         build_set_coin_sink_send_message(&env.squads_vault, &env.twap_cfg, &bk.book, &treasury);
-    let rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(treasury, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rem = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&treasury),
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -47518,12 +47685,8 @@ fn e2e_dao_flips_burn_to_buyback_only_via_squads() {
     // The flip configures the SINK; the buyback FRACTION is the separate set_economics control. Set it to
     // 100% (retain-all) so this pins the send-all boundary (no burn). (idx 7.)
     let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &treasury, 0, 10_000);
-    let er = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(treasury, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let er =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &treasury);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -48336,12 +48499,7 @@ fn e2e_config_a_cannot_mutate_config_bs_book() {
 
     // ATTACK: config-A's Squads authorizes set_reserve on config-B's BOOK.
     let msg = build_set_reserve_message(&vault_a, &config_a, &bk.book, 999, 1);
-    let rem = vec![
-        AccountMeta::new_readonly(vault_a, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(config_a, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let rem = set_reserve_remaining_accounts(&vault_a, &config_a, &bk.book);
     assert!(
         squads_execute(
             &mut svm,
@@ -48364,12 +48522,8 @@ fn e2e_config_a_cannot_mutate_config_bs_book() {
 
     // POSITIVE CONTROL: config-B's OWN Squads sets its book reserve (next env.multisig tx index = 6).
     let ok = build_set_reserve_message(&env.squads_vault, &env.twap_cfg, &bk.book, 5, 1);
-    let okr = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let okr =
+        set_reserve_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.book);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -48391,13 +48545,8 @@ fn e2e_config_a_cannot_mutate_config_bs_book() {
     let attacker_sink = Pubkey::new_unique();
     set_token(&mut svm, &attacker_sink, &env.coin_mint, &dao_a.pubkey(), 0); // A-owned, B's coin mint
     let sink_msg = build_set_coin_sink_send_message(&vault_a, &config_a, &bk.book, &attacker_sink);
-    let sink_rem = vec![
-        AccountMeta::new_readonly(vault_a, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(config_a, false),
-        AccountMeta::new_readonly(attacker_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let sink_rem =
+        set_coin_sink_remaining_accounts(&vault_a, &config_a, &bk.book, Some(&attacker_sink));
     assert!(squads_execute(&mut svm, &env.squads, &multisig_a, &dao_a, &payer, 2, &sink_msg, &sink_rem).is_err(),
         "config-A must NOT flip config-B's book sink (book.config pin) — would redirect B's buyback to A");
     assert_eq!(
@@ -48657,13 +48806,12 @@ fn e2e_send_sink_cannot_be_the_coin_escrow() {
         &bk.book,
         &bk.coin_escrow,
     );
-    let bad_rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(bk.coin_escrow, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let bad_rem = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&bk.coin_escrow),
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -48684,13 +48832,12 @@ fn e2e_send_sink_cannot_be_the_coin_escrow() {
     set_token(&mut svm, &treasury, &env.coin_mint, &payer.pubkey(), 0);
     let ok =
         build_set_coin_sink_send_message(&env.squads_vault, &env.twap_cfg, &bk.book, &treasury);
-    let ok_rem = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(treasury, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let ok_rem = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&treasury),
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -48733,13 +48880,12 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
         &bk.book,
         &bk.settlement_usd,
     );
-    let bad_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(bk.settlement_usd, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let bad_remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&bk.settlement_usd),
+    );
     let bad_result = squads_execute(
         &mut svm,
         &env.squads,
@@ -48758,12 +48904,8 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
             0,
             10_000,
         );
-        let economics_remaining = vec![
-            AccountMeta::new_readonly(env.squads_vault, false),
-            AccountMeta::new(env.twap_cfg, false),
-            AccountMeta::new_readonly(bk.holding, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ];
+        let economics_remaining =
+            set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.holding);
         squads_execute(
             &mut svm,
             &env.squads,
@@ -48868,13 +49010,12 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
         &bk.book,
         &bk.holding,
     );
-    let holding_alias_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(bk.holding, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let holding_alias_remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&bk.holding),
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -48905,13 +49046,12 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
         &bk.book,
         &external_sink,
     );
-    let valid_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(bk.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(external_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let valid_remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &bk.book,
+        Some(&external_sink),
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -48931,12 +49071,8 @@ fn e2e_same_mint_coin_sink_cannot_alias_the_settlement_account() {
         0,
         10_000,
     );
-    let economics_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(bk.holding, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics_remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &bk.holding);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -49573,12 +49709,8 @@ fn e2e_execute_cranker_cannot_redirect_the_savings_pull() {
         0,
     );
     let em = build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings_sink, 1_000, 0);
-    let er = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let er =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -49721,12 +49853,8 @@ fn e2e_execute_full_four_way_split_composes_in_one_round() {
         1_000,
         3_000,
     );
-    let er = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let er =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings_sink);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -52255,11 +52383,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
 
     // policy (insurance withdraw bps so execute can pull); operator -> twap (the handoff); floor = principal.
     let pol = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 8_000);
-    let pr = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let pr = reconfigure_remaining_accounts(&squads_vault, &twap_cfg);
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 7, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
     let op = build_subledger_handoff_to_twap_message(
@@ -52337,13 +52461,20 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &twap_authority,
         0,
     );
-    let economics = build_set_economics_message(&squads_vault, &twap_cfg, &twap_holding, 0, 5_000);
-    let economics_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_holding, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics = build_set_economics_message_with_expected(
+        &squads_vault,
+        &twap_cfg,
+        &twap_holding,
+        0,
+        5_000,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+        1,
+    );
+    let economics_remaining =
+        set_economics_remaining_accounts(&squads_vault, &twap_cfg, &twap_holding);
     squads_execute(
         &mut svm,
         &squads,
@@ -61296,11 +61427,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
     .expect("public donor adds protocol insurance while TWAP holds custody");
 
     let fifty_fifty = build_twap_reconfigure_message(&env.squads_vault, &twap_cfg, &twap_id(), 5_000);
-    let reconfigure_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let reconfigure_remaining =
+        reconfigure_remaining_accounts(&env.squads_vault, &twap_cfg);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -66096,6 +66224,15 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
 // buyback. This probe allocates and initializes the Percolator market through public instructions.
 #[test]
 fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
+    run_stale_coin_sink_after_correction(true);
+}
+
+#[test]
+fn e2e_noop_coin_sink_correction_invalidates_an_older_recipient() {
+    run_stale_coin_sink_after_correction(false);
+}
+
+fn run_stale_coin_sink_after_correction(correction_burns: bool) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -66200,39 +66337,14 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
         &payer,
         7,
         &economics,
-        &[
-            AccountMeta::new_readonly(env.squads_vault, false),
-            AccountMeta::new(env.twap_cfg, false),
-            AccountMeta::new_readonly(obsolete_sink, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ],
+        &set_economics_remaining_accounts(
+            &env.squads_vault,
+            &env.twap_cfg,
+            &obsolete_sink,
+        ),
     )
     .expect("DAO configures bought COIN for complete sink retention");
 
-    let build_burn_message = || {
-        let mut message = Vec::new();
-        message.push(1); // num_signers
-        message.push(0); // num_writable_signers
-        message.push(1); // num_writable_non_signers
-        message.push(4); // account_keys
-        message.extend_from_slice(env.squads_vault.as_ref()); // 0
-        message.extend_from_slice(book.book.as_ref()); // 1
-        message.extend_from_slice(env.twap_cfg.as_ref()); // 2
-        message.extend_from_slice(twap_id().as_ref()); // 3
-        message.push(1); // instructions
-        message.push(3); // program_id_index
-        message.push(3); // instruction accounts
-        message.extend_from_slice(&[0, 2, 1]);
-        let mut data = vec![10u8, 0u8]; // IX_SET_COIN_SINK, SINK_BURN
-        data.extend_from_slice(&u64::MAX.to_le_bytes());
-        data.push(1); // expected SINK_SEND
-        data.extend_from_slice(current_sink.as_ref());
-        data.extend_from_slice(&u64::MAX.to_le_bytes());
-        message.extend_from_slice(&(data.len() as u16).to_le_bytes());
-        message.extend_from_slice(&data);
-        message.push(0); // address_table_lookups
-        message
-    };
     let stale_message = build_set_coin_sink_send_message_from(
         &env.squads_vault,
         &env.twap_cfg,
@@ -66241,8 +66353,33 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
         1,
         &current_sink,
         u64::MAX,
+        0,
     );
-    let correction_message = build_burn_message();
+    let correction_message = if correction_burns {
+        build_set_coin_sink_message_from(
+            &env.squads_vault,
+            &env.twap_cfg,
+            &book.book,
+            0,
+            &Pubkey::default(),
+            u64::MAX,
+            1,
+            &current_sink,
+            u64::MAX,
+            0,
+        )
+    } else {
+        build_set_coin_sink_send_message_from(
+            &env.squads_vault,
+            &env.twap_cfg,
+            &book.book,
+            &current_sink,
+            1,
+            &current_sink,
+            u64::MAX,
+            0,
+        )
+    };
     let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
         let transaction = transaction_pda(&env.squads, &env.multisig, index);
         let proposal = proposal_pda(&env.squads, &env.multisig, index);
@@ -66279,12 +66416,12 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
     clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar(&clock);
 
-    let correction_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(book.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let correction_remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book.book,
+        (!correction_burns).then_some(&current_sink),
+    );
     send(
         &mut svm,
         &[&env.dao],
@@ -66297,15 +66434,14 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
             &correction_remaining,
         ),
     )
-    .expect("execute the burn correction first");
+    .expect("execute the latest sink correction first");
     let book_before_replay = svm.get_account(&book.book).unwrap();
-    let stale_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(book.book, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(obsolete_sink, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let stale_remaining = set_coin_sink_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &book.book,
+        Some(&obsolete_sink),
+    );
     let replay = send(
         &mut svm,
         &[&env.dao],
@@ -66367,7 +66503,13 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
             &book.settlement_usd,
             &book.book_escrow,
             &book.coin_escrow,
-            replay.is_ok().then_some(obsolete_sink),
+            if replay.is_ok() {
+                Some(obsolete_sink)
+            } else if correction_burns {
+                None
+            } else {
+                Some(current_sink)
+            },
         ),
     )
     .expect("permissionless cranker settles the independently funded buyback");
@@ -66383,10 +66525,20 @@ fn e2e_stale_coin_sink_cannot_overwrite_a_later_burn_correction() {
         );
     }
     assert_eq!(token_amount(&svm, &obsolete_sink), 0);
+    let expected_burn = if correction_burns {
+        auction_budget
+    } else {
+        0
+    };
     assert_eq!(
         supply_before - mint_supply(&svm, &env.coin_mint),
-        auction_budget,
-        "the correction burns the complete bought-COIN output",
+        expected_burn,
+        "only the surviving correction controls the bought-COIN output",
+    );
+    assert_eq!(
+        token_amount(&svm, &current_sink),
+        auction_budget - expected_burn,
+        "a no-op correction still preserves its configured recipient",
     );
     assert_eq!(
         token_amount(&svm, &book.settlement_usd),
@@ -66865,12 +67017,7 @@ fn run_stale_buyback_economics_after_correction(correction_buyback_bps: u16) {
         &payer,
         7,
         &initial_economics,
-        &[
-            AccountMeta::new_readonly(env.squads_vault, false),
-            AccountMeta::new(env.twap_cfg, false),
-            AccountMeta::new_readonly(savings, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ],
+        &set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings),
     )
     .expect("the live policy retains half of bought COIN");
 
@@ -66884,6 +67031,7 @@ fn run_stale_buyback_economics_after_correction(correction_buyback_bps: u16) {
         0,
         5_000,
         &savings,
+        1,
     );
     let correction_message = build_set_economics_message_with_expected(
         &env.squads_vault,
@@ -66895,6 +67043,7 @@ fn run_stale_buyback_economics_after_correction(correction_buyback_bps: u16) {
         0,
         5_000,
         &savings,
+        1,
     );
     let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
         let transaction = transaction_pda(&env.squads, &env.multisig, index);
@@ -66932,12 +67081,8 @@ fn run_stale_buyback_economics_after_correction(correction_buyback_bps: u16) {
     clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar(&clock);
 
-    let economics_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(savings, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let economics_remaining =
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings);
     send(
         &mut svm,
         &[&env.dao],
@@ -67070,6 +67215,23 @@ fn e2e_noop_economics_correction_invalidates_an_older_retention_policy() {
 // bidder-owned sink, the stale share otherwise pays collateral while returning every sold COIN.
 #[test]
 fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
+    run_stale_auction_share_after_correction(0, false);
+}
+
+#[test]
+fn e2e_noop_auction_share_correction_invalidates_an_older_policy() {
+    run_stale_auction_share_after_correction(5_000, false);
+}
+
+#[test]
+fn e2e_noop_economics_correction_invalidates_an_older_auction_share() {
+    run_stale_auction_share_after_correction(5_000, true);
+}
+
+fn run_stale_auction_share_after_correction(
+    correction_share_bps: u16,
+    correction_via_economics: bool,
+) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -67183,12 +67345,7 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
         &payer,
         7,
         &economics,
-        &[
-            AccountMeta::new_readonly(env.squads_vault, false),
-            AccountMeta::new(env.twap_cfg, false),
-            AccountMeta::new_readonly(savings, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ],
+        &set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings),
     )
     .expect("the live policy returns every bought COIN to the configured sink");
     let initial_share = build_twap_reconfigure_message_with_expected(
@@ -67200,12 +67357,10 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
         0,
         10_000,
         &savings,
+        1,
     );
-    let reconfigure_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.twap_cfg, false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let reconfigure_remaining =
+        reconfigure_remaining_accounts(&env.squads_vault, &env.twap_cfg);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -67227,17 +67382,34 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
         0,
         10_000,
         &savings,
+        2,
     );
-    let correction_message = build_twap_reconfigure_message_with_expected(
-        &env.squads_vault,
-        &env.twap_cfg,
-        &twap_id(),
-        0,
-        5_000,
-        0,
-        10_000,
-        &savings,
-    );
+    let correction_message = if correction_via_economics {
+        build_set_economics_message_with_expected(
+            &env.squads_vault,
+            &env.twap_cfg,
+            &savings,
+            0,
+            10_000,
+            5_000,
+            0,
+            10_000,
+            &savings,
+            2,
+        )
+    } else {
+        build_twap_reconfigure_message_with_expected(
+            &env.squads_vault,
+            &env.twap_cfg,
+            &twap_id(),
+            correction_share_bps,
+            5_000,
+            0,
+            10_000,
+            &savings,
+            2,
+        )
+    };
     let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
         let transaction = transaction_pda(&env.squads, &env.multisig, index);
         let proposal = proposal_pda(&env.squads, &env.multisig, index);
@@ -67274,6 +67446,11 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
     clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
     svm.set_sysvar(&clock);
 
+    let correction_remaining = if correction_via_economics {
+        set_economics_remaining_accounts(&env.squads_vault, &env.twap_cfg, &savings)
+    } else {
+        reconfigure_remaining.clone()
+    };
     send(
         &mut svm,
         &[&env.dao],
@@ -67283,10 +67460,10 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
             &correction_proposal,
             &correction_transaction,
             &env.dao.pubkey(),
-            &reconfigure_remaining,
+            &correction_remaining,
         ),
     )
-    .expect("execute the zero-share correction first");
+    .expect("execute the latest auction-share correction first");
     let config_before_replay = svm.get_account(&env.twap_cfg).unwrap();
     let replay = send(
         &mut svm,
@@ -67373,32 +67550,53 @@ fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
             "an older approved auction share paid {stale_budget} collateral while returning every sold COIN to the bidder",
         );
     }
-    assert_eq!(token_amount(&svm, &bidder_usd), 0);
-    assert_eq!(token_amount(&svm, &bidder_sink), 0);
-    warp_to(&mut svm, round_end + 10);
-    send(
-        &mut svm,
-        &[&bidder],
-        cancel_ix(
-            &bidder.pubkey(),
-            &env.twap_cfg,
-            &book.book,
-            &book.book_escrow,
-            &book.coin_escrow,
-            &bidder_coin,
-            0,
-        ),
-    )
-    .expect("the bidder recovers the unfilled bid after the bounded cooldown");
+    let expected_payout = donated * u64::from(correction_share_bps) / 10_000;
+    if expected_payout > 0 {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.settlement_usd,
+                &book.coin_escrow,
+                &bidder_usd,
+                &bidder_coin,
+                0,
+            ),
+        )
+        .expect("the permissionless claim pays only the corrected auction share");
+    }
+    assert_eq!(token_amount(&svm, &bidder_usd), expected_payout);
+    assert_eq!(token_amount(&svm, &bidder_sink), expected_payout);
+    if expected_payout == 0 {
+        warp_to(&mut svm, round_end + 10);
+        send(
+            &mut svm,
+            &[&bidder],
+            cancel_ix(
+                &bidder.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &bidder_coin,
+                0,
+            ),
+        )
+        .expect("the bidder recovers the unfilled bid after the bounded cooldown");
+    }
     assert_eq!(
-        token_amount(&svm, &bidder_coin),
+        token_amount(&svm, &bidder_coin) + token_amount(&svm, &bidder_sink),
         stale_budget,
-        "the zero-share correction returns the complete unfilled bid",
+        "the correction returns every unfilled or retained COIN atom",
     );
     assert_eq!(
         read_asset0_insurance(&svm, &env.slab),
-        u128::from(donated),
-        "the correction leaves the independent donation in insurance",
+        u128::from(donated - expected_payout),
+        "only the corrected auction share can leave independent-donor insurance",
     );
 }
 
