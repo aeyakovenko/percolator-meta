@@ -64673,3 +64673,638 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
 }
+
+// PUBLIC LOF: two separately signed fee-bump variants of one ConvertReleasedPnl intent remain
+// valid for the same portfolio incarnation. After the first variant consumes the current PnL,
+// a later organic PnL epoch replenishes the signed amount and an unprivileged relayer can submit
+// the retained variant. Conversion makes that later PnL maintenance-fee-bearing capital, which a
+// configured public cranker can withdraw. The control and retry paths conserve the same victim
+// value before fees; only the stale conversion changes who withdraws the second epoch's atoms.
+// Market and portfolio state are created by public handlers against the real pinned SBF.
+#[derive(Debug)]
+struct PresignedConvertRetryOutcome {
+    retry_accepted: bool,
+    first_released: u128,
+    second_released: u128,
+    victim_value_before_fee: u128,
+    attacker_withdrawal: u64,
+    victim_withdrawal: u64,
+}
+
+fn convert_retry_portfolio_parts(svm: &LiteSVM, portfolio: &Pubkey) -> (u128, i128) {
+    let account = svm.get_account(portfolio).expect("portfolio remains live");
+    let state = percolator_prog::state::read_portfolio(&account.data).unwrap();
+    (state.capital.get(), state.pnl.get())
+}
+
+fn create_convert_retry_portfolio(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    owner: &Keypair,
+    market: Pubkey,
+    portfolio_len: usize,
+) -> Pubkey {
+    let portfolio = Keypair::new();
+    let rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    send(
+        svm,
+        &[payer, &portfolio],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &portfolio.pubkey(),
+            rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("publicly allocate portfolio");
+    send(
+        svm,
+        &[payer, owner],
+        pix(
+            vec![
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio.pubkey(), false),
+            ],
+            percolator_prog::ix::Instruction::InitPortfolio,
+        ),
+    )
+    .expect("publicly initialize portfolio");
+    portfolio.pubkey()
+}
+
+fn fund_convert_retry_portfolio(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    owner: &Keypair,
+    market: Pubkey,
+    portfolio: Pubkey,
+    collateral: Pubkey,
+    vault: Pubkey,
+    amount: u64,
+) {
+    let source = Pubkey::new_unique();
+    set_token(svm, &source, &collateral, &owner.pubkey(), amount);
+    send(
+        svm,
+        &[payer, owner],
+        pix(
+            vec![
+                AccountMeta::new_readonly(owner.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            percolator_prog::ix::Instruction::Deposit {
+                amount: amount as u128,
+            },
+        ),
+    )
+    .expect("fund public portfolio");
+}
+
+fn make_convert_retry_released_pnl(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    oracle: &Keypair,
+    winner: &Keypair,
+    winner_portfolio: Pubkey,
+    market: Pubkey,
+    collateral: Pubkey,
+    vault: Pubkey,
+    portfolio_len: usize,
+    mark_slot: u64,
+    start_price: u64,
+    end_price: u64,
+) -> u128 {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let loser = Keypair::new();
+    svm.airdrop(&loser.pubkey(), 1_000_000_000).unwrap();
+    let loser_portfolio =
+        create_convert_retry_portfolio(svm, payer, &loser, market, portfolio_len);
+    fund_convert_retry_portfolio(
+        svm,
+        payer,
+        &loser,
+        market,
+        loser_portfolio,
+        collateral,
+        vault,
+        300,
+    );
+
+    let size_q = 20_i128
+        .checked_mul(percolator::POS_SCALE as i128)
+        .unwrap();
+    let trade = |size_q| {
+        pix(
+            vec![
+                AccountMeta::new_readonly(winner.pubkey(), true),
+                AccountMeta::new_readonly(loser.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(winner_portfolio, false),
+                AccountMeta::new(loser_portfolio, false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q,
+                exec_price: if size_q > 0 {
+                    start_price
+                } else {
+                    end_price
+                },
+                fee_bps: 0,
+            },
+        )
+    };
+    send(svm, &[payer, winner, &loser], trade(size_q))
+        .expect("winner opens an ordinary long");
+
+    svm.set_sysvar(&Clock {
+        slot: mark_slot,
+        unix_timestamp: mark_slot as i64,
+        ..Clock::default()
+    });
+    send(
+        svm,
+        &[payer, oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: mark_slot,
+                mark_e6: end_price,
+            },
+        ),
+    )
+    .expect("independent oracle creates organic winner PnL");
+
+    for portfolio in [loser_portfolio, winner_portfolio] {
+        send(
+            svm,
+            &[payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: mark_slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("permissionless crank settles the moved mark");
+    }
+
+    send(svm, &[payer, winner, &loser], trade(-size_q))
+        .expect("the users flatten at the independently moved mark");
+    let (_, pnl) = convert_retry_portfolio_parts(svm, &winner_portfolio);
+    assert!(pnl > 0, "the public trade path must release winner PnL");
+    pnl as u128
+}
+
+fn run_presigned_convert_retry(submit_retry: bool) -> PresignedConvertRetryOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INITIAL_SLOT: u64 = 1;
+    const INITIAL_PRICE: u64 = 100;
+    const WINNER_DEPOSIT: u64 = 300;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let oracle = Keypair::new();
+    let provider = Keypair::new();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &admin, &oracle, &provider, &victim, &attacker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: INITIAL_SLOT,
+        unix_timestamp: INITIAL_SLOT as i64,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_account = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_account],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_account.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("publicly allocate market");
+    let market = market_account.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: INITIAL_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 1_000,
+                initial_margin_bps: 1_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 500,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 1,
+            },
+        ),
+    )
+    .expect("publicly initialize live market");
+    send(
+        &mut svm,
+        &[&payer, &admin, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("bind an oracle independent from the attacker");
+    send(
+        &mut svm,
+        &[&payer, &admin, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 3,
+                new_pubkey: provider.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("delegate backing to an independent external provider");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: INITIAL_SLOT,
+                initial_mark_e6: INITIAL_PRICE,
+            },
+        ),
+    )
+    .expect("configure honest initial mark");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateMaintenanceFeePolicy {
+                cranker_share_bps: 10_000,
+            },
+        ),
+    )
+    .expect("live market enables public maintenance cranker rewards");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    let backing_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_source,
+        &collateral,
+        &provider.pubkey(),
+        600,
+    );
+    send(
+        &mut svm,
+        &[&payer, &provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(backing_source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: 1,
+                amount: 600,
+                expiry_slot: 10_000,
+            },
+        ),
+    )
+    .expect("independent provider supplies ordinary long-side backing");
+
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let victim_portfolio =
+        create_convert_retry_portfolio(&mut svm, &payer, &victim, market, portfolio_len);
+    fund_convert_retry_portfolio(
+        &mut svm,
+        &payer,
+        &victim,
+        market,
+        victim_portfolio,
+        collateral,
+        vault,
+        WINNER_DEPOSIT,
+    );
+    let attacker_portfolio =
+        create_convert_retry_portfolio(&mut svm, &payer, &attacker, market, portfolio_len);
+
+    let first_released = make_convert_retry_released_pnl(
+        &mut svm,
+        &payer,
+        &oracle,
+        &victim,
+        victim_portfolio,
+        market,
+        collateral,
+        vault,
+        portfolio_len,
+        2,
+        INITIAL_PRICE,
+        105,
+    );
+    let convert = |limit| {
+        Transaction::new_signed_with_payer(
+            &[
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(limit),
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(victim.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(victim_portfolio, false),
+                    ],
+                    PIx::ConvertReleasedPnl {
+                        amount: first_released,
+                    },
+                ),
+            ],
+            Some(&payer.pubkey()),
+            &[&payer, &victim],
+            svm.latest_blockhash(),
+        )
+    };
+    let first_convert = convert(1_399_999);
+    let retry_convert = convert(1_400_000);
+    svm.send_transaction(first_convert)
+        .expect("victim authorizes one conversion of currently released PnL");
+
+    let second_released = make_convert_retry_released_pnl(
+        &mut svm,
+        &payer,
+        &oracle,
+        &victim,
+        victim_portfolio,
+        market,
+        collateral,
+        vault,
+        portfolio_len,
+        3,
+        105,
+        110,
+    );
+    assert_eq!(
+        second_released, first_released,
+        "the control creates an equal independent second PnL epoch"
+    );
+    let retry_accepted = submit_retry && svm.send_transaction(retry_convert).is_ok();
+    let (victim_capital, victim_pnl) =
+        convert_retry_portfolio_parts(&svm, &victim_portfolio);
+    let victim_value_before_fee = victim_capital
+        .checked_add(victim_pnl.max(0) as u128)
+        .unwrap();
+
+    svm.set_sysvar(&Clock {
+        slot: 1_000,
+        unix_timestamp: 1_000,
+        ..Clock::default()
+    });
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio, false),
+                AccountMeta::new(attacker_portfolio, false),
+            ],
+            PIx::SyncMaintenanceFee { now_slot: 1_000 },
+        ),
+    )
+    .expect("unprivileged attacker claims the configured maintenance reward");
+
+    let (attacker_reward, attacker_pnl) =
+        convert_retry_portfolio_parts(&svm, &attacker_portfolio);
+    assert_eq!(attacker_pnl, 0);
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral,
+        &attacker.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio, false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Withdraw {
+                amount: attacker_reward,
+            },
+        ),
+    )
+    .expect("attacker withdraws the public cranker reward as SPL collateral");
+
+    let victim_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_destination,
+        &collateral,
+        &victim.pubkey(),
+        0,
+    );
+    if svm
+        .get_account(&victim_portfolio)
+        .is_some_and(|account| !account.data.is_empty())
+    {
+        send(
+            &mut svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(victim_portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: 1_000,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("refresh the victim's surviving flat source claim");
+        let (capital, pnl) = convert_retry_portfolio_parts(&svm, &victim_portfolio);
+        if pnl > 0 {
+            send(
+                &mut svm,
+                &[&payer, &victim],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(victim.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(victim_portfolio, false),
+                    ],
+                    PIx::ConvertReleasedPnl {
+                        amount: pnl as u128,
+                    },
+                ),
+            )
+            .expect("victim converts any PnL that the retry did not consume");
+        }
+        let withdrawal = if pnl > 0 {
+            capital.checked_add(pnl as u128).unwrap()
+        } else {
+            capital
+        };
+        if withdrawal > 0 {
+            send(
+                &mut svm,
+                &[&payer, &victim],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(victim.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(victim_portfolio, false),
+                        AccountMeta::new(victim_destination, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(vault_authority, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Withdraw { amount: withdrawal },
+                ),
+            )
+            .expect("victim withdraws every surviving atom");
+        }
+    }
+
+    PresignedConvertRetryOutcome {
+        retry_accepted,
+        first_released,
+        second_released,
+        victim_value_before_fee,
+        attacker_withdrawal: token_amount(&svm, &attacker_destination),
+        victim_withdrawal: token_amount(&svm, &victim_destination),
+    }
+}
+
+#[test]
+#[ignore = "RED on pinned percolator-prog: signed conversion intents need a one-shot action nonce"]
+fn e2e_public_presigned_convert_retry_cannot_fund_a_second_cranker_reward() {
+    let control = run_presigned_convert_retry(false);
+    let retry = run_presigned_convert_retry(true);
+
+    assert!(!control.retry_accepted);
+    assert_eq!(control.first_released, control.second_released);
+    assert_eq!(retry.first_released, retry.second_released);
+    assert_eq!(
+        retry.victim_value_before_fee, control.victim_value_before_fee,
+        "the retry must not create or destroy value before the public fee crank"
+    );
+    assert_eq!(
+        u128::from(control.attacker_withdrawal) + u128::from(control.victim_withdrawal),
+        control.victim_value_before_fee,
+        "the control withdraws all victim value between the configured fee recipient and victim"
+    );
+    assert_eq!(
+        u128::from(retry.attacker_withdrawal) + u128::from(retry.victim_withdrawal),
+        retry.victim_value_before_fee,
+        "the replay path conserves atoms while redirecting who can withdraw them"
+    );
+    assert_eq!(
+        retry.retry_accepted,
+        retry.attacker_withdrawal > control.attacker_withdrawal,
+        "the extra public payout must be attributable to acceptance of the retained variant"
+    );
+    assert_eq!(
+        retry.attacker_withdrawal, control.attacker_withdrawal,
+        "a second fee-bump variant of one conversion intent must not increase the attacker's withdrawable collateral: control={control:?} retry={retry:?}"
+    );
+    assert_eq!(
+        retry.victim_withdrawal, control.victim_withdrawal,
+        "the retained conversion signature must not consume a later independent PnL epoch"
+    );
+}
