@@ -948,6 +948,8 @@ fn process_reconfigure(
 
 // set_economics accounts: [squads_vault(signer), config(w), savings_account(ro)]
 // data: base_unit_savings_bps (u16) || buyback_bps (u16)
+//   || expected_surplus_buy_burn_bps (u16) || expected_base_unit_savings_bps (u16)
+//   || expected_buyback_bps (u16) || expected_base_unit_savings_account (Pubkey)
 //
 // Squads-vault-gated (timelock'd) DAO control of the 4-way surplus split. Sets the savings share (surplus
 // withdrawn to the base-unit/collateral savings sink) and the buyback share (of the auction's bought COIN,
@@ -972,16 +974,29 @@ fn process_set_economics(
     let config_account = next_account_info(iter)?;
     let savings_account = next_account_info(iter)?;
 
-    if data.len() != 4 {
+    if data.len() != 42 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let savings_bps = u16::from_le_bytes(data[..2].try_into().unwrap());
     let buyback_bps = u16::from_le_bytes(data[2..4].try_into().unwrap());
+    let expected_surplus_buy_burn_bps =
+        u16::from_le_bytes(data[4..6].try_into().unwrap());
+    let expected_savings_bps = u16::from_le_bytes(data[6..8].try_into().unwrap());
+    let expected_buyback_bps = u16::from_le_bytes(data[8..10].try_into().unwrap());
+    let expected_savings_account =
+        Pubkey::new_from_array(data[10..42].try_into().unwrap());
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
     let mut config = Config::deserialize(&config_account.try_borrow_data()?)?;
     require_squads_vault(squads_vault, &config)?;
+    if config.surplus_buy_burn_bps != expected_surplus_buy_burn_bps
+        || config.base_unit_savings_bps != expected_savings_bps
+        || config.buyback_bps != expected_buyback_bps
+        || config.base_unit_savings_account != expected_savings_account
+    {
+        return Err(ProgramError::InvalidArgument);
+    }
     // The two surplus pulls (auction + savings) must never collectively exceed 100% of the surplus, so the
     // insurance-growth remainder stays >= 0 and neither pull can reach the reserved principal floor.
     if (config.surplus_buy_burn_bps as u32) + (savings_bps as u32) > BPS_DENOMINATOR as u32 {

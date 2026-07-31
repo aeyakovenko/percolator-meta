@@ -5821,7 +5821,17 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
     .expect("auction -> 4000");
     assert_eq!(read_bps(&svm, &cfg_pda), 4_000);
     // (2) savings 5000 (4000 + 5000 = 9000 <= 100%).
-    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 5_000, 0);
+    let msg = build_set_economics_message_with_expected(
+        &vault,
+        &cfg_pda,
+        &savings_acct,
+        5_000,
+        0,
+        4_000,
+        0,
+        0,
+        &Pubkey::default(),
+    );
     squads_execute(
         &mut svm,
         &squads,
@@ -21623,13 +21633,38 @@ fn build_cross_backing_twap_restart_asset0_message(
 }
 
 // IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
-// accounts: [squads_vault(signer), config(w), savings_account(ro)]; data: savings_bps(u16)||buyback_bps(u16)
+// accounts: [squads_vault(signer), config(w), savings_account(ro)].
 fn build_set_economics_message(
     squads_vault: &Pubkey,
     config: &Pubkey,
     savings_account: &Pubkey,
     savings_bps: u16,
     buyback_bps: u16,
+) -> Vec<u8> {
+    build_set_economics_message_with_expected(
+        squads_vault,
+        config,
+        savings_account,
+        savings_bps,
+        buyback_bps,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_set_economics_message_with_expected(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    savings_account: &Pubkey,
+    savings_bps: u16,
+    buyback_bps: u16,
+    expected_surplus_buy_burn_bps: u16,
+    expected_savings_bps: u16,
+    expected_buyback_bps: u16,
+    expected_savings_account: &Pubkey,
 ) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // num_signers
@@ -21649,6 +21684,10 @@ fn build_set_economics_message(
     let mut data = vec![14u8]; // IX_SET_ECONOMICS
     data.extend_from_slice(&savings_bps.to_le_bytes());
     data.extend_from_slice(&buyback_bps.to_le_bytes());
+    data.extend_from_slice(&expected_surplus_buy_burn_bps.to_le_bytes());
+    data.extend_from_slice(&expected_savings_bps.to_le_bytes());
+    data.extend_from_slice(&expected_buyback_bps.to_le_bytes());
+    data.extend_from_slice(expected_savings_account.as_ref());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -36295,12 +36334,16 @@ fn e2e_savings_sink_cannot_alias_holding_and_expand_the_auction_budget() {
         &env.twap_authority,
         0,
     );
-    let valid = build_set_economics_message(
+    let valid = build_set_economics_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &savings_sink,
         1_000,
         0,
+        8_000,
+        1_000,
+        0,
+        &bk.holding,
     );
     let valid_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -45848,12 +45891,16 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         &env.twap_authority,
         0,
     );
-    let economics = build_set_economics_message(
+    let economics = build_set_economics_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &savings_sink,
         5_000,
         0,
+        5_000,
+        0,
+        0,
+        &Pubkey::default(),
     );
     let economics_accounts = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -66642,6 +66689,311 @@ fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
     assert_eq!(
         token_amount(&svm, &corrected_destination),
         first_budget + second_budget,
+    );
+}
+
+// PUBLIC LOF: buyback retention is a delayed economics policy, but independently approved
+// policies can execute in either order. A stale 100% retention action must not overwrite a later
+// burn correction; otherwise a bidder that owns the retained-COIN sink receives the insurance-
+// funded collateral and recovers every COIN it sold.
+#[test]
+fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donated = 400_000u64;
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        donated,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &env.slab);
+    send(
+        &mut svm,
+        &[&donor],
+        twap_donate_insurance_ix_with_nonce(
+            &donor.pubkey(),
+            &env.twap_cfg,
+            &env.twap_authority,
+            &donor_source,
+            &donation_holding,
+            &env.slab,
+            &env.perc_vault,
+            donated,
+            market_id,
+            0,
+        ),
+    )
+    .expect("an independent donor funds canonical protocol insurance");
+    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &floor,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("governance marks the donation as protocol surplus");
+
+    let auction_budget = donated * 8 / 10;
+    let (bidder, bidder_coin, bidder_usd) =
+        new_bidder(&mut svm, &payer, &env, auction_budget);
+    let bidder_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &bidder_sink,
+        &env.coin_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    let book = setup_auction_at_index(
+        &mut svm,
+        &payer,
+        &env,
+        6,
+        10,
+        1,
+        Some(bidder_sink),
+        0,
+    );
+    let savings = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let initial_economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings, 0, 5_000);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &initial_economics,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(savings, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("the live policy retains half of bought COIN");
+
+    let stale_message = build_set_economics_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings,
+        0,
+        10_000,
+        8_000,
+        0,
+        5_000,
+        &savings,
+    );
+    let correction_message = build_set_economics_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings,
+        0,
+        0,
+        8_000,
+        0,
+        5_000,
+        &savings,
+    );
+    let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
+        let transaction = transaction_pda(&env.squads, &env.multisig, index);
+        let proposal = proposal_pda(&env.squads, &env.multisig, index);
+        for instruction in [
+            vault_transaction_create_ix(
+                &env.squads,
+                &env.multisig,
+                &transaction,
+                &env.dao.pubkey(),
+                message,
+            ),
+            proposal_create_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+                index,
+            ),
+            proposal_approve_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+            ),
+        ] {
+            send(svm, &[&env.dao], instruction).expect("queue approved economics policy");
+        }
+        (transaction, proposal)
+    };
+    let (stale_transaction, stale_proposal) = queue(&mut svm, 8, &stale_message);
+    let (correction_transaction, correction_proposal) =
+        queue(&mut svm, 9, &correction_message);
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar(&clock);
+
+    let economics_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(savings, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &correction_proposal,
+            &correction_transaction,
+            &env.dao.pubkey(),
+            &economics_remaining,
+        ),
+    )
+    .expect("execute the complete-burn correction first");
+    let config_before_replay = svm.get_account(&env.twap_cfg).unwrap();
+    let replay = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &stale_transaction,
+            &env.dao.pubkey(),
+            &economics_remaining,
+        ),
+    );
+    if replay.is_err() {
+        assert_eq!(
+            svm.get_account(&env.twap_cfg).unwrap(),
+            config_before_replay,
+            "a rejected stale economics action leaves the config byte-identical",
+        );
+    }
+
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &bidder_coin,
+            &bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            u128::from(auction_budget),
+            u128::from(auction_budget),
+            None,
+        ),
+    )
+    .expect("the bidder offers its complete COIN balance");
+    let round_end = {
+        let account = svm.get_account(&book.book).unwrap();
+        u64::from_le_bytes(account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    let supply_before = mint_supply(&svm, &env.coin_mint);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            Some(bidder_sink),
+        ),
+    )
+    .expect("a permissionless cranker settles the independently funded auction");
+    send(
+        &mut svm,
+        &[&cranker],
+        claim_ix(
+            &cranker.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.settlement_usd,
+            &book.coin_escrow,
+            &bidder_usd,
+            &bidder_coin,
+            0,
+        ),
+    )
+    .expect("the permissionless claim pays the recorded bidder");
+    assert_eq!(token_amount(&svm, &bidder_usd), auction_budget);
+
+    if replay.is_ok() {
+        assert_eq!(token_amount(&svm, &bidder_sink), auction_budget);
+        assert_eq!(
+            mint_supply(&svm, &env.coin_mint),
+            supply_before,
+            "the stale retention policy returned every sold COIN instead of burning it",
+        );
+        panic!(
+            "an older approved economics policy paid {auction_budget} collateral while returning every sold COIN to the bidder",
+        );
+    }
+    assert_eq!(token_amount(&svm, &bidder_sink), 0);
+    assert_eq!(
+        supply_before - mint_supply(&svm, &env.coin_mint),
+        auction_budget,
+        "the corrected economics burns every bought COIN",
     );
 }
 
