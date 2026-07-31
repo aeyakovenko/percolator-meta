@@ -38,6 +38,7 @@ enum PoolRestartScenario {
     StaleLiquidationPolicyOrder,
     StaleMaintenancePolicyAfterRestart,
     StaleMaintenancePolicyOrder,
+    StaleReservePolicyOrder,
 }
 
 #[test]
@@ -106,6 +107,11 @@ fn e2e_stale_maintenance_policy_cannot_overwrite_a_later_policy() {
     run_pool_restart_claim_scenario(PoolRestartScenario::StaleMaintenancePolicyOrder);
 }
 
+#[test]
+fn e2e_stale_reserve_cannot_overwrite_a_later_correction() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::StaleReservePolicyOrder);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -122,6 +128,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleMaintenancePolicyOrder;
     let stale_maintenance_policy =
         stale_maintenance_generation || stale_maintenance_order;
+    let stale_reserve_order = scenario == PoolRestartScenario::StaleReservePolicyOrder;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -500,6 +507,248 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             owner_principal as u128
         },
     );
+
+    if stale_reserve_order {
+        let surplus = 500_000u64;
+        let donor = Keypair::new();
+        svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+        let donor_source = Pubkey::new_unique();
+        let donation_holding = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &donor_source,
+            &collateral,
+            &donor.pubkey(),
+            surplus,
+        );
+        set_token(
+            &mut svm,
+            &donation_holding,
+            &collateral,
+            &twap_authority,
+            0,
+        );
+        let market_id = read_asset0_market_id(&svm, &market);
+        send(
+            &mut svm,
+            &[&donor],
+            twap_donate_insurance_ix_with_nonce(
+                &donor.pubkey(),
+                &twap_cfg,
+                &twap_authority,
+                &donor_source,
+                &donation_holding,
+                &market,
+                &vault,
+                surplus,
+                market_id,
+                0,
+            ),
+        )
+        .expect("an independent donor adds canonical protocol surplus");
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            u128::from(owner_principal + surplus),
+        );
+
+        let auction_env = HandoffEnv {
+            squads,
+            multisig,
+            dao: Keypair::from_bytes(&dao.to_bytes()).unwrap(),
+            squads_vault,
+            slab: market,
+            collateral_mint: collateral,
+            coin_mint,
+            coin_mint_authority: Keypair::from_bytes(&coin_mint_authority.to_bytes()).unwrap(),
+            twap_cfg,
+            twap_authority,
+            perc_vault: vault,
+            vault_authority,
+            principal: owner_principal,
+            surplus,
+        };
+        let book = setup_auction_at_index(
+            &mut svm,
+            &payer,
+            &auction_env,
+            3,
+            10,
+            0,
+            None,
+            0,
+        );
+        let remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(book.book, false),
+            AccountMeta::new_readonly(twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        let queue = |svm: &mut LiteSVM, index: u64, reserve_num: u128, reserve_den: u128| {
+            let transaction = transaction_pda(&squads, &multisig, index);
+            let proposal = proposal_pda(&squads, &multisig, index);
+            let message = build_set_reserve_message(
+                &squads_vault,
+                &twap_cfg,
+                &book.book,
+                reserve_num,
+                reserve_den,
+            );
+            for instruction in [
+                vault_transaction_create_ix(
+                    &squads,
+                    &multisig,
+                    &transaction,
+                    &dao.pubkey(),
+                    &message,
+                ),
+                proposal_create_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &dao.pubkey(),
+                    index,
+                ),
+                proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey()),
+            ] {
+                send(svm, &[&dao], instruction).expect("queue reserve policy");
+            }
+            (transaction, proposal)
+        };
+        let (stale_transaction, stale_proposal) = queue(&mut svm, 4, 1, 400_000);
+        let (correction_transaction, correction_proposal) = queue(&mut svm, 5, 1, 1);
+        let mut clock = svm.get_sysvar::<Clock>();
+        clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+        svm.set_sysvar(&clock);
+        send(
+            &mut svm,
+            &[&dao],
+            vault_transaction_execute_ix(
+                &squads,
+                &multisig,
+                &correction_proposal,
+                &correction_transaction,
+                &dao.pubkey(),
+                &remaining,
+            ),
+        )
+        .expect("execute the one-coin-per-dollar correction first");
+        let book_before_replay = svm.get_account(&book.book).unwrap();
+        let replay = send(
+            &mut svm,
+            &[&dao],
+            vault_transaction_execute_ix(
+                &squads,
+                &multisig,
+                &stale_proposal,
+                &stale_transaction,
+                &dao.pubkey(),
+                &remaining,
+            ),
+        );
+        if replay.is_err() {
+            assert_eq!(
+                svm.get_account(&book.book).unwrap(),
+                book_before_replay,
+                "a rejected stale reserve leaves the auction byte-identical",
+            );
+        }
+
+        let (attacker, attacker_coin, attacker_usd) =
+            new_bidder(&mut svm, &payer, &auction_env, 1);
+        send(
+            &mut svm,
+            &[&attacker],
+            place_bid_ix(
+                &attacker.pubkey(),
+                &twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &attacker_coin,
+                &attacker_usd,
+                &coin_mint,
+                &collateral,
+                1,
+                400_000,
+                None,
+            ),
+        )
+        .expect("attacker places the reserve probe");
+        let cranker = Keypair::new();
+        svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+        let round_end = {
+            let book_data = svm.get_account(&book.book).unwrap();
+            u64::from_le_bytes(book_data.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&cranker],
+            execute_ix(
+                &cranker.pubkey(),
+                &auction_env,
+                &book.book,
+                &book.holding,
+                &book.settlement_usd,
+                &book.book_escrow,
+                &book.coin_escrow,
+                None,
+            ),
+        )
+        .expect("execute the reserve probe");
+        if replay.is_ok() {
+            send(
+                &mut svm,
+                &[&cranker],
+                claim_ix(
+                    &cranker.pubkey(),
+                    &twap_cfg,
+                    &book.book,
+                    &book.book_escrow,
+                    &book.settlement_usd,
+                    &book.coin_escrow,
+                    &attacker_usd,
+                    &attacker_coin,
+                    0,
+                ),
+            )
+            .expect("settle the filled reserve probe");
+            let attacker_payout = token_amount(&svm, &attacker_usd);
+            assert_eq!(
+                attacker_payout, 400_000,
+                "the stale reserve makes one COIN eligible for the complete auction budget",
+            );
+            panic!(
+                "an older reserve overwrote its correction and paid 400,000 independent-donor atoms for one attacker COIN",
+            );
+        }
+        assert_eq!(
+            token_amount(&svm, &attacker_usd),
+            0,
+            "one attacker COIN cannot collect the 400,000-atom surplus budget",
+        );
+        warp_to(&mut svm, round_end + 21);
+        send(
+            &mut svm,
+            &[&attacker],
+            cancel_ix(
+                &attacker.pubkey(),
+                &twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &attacker_coin,
+                0,
+            ),
+        )
+        .expect("the filtered reserve probe remains owner-recoverable");
+        assert_eq!(
+            token_amount(&svm, &attacker_coin),
+            1,
+            "the filtered attacker bid is fully recoverable",
+        );
+        return;
+    }
 
     let owner_exit_witness = subledger_full_exit_witness(&svm, &position);
     let owner_exit_ix = || {
@@ -32435,6 +32684,29 @@ fn setup_auction(
     coin_sink: Option<Pubkey>,
     bid_fee: u64,
 ) -> BookEnv {
+    setup_auction_at_index(
+        svm,
+        payer,
+        env,
+        5,
+        round_length,
+        sink_mode,
+        coin_sink,
+        bid_fee,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_auction_at_index(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    env: &HandoffEnv,
+    transaction_index: u64,
+    round_length: u64,
+    sink_mode: u8,
+    coin_sink: Option<Pubkey>,
+    bid_fee: u64,
+) -> BookEnv {
     let book = book_pda(&env.twap_cfg);
     let book_escrow = book_escrow_pda(&env.twap_cfg);
     let coin_escrow = Pubkey::new_unique();
@@ -32483,7 +32755,7 @@ fn setup_auction(
         &env.multisig,
         &env.dao,
         payer,
-        5,
+        transaction_index,
         &msg,
         &rem,
     )
@@ -40118,6 +40390,26 @@ fn build_set_reserve_message(
     reserve_num: u128,
     reserve_den: u128,
 ) -> Vec<u8> {
+    build_set_reserve_message_with_expected(
+        squads_vault,
+        config,
+        book,
+        reserve_num,
+        reserve_den,
+        0,
+        1,
+    )
+}
+
+fn build_set_reserve_message_with_expected(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    reserve_num: u128,
+    reserve_den: u128,
+    expected_reserve_num: u128,
+    expected_reserve_den: u128,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
@@ -40136,6 +40428,8 @@ fn build_set_reserve_message(
     let mut data = vec![6u8];
     data.extend_from_slice(&reserve_num.to_le_bytes());
     data.extend_from_slice(&reserve_den.to_le_bytes());
+    data.extend_from_slice(&expected_reserve_num.to_le_bytes());
+    data.extend_from_slice(&expected_reserve_den.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -43720,6 +44014,8 @@ fn e2e_attacker_cannot_lower_the_reserve_without_squads() {
     let mut data = vec![6u8]; // IX_SET_RESERVE
     data.extend_from_slice(&0u128.to_le_bytes()); // reserve_num
     data.extend_from_slice(&1u128.to_le_bytes()); // reserve_den
+    data.extend_from_slice(&2u128.to_le_bytes()); // expected reserve_num
+    data.extend_from_slice(&1u128.to_le_bytes()); // expected reserve_den
     let rogue = Instruction {
         program_id: twap_id(),
         accounts: vec![

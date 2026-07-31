@@ -225,6 +225,8 @@ the bidder's monotonic book-local nonce, so an independently signed retry cannot
 after eviction, cancellation, or another public book transition recreates its expected shape. The wire
 has no maximum-fee field, so allowing a fee increase could burn unrelated COIN from an already-signed
 bidder transaction.
+Each delayed reserve update commits to the exact current numerator and denominator it replaces. Reserve
+policy remains bidirectional, but an older approved action cannot overwrite a later correction.
 Current cancellation wires commit to the reusable slot's placement clocks and both bid legs. The old
 slot-only wire remains valid only for predecessor books that are exit-only under the upgraded binary.
 
