@@ -66751,8 +66751,7 @@ fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
 // policies can execute in either order. A stale 100% retention action must not overwrite a later
 // burn correction; otherwise a bidder that owns the retained-COIN sink receives the insurance-
 // funded collateral and recovers every COIN it sold.
-#[test]
-fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
+fn run_stale_buyback_economics_after_correction(correction_buyback_bps: u16) {
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
             compute_unit_limit: 1_400_000,
@@ -66891,7 +66890,7 @@ fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
         &env.twap_cfg,
         &savings,
         0,
-        0,
+        correction_buyback_bps,
         8_000,
         0,
         5_000,
@@ -66951,7 +66950,7 @@ fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
             &economics_remaining,
         ),
     )
-    .expect("execute the complete-burn correction first");
+    .expect("execute the correcting economics action first");
     let config_before_replay = svm.get_account(&env.twap_cfg).unwrap();
     let replay = send(
         &mut svm,
@@ -67044,12 +67043,26 @@ fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
             "an older approved economics policy paid {auction_budget} collateral while returning every sold COIN to the bidder",
         );
     }
-    assert_eq!(token_amount(&svm, &bidder_sink), 0);
+    let expected_retained = auction_budget * u64::from(correction_buyback_bps) / 10_000;
+    assert_eq!(token_amount(&svm, &bidder_sink), expected_retained);
     assert_eq!(
         supply_before - mint_supply(&svm, &env.coin_mint),
-        auction_budget,
-        "the corrected economics burns every bought COIN",
+        auction_budget - expected_retained,
+        "the corrected economics preserves its configured buyback/burn split",
     );
+}
+
+#[test]
+fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
+    run_stale_buyback_economics_after_correction(0);
+}
+
+// PUBLIC LOF: an exact-current value witness does not consume an action. If governance
+// corrects a queued 100% retention policy by reaffirming the already-live 50% policy,
+// the no-op leaves every witnessed value unchanged and the stale action can still land.
+#[test]
+fn e2e_noop_economics_correction_invalidates_an_older_retention_policy() {
+    run_stale_buyback_economics_after_correction(5_000);
 }
 
 // PUBLIC LOF: reconfigure is the other half of the coupled four-way policy. An older nonzero
