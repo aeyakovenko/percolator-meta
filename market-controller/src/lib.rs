@@ -6,8 +6,9 @@
 //! resolved paths can return backing or insurance only to its recorded provider or
 //! return controller-owned protocol insurance through an empty one-shot transit to
 //! the bound governance vault.
-//! A tiny controller-bound sequence PDA orders delayed policy updates. It cannot
-//! sign, hold tokens, name recipients, or authorize additional instructions.
+//! Independent counters in a tiny controller-bound sequence PDA order delayed
+//! policy updates. It cannot sign, hold tokens, name recipients, or authorize
+//! additional instructions.
 //! Permissionless terminal cleanup can deregister only a resolved empty portfolio;
 //! its rent returns to the market slab and no token destination is accepted.
 //! Terminal cleanup runs only after Percolator proves every attributed balance is
@@ -46,6 +47,7 @@ const POLICY_SEQUENCE_SEED: &[u8] = b"policy-sequence";
 const POLICY_SEQUENCE_DISC: [u8; 8] = *b"POLSEQ01";
 const POLICY_SEQUENCE_SIZE: usize = 72;
 const LIQUIDATION_POLICY_SEQUENCE_OFFSET: usize = 40;
+const MAINTENANCE_POLICY_SEQUENCE_OFFSET: usize = 48;
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
 pub const RETIRED_MARKET_SIZE: usize = 72;
@@ -117,6 +119,9 @@ const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
 const UPDATE_LIQUIDATION_FEE_POLICY_LEN: usize = 3;
 const SEQUENCED_LIQUIDATION_FEE_POLICY_LEN: usize =
     UPDATE_LIQUIDATION_FEE_POLICY_LEN + core::mem::size_of::<u64>();
+const UPDATE_MAINTENANCE_FEE_POLICY_LEN: usize = 3;
+const SEQUENCED_MAINTENANCE_FEE_POLICY_LEN: usize =
+    UPDATE_MAINTENANCE_FEE_POLICY_LEN + core::mem::size_of::<u64>();
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const CONFIGURE_HYBRID_ORACLE_LEN: usize = 156;
 const CONFIGURE_EWMA_MARK_LEN: usize = 35;
@@ -407,10 +412,11 @@ fn validate_policy_sequence_account(
     Ok(())
 }
 
-fn consume_liquidation_policy_sequence(
+fn consume_policy_sequence(
     program_id: &Pubkey,
     controller: &AccountInfo,
     policy_sequence: &AccountInfo,
+    sequence_offset: usize,
     expected_sequence: u64,
 ) -> ProgramResult {
     if !policy_sequence.is_writable {
@@ -420,18 +426,22 @@ fn consume_liquidation_policy_sequence(
     let next_sequence = expected_sequence
         .checked_add(1)
         .ok_or(ProgramError::ArithmeticOverflow)?;
+    let sequence_end = sequence_offset
+        .checked_add(core::mem::size_of::<u64>())
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    if sequence_end > POLICY_SEQUENCE_SIZE {
+        return Err(ProgramError::InvalidAccountData);
+    }
     let mut data = policy_sequence.try_borrow_mut_data()?;
     let current_sequence = u64::from_le_bytes(
-        data[LIQUIDATION_POLICY_SEQUENCE_OFFSET
-            ..LIQUIDATION_POLICY_SEQUENCE_OFFSET + core::mem::size_of::<u64>()]
+        data[sequence_offset..sequence_end]
             .try_into()
             .unwrap(),
     );
     if current_sequence != expected_sequence {
         return Err(ProgramError::InvalidAccountData);
     }
-    data[LIQUIDATION_POLICY_SEQUENCE_OFFSET
-        ..LIQUIDATION_POLICY_SEQUENCE_OFFSET + core::mem::size_of::<u64>()]
+    data[sequence_offset..sequence_end]
         .copy_from_slice(&next_sequence.to_le_bytes());
     Ok(())
 }
@@ -985,21 +995,31 @@ fn generation_bound_asset(data: &[u8]) -> Result<Option<(u16, usize, bool)>, Pro
 
 fn decode_sequenced_admin_data(
     data: &[u8],
-) -> Result<(&[u8], Option<u64>), ProgramError> {
-    if data.first().copied() != Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY) {
-        return Ok((data, None));
-    }
-    if data.len() != SEQUENCED_LIQUIDATION_FEE_POLICY_LEN {
+) -> Result<(&[u8], Option<(usize, u64)>), ProgramError> {
+    let (raw_len, sequenced_len, sequence_offset) = match data.first().copied() {
+        Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY) => (
+            UPDATE_LIQUIDATION_FEE_POLICY_LEN,
+            SEQUENCED_LIQUIDATION_FEE_POLICY_LEN,
+            LIQUIDATION_POLICY_SEQUENCE_OFFSET,
+        ),
+        Some(PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY) => (
+            UPDATE_MAINTENANCE_FEE_POLICY_LEN,
+            SEQUENCED_MAINTENANCE_FEE_POLICY_LEN,
+            MAINTENANCE_POLICY_SEQUENCE_OFFSET,
+        ),
+        _ => return Ok((data, None)),
+    };
+    if data.len() != sequenced_len {
         return Err(ProgramError::InvalidInstructionData);
     }
     let expected_sequence = u64::from_le_bytes(
-        data[UPDATE_LIQUIDATION_FEE_POLICY_LEN..]
+        data[raw_len..]
             .try_into()
             .map_err(|_| ProgramError::InvalidInstructionData)?,
     );
     Ok((
-        &data[..UPDATE_LIQUIDATION_FEE_POLICY_LEN],
-        Some(expected_sequence),
+        &data[..raw_len],
+        Some((sequence_offset, expected_sequence)),
     ))
 }
 
@@ -1107,13 +1127,14 @@ fn process_init_policy_sequence(
 // proxy_admin accounts:
 // [governance(signer), controller_pda, market(w), percolator_program, tail...]
 // data: raw Percolator bytes, plus an expected u64 sequence for delayed
-// liquidation-policy updates. Controller-only witnesses are removed before CPI.
+// liquidation- and maintenance-policy updates. Controller-only witnesses are
+// removed before CPI.
 fn process_proxy_admin<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &[u8],
 ) -> ProgramResult {
-    let (percolator_data, liquidation_policy_sequence) =
+    let (percolator_data, policy_sequence_update) =
         decode_sequenced_admin_data(data)?;
     let perc_tag = percolator_data
         .first()
@@ -1178,7 +1199,7 @@ fn process_proxy_admin<'a>(
                 .map_err(|_| ProgramError::InvalidAccountData)?
         };
         let expected_tail_len = 1usize
-            .checked_add(usize::from(liquidation_policy_sequence.is_some()))
+            .checked_add(usize::from(policy_sequence_update.is_some()))
             .ok_or(ProgramError::ArithmeticOverflow)?;
         if tail.len() != expected_tail_len {
             return Err(ProgramError::InvalidInstructionData);
@@ -1192,15 +1213,16 @@ fn process_proxy_admin<'a>(
             return Err(ProgramError::InvalidInstructionData);
         }
     }
-    if let Some(expected_sequence) = liquidation_policy_sequence {
+    if let Some((sequence_offset, expected_sequence)) = policy_sequence_update {
         if tail.len() != 1 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let policy_sequence = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
-        consume_liquidation_policy_sequence(
+        consume_policy_sequence(
             program_id,
             controller,
             &policy_sequence,
+            sequence_offset,
             expected_sequence,
         )?;
     }
@@ -3721,23 +3743,34 @@ mod tests {
     }
 
     #[test]
-    fn liquidation_policy_sequence_envelope_is_exact_and_stripped() {
-        let raw = vec![PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY, 7, 0];
-        let mut sequenced = raw.clone();
-        sequenced.extend_from_slice(&9u64.to_le_bytes());
-        assert_eq!(
-            decode_sequenced_admin_data(&sequenced),
-            Ok((raw.as_slice(), Some(9)))
-        );
-        assert_eq!(
-            decode_sequenced_admin_data(&raw),
-            Err(ProgramError::InvalidInstructionData)
-        );
-        sequenced.push(0);
-        assert_eq!(
-            decode_sequenced_admin_data(&sequenced),
-            Err(ProgramError::InvalidInstructionData)
-        );
+    fn policy_sequence_envelopes_are_exact_and_stripped() {
+        for (tag, sequence_offset) in [
+            (
+                PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY,
+                LIQUIDATION_POLICY_SEQUENCE_OFFSET,
+            ),
+            (
+                PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY,
+                MAINTENANCE_POLICY_SEQUENCE_OFFSET,
+            ),
+        ] {
+            let raw = vec![tag, 7, 0];
+            let mut sequenced = raw.clone();
+            sequenced.extend_from_slice(&9u64.to_le_bytes());
+            assert_eq!(
+                decode_sequenced_admin_data(&sequenced),
+                Ok((raw.as_slice(), Some((sequence_offset, 9))))
+            );
+            assert_eq!(
+                decode_sequenced_admin_data(&raw),
+                Err(ProgramError::InvalidInstructionData)
+            );
+            sequenced.push(0);
+            assert_eq!(
+                decode_sequenced_admin_data(&sequenced),
+                Err(ProgramError::InvalidInstructionData)
+            );
+        }
         assert_eq!(
             decode_sequenced_admin_data(&[PERC_IX_RESOLVE_MARKET]),
             Ok((&[PERC_IX_RESOLVE_MARKET][..], None))
