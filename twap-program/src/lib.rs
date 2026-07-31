@@ -3559,6 +3559,7 @@ fn process_init_book(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
 
 // set_reserve accounts: [squads_vault(signer), config, book(w)]
 // data: reserve_num (u128) || reserve_den (u128)
+//       || expected_reserve_num (u128) || expected_reserve_den (u128)
 fn process_set_reserve(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -3569,12 +3570,14 @@ fn process_set_reserve(
     let config_account = next_account_info(iter)?;
     let book_account = next_account_info(iter)?;
 
-    if data.len() != 32 {
+    if data.len() != 64 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let reserve_num = u128::from_le_bytes(data[..16].try_into().unwrap());
     let reserve_den = u128::from_le_bytes(data[16..32].try_into().unwrap());
-    if reserve_den == 0 {
+    let expected_reserve_num = u128::from_le_bytes(data[32..48].try_into().unwrap());
+    let expected_reserve_den = u128::from_le_bytes(data[48..64].try_into().unwrap());
+    if reserve_den == 0 || expected_reserve_den == 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
     if config_account.owner != program_id || book_account.owner != program_id {
@@ -3585,6 +3588,9 @@ fn process_set_reserve(
     let book = load_book_header(&book_account.try_borrow_data()?)?;
     if book.config != *config_account.key {
         return Err(ProgramError::InvalidAccountData);
+    }
+    if book.reserve_num != expected_reserve_num || book.reserve_den != expected_reserve_den {
+        return Err(ProgramError::InvalidArgument);
     }
     let mut d = book_account.try_borrow_mut_data()?;
     book_wr_u128(&mut d, BK_RESERVE_NUM, reserve_num);

@@ -696,24 +696,24 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             ),
         )
         .expect("execute the reserve probe");
-        send(
-            &mut svm,
-            &[&cranker],
-            claim_ix(
-                &cranker.pubkey(),
-                &twap_cfg,
-                &book.book,
-                &book.book_escrow,
-                &book.settlement_usd,
-                &book.coin_escrow,
-                &attacker_usd,
-                &attacker_coin,
-                0,
-            ),
-        )
-        .expect("settle the reserve probe");
-        let attacker_payout = token_amount(&svm, &attacker_usd);
         if replay.is_ok() {
+            send(
+                &mut svm,
+                &[&cranker],
+                claim_ix(
+                    &cranker.pubkey(),
+                    &twap_cfg,
+                    &book.book,
+                    &book.book_escrow,
+                    &book.settlement_usd,
+                    &book.coin_escrow,
+                    &attacker_usd,
+                    &attacker_coin,
+                    0,
+                ),
+            )
+            .expect("settle the filled reserve probe");
+            let attacker_payout = token_amount(&svm, &attacker_usd);
             assert_eq!(
                 attacker_payout, 400_000,
                 "the stale reserve makes one COIN eligible for the complete auction budget",
@@ -723,9 +723,25 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             );
         }
         assert_eq!(
-            attacker_payout, 0,
+            token_amount(&svm, &attacker_usd),
+            0,
             "one attacker COIN cannot collect the 400,000-atom surplus budget",
         );
+        warp_to(&mut svm, round_end + 21);
+        send(
+            &mut svm,
+            &[&attacker],
+            cancel_ix(
+                &attacker.pubkey(),
+                &twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.coin_escrow,
+                &attacker_coin,
+                0,
+            ),
+        )
+        .expect("the filtered reserve probe remains owner-recoverable");
         assert_eq!(
             token_amount(&svm, &attacker_coin),
             1,
@@ -40374,6 +40390,26 @@ fn build_set_reserve_message(
     reserve_num: u128,
     reserve_den: u128,
 ) -> Vec<u8> {
+    build_set_reserve_message_with_expected(
+        squads_vault,
+        config,
+        book,
+        reserve_num,
+        reserve_den,
+        0,
+        1,
+    )
+}
+
+fn build_set_reserve_message_with_expected(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    book: &Pubkey,
+    reserve_num: u128,
+    reserve_den: u128,
+    expected_reserve_num: u128,
+    expected_reserve_den: u128,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1);
     m.push(0);
@@ -40392,6 +40428,8 @@ fn build_set_reserve_message(
     let mut data = vec![6u8];
     data.extend_from_slice(&reserve_num.to_le_bytes());
     data.extend_from_slice(&reserve_den.to_le_bytes());
+    data.extend_from_slice(&expected_reserve_num.to_le_bytes());
+    data.extend_from_slice(&expected_reserve_den.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -43976,6 +44014,8 @@ fn e2e_attacker_cannot_lower_the_reserve_without_squads() {
     let mut data = vec![6u8]; // IX_SET_RESERVE
     data.extend_from_slice(&0u128.to_le_bytes()); // reserve_num
     data.extend_from_slice(&1u128.to_le_bytes()); // reserve_den
+    data.extend_from_slice(&2u128.to_le_bytes()); // expected reserve_num
+    data.extend_from_slice(&1u128.to_le_bytes()); // expected reserve_den
     let rogue = Instruction {
         program_id: twap_id(),
         accounts: vec![
