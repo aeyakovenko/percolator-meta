@@ -1,4 +1,4 @@
-//! Stateless, deny-by-default Percolator market controller.
+//! Deny-by-default Percolator market controller.
 //!
 //! A controller PDA permanently holds `marketauth`. Governance can make it sign
 //! only a fixed set of lifecycle and policy instructions. Generic value movement
@@ -6,6 +6,8 @@
 //! resolved paths can return backing or insurance only to its recorded provider or
 //! return controller-owned protocol insurance through an empty one-shot transit to
 //! the bound governance vault.
+//! A tiny controller-bound sequence PDA orders delayed policy updates. It cannot
+//! sign, hold tokens, name recipients, or authorize additional instructions.
 //! Permissionless terminal cleanup can deregister only a resolved empty portfolio;
 //! its rent returns to the market slab and no token destination is accepted.
 //! Terminal cleanup runs only after Percolator proves every attributed balance is
@@ -40,6 +42,10 @@ const SHUTDOWN_INSURANCE_OPERATOR_SEED: &[u8] = b"shutdown-insurance";
 const DONATION_NONCE_SEED: &[u8] = b"donation-nonce";
 const DONATION_NONCE_DISC: [u8; 8] = *b"DONNONC1";
 const DONATION_NONCE_SIZE: usize = 80;
+const POLICY_SEQUENCE_SEED: &[u8] = b"policy-sequence";
+const POLICY_SEQUENCE_DISC: [u8; 8] = *b"POLSEQ01";
+const POLICY_SEQUENCE_SIZE: usize = 72;
+const LIQUIDATION_POLICY_SEQUENCE_OFFSET: usize = 40;
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
 pub const RETIRED_MARKET_SIZE: usize = 72;
@@ -82,6 +88,7 @@ const IX_RETURN_SHUTDOWN_INSURANCE: u8 = 8;
 const IX_RETURN_RESOLVED_ASSET_INSURANCE: u8 = 9;
 const IX_RETURN_RESOLVED_ASSET_BACKING: u8 = 10;
 const IX_CLOSE_RESOLVED_PORTFOLIO: u8 = 11;
+const IX_INIT_POLICY_SEQUENCE: u8 = 12;
 
 const PERC_IX_INIT_MARKET: u8 = 0;
 const PERC_IX_CLOSE_PORTFOLIO: u8 = 8;
@@ -106,6 +113,9 @@ const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
 const ASSET_ACTION_ACTIVATE: u8 = 0;
 const ASSET_ACTION_DRAIN_ONLY: u8 = 1;
 const UPDATE_ASSET_LIFECYCLE_LEN: usize = 148;
+const UPDATE_LIQUIDATION_FEE_POLICY_LEN: usize = 3;
+const SEQUENCED_LIQUIDATION_FEE_POLICY_LEN: usize =
+    UPDATE_LIQUIDATION_FEE_POLICY_LEN + core::mem::size_of::<u64>();
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const CONFIGURE_HYBRID_ORACLE_LEN: usize = 156;
 const CONFIGURE_EWMA_MARK_LEN: usize = 35;
@@ -145,6 +155,13 @@ pub fn controller_address(
 pub fn donation_nonce_address(controller: &Pubkey, donor: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[DONATION_NONCE_SEED, controller.as_ref(), donor.as_ref()],
+        &id(),
+    )
+}
+
+pub fn policy_sequence_address(controller: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[POLICY_SEQUENCE_SEED, controller.as_ref()],
         &id(),
     )
 }
@@ -367,6 +384,54 @@ fn consume_donation_nonce<'a>(
         return Err(ProgramError::InvalidAccountData);
     }
     data[72..80].copy_from_slice(&next_nonce.to_le_bytes());
+    Ok(())
+}
+
+fn validate_policy_sequence_account(
+    program_id: &Pubkey,
+    controller: &AccountInfo,
+    policy_sequence: &AccountInfo,
+) -> ProgramResult {
+    if policy_sequence.owner != program_id
+        || policy_sequence.data_len() != POLICY_SEQUENCE_SIZE
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let data = policy_sequence.try_borrow_data()?;
+    if data[..8] != POLICY_SEQUENCE_DISC
+        || data[8..40] != controller.key.to_bytes()
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
+fn consume_liquidation_policy_sequence(
+    program_id: &Pubkey,
+    controller: &AccountInfo,
+    policy_sequence: &AccountInfo,
+    expected_sequence: u64,
+) -> ProgramResult {
+    if !policy_sequence.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    validate_policy_sequence_account(program_id, controller, policy_sequence)?;
+    let next_sequence = expected_sequence
+        .checked_add(1)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let mut data = policy_sequence.try_borrow_mut_data()?;
+    let current_sequence = u64::from_le_bytes(
+        data[LIQUIDATION_POLICY_SEQUENCE_OFFSET
+            ..LIQUIDATION_POLICY_SEQUENCE_OFFSET + core::mem::size_of::<u64>()]
+            .try_into()
+            .unwrap(),
+    );
+    if current_sequence != expected_sequence {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    data[LIQUIDATION_POLICY_SEQUENCE_OFFSET
+        ..LIQUIDATION_POLICY_SEQUENCE_OFFSET + core::mem::size_of::<u64>()]
+        .copy_from_slice(&next_sequence.to_le_bytes());
     Ok(())
 }
 
@@ -916,6 +981,26 @@ fn generation_bound_asset(data: &[u8]) -> Result<Option<(u16, usize, bool)>, Pro
     )))
 }
 
+fn decode_sequenced_admin_data(
+    data: &[u8],
+) -> Result<(&[u8], Option<u64>), ProgramError> {
+    if data.first().copied() != Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY) {
+        return Ok((data, None));
+    }
+    if data.len() != SEQUENCED_LIQUIDATION_FEE_POLICY_LEN {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let expected_sequence = u64::from_le_bytes(
+        data[UPDATE_LIQUIDATION_FEE_POLICY_LEN..]
+            .try_into()
+            .map_err(|_| ProgramError::InvalidInstructionData)?,
+    );
+    Ok((
+        &data[..UPDATE_LIQUIDATION_FEE_POLICY_LEN],
+        Some(expected_sequence),
+    ))
+}
+
 pub fn process_instruction<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -945,19 +1030,90 @@ pub fn process_instruction<'a>(
             process_return_resolved_asset_backing(program_id, accounts, data)
         }
         IX_CLOSE_RESOLVED_PORTFOLIO => process_close_resolved_portfolio(program_id, accounts, data),
+        IX_INIT_POLICY_SEQUENCE => process_init_policy_sequence(program_id, accounts, data),
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
 
+// init_policy_sequence accounts:
+// [payer(s,w), governance, controller_pda, market, percolator_program,
+//  policy_sequence(w,pda), system_program]
+//
+// Anyone may fund this controller-bound ordering watermark. The account cannot
+// sign, name a recipient, or move tokens; policy execution is still gated by the
+// bound Squads vault through IX_PROXY_ADMIN.
+fn process_init_policy_sequence(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let payer = next_account_info(iter)?;
+    let governance = next_account_info(iter)?;
+    let controller = next_account_info(iter)?;
+    let market = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    let policy_sequence = next_account_info(iter)?;
+    let system_program_ai = next_account_info(iter)?;
+    if iter.next().is_some()
+        || !payer.is_signer
+        || !payer.is_writable
+        || *system_program_ai.key != solana_program::system_program::ID
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    controller_bump(
+        program_id,
+        governance,
+        controller,
+        market,
+        percolator_program,
+    )?;
+    let (expected_policy_sequence, bump) = policy_sequence_address(controller.key);
+    if *policy_sequence.key != expected_policy_sequence {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if policy_sequence.data_len() == 0 {
+        if policy_sequence.owner != system_program_ai.key {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let bump_seed = [bump];
+        let seeds = [
+            POLICY_SEQUENCE_SEED,
+            controller.key.as_ref(),
+            &bump_seed,
+        ];
+        create_signer_funded_pda(
+            payer,
+            policy_sequence,
+            system_program_ai,
+            program_id,
+            &seeds,
+            POLICY_SEQUENCE_SIZE,
+        )?;
+        let data = &mut policy_sequence.try_borrow_mut_data()?;
+        data.fill(0);
+        data[..8].copy_from_slice(&POLICY_SEQUENCE_DISC);
+        data[8..40].copy_from_slice(controller.key.as_ref());
+    }
+    validate_policy_sequence_account(program_id, controller, policy_sequence)
+}
+
 // proxy_admin accounts:
 // [governance(signer), controller_pda, market(w), percolator_program, tail...]
-// data: exact raw Percolator instruction bytes.
+// data: raw Percolator bytes, plus an expected u64 sequence for delayed
+// liquidation-policy updates. Controller-only witnesses are removed before CPI.
 fn process_proxy_admin<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
     data: &[u8],
 ) -> ProgramResult {
-    let perc_tag = data
+    let (percolator_data, liquidation_policy_sequence) =
+        decode_sequenced_admin_data(data)?;
+    let perc_tag = percolator_data
         .first()
         .copied()
         .ok_or(ProgramError::InvalidInstructionData)?;
@@ -972,7 +1128,7 @@ fn process_proxy_admin<'a>(
     if !governance.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
-    validate_admin_instruction_data(data, controller.key)?;
+    validate_admin_instruction_data(percolator_data, controller.key)?;
     let bump = controller_bump(
         program_id,
         governance,
@@ -985,7 +1141,7 @@ fn process_proxy_admin<'a>(
         let current_trade_fee_base_bps =
             percolator_accounting::read_trade_fee_base_bps(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
-        validate_trade_fee_update(data, current_trade_fee_base_bps)?;
+        validate_trade_fee_update(percolator_data, current_trade_fee_base_bps)?;
     }
     if perc_tag == PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE {
         let market_data = market.try_borrow_data()?;
@@ -993,7 +1149,7 @@ fn process_proxy_admin<'a>(
             percolator_accounting::read_permissionless_resolve_policy(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
         validate_permissionless_resolve_update(
-            data,
+            percolator_data,
             current_stale_slots,
             current_force_close_delay_slots,
         )?;
@@ -1013,13 +1169,16 @@ fn process_proxy_admin<'a>(
         }
     }
     let mut tail: alloc::vec::Vec<AccountInfo<'a>> = iter.cloned().collect();
-    if generation_bound_market(data) {
+    if generation_bound_market(percolator_data) {
         let next_market_id = {
             let market_data = market.try_borrow_data()?;
             percolator_accounting::read_next_market_id(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?
         };
-        if tail.len() != 1 {
+        let expected_tail_len = 1usize
+            .checked_add(usize::from(liquidation_policy_sequence.is_some()))
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        if tail.len() != expected_tail_len {
             return Err(ProgramError::InvalidInstructionData);
         }
         let witness = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -1031,8 +1190,20 @@ fn process_proxy_admin<'a>(
             return Err(ProgramError::InvalidInstructionData);
         }
     }
+    if let Some(expected_sequence) = liquidation_policy_sequence {
+        if tail.len() != 1 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let policy_sequence = tail.pop().ok_or(ProgramError::NotEnoughAccountKeys)?;
+        consume_liquidation_policy_sequence(
+            program_id,
+            controller,
+            &policy_sequence,
+            expected_sequence,
+        )?;
+    }
     if let Some((asset_index, native_tail_len, permits_unconfigured)) =
-        generation_bound_asset(data)?
+        generation_bound_asset(percolator_data)?
     {
         let market_id = {
             let market_data = market.try_borrow_data()?;
@@ -1067,7 +1238,7 @@ fn process_proxy_admin<'a>(
             }
         }
     }
-    if let Some(asset_index) = restart_asset_index(data)? {
+    if let Some(asset_index) = restart_asset_index(percolator_data)? {
         let market_data = market.try_borrow_data()?;
         let controller_key = controller.key.to_bytes();
         if percolator_accounting::read_asset_insurance_authority(&market_data, asset_index)
@@ -1113,7 +1284,7 @@ fn process_proxy_admin<'a>(
         &Instruction {
             program_id: *percolator_program.key,
             accounts: metas,
-            data: data.to_vec(),
+            data: percolator_data.to_vec(),
         },
         &cpi_accounts,
         &[&seeds],
@@ -2519,7 +2690,7 @@ fn process_close_resolved_portfolio<'a>(
 //  optional secondary_vault(w), controller_secondary_transit(w), governance_secondary_dest(w)]
 //
 // Percolator's CloseSlab requires its current marketauth to receive the slab rent,
-// vault rent, and any raw vault dust. Here marketauth is the stateless controller
+// vault rent, and any raw vault dust. Here marketauth is the noncustodial controller
 // PDA, so exposing CloseSlab through the generic proxy would strand that value.
 // This fixed instruction closes only a fully wound-down market (enforced by
 // Percolator), forwards each clean controller-owned transit's complete balance to
@@ -2747,7 +2918,7 @@ fn process_close_market_and_reclaim<'a>(
 //  retired_market_marker]
 // data: exact raw Percolator InitMarket bytes. Governance need not sign, so market
 // creation is permissionless while future controller actions remain governance-gated.
-// A retired slab key cannot re-enter this stateless controller: approved governance
+// A retired slab key cannot re-enter this constrained controller: approved governance
 // actions bind account keys and could otherwise act on a later market generation.
 fn process_init_market<'a>(
     program_id: &Pubkey,
@@ -3532,5 +3703,39 @@ mod tests {
             market_generation_witness_address(&Pubkey::new_unique(), 2).0
         );
         assert_ne!(witness, market_generation_witness_address(&market, 3).0);
+    }
+
+    #[test]
+    fn policy_sequence_address_binds_the_exact_controller() {
+        let controller = Pubkey::new_unique();
+        let sequence = policy_sequence_address(&controller).0;
+        assert_ne!(
+            sequence,
+            policy_sequence_address(&Pubkey::new_unique()).0
+        );
+    }
+
+    #[test]
+    fn liquidation_policy_sequence_envelope_is_exact_and_stripped() {
+        let raw = vec![PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY, 7, 0];
+        let mut sequenced = raw.clone();
+        sequenced.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(
+            decode_sequenced_admin_data(&sequenced),
+            Ok((raw.as_slice(), Some(9)))
+        );
+        assert_eq!(
+            decode_sequenced_admin_data(&raw),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        sequenced.push(0);
+        assert_eq!(
+            decode_sequenced_admin_data(&sequenced),
+            Err(ProgramError::InvalidInstructionData)
+        );
+        assert_eq!(
+            decode_sequenced_admin_data(&[PERC_IX_RESOLVE_MARKET]),
+            Ok((&[PERC_IX_RESOLVE_MARKET][..], None))
+        );
     }
 }
