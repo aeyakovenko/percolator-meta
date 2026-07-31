@@ -48,6 +48,7 @@ const POLICY_SEQUENCE_DISC: [u8; 8] = *b"POLSEQ01";
 const POLICY_SEQUENCE_SIZE: usize = 72;
 const LIQUIDATION_POLICY_SEQUENCE_OFFSET: usize = 40;
 const MAINTENANCE_POLICY_SEQUENCE_OFFSET: usize = 48;
+const FEE_REDIRECT_POLICY_SEQUENCE_OFFSET: usize = 56;
 pub const RETIRED_MARKET_SEED: &[u8] = b"retired-market";
 pub const RETIRED_MARKET_DISC: [u8; 8] = *b"MKTRET01";
 pub const RETIRED_MARKET_SIZE: usize = 72;
@@ -123,6 +124,9 @@ const SEQUENCED_LIQUIDATION_FEE_POLICY_LEN: usize =
 const UPDATE_MAINTENANCE_FEE_POLICY_LEN: usize = 3;
 const SEQUENCED_MAINTENANCE_FEE_POLICY_LEN: usize =
     UPDATE_MAINTENANCE_FEE_POLICY_LEN + core::mem::size_of::<u64>();
+const UPDATE_FEE_REDIRECT_POLICY_LEN: usize = 3;
+const SEQUENCED_FEE_REDIRECT_POLICY_LEN: usize =
+    UPDATE_FEE_REDIRECT_POLICY_LEN + core::mem::size_of::<u64>();
 const UPDATE_BACKING_FEE_POLICY_LEN: usize = 7;
 const CONFIGURE_HYBRID_ORACLE_LEN: usize = 156;
 const CONFIGURE_EWMA_MARK_LEN: usize = 35;
@@ -1009,6 +1013,11 @@ fn decode_sequenced_admin_data(
             SEQUENCED_MAINTENANCE_FEE_POLICY_LEN,
             MAINTENANCE_POLICY_SEQUENCE_OFFSET,
         ),
+        Some(PERC_IX_UPDATE_FEE_REDIRECT_POLICY) => (
+            UPDATE_FEE_REDIRECT_POLICY_LEN,
+            SEQUENCED_FEE_REDIRECT_POLICY_LEN,
+            FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
+        ),
         _ => return Ok((data, None)),
     };
     if data.len() != sequenced_len {
@@ -1129,8 +1138,8 @@ fn process_init_policy_sequence(
 // proxy_admin accounts:
 // [governance(signer), controller_pda, market(w), percolator_program, tail...]
 // data: raw Percolator bytes, plus an expected u64 sequence for delayed
-// liquidation- and maintenance-policy updates. Controller-only witnesses are
-// removed before CPI.
+// liquidation, maintenance, and fee-redirect policy updates. Controller-only
+// witnesses are removed before CPI.
 fn process_proxy_admin<'a>(
     program_id: &Pubkey,
     accounts: &'a [AccountInfo<'a>],
@@ -3757,6 +3766,10 @@ mod tests {
             (
                 PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY,
                 MAINTENANCE_POLICY_SEQUENCE_OFFSET,
+            ),
+            (
+                PERC_IX_UPDATE_FEE_REDIRECT_POLICY,
+                FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
             ),
         ] {
             let raw = vec![tag, 7, 0];

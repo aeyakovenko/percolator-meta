@@ -2672,6 +2672,36 @@ fn controller_market_generation_witness(svm: &LiteSVM, market: &Pubkey) -> Pubke
     market_controller_program::market_generation_witness_address(market, next_market_id).0
 }
 
+fn init_controller_policy_sequence(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+) -> Pubkey {
+    let policy_sequence =
+        market_controller_program::policy_sequence_address(controller).0;
+    send(
+        svm,
+        &[payer],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new_readonly(*governance, false),
+                AccountMeta::new_readonly(*controller, false),
+                AccountMeta::new_readonly(*market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new(policy_sequence, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            data: vec![12u8], // IX_INIT_POLICY_SEQUENCE
+        },
+    )
+    .expect("permissionlessly initialize the controller policy sequence");
+    policy_sequence
+}
+
 fn retired_market_pda(market: &Pubkey, perc: &Pubkey) -> Pubkey {
     market_controller_program::retired_market_address(perc, market).0
 }
@@ -18323,6 +18353,13 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
         percolator_prog::state::read_market_config_mode_and_capacity(&slab_account.data).unwrap();
     assert_eq!(cfg.marketauth, controller.to_bytes());
     assert_eq!((configured_slots, capacity), (1, 1));
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &squads_vault,
+        &controller,
+        &slab,
+    );
 
     let vault_authority = perc_vault_authority(&slab, &perc_id());
     let perc_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -18442,21 +18479,24 @@ fn e2e_market_controller_separates_lifecycle_from_genesis_custody() {
     .expect("owner deposits through constrained custody");
 
     // Governance can update policy through the allowlist.
-    let fee_data =
-        percolator_prog::ix::Instruction::UpdateFeeRedirectPolicy { redirect_bps: 777 }.encode();
+    let fee_data = sequenced_controller_policy_data(
+        percolator_prog::ix::Instruction::UpdateFeeRedirectPolicy { redirect_bps: 777 }.encode(),
+        0,
+    );
     let fee_witness = controller_market_generation_witness(&svm, &slab);
-    let fee = build_controller_generation_proxy_message(
+    let fee = build_controller_sequenced_generation_proxy_message(
         &squads_vault,
         &controller,
         &slab,
         &perc_id(),
-        &[],
+        &policy_sequence,
         &fee_witness,
         &fee_data,
     );
     let controller_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(policy_sequence, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(fee_witness, false),
@@ -50120,6 +50160,13 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         unix_timestamp: 100,
         ..Clock::default()
     });
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &squads_vault,
+        &controller,
+        &slab,
+    );
     let oracle_cfg = build_controller_proxy_message(
         &squads_vault,
         &controller,
@@ -50170,21 +50217,26 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     );
     let bootstrap_policy_witness =
         controller_market_generation_witness(&svm, &slab);
-    let bootstrap_policy = build_controller_generation_proxy_message(
+    let bootstrap_policy_data = sequenced_controller_policy_data(
+        PIx::UpdateFeeRedirectPolicy {
+            redirect_bps: 2_000,
+        }
+        .encode(),
+        0,
+    );
+    let bootstrap_policy = build_controller_sequenced_generation_proxy_message(
         &squads_vault,
         &controller,
         &slab,
         &perc_id(),
-        &[],
+        &policy_sequence,
         &bootstrap_policy_witness,
-        &PIx::UpdateFeeRedirectPolicy {
-            redirect_bps: 2_000,
-        }
-        .encode(),
+        &bootstrap_policy_data,
     );
     let bootstrap_policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(slab, false),
+        AccountMeta::new(policy_sequence, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(bootstrap_policy_witness, false),
@@ -63383,6 +63435,13 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
         },
     )
     .expect("permissionlessly initialize the controller-owned market");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &squads_vault,
+        &controller,
+        &market_key,
+    );
 
     let vault_authority = perc_vault_authority(&market_key, &perc_id());
     let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -63398,6 +63457,17 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
         vec![
             AccountMeta::new_readonly(squads_vault, false),
             AccountMeta::new(market_key, false),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(witness, false),
+            AccountMeta::new_readonly(controller_id(), false),
+        ]
+    };
+    let sequenced_generation_remaining = |witness: Pubkey| {
+        vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new(policy_sequence, false),
             AccountMeta::new_readonly(controller, false),
             AccountMeta::new_readonly(perc_id(), false),
             AccountMeta::new_readonly(witness, false),
@@ -63432,17 +63502,21 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
     .expect("configure a bounded one-slot shutdown delay");
 
     let market_witness = controller_market_generation_witness(&svm, &market_key);
-    let protected_redirect = build_controller_generation_proxy_message(
+    let protected_redirect_data = sequenced_controller_policy_data(
+        PIx::UpdateFeeRedirectPolicy {
+            redirect_bps: 10_000,
+        }
+        .encode(),
+        0,
+    );
+    let protected_redirect = build_controller_sequenced_generation_proxy_message(
         &squads_vault,
         &controller,
         &market_key,
         &perc_id(),
-        &[],
+        &policy_sequence,
         &market_witness,
-        &PIx::UpdateFeeRedirectPolicy {
-            redirect_bps: 10_000,
-        }
-        .encode(),
+        &protected_redirect_data,
     );
     squads_execute(
         &mut svm,
@@ -63452,7 +63526,7 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
         &payer,
         2,
         &protected_redirect,
-        &generation_remaining(market_witness),
+        &sequenced_generation_remaining(market_witness),
     )
     .expect("route generation-A secondary fees to canonical market-0 insurance");
 
@@ -63512,14 +63586,18 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
     let stale_transaction = transaction_pda(&squads, &multisig, stale_transaction_index);
     let stale_proposal = proposal_pda(&squads, &multisig, stale_transaction_index);
     let stale_witness = controller_market_generation_witness(&svm, &market_key);
-    let stale_message = build_controller_generation_proxy_message(
+    let stale_redirect_data = sequenced_controller_policy_data(
+        PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 }.encode(),
+        1,
+    );
+    let stale_message = build_controller_sequenced_generation_proxy_message(
         &squads_vault,
         &controller,
         &market_key,
         &perc_id(),
-        &[],
+        &policy_sequence,
         &stale_witness,
-        &PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 }.encode(),
+        &stale_redirect_data,
     );
     for instruction in [
         vault_transaction_create_ix(
@@ -63647,26 +63725,34 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
                 proposal_pda(&squads, &multisig, correction_index);
             let current_witness =
                 controller_market_generation_witness(&svm, &market_key);
-            let local_message = build_controller_generation_proxy_message(
-                &squads_vault,
-                &controller,
-                &market_key,
-                &perc_id(),
-                &[],
-                &current_witness,
-                &PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 }.encode(),
+            let local_redirect_data = sequenced_controller_policy_data(
+                PIx::UpdateFeeRedirectPolicy { redirect_bps: 0 }.encode(),
+                1,
             );
-            let correction_message = build_controller_generation_proxy_message(
-                &squads_vault,
-                &controller,
-                &market_key,
-                &perc_id(),
-                &[],
-                &current_witness,
-                &PIx::UpdateFeeRedirectPolicy {
+            let correction_redirect_data = sequenced_controller_policy_data(
+                PIx::UpdateFeeRedirectPolicy {
                     redirect_bps: 10_000,
                 }
                 .encode(),
+                1,
+            );
+            let local_message = build_controller_sequenced_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market_key,
+                &perc_id(),
+                &policy_sequence,
+                &current_witness,
+                &local_redirect_data,
+            );
+            let correction_message = build_controller_sequenced_generation_proxy_message(
+                &squads_vault,
+                &controller,
+                &market_key,
+                &perc_id(),
+                &policy_sequence,
+                &current_witness,
+                &correction_redirect_data,
             );
             for (transaction, proposal, index, message) in [
                 (
@@ -63720,7 +63806,7 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
                     &correction_proposal,
                     &correction_transaction,
                     &dao.pubkey(),
-                    &generation_remaining(current_witness),
+                    &sequenced_generation_remaining(current_witness),
                 ),
             )
             .expect("execute the later canonical-insurance redirect first");
@@ -63735,6 +63821,17 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
     let governance_index_offset = 2 * u64::from(same_generation_order);
 
     let market_before_replay = svm.get_account(&market_key).unwrap();
+    let policy_sequence_before_replay =
+        svm.get_account(&policy_sequence).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(
+            policy_sequence_before_replay.data[56..64]
+                .try_into()
+                .unwrap(),
+        ),
+        1 + u64::from(same_generation_order),
+        "only executed fee redirects advance their independent sequence",
+    );
     let replay = send(
         &mut svm,
         &[&dao],
@@ -63744,7 +63841,7 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
             &replay_proposal,
             &replay_transaction,
             &dao.pubkey(),
-            &generation_remaining(replay_witness),
+            &sequenced_generation_remaining(replay_witness),
         ),
     );
     let replay_succeeded = replay.is_ok();
@@ -63753,6 +63850,11 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
             svm.get_account(&market_key).unwrap(),
             market_before_replay,
             "a rejected stale redirect leaves generation B byte-identical",
+        );
+        assert_eq!(
+            svm.get_account(&policy_sequence).unwrap(),
+            policy_sequence_before_replay,
+            "a rejected stale redirect cannot consume the live policy sequence",
         );
     }
 
