@@ -110,6 +110,7 @@ const PERC_IX_UPDATE_BACKING_FEE_POLICY: u8 = 51;
 const PERC_IX_UPDATE_TRADE_FEE_POLICY: u8 = 55;
 const PERC_IX_WITHDRAW_BACKING_EARNINGS: u8 = 52;
 const PERC_IX_WITHDRAW_INSURANCE_ASSET: u8 = 57;
+const PERC_IX_UPDATE_FEE_REDIRECT_POLICY: u8 = 58;
 const PERC_IX_CONFIGURE_AUTH_MARK: u8 = 62;
 const PERC_IX_UPDATE_ASSET_AUTHORITY: u8 = 65;
 const PERC_IX_RESTART_ASSET_ORACLE: u8 = 69;
@@ -800,7 +801,7 @@ fn admin_tag_allowed(tag: u8) -> bool {
             | PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY
             | 51 // UpdateBackingFeePolicy
             | 55 // UpdateTradeFeePolicy
-            | 58 // UpdateFeeRedirectPolicy
+            | PERC_IX_UPDATE_FEE_REDIRECT_POLICY
             | 62 // ConfigureAuthMark
             | 69 // RestartAssetOracle
     )
@@ -925,6 +926,7 @@ fn generation_bound_market(data: &[u8]) -> bool {
             | Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY)
             | Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE)
             | Some(PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY)
+            | Some(PERC_IX_UPDATE_FEE_REDIRECT_POLICY)
     )
 }
 
@@ -3705,7 +3707,7 @@ mod tests {
     }
 
     #[test]
-    fn market_generation_binding_covers_resolution_and_fee_policies() {
+    fn market_generation_binding_covers_resolution_fee_policies_and_routing() {
         assert!(generation_bound_market(&[PERC_IX_RESOLVE_MARKET]));
         assert!(generation_bound_market(&[
             PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY
@@ -3715,6 +3717,9 @@ mod tests {
         ]));
         assert!(generation_bound_market(&[
             PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY
+        ]));
+        assert!(generation_bound_market(&[
+            PERC_IX_UPDATE_FEE_REDIRECT_POLICY
         ]));
         assert!(!generation_bound_market(&[
             PERC_IX_UPDATE_TRADE_FEE_POLICY
