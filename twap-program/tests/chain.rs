@@ -5821,7 +5821,17 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
     .expect("auction -> 4000");
     assert_eq!(read_bps(&svm, &cfg_pda), 4_000);
     // (2) savings 5000 (4000 + 5000 = 9000 <= 100%).
-    let msg = build_set_economics_message(&vault, &cfg_pda, &savings_acct, 5_000, 0);
+    let msg = build_set_economics_message_with_expected(
+        &vault,
+        &cfg_pda,
+        &savings_acct,
+        5_000,
+        0,
+        4_000,
+        0,
+        0,
+        &Pubkey::default(),
+    );
     squads_execute(
         &mut svm,
         &squads,
@@ -21623,13 +21633,38 @@ fn build_cross_backing_twap_restart_asset0_message(
 }
 
 // IX_SET_ECONOMICS (tag 14): Squads-vault-gated 4-way split setter.
-// accounts: [squads_vault(signer), config(w), savings_account(ro)]; data: savings_bps(u16)||buyback_bps(u16)
+// accounts: [squads_vault(signer), config(w), savings_account(ro)].
 fn build_set_economics_message(
     squads_vault: &Pubkey,
     config: &Pubkey,
     savings_account: &Pubkey,
     savings_bps: u16,
     buyback_bps: u16,
+) -> Vec<u8> {
+    build_set_economics_message_with_expected(
+        squads_vault,
+        config,
+        savings_account,
+        savings_bps,
+        buyback_bps,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_set_economics_message_with_expected(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    savings_account: &Pubkey,
+    savings_bps: u16,
+    buyback_bps: u16,
+    expected_surplus_buy_burn_bps: u16,
+    expected_savings_bps: u16,
+    expected_buyback_bps: u16,
+    expected_savings_account: &Pubkey,
 ) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // num_signers
@@ -21649,6 +21684,10 @@ fn build_set_economics_message(
     let mut data = vec![14u8]; // IX_SET_ECONOMICS
     data.extend_from_slice(&savings_bps.to_le_bytes());
     data.extend_from_slice(&buyback_bps.to_le_bytes());
+    data.extend_from_slice(&expected_surplus_buy_burn_bps.to_le_bytes());
+    data.extend_from_slice(&expected_savings_bps.to_le_bytes());
+    data.extend_from_slice(&expected_buyback_bps.to_le_bytes());
+    data.extend_from_slice(expected_savings_account.as_ref());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
@@ -36295,12 +36334,16 @@ fn e2e_savings_sink_cannot_alias_holding_and_expand_the_auction_budget() {
         &env.twap_authority,
         0,
     );
-    let valid = build_set_economics_message(
+    let valid = build_set_economics_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &savings_sink,
         1_000,
         0,
+        8_000,
+        1_000,
+        0,
+        &bk.holding,
     );
     let valid_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -45848,12 +45891,16 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
         &env.twap_authority,
         0,
     );
-    let economics = build_set_economics_message(
+    let economics = build_set_economics_message_with_expected(
         &env.squads_vault,
         &env.twap_cfg,
         &savings_sink,
         5_000,
         0,
+        5_000,
+        0,
+        0,
+        &Pubkey::default(),
     );
     let economics_accounts = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
@@ -66773,10 +66820,28 @@ fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
     )
     .expect("the live policy retains half of bought COIN");
 
-    let stale_message =
-        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings, 0, 10_000);
-    let correction_message =
-        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings, 0, 0);
+    let stale_message = build_set_economics_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings,
+        0,
+        10_000,
+        8_000,
+        0,
+        5_000,
+        &savings,
+    );
+    let correction_message = build_set_economics_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &savings,
+        0,
+        0,
+        8_000,
+        0,
+        5_000,
+        &savings,
+    );
     let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
         let transaction = transaction_pda(&env.squads, &env.multisig, index);
         let proposal = proposal_pda(&env.squads, &env.multisig, index);
