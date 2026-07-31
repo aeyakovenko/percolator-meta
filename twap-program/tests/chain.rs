@@ -6369,6 +6369,13 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
         },
     )
     .expect("permissionless controller market initialization");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &governance.pubkey(),
+        &controller,
+        &market,
+    );
 
     let insurance_amount = 17u64;
     let vault_authority = perc_vault_authority(&market, &perc_id());
@@ -6562,10 +6569,32 @@ fn controller_can_restart_asset0_after_governed_shutdown() {
     );
     assert_eq!(svm.get_account(&market).unwrap(), shutdown_market);
 
+    let restart_witness = market_controller_program::asset_generation_witness_address(
+        &market,
+        0,
+        old_market_id,
+    )
+    .0;
+    let mut restart_proxy_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    restart_proxy_data.extend_from_slice(&sequenced_controller_policy_data(
+        restart.encode(),
+        0,
+    ));
     send(
         &mut svm,
         &[&payer, &governance],
-        proxy(restart, None),
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(restart_witness, false),
+                AccountMeta::new(policy_sequence, false),
+            ],
+            data: restart_proxy_data,
+        },
     )
     .expect("controller exposes the pinned value-neutral restart lifecycle");
 
@@ -6659,6 +6688,13 @@ fn e2e_presigned_controller_insurance_donation_cannot_cross_asset0_restart() {
         },
     )
     .expect("permissionlessly initialize a controller-owned market");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &governance.pubkey(),
+        &controller,
+        &market,
+    );
 
     let proxy = |percolator_instruction: percolator_prog::ix::Instruction,
                  generation_witness: Option<Pubkey>| {
@@ -6768,15 +6804,35 @@ fn e2e_presigned_controller_insurance_donation_cannot_cross_asset0_restart() {
         &[&payer, &governance],
         shared_blockhash,
     );
+    let restart_witness = market_controller_program::asset_generation_witness_address(
+        &market,
+        0,
+        old_market_id,
+    )
+    .0;
+    let mut restart_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    restart_data.extend_from_slice(&sequenced_controller_policy_data(
+        percolator_prog::ix::Instruction::RestartAssetOracle {
+            asset_index: 0,
+            now_slot: 111,
+            initial_price: 1_000_000,
+        }
+        .encode(),
+        0,
+    ));
     let restart = Transaction::new_signed_with_payer(
-        &[proxy(
-            percolator_prog::ix::Instruction::RestartAssetOracle {
-                asset_index: 0,
-                now_slot: 111,
-                initial_price: 1_000_000,
-            },
-            None,
-        )],
+        &[Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(restart_witness, false),
+                AccountMeta::new(policy_sequence, false),
+            ],
+            data: restart_data,
+        }],
         Some(&payer.pubkey()),
         &[&payer, &governance],
         shared_blockhash,
@@ -6905,6 +6961,13 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         },
     )
     .expect("permissionlessly initialize the controller-owned market");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+    );
 
     let insurance_amount = 17u64;
     let vault_authority = perc_vault_authority(&market.pubkey(), &perc_id());
@@ -6952,13 +7015,6 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
 
     let policy_generation_witness =
         controller_market_generation_witness(&svm, &market.pubkey());
-    let controller_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(market.pubkey(), false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market.pubkey(), false),
@@ -7013,19 +7069,25 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         AccountMeta::new_readonly(generation_a_witness, false),
         AccountMeta::new_readonly(controller_id(), false),
     ];
-    let stale_oracle = build_controller_proxy_message(
+    let stale_oracle = build_controller_sequenced_asset_generation_proxy_message(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
-        &PIx::ConfigureEwmaMark {
-            asset_index: 0,
-            now_slot: 100,
-            initial_mark_e6: 2_000_000,
-            mark_ewma_halflife_slots: 1,
-            mark_min_fee: 0,
-        }
-        .encode(),
+        &policy_sequence,
+        &[],
+        &generation_a_witness,
+        &sequenced_controller_policy_data(
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 2_000_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            }
+            .encode(),
+            1,
+        ),
     );
     let stale_index = 2u64;
     let stale_transaction = transaction_pda(&squads, &multisig, stale_index);
@@ -7081,19 +7143,32 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
     )
     .expect("independently shut down generation A");
     svm.warp_to_slot(101);
-    let restart = build_controller_generation_proxy_message(
+    let restart = build_controller_sequenced_asset_generation_proxy_message(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
+        &policy_sequence,
         &[],
         &generation_a_witness,
-        &PIx::RestartAssetOracle {
-            asset_index: 0,
-            now_slot: 101,
-            initial_price: 1_000_000,
-        }
-        .encode(),
+        &sequenced_controller_policy_data(
+            PIx::RestartAssetOracle {
+                asset_index: 0,
+                now_slot: 101,
+                initial_price: 1_000_000,
+            }
+            .encode(),
+            0,
+        ),
+    );
+    let restart_remaining = controller_sequenced_asset_generation_remaining(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &policy_sequence,
+        &[],
+        &generation_a_witness,
     );
     squads_execute(
         &mut svm,
@@ -7103,7 +7178,7 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         &payer,
         4,
         &restart,
-        &generation_a_remaining,
+        &restart_remaining,
     )
     .expect("restart the same funded slot as generation B");
 
@@ -7124,7 +7199,15 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
             &stale_proposal,
             &stale_transaction,
             &dao.pubkey(),
-            &controller_remaining,
+            &controller_sequenced_asset_generation_remaining(
+                &squads_vault,
+                &controller,
+                &market.pubkey(),
+                &perc_id(),
+                &policy_sequence,
+                &[],
+                &generation_a_witness,
+            ),
         ),
     );
     let generation_b_after = svm.get_account(&market.pubkey()).unwrap();
@@ -7151,29 +7234,34 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         generation_b,
     )
     .0;
-    let generation_b_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(market.pubkey(), false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(generation_b_witness, false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
-    let wrong_generation_oracle = build_controller_generation_proxy_message(
+    let generation_b_remaining = controller_sequenced_asset_generation_remaining(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
+        &policy_sequence,
+        &[],
+        &generation_b_witness,
+    );
+    let wrong_generation_oracle = build_controller_sequenced_asset_generation_proxy_message(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &policy_sequence,
         &[],
         &generation_a_witness,
-        &PIx::ConfigureEwmaMark {
-            asset_index: 0,
-            now_slot: 101,
-            initial_mark_e6: 1_250_000,
-            mark_ewma_halflife_slots: 1,
-            mark_min_fee: 0,
-        }
-        .encode(),
+        &sequenced_controller_policy_data(
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 101,
+                initial_mark_e6: 1_250_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            }
+            .encode(),
+            1,
+        ),
     );
     assert!(
         squads_execute(
@@ -7195,21 +7283,25 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         "wrong-witness rejection must preserve all generation-B accounting"
     );
 
-    let fresh_oracle = build_controller_generation_proxy_message(
+    let fresh_oracle = build_controller_sequenced_asset_generation_proxy_message(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
+        &policy_sequence,
         &[],
         &generation_b_witness,
-        &PIx::ConfigureEwmaMark {
-            asset_index: 0,
-            now_slot: 101,
-            initial_mark_e6: 1_500_000,
-            mark_ewma_halflife_slots: 1,
-            mark_min_fee: 0,
-        }
-        .encode(),
+        &sequenced_controller_policy_data(
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 101,
+                initial_mark_e6: 1_500_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            }
+            .encode(),
+            1,
+        ),
     );
     squads_execute(
         &mut svm,
@@ -7254,39 +7346,43 @@ fn e2e_approved_old_oracle_action_cannot_reanchor_funded_restarted_generation() 
         },
     )
     .unwrap();
-    let hybrid_oracle = build_controller_generation_proxy_message(
+    let hybrid_oracle = build_controller_sequenced_asset_generation_proxy_message(
         &squads_vault,
         &controller,
         &market.pubkey(),
         &perc_id(),
+        &policy_sequence,
         &[feed],
         &generation_b_witness,
-        &PIx::ConfigureHybridOracle {
-            asset_index: 0,
-            now_slot: hybrid_clock.slot,
-            now_unix_ts: hybrid_clock.unix_timestamp,
-            oracle_leg_count: 1,
-            oracle_leg_flags: 0,
-            max_staleness_secs: 60,
-            hybrid_soft_stale_slots: 3,
-            mark_ewma_halflife_slots: 1,
-            mark_min_fee: 0,
-            invert: 0,
-            unit_scale: 0,
-            conf_filter_bps: 500,
-            oracle_leg_feeds: [feed_id, [0; 32], [0; 32]],
-        }
-        .encode(),
+        &sequenced_controller_policy_data(
+            PIx::ConfigureHybridOracle {
+                asset_index: 0,
+                now_slot: hybrid_clock.slot,
+                now_unix_ts: hybrid_clock.unix_timestamp,
+                oracle_leg_count: 1,
+                oracle_leg_flags: 0,
+                max_staleness_secs: 60,
+                hybrid_soft_stale_slots: 3,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+                invert: 0,
+                unit_scale: 0,
+                conf_filter_bps: 500,
+                oracle_leg_feeds: [feed_id, [0; 32], [0; 32]],
+            }
+            .encode(),
+            2,
+        ),
     );
-    let hybrid_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(market.pubkey(), false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(feed, false),
-        AccountMeta::new_readonly(generation_b_witness, false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
+    let hybrid_remaining = controller_sequenced_asset_generation_remaining(
+        &squads_vault,
+        &controller,
+        &market.pubkey(),
+        &perc_id(),
+        &policy_sequence,
+        &[feed],
+        &generation_b_witness,
+    );
     squads_execute(
         &mut svm,
         &squads,
@@ -7433,7 +7529,7 @@ fn e2e_older_oracle_configuration_cannot_front_run_a_presigned_trade() {
         },
     )
     .expect("permissionlessly initialize the controller-owned market");
-    init_controller_policy_sequence(
+    let policy_sequence = init_controller_policy_sequence(
         &mut svm,
         &payer,
         &squads_vault,
@@ -7457,40 +7553,44 @@ fn e2e_older_oracle_configuration_cannot_front_run_a_presigned_trade() {
     let oracle_witness =
         market_controller_program::asset_generation_witness_address(&market_key, 0, 1).0;
     let oracle_remaining = |feed| {
-        vec![
-            AccountMeta::new_readonly(squads_vault, false),
-            AccountMeta::new(market_key, false),
-            AccountMeta::new_readonly(controller, false),
-            AccountMeta::new_readonly(perc_id(), false),
-            AccountMeta::new_readonly(feed, false),
-            AccountMeta::new_readonly(oracle_witness, false),
-            AccountMeta::new_readonly(controller_id(), false),
-        ]
-    };
-    let oracle_message = |feed, feed_id| {
-        build_controller_generation_proxy_message(
+        controller_sequenced_asset_generation_remaining(
             &squads_vault,
             &controller,
             &market_key,
             &perc_id(),
+            &policy_sequence,
             &[feed],
             &oracle_witness,
-            &PIx::ConfigureHybridOracle {
-                asset_index: 0,
-                now_slot: 100,
-                now_unix_ts: 100,
-                oracle_leg_count: 1,
-                oracle_leg_flags: 0,
-                max_staleness_secs: 60,
-                hybrid_soft_stale_slots: 3,
-                mark_ewma_halflife_slots: 1,
-                mark_min_fee: 0,
-                invert: 0,
-                unit_scale: 0,
-                conf_filter_bps: 500,
-                oracle_leg_feeds: [feed_id, [0; 32], [0; 32]],
-            }
-            .encode(),
+        )
+    };
+    let oracle_message = |feed, feed_id| {
+        build_controller_sequenced_asset_generation_proxy_message(
+            &squads_vault,
+            &controller,
+            &market_key,
+            &perc_id(),
+            &policy_sequence,
+            &[feed],
+            &oracle_witness,
+            &sequenced_controller_policy_data(
+                PIx::ConfigureHybridOracle {
+                    asset_index: 0,
+                    now_slot: 100,
+                    now_unix_ts: 100,
+                    oracle_leg_count: 1,
+                    oracle_leg_flags: 0,
+                    max_staleness_secs: 60,
+                    hybrid_soft_stale_slots: 3,
+                    mark_ewma_halflife_slots: 1,
+                    mark_min_fee: 0,
+                    invert: 0,
+                    unit_scale: 0,
+                    conf_filter_bps: 500,
+                    oracle_leg_feeds: [feed_id, [0; 32], [0; 32]],
+                }
+                .encode(),
+                0,
+            ),
         )
     };
     let stale_index = 1u64;
@@ -9310,6 +9410,13 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
         },
     )
     .expect("initialize controller market");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &governance.pubkey(),
+        &controller,
+        &market,
+    );
 
     // Upgrade fixture: this exact matched external role state was publicly creatable through
     // predecessor controller activation/donation paths. New entry is blocked by the preceding fixes.
@@ -9443,14 +9550,37 @@ fn e2e_restart_cannot_preserve_a_zero_capital_external_fee_operator() {
     clock.slot = 111;
     svm.set_sysvar(&clock);
     let market_before_restart = svm.get_account(&market).unwrap();
-    if send(
-        &mut svm,
-        &[&payer, &governance],
-        proxy(PIx::RestartAssetOracle {
+    let restart_witness = market_controller_program::asset_generation_witness_address(
+        &market,
+        0,
+        read_asset0_market_id(&svm, &market),
+    )
+    .0;
+    let mut restart_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    restart_data.extend_from_slice(&sequenced_controller_policy_data(
+        PIx::RestartAssetOracle {
             asset_index: 0,
             now_slot: 111,
             initial_price: 1_000_000,
-        }, None),
+        }
+        .encode(),
+        0,
+    ));
+    if send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(restart_witness, false),
+                AccountMeta::new(policy_sequence, false),
+            ],
+            data: restart_data,
+        },
     )
     .is_ok()
     {
@@ -11041,6 +11171,76 @@ fn build_controller_sequenced_generation_proxy_message(
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn build_controller_sequenced_asset_generation_proxy_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    policy_sequence: &Pubkey,
+    native_tail: &[Pubkey],
+    generation_witness: &Pubkey,
+    percolator_data: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(0);
+    m.push(2); // market and policy sequence writable
+    m.push(u8::try_from(7 + native_tail.len()).unwrap());
+    m.extend_from_slice(governance.as_ref()); // 0
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(policy_sequence.as_ref()); // 2 writable
+    m.extend_from_slice(controller.as_ref()); // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    for account in native_tail {
+        m.extend_from_slice(account.as_ref());
+    }
+    let witness_index = u8::try_from(5 + native_tail.len()).unwrap();
+    m.extend_from_slice(generation_witness.as_ref());
+    let program_index = witness_index.checked_add(1).unwrap();
+    m.extend_from_slice(controller_id().as_ref());
+    m.push(1);
+    m.push(program_index);
+    m.push(u8::try_from(6 + native_tail.len()).unwrap());
+    for index in [0u8, 3, 1, 4] {
+        m.push(index);
+    }
+    for index in 0..native_tail.len() {
+        m.push(u8::try_from(5 + index).unwrap());
+    }
+    m.push(witness_index);
+    m.push(2); // sequence account is the final controller-only account
+    let mut data = vec![0u8]; // IX_PROXY_ADMIN
+    data.extend_from_slice(percolator_data);
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn controller_sequenced_asset_generation_remaining(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    policy_sequence: &Pubkey,
+    native_tail: &[Pubkey],
+    generation_witness: &Pubkey,
+) -> Vec<AccountMeta> {
+    let mut remaining = vec![
+        AccountMeta::new_readonly(*governance, false),
+        AccountMeta::new(*market, false),
+        AccountMeta::new(*policy_sequence, false),
+        AccountMeta::new_readonly(*controller, false),
+        AccountMeta::new_readonly(*percolator_program, false),
+    ];
+    for account in native_tail {
+        remaining.push(AccountMeta::new_readonly(*account, false));
+    }
+    remaining.push(AccountMeta::new_readonly(*generation_witness, false));
+    remaining.push(AccountMeta::new_readonly(controller_id(), false));
+    remaining
 }
 
 fn sequenced_controller_policy_data(
@@ -51334,27 +51534,41 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         &controller,
         &slab,
     );
-    let oracle_cfg = build_controller_proxy_message(
+    let oracle_witness = market_controller_program::asset_generation_witness_address(
+        &slab,
+        0,
+        read_asset0_market_id(&svm, &slab),
+    )
+    .0;
+    let oracle_cfg = build_controller_sequenced_asset_generation_proxy_message(
         &squads_vault,
         &controller,
         &slab,
         &perc_id(),
-        &PIx::ConfigureEwmaMark {
-            asset_index: 0,
-            now_slot: 100,
-            initial_mark_e6: initial_price,
-            mark_ewma_halflife_slots: 1,
-            mark_min_fee: 0,
-        }
-        .encode(),
+        &policy_sequence,
+        &[],
+        &oracle_witness,
+        &sequenced_controller_policy_data(
+            PIx::ConfigureEwmaMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: initial_price,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+            }
+            .encode(),
+            0,
+        ),
     );
-    let oracle_cfg_remaining = vec![
-        AccountMeta::new_readonly(squads_vault, false),
-        AccountMeta::new(slab, false),
-        AccountMeta::new_readonly(controller, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(controller_id(), false),
-    ];
+    let oracle_cfg_remaining = controller_sequenced_asset_generation_remaining(
+        &squads_vault,
+        &controller,
+        &slab,
+        &perc_id(),
+        &policy_sequence,
+        &[],
+        &oracle_witness,
+    );
     squads_execute(
         &mut svm,
         &squads,
@@ -63849,6 +64063,13 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         },
     )
     .expect("permissionless controller market init");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &governance.pubkey(),
+        &controller,
+        &market,
+    );
 
     let vault_authority = perc_vault_authority(&market, &perc_id());
     let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
@@ -64298,18 +64519,37 @@ fn e2e_controller_owned_secondary_fee_insurance_can_retire_after_shutdown() {
         .unwrap(),
         0
     );
+    let restart_witness = market_controller_program::asset_generation_witness_address(
+        &market,
+        1,
+        generation_a,
+    )
+    .0;
+    let mut restart_data = vec![0u8]; // controller IX_PROXY_ADMIN
+    restart_data.extend_from_slice(&sequenced_controller_policy_data(
+        PIx::RestartAssetOracle {
+            asset_index: 1,
+            now_slot: 111,
+            initial_price: 1_000_000,
+        }
+        .encode(),
+        0,
+    ));
     send(
         &mut svm,
         &[&payer, &governance],
-        proxy(
-            PIx::RestartAssetOracle {
-                asset_index: 1,
-                now_slot: 111,
-                initial_price: 1_000_000,
-            }
-            .encode(),
-            Some(generation_a),
-        ),
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(restart_witness, false),
+                AccountMeta::new(policy_sequence, false),
+            ],
+            data: restart_data,
+        },
     )
     .expect("governance restarts the cleaned secondary market");
     let generation_b = percolator_prog::state::read_market(
@@ -64835,19 +65075,23 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
 
     warp_to(&mut svm, shutdown_slot + 1);
     let restart_slot = svm.get_sysvar::<Clock>().slot;
-    let restart = build_controller_generation_proxy_message(
+    let restart = build_controller_sequenced_asset_generation_proxy_message(
         &squads_vault,
         &controller,
         &market_key,
         &perc_id(),
+        &policy_sequence,
         &[],
         &asset_witness,
-        &PIx::RestartAssetOracle {
-            asset_index: ASSET_INDEX,
-            now_slot: restart_slot,
-            initial_price: INITIAL_PRICE,
-        }
-        .encode(),
+        &sequenced_controller_policy_data(
+            PIx::RestartAssetOracle {
+                asset_index: ASSET_INDEX,
+                now_slot: restart_slot,
+                initial_price: INITIAL_PRICE,
+            }
+            .encode(),
+            0,
+        ),
     );
     squads_execute(
         &mut svm,
@@ -64857,7 +65101,7 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
         &payer,
         6,
         &restart,
-        &generation_remaining(asset_witness),
+        &sequenced_generation_remaining(asset_witness),
     )
     .expect("restart the empty asset as generation B");
     let current_witness = controller_market_generation_witness(&svm, &market_key);
