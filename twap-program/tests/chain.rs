@@ -1924,13 +1924,23 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         return;
     }
 
-    let policy = build_twap_reconfigure_message(&squads_vault, &twap_cfg, &twap_id(), 10_000);
     let policy_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
         AccountMeta::new_readonly(twap_id(), false),
     ];
     for index in [3u64, 4] {
+        let expected_bps = if index == 3 { 8_000 } else { 10_000 };
+        let policy = build_twap_reconfigure_message_with_expected(
+            &squads_vault,
+            &twap_cfg,
+            &twap_id(),
+            10_000,
+            expected_bps,
+            0,
+            0,
+            &Pubkey::default(),
+        );
         squads_execute(
             &mut svm,
             &squads,
@@ -4857,6 +4867,29 @@ fn build_twap_reconfigure_message(
     twap_program: &Pubkey,
     new_bps: u16,
 ) -> Vec<u8> {
+    build_twap_reconfigure_message_with_expected(
+        vault,
+        config,
+        twap_program,
+        new_bps,
+        8_000,
+        0,
+        0,
+        &Pubkey::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_twap_reconfigure_message_with_expected(
+    vault: &Pubkey,
+    config: &Pubkey,
+    twap_program: &Pubkey,
+    new_bps: u16,
+    expected_surplus_buy_burn_bps: u16,
+    expected_savings_bps: u16,
+    expected_buyback_bps: u16,
+    expected_savings_account: &Pubkey,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // num_signers (vault)
     m.push(0); // num_writable_signers
@@ -4873,6 +4906,10 @@ fn build_twap_reconfigure_message(
     m.push(1);
     let mut data = vec![2u8]; // IX_RECONFIGURE
     data.extend_from_slice(&new_bps.to_le_bytes());
+    data.extend_from_slice(&expected_surplus_buy_burn_bps.to_le_bytes());
+    data.extend_from_slice(&expected_savings_bps.to_le_bytes());
+    data.extend_from_slice(&expected_buyback_bps.to_le_bytes());
+    data.extend_from_slice(expected_savings_account.as_ref());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0); // address_table_lookups: empty
@@ -5847,7 +5884,16 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
 
     // (3) ATTACK/FOOTGUN: reconfigure the auction to 6000 -> 6000 + 5000 = 11000 > 100% -> rejected even
     // past the timelock, so `execute` can never be driven into an underflow-revert brick.
-    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 6_000);
+    let msg = build_twap_reconfigure_message_with_expected(
+        &vault,
+        &cfg_pda,
+        &twap_id(),
+        6_000,
+        4_000,
+        5_000,
+        0,
+        &savings_acct,
+    );
     assert!(
         squads_execute(
             &mut svm,
@@ -5869,7 +5915,16 @@ fn reconfigure_must_hold_the_auction_plus_savings_invariant() {
     );
 
     // (4) BOUNDARY: auction 5000 -> 5000 + 5000 = exactly 100% -> accepted.
-    let msg = build_twap_reconfigure_message(&vault, &cfg_pda, &twap_id(), 5_000);
+    let msg = build_twap_reconfigure_message_with_expected(
+        &vault,
+        &cfg_pda,
+        &twap_id(),
+        5_000,
+        4_000,
+        5_000,
+        0,
+        &savings_acct,
+    );
     squads_execute(
         &mut svm,
         &squads,
@@ -66994,6 +67049,343 @@ fn e2e_stale_buyback_economics_cannot_overwrite_a_later_burn_correction() {
         supply_before - mint_supply(&svm, &env.coin_mint),
         auction_budget,
         "the corrected economics burns every bought COIN",
+    );
+}
+
+// PUBLIC LOF: reconfigure is the other half of the coupled four-way policy. An older nonzero
+// auction share must not overwrite a later 0% correction; with complete buyback retention and a
+// bidder-owned sink, the stale share otherwise pays collateral while returning every sold COIN.
+#[test]
+fn e2e_stale_auction_share_cannot_overwrite_a_later_zero_correction() {
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+        .unwrap();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+    let env = setup_public_empty_market_handoff(&mut svm, &payer);
+    set_token(
+        &mut svm,
+        &env.perc_vault,
+        &env.collateral_mint,
+        &env.vault_authority,
+        0,
+    );
+
+    let donor = Keypair::new();
+    svm.airdrop(&donor.pubkey(), 1_000_000_000).unwrap();
+    let donated = 400_000u64;
+    let donor_source = Pubkey::new_unique();
+    let donation_holding = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &donor_source,
+        &env.collateral_mint,
+        &donor.pubkey(),
+        donated,
+    );
+    set_token(
+        &mut svm,
+        &donation_holding,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let market_id = read_asset0_market_id(&svm, &env.slab);
+    send(
+        &mut svm,
+        &[&donor],
+        twap_donate_insurance_ix_with_nonce(
+            &donor.pubkey(),
+            &env.twap_cfg,
+            &env.twap_authority,
+            &donor_source,
+            &donation_holding,
+            &env.slab,
+            &env.perc_vault,
+            donated,
+            market_id,
+            0,
+        ),
+    )
+    .expect("an independent donor funds canonical protocol insurance");
+    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        5,
+        &floor,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("governance marks the donation as protocol surplus");
+
+    let stale_budget = donated * 8 / 10;
+    let (bidder, bidder_coin, bidder_usd) =
+        new_bidder(&mut svm, &payer, &env, stale_budget);
+    let bidder_sink = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &bidder_sink,
+        &env.coin_mint,
+        &bidder.pubkey(),
+        0,
+    );
+    let book = setup_auction_at_index(
+        &mut svm,
+        &payer,
+        &env,
+        6,
+        10,
+        1,
+        Some(bidder_sink),
+        0,
+    );
+    let savings = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &savings,
+        &env.collateral_mint,
+        &env.twap_authority,
+        0,
+    );
+    let economics =
+        build_set_economics_message(&env.squads_vault, &env.twap_cfg, &savings, 0, 10_000);
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        7,
+        &economics,
+        &[
+            AccountMeta::new_readonly(env.squads_vault, false),
+            AccountMeta::new(env.twap_cfg, false),
+            AccountMeta::new_readonly(savings, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ],
+    )
+    .expect("the live policy returns every bought COIN to the configured sink");
+    let initial_share = build_twap_reconfigure_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &twap_id(),
+        5_000,
+        8_000,
+        0,
+        10_000,
+        &savings,
+    );
+    let reconfigure_remaining = vec![
+        AccountMeta::new_readonly(env.squads_vault, false),
+        AccountMeta::new(env.twap_cfg, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ];
+    squads_execute(
+        &mut svm,
+        &env.squads,
+        &env.multisig,
+        &env.dao,
+        &payer,
+        8,
+        &initial_share,
+        &reconfigure_remaining,
+    )
+    .expect("the live auction share is 50%");
+
+    let stale_message = build_twap_reconfigure_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &twap_id(),
+        8_000,
+        5_000,
+        0,
+        10_000,
+        &savings,
+    );
+    let correction_message = build_twap_reconfigure_message_with_expected(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &twap_id(),
+        0,
+        5_000,
+        0,
+        10_000,
+        &savings,
+    );
+    let queue = |svm: &mut LiteSVM, index: u64, message: &[u8]| {
+        let transaction = transaction_pda(&env.squads, &env.multisig, index);
+        let proposal = proposal_pda(&env.squads, &env.multisig, index);
+        for instruction in [
+            vault_transaction_create_ix(
+                &env.squads,
+                &env.multisig,
+                &transaction,
+                &env.dao.pubkey(),
+                message,
+            ),
+            proposal_create_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+                index,
+            ),
+            proposal_approve_ix(
+                &env.squads,
+                &env.multisig,
+                &proposal,
+                &env.dao.pubkey(),
+            ),
+        ] {
+            send(svm, &[&env.dao], instruction).expect("queue approved auction-share policy");
+        }
+        (transaction, proposal)
+    };
+    let (stale_transaction, stale_proposal) = queue(&mut svm, 9, &stale_message);
+    let (correction_transaction, correction_proposal) =
+        queue(&mut svm, 10, &correction_message);
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+    svm.set_sysvar(&clock);
+
+    send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &correction_proposal,
+            &correction_transaction,
+            &env.dao.pubkey(),
+            &reconfigure_remaining,
+        ),
+    )
+    .expect("execute the zero-share correction first");
+    let config_before_replay = svm.get_account(&env.twap_cfg).unwrap();
+    let replay = send(
+        &mut svm,
+        &[&env.dao],
+        vault_transaction_execute_ix(
+            &env.squads,
+            &env.multisig,
+            &stale_proposal,
+            &stale_transaction,
+            &env.dao.pubkey(),
+            &reconfigure_remaining,
+        ),
+    );
+    if replay.is_err() {
+        assert_eq!(
+            svm.get_account(&env.twap_cfg).unwrap(),
+            config_before_replay,
+            "a rejected stale share leaves the config byte-identical",
+        );
+    }
+
+    send(
+        &mut svm,
+        &[&bidder],
+        place_bid_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &bidder_coin,
+            &bidder_usd,
+            &env.coin_mint,
+            &env.collateral_mint,
+            u128::from(stale_budget),
+            u128::from(stale_budget),
+            None,
+        ),
+    )
+    .expect("the bidder offers its complete COIN balance");
+    let round_end = {
+        let account = svm.get_account(&book.book).unwrap();
+        u64::from_le_bytes(account.data[240..248].try_into().unwrap())
+    };
+    warp_to(&mut svm, round_end);
+    let cranker = Keypair::new();
+    svm.airdrop(&cranker.pubkey(), 1_000_000_000).unwrap();
+    send(
+        &mut svm,
+        &[&cranker],
+        execute_ix(
+            &cranker.pubkey(),
+            &env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            Some(bidder_sink),
+        ),
+    )
+    .expect("a permissionless cranker settles under the surviving share");
+
+    if replay.is_ok() {
+        send(
+            &mut svm,
+            &[&cranker],
+            claim_ix(
+                &cranker.pubkey(),
+                &env.twap_cfg,
+                &book.book,
+                &book.book_escrow,
+                &book.settlement_usd,
+                &book.coin_escrow,
+                &bidder_usd,
+                &bidder_coin,
+                0,
+            ),
+        )
+        .expect("the permissionless claim pays the recorded bidder");
+        assert_eq!(token_amount(&svm, &bidder_usd), stale_budget);
+        assert_eq!(token_amount(&svm, &bidder_sink), stale_budget);
+        panic!(
+            "an older approved auction share paid {stale_budget} collateral while returning every sold COIN to the bidder",
+        );
+    }
+    assert_eq!(token_amount(&svm, &bidder_usd), 0);
+    assert_eq!(token_amount(&svm, &bidder_sink), 0);
+    warp_to(&mut svm, round_end + 10);
+    send(
+        &mut svm,
+        &[&bidder],
+        cancel_ix(
+            &bidder.pubkey(),
+            &env.twap_cfg,
+            &book.book,
+            &book.book_escrow,
+            &book.coin_escrow,
+            &bidder_coin,
+            0,
+        ),
+    )
+    .expect("the bidder recovers the unfilled bid after the bounded cooldown");
+    assert_eq!(
+        token_amount(&svm, &bidder_coin),
+        stale_budget,
+        "the zero-share correction returns the complete unfilled bid",
+    );
+    assert_eq!(
+        read_asset0_insurance(&svm, &env.slab),
+        u128::from(donated),
+        "the correction leaves the independent donation in insurance",
     );
 }
 
