@@ -1246,6 +1246,42 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             );
         }
     }
+    if cross_backing_liquidation_reward {
+        let market_before_early_exit = svm.get_account(&market).unwrap();
+        let pool_before_early_exit = svm.get_account(&pool).unwrap();
+        let position_before_early_exit = svm.get_account(&position).unwrap();
+        let config_before_early_exit = svm.get_account(&twap_cfg).unwrap();
+        let vault_before_early_exit = svm.get_account(&vault).unwrap();
+        let holding_before_early_exit = svm.get_account(&pool_holding).unwrap();
+        let ledgers_before_early_exit = [long_backing_ledger, short_backing_ledger]
+            .map(|ledger| svm.get_account(&ledger).unwrap());
+        let owner_balance_before_early_exit = token_amount(&svm, &depositor_token);
+        assert!(
+            send(&mut svm, &[&payer, &depositor], owner_exit_ix()).is_err(),
+            "a provider cannot exit while the winner's deferred backing claim remains live",
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_early_exit);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_early_exit);
+        assert_eq!(
+            svm.get_account(&position).unwrap(),
+            position_before_early_exit,
+        );
+        assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_early_exit);
+        assert_eq!(svm.get_account(&vault).unwrap(), vault_before_early_exit);
+        assert_eq!(
+            svm.get_account(&pool_holding).unwrap(),
+            holding_before_early_exit,
+        );
+        assert_eq!(
+            [long_backing_ledger, short_backing_ledger]
+                .map(|ledger| svm.get_account(&ledger).unwrap()),
+            ledgers_before_early_exit,
+        );
+        assert_eq!(
+            token_amount(&svm, &depositor_token),
+            owner_balance_before_early_exit,
+        );
+    }
 
     let settle_terminal = |svm: &mut LiteSVM| {
         let resolve_witness = controller_market_generation_witness(svm, &market);
