@@ -69958,3 +69958,287 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
 }
+
+// PUBLIC LoF: a direct market authority can honestly sign two fee-bump variants of one maintenance
+// policy update. After one lands and governance corrects the policy, an unprivileged holder of the
+// second variant can restore the stale cranker share and redirect the next user's real fee atom out
+// of insurance. A program-owned sequence must make each policy intent one-shot.
+fn run_public_raw_maintenance_policy_replay_case(replay_retained: bool) -> (u64, u64, u128) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [&payer, &admin, &victim, &attacker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000)
+            .unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("system-allocate the public market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 100,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 1,
+            },
+        ),
+    )
+    .expect("publicly initialize the fee-bearing market");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+
+    let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let victim_portfolio = Keypair::new();
+    let attacker_portfolio = Keypair::new();
+    for (owner, portfolio, capital) in [
+        (&victim, &victim_portfolio, 10u64),
+        (&attacker, &attacker_portfolio, 1u64),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("system-allocate a public portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("publicly initialize a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral,
+            &owner.pubkey(),
+            capital,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(capital),
+                },
+            ),
+        )
+        .expect("deposit independent collateral");
+    }
+
+    let high_policy = pix(
+        vec![
+            AccountMeta::new_readonly(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        PIx::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+        },
+    );
+    svm.expire_blockhash();
+    let policy_blockhash = svm.latest_blockhash();
+    let first_high_policy = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1),
+            high_policy.clone(),
+        ],
+        Some(&attacker.pubkey()),
+        &[&attacker, &admin],
+        policy_blockhash,
+    );
+    let retained_high_policy = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(2),
+            high_policy,
+        ],
+        Some(&attacker.pubkey()),
+        &[&attacker, &admin],
+        policy_blockhash,
+    );
+    svm.send_transaction(first_high_policy)
+        .expect("land the first high-share policy intent");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateMaintenanceFeePolicy {
+                cranker_share_bps: 0,
+            },
+        ),
+    )
+    .expect("governance corrects the maintenance cranker share to zero");
+    if replay_retained {
+        svm.send_transaction(retained_high_policy)
+            .expect("the current pin accepts the stale high-share variant");
+    }
+
+    let mut clock = svm.get_sysvar::<Clock>();
+    let fee_slot = clock.slot.checked_add(1).unwrap();
+    clock.slot = fee_slot;
+    clock.unix_timestamp = fee_slot as i64;
+    svm.set_sysvar(&clock);
+    send(
+        &mut svm,
+        &[&attacker],
+        pix(
+            vec![
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+            ],
+            PIx::SyncMaintenanceFee { now_slot: fee_slot },
+        ),
+    )
+    .expect("the public cranker charges exactly one victim fee atom");
+
+    let victim_destination = Pubkey::new_unique();
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_destination,
+        &collateral,
+        &victim.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral,
+        &attacker.pubkey(),
+        0,
+    );
+    for (owner, portfolio, destination) in [
+        (&victim, &victim_portfolio, victim_destination),
+        (&attacker, &attacker_portfolio, attacker_destination),
+    ] {
+        let capital = percolator_prog::state::read_portfolio(
+            &svm.get_account(&portfolio.pubkey()).unwrap().data,
+        )
+        .unwrap()
+        .capital
+        .get();
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw { amount: capital },
+            ),
+        )
+        .expect("withdraw the complete post-fee portfolio capital");
+    }
+
+    (
+        token_amount(&svm, &victim_destination),
+        token_amount(&svm, &attacker_destination),
+        read_asset0_insurance(&svm, &market),
+    )
+}
+
+#[test]
+#[ignore = "RED: raw maintenance policies need a monotonic sequence"]
+fn probe_public_raw_maintenance_policy_replay_redirects_victim_fee() {
+    let control = run_public_raw_maintenance_policy_replay_case(false);
+    let replay = run_public_raw_maintenance_policy_replay_case(true);
+
+    assert_eq!(control, (9, 1, 1));
+    assert_eq!(replay, (9, 2, 0));
+    assert_eq!(
+        replay, control,
+        "a retained policy intent must not overwrite a later governance correction",
+    );
+}
