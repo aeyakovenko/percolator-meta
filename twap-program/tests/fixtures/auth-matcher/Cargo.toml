@@ -1,0 +1,13 @@
+[package]
+name = "auth-matcher"
+version = "0.1.0"
+edition = "2021"
+
+# Keep the SBF fixture out of the repository workspace's host build.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+solana-program = "=2.3.0"

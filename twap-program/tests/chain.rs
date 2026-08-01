@@ -69570,3 +69570,536 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         .get_account(&env.slab)
         .map_or(true, |account| account.lamports == 0));
 }
+
+// PUBLIC LOF PROBE: relayers commonly retain multiple fee variants signed under one
+// blockhash. Revoking an LP matcher must invalidate every older enable variant; otherwise
+// a public taker can restore it without a fresh LP signature immediately before a known
+// oracle update, force the LP onto the losing side, and withdraw the crystallized loss.
+#[test]
+fn e2e_revoked_matcher_retry_cannot_restore_lp_risk() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const START_SLOT: u64 = 100;
+    const START_PRICE: u64 = 1_000;
+    const END_PRICE: u64 = 1_500;
+    const DEPOSIT: u64 = 1_000_000;
+    const POSITION_Q: i128 = (percolator::POS_SCALE / 2) as i128;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+    let matcher_program = Pubkey::new_unique();
+    let matcher_path = format!(
+        "{}/../target/deploy/auth_matcher.so",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let matcher_bytes = std::fs::read(&matcher_path)
+        .unwrap_or_else(|error| panic!("read authenticated matcher fixture at {matcher_path}: {error}"));
+    svm.add_program(matcher_program, &matcher_bytes);
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    let oracle = Keypair::new();
+    let backing_provider = Keypair::new();
+    let lp_owner = Keypair::new();
+    let attacker = Keypair::new();
+    for signer in [
+        &payer,
+        &creator,
+        &governance,
+        &oracle,
+        &backing_provider,
+        &lp_owner,
+        &attacker,
+    ] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT,
+        unix_timestamp: START_SLOT as i64,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market_keypair = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market_keypair],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market_keypair.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate public market");
+    let market = market_keypair.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: START_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize public market");
+    for (kind, authority) in [(4u8, &oracle), (3u8, &backing_provider)] {
+        send(
+            &mut svm,
+            &[&payer, &creator, authority],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(authority.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind,
+                    new_pubkey: authority.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("assign independent market authority");
+    }
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: START_SLOT,
+                initial_mark_e6: START_PRICE,
+            },
+        ),
+    )
+    .expect("configure independent oracle");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market, &perc_id()), false),
+            ],
+            data: vec![3u8],
+        },
+    )
+    .expect("handoff the live market to constrained governance");
+
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    let create_portfolio = |svm: &mut LiteSVM, owner: &Keypair| {
+        let portfolio = Keypair::new();
+        send(
+            svm,
+            &[&payer, &portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate public portfolio");
+        send(
+            svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize public portfolio");
+        let source = Pubkey::new_unique();
+        set_token(svm, &source, &collateral, &owner.pubkey(), DEPOSIT);
+        send(
+            svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(DEPOSIT),
+                },
+            ),
+        )
+        .expect("deposit public collateral");
+        portfolio.pubkey()
+    };
+    let attacker_portfolio = create_portfolio(&mut svm, &attacker);
+    let lp_portfolio = create_portfolio(&mut svm, &lp_owner);
+
+    let backing_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_source,
+        &collateral,
+        &backing_provider.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&payer, &backing_provider],
+        pix(
+            vec![
+                AccountMeta::new_readonly(backing_provider.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(backing_source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: 0,
+                amount: 1,
+                expiry_slot: 10_000,
+            },
+        ),
+    )
+    .expect("seed the source-backed conversion path");
+
+    let matcher_context_keypair = Keypair::new();
+    let matcher_context_rent = svm.minimum_balance_for_rent_exemption(128);
+    send(
+        &mut svm,
+        &[&payer, &matcher_context_keypair],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &matcher_context_keypair.pubkey(),
+            matcher_context_rent,
+            128,
+            &matcher_program,
+        ),
+    )
+    .expect("allocate authenticated matcher context");
+    let matcher_context = matcher_context_keypair.pubkey();
+    let matcher_delegate = Pubkey::find_program_address(
+        &[
+            b"matcher",
+            market.as_ref(),
+            lp_portfolio.as_ref(),
+            lp_owner.pubkey().as_ref(),
+            matcher_program.as_ref(),
+            matcher_context.as_ref(),
+        ],
+        &perc_id(),
+    )
+    .0;
+    send(
+        &mut svm,
+        &[&payer, &lp_owner],
+        Instruction {
+            program_id: matcher_program,
+            accounts: vec![
+                AccountMeta::new_readonly(lp_owner.pubkey(), true),
+                AccountMeta::new_readonly(matcher_delegate, false),
+                AccountMeta::new(matcher_context, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new_readonly(lp_portfolio, false),
+            ],
+            data: vec![2u8],
+        },
+    )
+    .expect("initialize authenticated matcher context");
+    let set_matcher = |enabled, expected_sequence: Option<u64>| {
+        let mut accounts = vec![
+            AccountMeta::new_readonly(lp_owner.pubkey(), true),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(lp_portfolio, false),
+        ];
+        if enabled == 1 {
+            accounts.extend([
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new_readonly(matcher_context, false),
+                AccountMeta::new_readonly(matcher_delegate, false),
+            ]);
+        }
+        let data = if let Some(sequence) = expected_sequence {
+            let mut data = vec![68u8, enabled];
+            data.extend_from_slice(&sequence.to_le_bytes());
+            data
+        } else {
+            PIx::SetMatcherConfig { enabled }.encode()
+        };
+        Instruction {
+            program_id: perc_id(),
+            accounts,
+            data,
+        }
+    };
+    svm.expire_blockhash();
+    let retained_blockhash = svm.latest_blockhash();
+    let legacy_enable_a = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1),
+            set_matcher(1, None),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &lp_owner],
+        retained_blockhash,
+    );
+    let legacy_enable_b = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(2),
+            set_matcher(1, None),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &lp_owner],
+        retained_blockhash,
+    );
+    let sequenced_enable_a = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(3),
+            set_matcher(1, Some(0)),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &lp_owner],
+        retained_blockhash,
+    );
+    let sequenced_enable_b = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(4),
+            set_matcher(1, Some(0)),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &lp_owner],
+        retained_blockhash,
+    );
+    let (sequenced, signed_enable_b) = if svm.send_transaction(legacy_enable_a).is_ok() {
+        (false, legacy_enable_b)
+    } else {
+        svm.send_transaction(sequenced_enable_a)
+            .expect("first sequenced matcher enable");
+        (true, sequenced_enable_b)
+    };
+    send(
+        &mut svm,
+        &[&payer, &lp_owner],
+        set_matcher(0, sequenced.then_some(1)),
+    )
+        .expect("LP revokes the matcher");
+
+    let trade = |size_q| {
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio, false),
+                AccountMeta::new(lp_portfolio, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(matcher_context, false),
+                AccountMeta::new_readonly(matcher_delegate, false),
+            ],
+            PIx::TradeCpi {
+                asset_index: 0,
+                size_q,
+                fee_bps: 0,
+                limit_price: if size_q > 0 { START_PRICE } else { END_PRICE },
+            },
+        )
+    };
+    assert!(
+        send(&mut svm, &[&payer, &attacker], trade(POSITION_Q)).is_err(),
+        "the revocation must block an unsigned LP fill before replay",
+    );
+    let lp_before_replay = svm.get_account(&lp_portfolio).unwrap();
+    if svm.send_transaction(signed_enable_b).is_err() {
+        assert_eq!(
+            svm.get_account(&lp_portfolio).unwrap(),
+            lp_before_replay,
+            "a rejected stale enable leaves the LP byte-identical",
+        );
+        return;
+    }
+    send(&mut svm, &[&payer, &attacker], trade(POSITION_Q))
+        .expect("attacker opens against the revoked LP matcher");
+
+    warp_to(&mut svm, START_SLOT + 10);
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::PushAuthMark {
+                asset_index: 0,
+                now_slot: START_SLOT + 10,
+                mark_e6: END_PRICE,
+            },
+        ),
+    )
+    .expect("independent oracle publishes its already-known update");
+    let crank = |svm: &mut LiteSVM, portfolio| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: START_SLOT + 10,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+    for portfolio in [attacker_portfolio, lp_portfolio] {
+        crank(&mut svm, portfolio).expect("settle moved mark");
+        crank(&mut svm, portfolio).expect("refresh settled portfolio");
+    }
+    let lp_loss = read_portfolio_crystallized(&svm, &lp_portfolio);
+    assert!(lp_loss > 0, "the restored matcher must expose LP principal");
+
+    send(&mut svm, &[&payer, &attacker], trade(-POSITION_Q))
+        .expect("attacker flattens through the restored matcher");
+    for portfolio in [attacker_portfolio, lp_portfolio] {
+        crank(&mut svm, portfolio).expect("settle flattened portfolio");
+    }
+    let attacker_before_convert = percolator_prog::state::read_portfolio(
+        &svm.get_account(&attacker_portfolio).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio, false),
+            ],
+            PIx::ConvertReleasedPnl { amount: u128::MAX },
+        ),
+    )
+    .expect("attacker converts the LP-funded released PnL");
+    let attacker_after_convert = percolator_prog::state::read_portfolio(
+        &svm.get_account(&attacker_portfolio).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    assert!(
+        attacker_after_convert > attacker_before_convert,
+        "the public conversion must make the stolen value withdrawable",
+    );
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral,
+        &attacker.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio, false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Withdraw {
+                amount: attacker_after_convert,
+            },
+        ),
+    )
+    .expect("attacker withdraws the captured LP principal");
+    assert!(
+        token_amount(&svm, &attacker_destination) > DEPOSIT,
+        "the attacker must withdraw more collateral than it deposited",
+    );
+    let lp_after = percolator_prog::state::read_portfolio(
+        &svm.get_account(&lp_portfolio).unwrap().data,
+    )
+    .unwrap();
+    assert!(
+        lp_after.capital.get() < u128::from(DEPOSIT),
+        "the independent LP must bear the attacker-extractable loss",
+    );
+    panic!(
+        "a withheld matcher enable restored revoked LP risk and let the attacker withdraw {} atoms against {} atoms of crystallized LP loss",
+        token_amount(&svm, &attacker_destination),
+        lp_loss,
+    );
+}
