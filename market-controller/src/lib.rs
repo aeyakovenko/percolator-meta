@@ -136,6 +136,8 @@ const CONFIGURE_EWMA_MARK_LEN: usize = 35;
 const SEQUENCED_CONFIGURE_EWMA_MARK_LEN: usize =
     CONFIGURE_EWMA_MARK_LEN + core::mem::size_of::<u64>();
 const CONFIGURE_PERMISSIONLESS_RESOLVE_LEN: usize = 17;
+const SEQUENCED_CONFIGURE_PERMISSIONLESS_RESOLVE_LEN: usize =
+    CONFIGURE_PERMISSIONLESS_RESOLVE_LEN + core::mem::size_of::<u64>();
 const CONFIGURE_AUTH_MARK_LEN: usize = 19;
 const SEQUENCED_CONFIGURE_AUTH_MARK_LEN: usize =
     CONFIGURE_AUTH_MARK_LEN + core::mem::size_of::<u64>();
@@ -1011,10 +1013,22 @@ fn generation_bound_asset(data: &[u8]) -> Result<Option<(u16, usize, bool)>, Pro
 fn decode_sequenced_admin_data(
     data: &[u8],
 ) -> Result<(&[u8], Option<(usize, u64)>), ProgramError> {
+    if data.first().copied() == Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE)
+        && data.len() == CONFIGURE_PERMISSIONLESS_RESOLVE_LEN
+    {
+        // Preserve the deployed first-configuration wire. Once either deadline
+        // is nonzero, process_proxy_admin requires the sequenced envelope below.
+        return Ok((data, None));
+    }
     let (raw_len, sequenced_len, sequence_offset) = match data.first().copied() {
         Some(PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY) => (
             UPDATE_LIQUIDATION_FEE_POLICY_LEN,
             SEQUENCED_LIQUIDATION_FEE_POLICY_LEN,
+            LIQUIDATION_POLICY_SEQUENCE_OFFSET,
+        ),
+        Some(PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE) => (
+            CONFIGURE_PERMISSIONLESS_RESOLVE_LEN,
+            SEQUENCED_CONFIGURE_PERMISSIONLESS_RESOLVE_LEN,
             LIQUIDATION_POLICY_SEQUENCE_OFFSET,
         ),
         Some(PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY) => (
@@ -1167,7 +1181,7 @@ fn process_init_policy_sequence(
 // proxy_admin accounts:
 // [governance(signer), controller_pda, market(w), percolator_program, tail...]
 // data: raw Percolator bytes, plus an expected u64 sequence for delayed
-// liquidation, maintenance, fee-redirect, and oracle policy updates.
+// forced-exit, maintenance, fee-redirect, and oracle policy updates.
 // Controller-only sequence accounts and witnesses are removed before CPI.
 fn process_proxy_admin<'a>(
     program_id: &Pubkey,
@@ -1211,6 +1225,15 @@ fn process_proxy_admin<'a>(
         let (current_stale_slots, current_force_close_delay_slots) =
             percolator_accounting::read_permissionless_resolve_policy(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
+        let initially_unconfigured =
+            current_stale_slots == 0 && current_force_close_delay_slots == 0;
+        if initially_unconfigured != policy_sequence_update.is_none() {
+            // The first nonzero policy remains wire-compatible. Every later
+            // correction must consume the shared forced-exit sequence, and a
+            // pre-initial sequenced action is rejected so it cannot replay after
+            // a raw initial configuration.
+            return Err(ProgramError::InvalidInstructionData);
+        }
         validate_permissionless_resolve_update(
             percolator_data,
             current_stale_slots,
@@ -3846,6 +3869,27 @@ mod tests {
         assert_eq!(
             decode_sequenced_admin_data(&[PERC_IX_RESOLVE_MARKET]),
             Ok((&[PERC_IX_RESOLVE_MARKET][..], None))
+        );
+
+        let mut initial_resolve = vec![0; CONFIGURE_PERMISSIONLESS_RESOLVE_LEN];
+        initial_resolve[0] = PERC_IX_CONFIGURE_PERMISSIONLESS_RESOLVE;
+        assert_eq!(
+            decode_sequenced_admin_data(&initial_resolve),
+            Ok((initial_resolve.as_slice(), None))
+        );
+        let mut corrected_resolve = initial_resolve.clone();
+        corrected_resolve.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(
+            decode_sequenced_admin_data(&corrected_resolve),
+            Ok((
+                initial_resolve.as_slice(),
+                Some((LIQUIDATION_POLICY_SEQUENCE_OFFSET, 9)),
+            ))
+        );
+        corrected_resolve.push(0);
+        assert_eq!(
+            decode_sequenced_admin_data(&corrected_resolve),
+            Err(ProgramError::InvalidInstructionData)
         );
     }
 }
