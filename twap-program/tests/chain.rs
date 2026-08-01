@@ -8468,14 +8468,29 @@ fn e2e_controller_cannot_strand_positions_in_drain_only() {
 }
 
 // PUBLIC LOF: an asset admin can sign multiple fee variants of the same role transfer.
-// After one variant lands, the role is revoked to a new backing provider, and that provider
-// deposits collateral, a withheld variant must not restore the former authority. Otherwise the
-// former authority can withdraw backing that did not exist when the transfer was authorized.
+// After one variant lands, the role is revoked to a new provider, and that provider deposits
+// collateral, a withheld variant must not restore the former authority. Otherwise the former
+// authority can withdraw backing or insurance that did not exist when the transfer was authorized.
+#[derive(Clone, Copy, Debug)]
+enum AssetAuthorityRetryPool {
+    Backing,
+    Insurance,
+}
+
 #[test]
 fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
+    run_presigned_asset_authority_retry(AssetAuthorityRetryPool::Backing);
+}
+
+#[test]
+fn e2e_presigned_asset_authority_retry_cannot_seize_later_insurance() {
+    run_presigned_asset_authority_retry(AssetAuthorityRetryPool::Insurance);
+}
+
+fn run_presigned_asset_authority_retry(pool: AssetAuthorityRetryPool) {
     use percolator_prog::ix::Instruction as PIx;
 
-    const BACKING: u64 = 100;
+    const DEPOSIT: u64 = 100;
 
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -8587,12 +8602,16 @@ fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
             &victim_source,
             &mint_authority.pubkey(),
             &[],
-            BACKING,
+            DEPOSIT,
         )
         .unwrap(),
     )
     .expect("mint valid collateral to the victim");
 
+    let role_kind = match pool {
+        AssetAuthorityRetryPool::Backing => 3,
+        AssetAuthorityRetryPool::Insurance => 2,
+    };
     let rotate_to_former = pix(
         vec![
             AccountMeta::new_readonly(admin.pubkey(), true),
@@ -8601,7 +8620,7 @@ fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
         ],
         PIx::UpdateAssetAuthority {
             asset_index: 0,
-            kind: 3,
+            kind: role_kind,
             new_pubkey: former_authority.pubkey().to_bytes(),
         },
     );
@@ -8634,7 +8653,7 @@ fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
             ],
             PIx::UpdateAssetAuthority {
                 asset_index: 0,
-                kind: 3,
+                kind: role_kind,
                 new_pubkey: victim.pubkey().to_bytes(),
             },
         )],
@@ -8642,6 +8661,16 @@ fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
         &[&payer, &admin, &victim],
         attack_blockhash,
     );
+    let victim_top_up_ix = match pool {
+        AssetAuthorityRetryPool::Backing => PIx::TopUpBackingBucket {
+            domain: 0,
+            amount: u128::from(DEPOSIT),
+            expiry_slot: u64::MAX,
+        },
+        AssetAuthorityRetryPool::Insurance => PIx::TopUpInsurance {
+            amount: u128::from(DEPOSIT),
+        },
+    };
     let victim_top_up = Transaction::new_signed_with_payer(
         &[pix(
             vec![
@@ -8651,11 +8680,7 @@ fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
                 AccountMeta::new(percolator_vault, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
-            PIx::TopUpBackingBucket {
-                domain: 0,
-                amount: u128::from(BACKING),
-                expiry_slot: u64::MAX,
-            },
+            victim_top_up_ix,
         )],
         Some(&payer.pubkey()),
         &[&payer, &victim],
@@ -8664,62 +8689,78 @@ fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
 
     svm.send_transaction(first_variant)
         .expect("land the first pre-signed role-transfer variant");
+    if matches!(pool, AssetAuthorityRetryPool::Insurance) {
+        send(
+            &mut svm,
+            &[&payer, &admin, &victim],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new_readonly(victim.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind: 1,
+                    new_pubkey: victim.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("install the victim as the replacement insurance depositor");
+    }
     svm.send_transaction(rotate_to_victim)
         .expect("revoke the former authority and install the victim");
     svm.send_transaction(victim_top_up)
-        .expect("the victim deposits backing after the revocation");
+        .expect("the victim deposits collateral after the revocation");
 
     let stale_accepted = svm.send_transaction(withheld_variant).is_ok();
+    let withdrawal_ix = |authority: Pubkey, destination: Pubkey| {
+        let instruction = match pool {
+            AssetAuthorityRetryPool::Backing => PIx::WithdrawBackingBucket {
+                domain: 0,
+                amount: u128::from(DEPOSIT),
+            },
+            AssetAuthorityRetryPool::Insurance => PIx::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: u128::from(DEPOSIT),
+            },
+        };
+        pix(
+            vec![
+                AccountMeta::new_readonly(authority, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            instruction,
+        )
+    };
     if stale_accepted {
         send(
             &mut svm,
             &[&payer, &former_authority],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(former_authority.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(attacker_destination, false),
-                    AccountMeta::new(percolator_vault, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                PIx::WithdrawBackingBucket {
-                    domain: 0,
-                    amount: u128::from(BACKING),
-                },
-            ),
+            withdrawal_ix(former_authority.pubkey(), attacker_destination),
         )
-        .expect("the restored former authority extracts the victim's backing");
+        .expect("the restored former authority extracts the victim's deposit");
         assert_eq!(
             token_amount(&svm, &attacker_destination),
-            BACKING,
-            "the stale role-transfer variant creates attacker-extractable loss"
+            DEPOSIT,
+            "{pool:?}: the stale role-transfer variant creates attacker-extractable loss"
         );
     } else {
         send(
             &mut svm,
             &[&payer, &victim],
-            pix(
-                vec![
-                    AccountMeta::new_readonly(victim.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(victim_source, false),
-                    AccountMeta::new(percolator_vault, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(spl_token::ID, false),
-                ],
-                PIx::WithdrawBackingBucket {
-                    domain: 0,
-                    amount: u128::from(BACKING),
-                },
-            ),
+            withdrawal_ix(victim.pubkey(), victim_source),
         )
         .expect("the current provider retains its complete withdrawal path");
-        assert_eq!(token_amount(&svm, &victim_source), BACKING);
+        assert_eq!(token_amount(&svm, &victim_source), DEPOSIT);
     }
     assert!(
         !stale_accepted,
-        "a revoked authority must not be restorable by a pre-signed retry variant"
+        "{pool:?}: a revoked authority must not be restorable by a pre-signed retry variant"
     );
 }
 
