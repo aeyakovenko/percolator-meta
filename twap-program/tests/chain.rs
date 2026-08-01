@@ -67039,6 +67039,491 @@ fn e2e_terminal_close_preserves_staged_genesis_claim() {
         .map_or(true, |account| account.lamports == 0));
 }
 
+#[derive(Debug)]
+struct CompositeOracleSkewOutcome {
+    report_accepted: bool,
+    effective_price: u64,
+    victim_loss: u128,
+    extracted_tokens: u64,
+}
+
+fn set_composite_pyth_price(
+    svm: &mut LiteSVM,
+    key: Pubkey,
+    feed_id: [u8; 32],
+    price_e6: i64,
+    publish_time: i64,
+) {
+    let mut data = vec![0u8; 134];
+    data[0..8].copy_from_slice(&[0x22, 0xf1, 0x23, 0x63, 0x9d, 0x7e, 0xf4, 0xcd]);
+    data[40] = 1;
+    data[41..73].copy_from_slice(&feed_id);
+    data[73..81].copy_from_slice(&price_e6.to_le_bytes());
+    data[81..89].copy_from_slice(&1u64.to_le_bytes());
+    data[89..93].copy_from_slice(&(-6i32).to_le_bytes());
+    data[93..101].copy_from_slice(&publish_time.to_le_bytes());
+    svm.set_account(
+        key,
+        Account {
+            lamports: 1_000_000_000,
+            data,
+            owner: percolator_prog::oracle_v16::PYTH_RECEIVER_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
+fn run_composite_oracle_time_skew(skewed: bool) -> CompositeOracleSkewOutcome {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const START_SLOT: u64 = 1;
+    const START_TIME: i64 = 100;
+    const UPDATE_TIME: i64 = 101;
+    const DEPOSIT: u64 = 540_000;
+    const CRANKER_DEPOSIT: u64 = 1_000;
+    const FAIR_PRICE: u64 = 1_500_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT,
+        unix_timestamp: START_TIME,
+        ..Clock::default()
+    });
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = Keypair::new();
+    let cranker = Keypair::new();
+    for signer in [&payer, &creator, &attacker, &victim, &cranker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the public market");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 6_480_000,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 500,
+                initial_margin_bps: 500,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 5,
+                liquidation_fee_cap: percolator::MAX_PROTOCOL_FEE_ABS,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 24,
+                max_accrual_dt_slots: 20,
+                max_abs_funding_e9_per_slot: 1_000,
+                min_funding_lifetime_slots: 10_000_000,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("permissionlessly initialize the live market");
+
+    let numerator_feed = Pubkey::new_unique();
+    let denominator_feed = Pubkey::new_unique();
+    let numerator_id = [0x31u8; 32];
+    let denominator_id = [0x42u8; 32];
+    set_composite_pyth_price(
+        &mut svm,
+        numerator_feed,
+        numerator_id,
+        3_000_000,
+        START_TIME,
+    );
+    set_composite_pyth_price(
+        &mut svm,
+        denominator_feed,
+        denominator_id,
+        2_000_000,
+        START_TIME,
+    );
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new_readonly(numerator_feed, false),
+                AccountMeta::new_readonly(denominator_feed, false),
+            ],
+            PIx::ConfigureHybridOracle {
+                asset_index: 0,
+                now_slot: START_SLOT,
+                now_unix_ts: START_TIME,
+                oracle_leg_count: 2,
+                oracle_leg_flags:
+                    percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2,
+                max_staleness_secs: 60,
+                hybrid_soft_stale_slots: 1_000,
+                mark_ewma_halflife_slots: 1,
+                mark_min_fee: 0,
+                invert: 0,
+                unit_scale: 0,
+                conf_filter_bps: 0,
+                oracle_leg_feeds: [numerator_id, denominator_id, [0; 32]],
+            },
+        ),
+    )
+    .expect("configure a synchronized composite oracle");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+            ],
+            PIx::UpdateLiquidationFeePolicy {
+                cranker_share_bps: 5_000,
+            },
+        ),
+    )
+    .expect("route liquidation work rewards to the public cranker");
+
+    let vault_authority = perc_vault_authority(&market.pubkey(), &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+    let attacker_position = Keypair::new();
+    let victim_position = Keypair::new();
+    let cranker_position = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&attacker, &attacker_position),
+        (&victim, &victim_position),
+        (&cranker, &cranker_position),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate a public portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market.pubkey(), false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a public portfolio");
+    }
+    for (owner, portfolio, amount) in [
+        (&attacker, &attacker_position, DEPOSIT),
+        (&victim, &victim_position, DEPOSIT),
+        (&cranker, &cranker_position, CRANKER_DEPOSIT),
+    ] {
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            amount,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market.pubkey(), false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(amount),
+                },
+            ),
+        )
+        .expect("fund an independently owned trading portfolio");
+    }
+
+    let backing_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &backing_source,
+        &collateral_mint,
+        &creator.pubkey(),
+        1,
+    );
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new(backing_source, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::TopUpBackingBucket {
+                domain: 0,
+                amount: 1,
+                expiry_slot: 10_000,
+            },
+        ),
+    )
+    .expect("provide the live market's independent backing");
+    send(
+        &mut svm,
+        &[&payer, &attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(attacker.pubkey(), true),
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new(attacker_position.pubkey(), false),
+                AccountMeta::new(victim_position.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: ((percolator::POS_SCALE as i128) * 35) / 100,
+                exec_price: FAIR_PRICE,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("the independent users open balanced exposure at the synchronized fair ratio");
+
+    set_composite_pyth_price(
+        &mut svm,
+        numerator_feed,
+        numerator_id,
+        6_000_000,
+        UPDATE_TIME,
+    );
+    if !skewed {
+        set_composite_pyth_price(
+            &mut svm,
+            denominator_feed,
+            denominator_id,
+            4_000_000,
+            UPDATE_TIME,
+        );
+    }
+
+    let oracle_crank = |owner: Pubkey, portfolio: Pubkey, slot: u64, reward: Option<Pubkey>| {
+        let mut accounts = vec![
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(market.pubkey(), false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new_readonly(numerator_feed, false),
+            AccountMeta::new_readonly(denominator_feed, false),
+        ];
+        if let Some(reward) = reward {
+            accounts.push(AccountMeta::new(reward, false));
+        }
+        pix(
+            accounts,
+            PIx::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![percolator_prog::ix::CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 2,
+                }],
+            },
+        )
+    };
+    let mut slot = START_SLOT;
+    let mut report_accepted = true;
+    for _ in 0..12 {
+        slot = slot.checked_add(20).unwrap();
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: UPDATE_TIME,
+            ..Clock::default()
+        });
+        if send(
+            &mut svm,
+            &[&payer],
+            oracle_crank(payer.pubkey(), cranker_position.pubkey(), slot, None),
+        )
+        .is_err()
+        {
+            report_accepted = false;
+            break;
+        }
+    }
+    if report_accepted
+        && send(
+            &mut svm,
+            &[&payer],
+            oracle_crank(payer.pubkey(), victim_position.pubkey(), slot, None),
+        )
+        .is_err()
+    {
+        report_accepted = false;
+    }
+
+    let cranker_capital_before = percolator_prog::state::read_portfolio(
+        &svm.get_account(&cranker_position.pubkey()).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    if report_accepted {
+        let _ = send(
+            &mut svm,
+            &[&payer, &cranker],
+            oracle_crank(
+                cranker.pubkey(),
+                victim_position.pubkey(),
+                slot,
+                Some(cranker_position.pubkey()),
+            ),
+        );
+    }
+    let cranker_capital = percolator_prog::state::read_portfolio(
+        &svm.get_account(&cranker_position.pubkey()).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    let cranker_reward = cranker_capital.saturating_sub(cranker_capital_before);
+    let extracted_tokens = if cranker_reward == 0 {
+        0
+    } else {
+        let destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &destination,
+            &collateral_mint,
+            &cranker.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &cranker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(cranker.pubkey(), true),
+                    AccountMeta::new(market.pubkey(), false),
+                    AccountMeta::new(cranker_position.pubkey(), false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Withdraw {
+                    amount: cranker_reward,
+                },
+            ),
+        )
+        .expect("the public cranker withdraws the victim-funded liquidation reward");
+        token_amount(&svm, &destination)
+    };
+
+    let market_data = svm.get_account(&market.pubkey()).unwrap().data;
+    let (_, group) = percolator_prog::state::read_market(&market_data).unwrap();
+    let victim_capital = percolator_prog::state::read_portfolio(
+        &svm.get_account(&victim_position.pubkey()).unwrap().data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    CompositeOracleSkewOutcome {
+        report_accepted,
+        effective_price: group.assets[0].effective_price,
+        victim_loss: u128::from(DEPOSIT).saturating_sub(victim_capital),
+        extracted_tokens,
+    }
+}
+
+// PUBLIC LOF: composite oracle legs must describe one temporal observation. Otherwise a public
+// cranker can combine a newly published numerator with an older, individually fresh denominator,
+// liquidate an independent trader at a ratio no synchronized report ever produced, and withdraw
+// the liquidation reward.
+#[test]
+#[ignore = "upstream percolator-prog#331: composite oracle legs need one publish time"]
+fn e2e_composite_oracle_rejects_temporally_skewed_report() {
+    let control = run_composite_oracle_time_skew(false);
+    let skewed = run_composite_oracle_time_skew(true);
+
+    assert!(control.report_accepted, "synchronized control: {control:?}");
+    assert_eq!(control.effective_price, 1_500_000);
+    assert_eq!(control.victim_loss, 0);
+    assert_eq!(control.extracted_tokens, 0);
+    if skewed.report_accepted {
+        assert!(
+            skewed.effective_price > control.effective_price,
+            "accepted temporal skew must reproduce the false cross-rate: {skewed:?}",
+        );
+        assert!(
+            skewed.victim_loss > control.victim_loss,
+            "accepted temporal skew must cause an independent-user loss: {skewed:?}",
+        );
+        assert!(
+            skewed.extracted_tokens > control.extracted_tokens,
+            "accepted temporal skew must create attacker-withdrawable value: {skewed:?}",
+        );
+    }
+    assert!(
+        !skewed.report_accepted,
+        "new and old oracle legs were accepted as one observation: control={control:?} skewed={skewed:?}",
+    );
+    assert_eq!(skewed.victim_loss, control.victim_loss);
+    assert_eq!(skewed.extracted_tokens, control.extracted_tokens);
+}
+
 // PUBLIC LOF: two independently approved Squads sink policies can remain executable together.
 // Executing the burn correction first must invalidate the older SEND policy; otherwise an
 // untrusted executor can restore an obsolete external recipient and capture the next permissionless
