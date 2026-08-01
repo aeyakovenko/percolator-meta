@@ -140,6 +140,8 @@ const CONFIGURE_AUTH_MARK_LEN: usize = 19;
 const SEQUENCED_CONFIGURE_AUTH_MARK_LEN: usize =
     CONFIGURE_AUTH_MARK_LEN + core::mem::size_of::<u64>();
 const UPDATE_TRADE_FEE_POLICY_LEN: usize = 9;
+const SEQUENCED_UPDATE_TRADE_FEE_POLICY_LEN: usize =
+    UPDATE_TRADE_FEE_POLICY_LEN + core::mem::size_of::<u64>();
 const RESTART_ASSET_ORACLE_LEN: usize = 19;
 const SEQUENCED_RESTART_ASSET_ORACLE_LEN: usize =
     RESTART_ASSET_ORACLE_LEN + core::mem::size_of::<u64>();
@@ -1027,6 +1029,11 @@ fn decode_sequenced_admin_data(
             SEQUENCED_FEE_REDIRECT_POLICY_LEN,
             FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
         ),
+        Some(PERC_IX_UPDATE_TRADE_FEE_POLICY) => (
+            UPDATE_TRADE_FEE_POLICY_LEN,
+            SEQUENCED_UPDATE_TRADE_FEE_POLICY_LEN,
+            FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
+        ),
         Some(PERC_IX_CONFIGURE_HYBRID_ORACLE) => (
             CONFIGURE_HYBRID_ORACLE_LEN,
             SEQUENCED_CONFIGURE_HYBRID_ORACLE_LEN,
@@ -1167,7 +1174,7 @@ fn process_init_policy_sequence(
 // proxy_admin accounts:
 // [governance(signer), controller_pda, market(w), percolator_program, tail...]
 // data: raw Percolator bytes, plus an expected u64 sequence for delayed
-// liquidation, maintenance, fee-redirect, and oracle policy updates.
+// liquidation, maintenance, fee-economics, and oracle policy updates.
 // Controller-only sequence accounts and witnesses are removed before CPI.
 fn process_proxy_admin<'a>(
     program_id: &Pubkey,
@@ -3802,6 +3809,11 @@ mod tests {
             (
                 PERC_IX_UPDATE_FEE_REDIRECT_POLICY,
                 UPDATE_FEE_REDIRECT_POLICY_LEN,
+                FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
+            ),
+            (
+                PERC_IX_UPDATE_TRADE_FEE_POLICY,
+                UPDATE_TRADE_FEE_POLICY_LEN,
                 FEE_REDIRECT_POLICY_SEQUENCE_OFFSET,
             ),
             (

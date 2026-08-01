@@ -8760,6 +8760,380 @@ fn e2e_controller_cannot_front_run_a_presigned_trade_with_a_fee_increase() {
     );
 }
 
+// PUBLIC RELAYER LOF: independently authorized trade-fee reductions have no ordering watermark.
+// A relayer can execute a later correction first, replay the older reduction second, and trade
+// against the unintended lower fee. The missing fee is a deterministic canonical-insurance loss.
+#[test]
+fn e2e_stale_trade_fee_policy_cannot_overwrite_a_later_correction() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INITIAL_FEE_BPS: u64 = 100;
+    const STALE_FEE_BPS: u64 = 50;
+    const CORRECTED_FEE_BPS: u64 = 80;
+    const DEPOSIT: u64 = 1_000_000;
+    const TRADE_NOTIONAL: u128 = 100_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    for signer in [&payer, &creator, &governance] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public creator allocates the market");
+    let market_key = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: INITIAL_FEE_BPS,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("creator initializes a live market");
+
+    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates policy control to the constrained controller");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &governance.pubkey(),
+        &controller,
+        &market_key,
+    );
+    let proxy = |raw: Vec<u8>, sequenced: bool| {
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if sequenced {
+            accounts.push(AccountMeta::new(policy_sequence, false));
+        }
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&raw);
+        Instruction {
+            program_id: controller_id(),
+            accounts,
+            data,
+        }
+    };
+
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let long = Keypair::new();
+    let short = Keypair::new();
+    let long_portfolio = Keypair::new();
+    let short_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [(&long, &long_portfolio), (&short, &short_portfolio)] {
+        svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            DEPOSIT,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(DEPOSIT),
+                },
+            ),
+        )
+        .expect("public user deposits collateral");
+    }
+
+    let update = |trade_fee_base_bps| {
+        PIx::UpdateTradeFeePolicy {
+            trade_fee_base_bps,
+        }
+        .encode()
+    };
+    svm.expire_blockhash();
+    let raw_blockhash = svm.latest_blockhash();
+    let stale_raw = Transaction::new_signed_with_payer(
+        &[proxy(update(STALE_FEE_BPS), false)],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        raw_blockhash,
+    );
+    let correction_raw = Transaction::new_signed_with_payer(
+        &[proxy(update(CORRECTED_FEE_BPS), false)],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        raw_blockhash,
+    );
+    let market_before_raw = svm.get_account(&market_key).unwrap();
+    let sequence_before_raw = svm.get_account(&policy_sequence).unwrap();
+    let raw_correction_succeeded = svm.send_transaction(correction_raw).is_ok();
+    if raw_correction_succeeded {
+        svm.send_transaction(stale_raw)
+            .expect("the stale governance-signed reduction remains publicly executable");
+        assert_eq!(
+            percolator_accounting::read_trade_fee_base_bps(
+                &svm.get_account(&market_key).unwrap().data,
+            )
+            .unwrap(),
+            STALE_FEE_BPS,
+            "the stale reduction overwrites governance's later correction"
+        );
+    } else {
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_before_raw,
+            "the rejected legacy correction is byte-atomic"
+        );
+        assert_eq!(
+            svm.get_account(&policy_sequence).unwrap(),
+            sequence_before_raw,
+            "legacy data cannot consume the policy sequence"
+        );
+        assert!(
+            svm.send_transaction(stale_raw).is_err(),
+            "all trade-fee updates must use the sequenced envelope"
+        );
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_before_raw,
+            "the rejected legacy stale update is byte-atomic"
+        );
+
+        svm.expire_blockhash();
+        let sequenced_blockhash = svm.latest_blockhash();
+        let stale_sequenced = Transaction::new_signed_with_payer(
+            &[proxy(
+                sequenced_controller_policy_data(update(STALE_FEE_BPS), 0),
+                true,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            sequenced_blockhash,
+        );
+        let correction_sequenced = Transaction::new_signed_with_payer(
+            &[proxy(
+                sequenced_controller_policy_data(update(CORRECTED_FEE_BPS), 0),
+                true,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            sequenced_blockhash,
+        );
+        svm.send_transaction(correction_sequenced)
+            .expect("the later correction consumes its exact fee-policy sequence");
+        let market_after_correction = svm.get_account(&market_key).unwrap();
+        let sequence_after_correction = svm.get_account(&policy_sequence).unwrap();
+        assert!(
+            svm.send_transaction(stale_sequenced).is_err(),
+            "the stale reduction cannot replay after the correction"
+        );
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_after_correction,
+            "the rejected stale reduction is byte-atomic"
+        );
+        assert_eq!(
+            svm.get_account(&policy_sequence).unwrap(),
+            sequence_after_correction,
+            "a rejected stale reduction cannot consume another sequence"
+        );
+        assert_eq!(
+            percolator_accounting::read_trade_fee_base_bps(
+                &svm.get_account(&market_key).unwrap().data,
+            )
+            .unwrap(),
+            CORRECTED_FEE_BPS
+        );
+    }
+
+    let capital = |svm: &LiteSVM, portfolio: &Pubkey| {
+        percolator_prog::state::read_portfolio(&svm.get_account(portfolio).unwrap().data)
+            .unwrap()
+            .capital
+            .get()
+    };
+    let long_before = capital(&svm, &long_portfolio.pubkey());
+    let short_before = capital(&svm, &short_portfolio.pubkey());
+    let insurance_before = percolator_accounting::read_asset_insurance_remaining(
+        &svm.get_account(&market_key).unwrap().data,
+        0,
+    )
+    .unwrap();
+    let position_q = (percolator::POS_SCALE / 10) as i128;
+    send(
+        &mut svm,
+        &[&payer, &long, &short],
+        pix(
+            vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: position_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("public users trade after the relayer orders the policies");
+    let charged_bps = if raw_correction_succeeded {
+        STALE_FEE_BPS
+    } else {
+        CORRECTED_FEE_BPS
+    };
+    let expected_fee_per_user =
+        (TRADE_NOTIONAL * u128::from(charged_bps) + 9_999) / 10_000;
+    let long_fee = long_before - capital(&svm, &long_portfolio.pubkey());
+    let short_fee = short_before - capital(&svm, &short_portfolio.pubkey());
+    assert_eq!(long_fee, expected_fee_per_user);
+    assert_eq!(short_fee, expected_fee_per_user);
+    let insurance_after = percolator_accounting::read_asset_insurance_remaining(
+        &svm.get_account(&market_key).unwrap().data,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        insurance_after - insurance_before,
+        expected_fee_per_user * 2,
+        "canonical insurance receives exactly the two charged fees"
+    );
+    if raw_correction_succeeded {
+        let corrected_fee =
+            (TRADE_NOTIONAL * u128::from(CORRECTED_FEE_BPS) + 9_999) / 10_000;
+        assert_eq!(
+            corrected_fee * 2 - (insurance_after - insurance_before),
+            600,
+            "the stale update deterministically undercharges canonical insurance"
+        );
+        panic!("a public relayer replayed stale policy and undercharged canonical insurance");
+    }
+}
+
 // PUBLIC ADMIN DOS: users enter under fixed stale-resolution and force-close deadlines. Once
 // capital is live, governance must not extend either deadline and postpone the permissionless exit
 // users relied on. The pinned Percolator accepts both increases, so the controller has to make the
@@ -11085,6 +11459,39 @@ fn build_controller_proxy_message(
     m.push(4);
     m.push(4);
     for index in [0u8, 2, 1, 3] {
+        m.push(index);
+    }
+    let mut data = vec![0u8]; // IX_PROXY_ADMIN
+    data.extend_from_slice(percolator_data);
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_controller_sequenced_proxy_message(
+    governance: &Pubkey,
+    controller: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    policy_sequence: &Pubkey,
+    percolator_data: &[u8],
+) -> Vec<u8> {
+    let mut m = Vec::new();
+    m.push(1); // governance signer
+    m.push(0);
+    m.push(2); // market and policy sequence writable
+    m.push(6);
+    m.extend_from_slice(governance.as_ref()); // 0
+    m.extend_from_slice(market.as_ref()); // 1 writable
+    m.extend_from_slice(policy_sequence.as_ref()); // 2 writable
+    m.extend_from_slice(controller.as_ref()); // 3
+    m.extend_from_slice(percolator_program.as_ref()); // 4
+    m.extend_from_slice(controller_id().as_ref()); // 5 program
+    m.push(1);
+    m.push(5);
+    m.push(5);
+    for index in [0u8, 3, 1, 4, 2] {
         m.push(index);
     }
     let mut data = vec![0u8]; // IX_PROXY_ADMIN
@@ -65445,19 +65852,25 @@ fn run_stale_fee_redirect_scenario(scenario: StaleFeeRedirectScenario) {
     let flat_counterparty_destination =
         withdraw_flat_user(&flat_counterparty, flat_counterparty_portfolio);
 
-    let zero_trade_fee = build_controller_proxy_message(
+    let zero_trade_fee_data = sequenced_controller_policy_data(
+        PIx::UpdateTradeFeePolicy {
+            trade_fee_base_bps: 0,
+        }
+        .encode(),
+        1 + u64::from(same_generation_order),
+    );
+    let zero_trade_fee = build_controller_sequenced_proxy_message(
         &squads_vault,
         &controller,
         &market_key,
         &perc_id(),
-        &PIx::UpdateTradeFeePolicy {
-            trade_fee_base_bps: 0,
-        }
-        .encode(),
+        &policy_sequence,
+        &zero_trade_fee_data,
     );
     let ordinary_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market_key, false),
+        AccountMeta::new(policy_sequence, false),
         AccountMeta::new_readonly(controller, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(controller_id(), false),
