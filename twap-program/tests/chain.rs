@@ -8467,6 +8467,303 @@ fn e2e_controller_cannot_strand_positions_in_drain_only() {
     .expect("permissionless force-close remains live after the explicit shutdown delay");
 }
 
+// PUBLIC LOF: an asset admin can sign multiple fee variants of the same role transfer.
+// After one variant lands, the role is revoked to a new provider, and that provider deposits
+// collateral, a withheld variant must not restore the former authority. Otherwise the former
+// authority can withdraw backing or insurance that did not exist when the transfer was authorized.
+#[derive(Clone, Copy, Debug)]
+enum AssetAuthorityRetryPool {
+    Backing,
+    Insurance,
+}
+
+#[test]
+fn e2e_presigned_asset_authority_retry_cannot_seize_later_backing() {
+    run_presigned_asset_authority_retry(AssetAuthorityRetryPool::Backing);
+}
+
+#[test]
+fn e2e_presigned_asset_authority_retry_cannot_seize_later_insurance() {
+    run_presigned_asset_authority_retry(AssetAuthorityRetryPool::Insurance);
+}
+
+fn run_presigned_asset_authority_retry(pool: AssetAuthorityRetryPool) {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const DEPOSIT: u64 = 100;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let former_authority = Keypair::new();
+    let victim = Keypair::new();
+    let mint_authority = Keypair::new();
+    for signer in [&payer, &admin, &former_authority, &victim] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate a public Percolator market");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market.pubkey(), false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 5_000,
+                initial_margin_bps: 5_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 4_900,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize the market through the public program API");
+
+    let market = market.pubkey();
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    let victim_source = Pubkey::new_unique();
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &victim_source,
+        &collateral_mint,
+        &victim.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &former_authority.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &mint_authority],
+        spl_token::instruction::mint_to(
+            &spl_token::ID,
+            &collateral_mint,
+            &victim_source,
+            &mint_authority.pubkey(),
+            &[],
+            DEPOSIT,
+        )
+        .unwrap(),
+    )
+    .expect("mint valid collateral to the victim");
+
+    let role_kind = match pool {
+        AssetAuthorityRetryPool::Backing => 3,
+        AssetAuthorityRetryPool::Insurance => 2,
+    };
+    let rotate_to_former = pix(
+        vec![
+            AccountMeta::new_readonly(admin.pubkey(), true),
+            AccountMeta::new_readonly(former_authority.pubkey(), true),
+            AccountMeta::new(market, false),
+        ],
+        PIx::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: role_kind,
+            new_pubkey: former_authority.pubkey().to_bytes(),
+        },
+    );
+    svm.expire_blockhash();
+    let attack_blockhash = svm.latest_blockhash();
+    let first_variant = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1),
+            rotate_to_former.clone(),
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &admin, &former_authority],
+        attack_blockhash,
+    );
+    let withheld_variant = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(2),
+            rotate_to_former,
+        ],
+        Some(&payer.pubkey()),
+        &[&payer, &admin, &former_authority],
+        attack_blockhash,
+    );
+    let rotate_to_victim = Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: role_kind,
+                new_pubkey: victim.pubkey().to_bytes(),
+            },
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &admin, &victim],
+        attack_blockhash,
+    );
+    let victim_top_up_ix = match pool {
+        AssetAuthorityRetryPool::Backing => PIx::TopUpBackingBucket {
+            domain: 0,
+            amount: u128::from(DEPOSIT),
+            expiry_slot: u64::MAX,
+        },
+        AssetAuthorityRetryPool::Insurance => PIx::TopUpInsurance {
+            amount: u128::from(DEPOSIT),
+        },
+    };
+    let victim_top_up = Transaction::new_signed_with_payer(
+        &[pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_source, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            victim_top_up_ix,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &victim],
+        attack_blockhash,
+    );
+
+    svm.send_transaction(first_variant)
+        .expect("land the first pre-signed role-transfer variant");
+    if matches!(pool, AssetAuthorityRetryPool::Insurance) {
+        send(
+            &mut svm,
+            &[&payer, &admin, &victim],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new_readonly(victim.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind: 1,
+                    new_pubkey: victim.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("install the victim as the replacement insurance depositor");
+    }
+    svm.send_transaction(rotate_to_victim)
+        .expect("revoke the former authority and install the victim");
+    svm.send_transaction(victim_top_up)
+        .expect("the victim deposits collateral after the revocation");
+
+    let stale_accepted = svm.send_transaction(withheld_variant).is_ok();
+    let withdrawal_ix = |authority: Pubkey, destination: Pubkey| {
+        let instruction = match pool {
+            AssetAuthorityRetryPool::Backing => PIx::WithdrawBackingBucket {
+                domain: 0,
+                amount: u128::from(DEPOSIT),
+            },
+            AssetAuthorityRetryPool::Insurance => PIx::WithdrawInsuranceAsset {
+                asset_index: 0,
+                amount: u128::from(DEPOSIT),
+            },
+        };
+        pix(
+            vec![
+                AccountMeta::new_readonly(authority, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new(percolator_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            instruction,
+        )
+    };
+    if stale_accepted {
+        send(
+            &mut svm,
+            &[&payer, &former_authority],
+            withdrawal_ix(former_authority.pubkey(), attacker_destination),
+        )
+        .expect("the restored former authority extracts the victim's deposit");
+        assert_eq!(
+            token_amount(&svm, &attacker_destination),
+            DEPOSIT,
+            "{pool:?}: the stale role-transfer variant creates attacker-extractable loss"
+        );
+    } else {
+        send(
+            &mut svm,
+            &[&payer, &victim],
+            withdrawal_ix(victim.pubkey(), victim_source),
+        )
+        .expect("the current provider retains its complete withdrawal path");
+        assert_eq!(token_amount(&svm, &victim_source), DEPOSIT);
+    }
+    assert!(
+        !stale_accepted,
+        "{pool:?}: a revoked authority must not be restorable by a pre-signed retry variant"
+    );
+}
+
 // PUBLIC ADMIN LOF: Percolator applies max(caller_fee_bps, trade_fee_base_bps) when a trade lands,
 // but the trade wire has no user maximum. A controller admin could therefore raise the base fee
 // after both users sign a close, land that update first with the same recent blockhash, and turn
