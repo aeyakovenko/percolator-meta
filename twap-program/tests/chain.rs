@@ -68887,6 +68887,398 @@ fn e2e_resolved_settlement_prepares_lapsed_backing_before_mark_debit() {
     );
 }
 
+// PRIVILEGED LOF PROBE: a donated market may already have a secondary base-unit mint controlled
+// by the donor. Deposits still enter only the primary vault, but after resolution any cranker can
+// settle a victim into either configured mint. If the controller accepts that market, the donor
+// can mint worthless secondary units for the victim and governance can reclaim the victim's
+// stranded primary units during terminal close. Admission must reject the dual-mint market before
+// any independently owned portfolio can fund it.
+#[test]
+fn controller_rejects_donated_secondary_collateral_before_user_primary_can_be_swept() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let donor = Keypair::new();
+    let governance = Keypair::new();
+    let victim = Keypair::new();
+    for key in [
+        payer.pubkey(),
+        donor.pubkey(),
+        governance.pubkey(),
+        victim.pubkey(),
+    ] {
+        svm.airdrop(&key, 1_000_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let primary_mint_authority = Keypair::new();
+    let primary_mint =
+        create_real_mint(&mut svm, &payer, &primary_mint_authority.pubkey());
+    let secondary_mint = create_real_mint(&mut svm, &payer, &donor.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public donor allocates a zeroed Percolator slab");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &donor],
+        pix(
+            vec![
+                AccountMeta::new_readonly(donor.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(primary_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("donor initializes the raw market");
+    send(
+        &mut svm,
+        &[&payer, &donor],
+        pix(
+            vec![
+                AccountMeta::new_readonly(donor.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(primary_mint, false),
+                AccountMeta::new_readonly(secondary_mint, false),
+            ],
+            PIx::UpdateBaseUnitMints {
+                primary_mint: primary_mint.to_bytes(),
+                secondary_mint: secondary_mint.to_bytes(),
+            },
+        ),
+    )
+    .expect("donor installs its secondary settlement mint while the market is empty");
+
+    let controller = controller_pda(&governance.pubkey(), &market, &perc_id());
+    send(
+        &mut svm,
+        &[&payer],
+        solana_sdk::system_instruction::transfer(&payer.pubkey(), &controller, 1),
+    )
+    .expect("fund the deterministic controller system account");
+    let admission = send(
+        &mut svm,
+        &[&payer, &donor],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(donor.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(
+                    retired_market_pda(&market, &perc_id()),
+                    false,
+                ),
+            ],
+            data: vec![3u8],
+        },
+    );
+    if admission.is_err() {
+        let (config, _, _, _) = percolator_prog::state::read_market_config_mode_and_capacity(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(config.marketauth, donor.pubkey().to_bytes());
+        assert_eq!(
+            config.secondary_collateral_mint,
+            secondary_mint.to_bytes()
+        );
+        return;
+    }
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let primary_vault = canonical_insurance_vault(&vault_authority, &primary_mint);
+    let secondary_vault = canonical_insurance_vault(&vault_authority, &secondary_mint);
+    set_token(
+        &mut svm,
+        &primary_vault,
+        &primary_mint,
+        &vault_authority,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &secondary_vault,
+        &secondary_mint,
+        &vault_authority,
+        0,
+    );
+
+    let victim_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    send(
+        &mut svm,
+        &[&payer, &victim_portfolio],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &victim_portfolio.pubkey(),
+            portfolio_rent,
+            portfolio_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("victim allocates a zeroed portfolio");
+    send(
+        &mut svm,
+        &[&payer, &victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::InitPortfolio,
+        ),
+    )
+    .expect("victim initializes a portfolio after controller admission");
+
+    let deposit_amount = 100u64;
+    let victim_source = Pubkey::new_unique();
+    let victim_primary_destination = Pubkey::new_unique();
+    let victim_secondary_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &victim_source,
+        &primary_mint,
+        &victim.pubkey(),
+        deposit_amount,
+    );
+    set_token(
+        &mut svm,
+        &victim_primary_destination,
+        &primary_mint,
+        &victim.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &victim_secondary_destination,
+        &secondary_mint,
+        &victim.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(victim_source, false),
+                AccountMeta::new(primary_vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Deposit {
+                amount: deposit_amount.into(),
+            },
+        ),
+    )
+    .expect("victim deposits primary base units");
+    assert_eq!(token_amount(&svm, &primary_vault), deposit_amount);
+
+    let resolve_witness = controller_market_generation_witness(&svm, &market);
+    let mut resolve_data = vec![0u8];
+    resolve_data.extend_from_slice(&PIx::ResolveMarket.encode());
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(resolve_witness, false),
+            ],
+            data: resolve_data,
+        },
+    )
+    .expect("governance resolves the funded market");
+
+    send(
+        &mut svm,
+        &[&payer, &donor],
+        spl_token::instruction::mint_to(
+            &spl_token::ID,
+            &secondary_mint,
+            &secondary_vault,
+            &donor.pubkey(),
+            &[],
+            deposit_amount,
+        )
+        .unwrap(),
+    )
+    .expect("donor mints worthless secondary units into the canonical vault");
+    send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), false),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+                AccountMeta::new(victim_secondary_destination, false),
+                AccountMeta::new(secondary_vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+        ),
+    )
+    .expect("an untrusted cranker substitutes secondary units for the victim's primary claim");
+    assert_eq!(
+        token_amount(&svm, &victim_secondary_destination),
+        deposit_amount
+    );
+    assert_eq!(token_amount(&svm, &victim_primary_destination), 0);
+    assert_eq!(
+        token_amount(&svm, &primary_vault),
+        deposit_amount,
+        "the victim's primary units remain in the canonical vault after its claim is consumed"
+    );
+
+    send(
+        &mut svm,
+        &[&payer, &victim],
+        pix(
+            vec![
+                AccountMeta::new_readonly(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::ClosePortfolio,
+        ),
+    )
+    .expect("victim follows the normal terminal portfolio lifecycle");
+
+    let primary_transit = canonical_insurance_vault(&controller, &primary_mint);
+    let secondary_transit = canonical_insurance_vault(&controller, &secondary_mint);
+    let governance_primary_destination = Pubkey::new_unique();
+    let governance_secondary_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &primary_transit,
+        &primary_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &secondary_transit,
+        &secondary_mint,
+        &controller,
+        0,
+    );
+    set_token(
+        &mut svm,
+        &governance_primary_destination,
+        &primary_mint,
+        &governance.pubkey(),
+        0,
+    );
+    set_token(
+        &mut svm,
+        &governance_secondary_destination,
+        &secondary_mint,
+        &governance.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &governance],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new(governance.pubkey(), true),
+                AccountMeta::new(controller, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new(primary_vault, false),
+                AccountMeta::new(primary_transit, false),
+                AccountMeta::new(governance_primary_destination, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+                AccountMeta::new(retired_market_pda(&market, &perc_id()), false),
+                AccountMeta::new(secondary_vault, false),
+                AccountMeta::new(secondary_transit, false),
+                AccountMeta::new(governance_secondary_destination, false),
+            ],
+            data: vec![5u8],
+        },
+    )
+    .expect("governance reclaims both terminal vaults");
+
+    assert_eq!(
+        token_amount(&svm, &governance_primary_destination),
+        0,
+        "controller admission let governance reclaim the victim's primary deposit"
+    );
+    assert_eq!(
+        token_amount(&svm, &victim_primary_destination),
+        deposit_amount,
+        "the victim received secondary units instead of recovering its primary deposit"
+    );
+}
+
 // PUBLIC DOS/LOF: ordinary funding settlement can leave fresh backing principal above the amount
 // attributed to the Genesis provider ledger. The final owner exit must sweep that protocol surplus
 // separately instead of debiting it as provider principal and underflowing the pinned ledger.

@@ -17,6 +17,11 @@ pub const NEXT_MARKET_ID_OFFSET: usize =
 pub const INSURANCE_OFFSET: usize =
     MARKET_GROUP_OFFSET + offset_of!(MarketGroupV16HeaderAccount, insurance);
 pub const MARKET_AUTHORITY_OFFSET: usize = HEADER_LEN;
+pub const SECONDARY_COLLATERAL_MINT_OFFSET: usize = HEADER_LEN
+    + offset_of!(
+        percolator_prog::state::WrapperConfigV16,
+        secondary_collateral_mint
+    );
 // Pinned `WrapperConfigV16::maintenance_fee_per_slot` follows the three
 // market-level mint/authority keys.
 pub const MAINTENANCE_FEE_PER_SLOT_OFFSET: usize = HEADER_LEN + 96;
@@ -547,6 +552,12 @@ fn asset_engine_offset(asset_index: usize) -> Result<usize, ReadError> {
 pub fn read_market_authority(data: &[u8]) -> Result<[u8; 32], ReadError> {
     validate_market(data)?;
     bytes(data, MARKET_AUTHORITY_OFFSET)
+}
+
+/// Returns the optional secondary base-unit mint from the pinned wrapper config.
+pub fn read_secondary_collateral_mint(data: &[u8]) -> Result<[u8; 32], ReadError> {
+    validate_market(data)?;
+    bytes(data, SECONDARY_COLLATERAL_MINT_OFFSET)
 }
 
 /// Returns the immutable account-level maintenance fee from the pinned wrapper config.
@@ -1422,6 +1433,17 @@ mod tests {
             market_is_live_before_portfolio_admission(&market),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn secondary_collateral_mint_view_reads_the_pinned_wrapper_field() {
+        let mut market = market_with_insurance_capacity();
+        assert_eq!(read_secondary_collateral_mint(&market), Ok([0u8; 32]));
+
+        let secondary = [9u8; 32];
+        market[SECONDARY_COLLATERAL_MINT_OFFSET..SECONDARY_COLLATERAL_MINT_OFFSET + 32]
+            .copy_from_slice(&secondary);
+        assert_eq!(read_secondary_collateral_mint(&market), Ok(secondary));
     }
 
     #[test]

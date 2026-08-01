@@ -540,9 +540,12 @@ canonical owner-bound pool; governance cannot convert the external balance into 
 pool-controlled insurance. Percolator's market-authority update does not migrate secondary
 `asset_admin` roles, so the controller rejects donation while any secondary slot is active,
 drain-only, or recovering. Once those slots are empty and retired, the same permissionless handoff
-succeeds only if direct permissionless asset append is disabled. The controller proxy cannot enable
-that mode because a direct activator becomes an external `asset_admin`. New multi-asset deployments
-use permissionless controller initialization followed by governance-approved asset activation. Both
+succeeds only if direct permissionless asset append is disabled and no secondary base-unit mint is
+configured. Deposits enter only Percolator's primary base-unit vault while resolved payouts may use
+either configured mint; rejecting a donor-controlled secondary mint prevents a cranker from consuming
+a user's primary claim in attacker-minted secondary units and leaving the primary units for terminal
+governance reclaim. The controller proxy cannot enable either mode. New multi-asset deployments use
+permissionless controller initialization followed by governance-approved asset activation. Both
 insurance roles stay on the constrained controller, while external backing and oracle providers remain
 independently selectable. This prevents an unfunded raw key from collecting user-paid trade fees.
 The same constrained proxy can restart an empty recovering asset through Percolator's value-neutral
