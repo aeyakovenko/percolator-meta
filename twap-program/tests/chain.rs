@@ -9050,6 +9050,401 @@ fn e2e_controller_cannot_extend_funded_resolution_deadlines() {
     );
 }
 
+// PUBLIC RELAYER DOS: independently authorized deadline reductions have no ordering watermark.
+// A relayer can execute a later correction first, replay the older aggressive policy second, and
+// permissionlessly resolve a funded live market before the corrected stale deadline.
+#[test]
+fn e2e_stale_resolution_policy_cannot_overwrite_a_later_correction() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const START_SLOT: u64 = 100;
+    const INITIAL_STALE_SLOTS: u64 = 100;
+    const STALE_POLICY_SLOTS: u64 = 10;
+    const CORRECTED_POLICY_SLOTS: u64 = 80;
+    const DEPOSIT: u64 = 1_000_000;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+    svm.add_program_from_file(controller_id(), so_deploy("market_controller_program"))
+        .unwrap();
+
+    let payer = Keypair::new();
+    let creator = Keypair::new();
+    let governance = Keypair::new();
+    for signer in [&payer, &creator, &governance] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+    }
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT,
+        unix_timestamp: START_SLOT as i64,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public creator allocates the market");
+    let market_key = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("creator initializes a live market");
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        pix(
+            vec![
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new(market_key, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: INITIAL_STALE_SLOTS,
+                force_close_delay_slots: INITIAL_STALE_SLOTS / 2,
+            },
+        ),
+    )
+    .expect("creator publishes the initial nonzero exit policy");
+
+    let controller = controller_pda(&governance.pubkey(), &market_key, &perc_id());
+    send(
+        &mut svm,
+        &[&payer, &creator],
+        Instruction {
+            program_id: controller_id(),
+            accounts: vec![
+                AccountMeta::new_readonly(governance.pubkey(), false),
+                AccountMeta::new_readonly(creator.pubkey(), true),
+                AccountMeta::new_readonly(controller, false),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(retired_market_pda(&market_key, &perc_id()), false),
+            ],
+            data: vec![3u8], // IX_ACCEPT_MARKET_AUTHORITY
+        },
+    )
+    .expect("creator donates policy control to the constrained controller");
+    let policy_sequence = init_controller_policy_sequence(
+        &mut svm,
+        &payer,
+        &governance.pubkey(),
+        &controller,
+        &market_key,
+    );
+    let generation_witness = controller_market_generation_witness(&svm, &market_key);
+    let proxy = |raw: Vec<u8>, sequenced: bool| {
+        let mut accounts = vec![
+            AccountMeta::new_readonly(governance.pubkey(), true),
+            AccountMeta::new_readonly(controller, false),
+            AccountMeta::new(market_key, false),
+            AccountMeta::new_readonly(perc_id(), false),
+        ];
+        if sequenced {
+            accounts.push(AccountMeta::new(policy_sequence, false));
+        }
+        accounts.push(AccountMeta::new_readonly(generation_witness, false));
+        let mut data = vec![0u8]; // IX_PROXY_ADMIN
+        data.extend_from_slice(&raw);
+        Instruction {
+            program_id: controller_id(),
+            accounts,
+            data,
+        }
+    };
+
+    let vault_authority = perc_vault_authority(&market_key, &perc_id());
+    let percolator_vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(
+        &mut svm,
+        &percolator_vault,
+        &collateral_mint,
+        &vault_authority,
+        0,
+    );
+    let long = Keypair::new();
+    let short = Keypair::new();
+    let long_portfolio = Keypair::new();
+    let short_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [(&long, &long_portfolio), (&short, &short_portfolio)] {
+        svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+        let source = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &source,
+            &collateral_mint,
+            &owner.pubkey(),
+            DEPOSIT,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market_key, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(percolator_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: u128::from(DEPOSIT),
+                },
+            ),
+        )
+        .expect("public user deposits real collateral");
+    }
+    let position_q = (percolator::POS_SCALE / 10) as i128;
+    let trade = |size_q| {
+        pix(
+            vec![
+                AccountMeta::new(long.pubkey(), true),
+                AccountMeta::new(short.pubkey(), true),
+                AccountMeta::new(market_key, false),
+                AccountMeta::new(long_portfolio.pubkey(), false),
+                AccountMeta::new(short_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q,
+                exec_price: 1_000_000,
+                fee_bps: 0,
+            },
+        )
+    };
+    send(
+        &mut svm,
+        &[&payer, &long, &short],
+        trade(position_q),
+    )
+    .expect("independent users open a balanced live position");
+
+    let policy = |stale_slots, force_close_delay_slots| {
+        PIx::ConfigurePermissionlessResolve {
+            stale_slots,
+            force_close_delay_slots,
+        }
+        .encode()
+    };
+    svm.expire_blockhash();
+    let raw_blockhash = svm.latest_blockhash();
+    let stale_raw = Transaction::new_signed_with_payer(
+        &[proxy(
+            policy(STALE_POLICY_SLOTS, STALE_POLICY_SLOTS / 2),
+            false,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        raw_blockhash,
+    );
+    let correction_raw = Transaction::new_signed_with_payer(
+        &[proxy(
+            policy(CORRECTED_POLICY_SLOTS, CORRECTED_POLICY_SLOTS / 2),
+            false,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer, &governance],
+        raw_blockhash,
+    );
+    let market_before_raw = svm.get_account(&market_key).unwrap();
+    let sequence_before_raw = svm.get_account(&policy_sequence).unwrap();
+    let raw_correction_succeeded = svm.send_transaction(correction_raw).is_ok();
+    if raw_correction_succeeded {
+        svm.send_transaction(stale_raw)
+            .expect("the older aggressive deadline remains publicly executable");
+    } else {
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_before_raw,
+            "the rejected legacy correction is byte-atomic"
+        );
+        assert_eq!(
+            svm.get_account(&policy_sequence).unwrap(),
+            sequence_before_raw,
+            "legacy data cannot consume the forced-exit policy sequence"
+        );
+        assert!(
+            svm.send_transaction(stale_raw).is_err(),
+            "configured deadline changes must use the sequenced envelope"
+        );
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_before_raw,
+            "the rejected legacy stale policy is byte-atomic"
+        );
+
+        svm.expire_blockhash();
+        let sequenced_blockhash = svm.latest_blockhash();
+        let stale_sequenced = Transaction::new_signed_with_payer(
+            &[proxy(
+                sequenced_controller_policy_data(
+                    policy(STALE_POLICY_SLOTS, STALE_POLICY_SLOTS / 2),
+                    0,
+                ),
+                true,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            sequenced_blockhash,
+        );
+        let correction_sequenced = Transaction::new_signed_with_payer(
+            &[proxy(
+                sequenced_controller_policy_data(
+                    policy(CORRECTED_POLICY_SLOTS, CORRECTED_POLICY_SLOTS / 2),
+                    0,
+                ),
+                true,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer, &governance],
+            sequenced_blockhash,
+        );
+        svm.send_transaction(correction_sequenced)
+            .expect("the later correction consumes the forced-exit policy sequence");
+        let market_after_correction = svm.get_account(&market_key).unwrap();
+        let sequence_after_correction = svm.get_account(&policy_sequence).unwrap();
+        assert!(
+            svm.send_transaction(stale_sequenced).is_err(),
+            "the older aggressive deadline cannot replay after the correction"
+        );
+        assert_eq!(
+            svm.get_account(&market_key).unwrap(),
+            market_after_correction,
+            "the rejected stale policy is byte-atomic"
+        );
+        assert_eq!(
+            svm.get_account(&policy_sequence).unwrap(),
+            sequence_after_correction,
+            "a rejected stale policy cannot consume another sequence"
+        );
+    }
+
+    svm.set_sysvar(&Clock {
+        slot: START_SLOT + STALE_POLICY_SLOTS,
+        unix_timestamp: (START_SLOT + STALE_POLICY_SLOTS) as i64,
+        ..Clock::default()
+    });
+    let market_before_resolution = svm.get_account(&market_key).unwrap();
+    let resolution = send(
+        &mut svm,
+        &[&payer],
+        pix(
+            vec![AccountMeta::new(market_key, false)],
+            PIx::ResolveStalePermissionless { now_slot: 0 },
+        ),
+    );
+    if raw_correction_succeeded {
+        resolution.expect("the stale policy makes premature terminal resolution public");
+        assert!(
+            !percolator_accounting::market_is_live(
+                &svm.get_account(&market_key).unwrap().data,
+            )
+            .unwrap(),
+            "the public relayer irreversibly leaves live mode"
+        );
+        assert!(
+            send(
+                &mut svm,
+                &[&payer, &long, &short],
+                trade(-position_q),
+            )
+            .is_err(),
+            "ordinary trading cannot recover the terminally resolved market"
+        );
+        panic!("a public relayer replayed stale deadlines and terminally resolved the market");
+    }
+    assert!(
+        resolution.is_err(),
+        "the corrected deadline must keep the market live at the stale policy's boundary"
+    );
+    assert_eq!(
+        svm.get_account(&market_key).unwrap(),
+        market_before_resolution,
+        "premature resolution rejection is byte-atomic"
+    );
+    assert!(
+        percolator_accounting::market_is_live(&market_before_resolution.data).unwrap(),
+        "the funded market remains live under the corrected policy"
+    );
+}
+
 // PUBLIC POSITION DOS PROBE: the pinned Percolator rejects every atomic batch while any backing
 // fee policy is active. A cross-margined user may need a final-state-only batch because either
 // standalone rotation leg exceeds initial margin. The controller must therefore reject nonzero
