@@ -215,8 +215,10 @@ any backing utilization-fee policy is active. Both governance wrappers therefore
 policies but preserve exact-zero updates to clear predecessor state. The ordinary trade fee is selected
 when the market is initialized and can only stay constant or decrease afterward: the pinned trade wire
 has a caller fee floor but no user maximum, so an increase could reprice an already-signed trade. Safe
-increases require an upstream max-fee field and a new pin. Backing fees can be re-enabled only after
-batch-safe accounting is merged on top of this exact security line.
+increases require an upstream max-fee field and a new pin. Post-handoff TWAP fee changes also consume
+an exact policy sequence, so public executors cannot apply an older decrease after a later correction.
+Backing fees can be re-enabled only after batch-safe accounting is merged on top of this exact
+security line.
 
 The auction's flat bid fee follows the same rule: book initialization selects its maximum and later
 Squads actions may keep or lower it. The bid wire commits to its amounts, exact round end, and either a

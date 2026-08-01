@@ -2389,20 +2389,23 @@ fn process_donate_insurance(
 }
 
 // set_market_fees accounts:
-// [squads_vault(signer), config, twap_authority, market_slab(w), percolator_program]
+// [squads_vault(signer,payer), config, twap_authority, market_slab(w),
+//  percolator_program, policy_nonce(w), system_program]
 // data: trade_fee(u64) || long_fee(u16) || long_insurance_share(u16) ||
-//       short_fee(u16) || short_insurance_share(u16)
+//       short_fee(u16) || short_insurance_share(u16) || expected_policy_nonce(u64)
 //
 // Percolator gates these three policy updates on insurance_authority, which is the
 // constrained TWAP PDA after handoff. The pinned program globally rejects atomic
 // batches while any backing fee is active, so only zero backing updates are exposed
 // until that accounting is batch-safe. Zero updates preserve predecessor recovery.
+// The exact nonce orders independently approved decreases so a public executor cannot
+// replay an older, lower fee after governance approves a later correction.
 fn process_set_market_fees(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
-    if data.len() != 16 {
+    if data.len() != 24 {
         return Err(ProgramError::InvalidInstructionData);
     }
     let trade_fee = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -2410,6 +2413,7 @@ fn process_set_market_fees(
     let long_insurance = u16::from_le_bytes(data[10..12].try_into().unwrap());
     let short_fee = u16::from_le_bytes(data[12..14].try_into().unwrap());
     let short_insurance = u16::from_le_bytes(data[14..16].try_into().unwrap());
+    let expected_policy_nonce = u64::from_le_bytes(data[16..24].try_into().unwrap());
     if long_fee != 0 || long_insurance != 0 || short_fee != 0 || short_insurance != 0 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -2419,16 +2423,16 @@ fn process_set_market_fees(
     let twap_authority = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
-    if !squads_vault.is_signer || iter.next().is_some() {
-        return Err(ProgramError::MissingRequiredSignature);
+    let policy_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
     }
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
     let config = Config::deserialize(&config_account.try_borrow_data()?)?;
-    if *squads_vault.key != squads_default_vault(&config.squads_multisig) {
-        return Err(ProgramError::IllegalOwner);
-    }
+    require_squads_vault(squads_vault, &config)?;
     if *market_slab.key != config.market_slab
         || market_slab.owner != percolator_program.key
         || *percolator_program.key != config.percolator_program
@@ -2452,6 +2456,15 @@ fn process_set_market_fees(
     if trade_fee > current_trade_fee {
         return Err(ProgramError::InvalidInstructionData);
     }
+    consume_policy_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        policy_nonce,
+        system_program,
+        IX_SET_MARKET_FEES,
+        expected_policy_nonce,
+    )?;
 
     let mut trade_data = vec![PERC_IX_UPDATE_TRADE_FEE_POLICY];
     trade_data.extend_from_slice(&trade_fee.to_le_bytes());

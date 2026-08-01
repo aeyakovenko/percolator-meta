@@ -40,6 +40,7 @@ enum PoolRestartScenario {
     StaleMaintenancePolicyOrder,
     StaleReservePolicyOrder,
     NoopReservePolicyOrder,
+    StaleTwapTradeFeePolicyOrder,
 }
 
 #[test]
@@ -118,6 +119,11 @@ fn e2e_noop_reserve_correction_invalidates_an_older_policy() {
     run_pool_restart_claim_scenario(PoolRestartScenario::NoopReservePolicyOrder);
 }
 
+#[test]
+fn e2e_stale_twap_trade_fee_policy_cannot_overwrite_a_later_correction() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::StaleTwapTradeFeePolicyOrder);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -137,6 +143,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     let noop_reserve_order = scenario == PoolRestartScenario::NoopReservePolicyOrder;
     let stale_reserve_order =
         scenario == PoolRestartScenario::StaleReservePolicyOrder || noop_reserve_order;
+    let stale_twap_trade_fee_order =
+        scenario == PoolRestartScenario::StaleTwapTradeFeePolicyOrder;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -226,6 +234,11 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     )
     .expect("allocate market");
     let market = market.pubkey();
+    let initial_price = if stale_twap_trade_fee_order {
+        1_000_000
+    } else {
+        1_000
+    };
     send(
         &mut svm,
         &[&payer, &admin],
@@ -239,13 +252,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                 max_portfolio_assets: 1,
                 h_min: 0,
                 h_max: 10,
-                initial_price: 1_000,
+                initial_price,
                 min_nonzero_mm_req: 599,
                 min_nonzero_im_req: 600,
                 maintenance_margin_bps: 5_000,
                 initial_margin_bps: 5_000,
                 max_trading_fee_bps: 10_000,
-                trade_fee_base_bps: 0,
+                trade_fee_base_bps: if stale_twap_trade_fee_order {
+                    100
+                } else {
+                    0
+                },
                 liquidation_fee_bps: if stale_liquidation_policy { 100 } else { 0 },
                 liquidation_fee_cap: if stale_liquidation_policy { 2 } else { 0 },
                 min_liquidation_abs: 0,
@@ -290,7 +307,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             PIx::ConfigureAuthMark {
                 asset_index: 0,
                 now_slot: 100,
-                initial_mark_e6: 1_000,
+                initial_mark_e6: initial_price,
             },
         ),
     )
@@ -525,6 +542,292 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             owner_principal as u128
         },
     );
+
+    if stale_twap_trade_fee_order {
+        const STALE_FEE_BPS: u64 = 50;
+        const CORRECTED_FEE_BPS: u64 = 80;
+        const DEPOSIT: u64 = 1_000_000;
+        const TRADE_NOTIONAL: u128 = 100_000;
+
+        let remaining = set_market_fees_remaining_accounts(
+            &squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &market,
+            &perc_id(),
+        );
+        let queue = |svm: &mut LiteSVM, index: u64, message: Vec<u8>| {
+            let transaction = transaction_pda(&squads, &multisig, index);
+            let proposal = proposal_pda(&squads, &multisig, index);
+            for instruction in [
+                vault_transaction_create_ix(
+                    &squads,
+                    &multisig,
+                    &transaction,
+                    &dao.pubkey(),
+                    &message,
+                ),
+                proposal_create_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &dao.pubkey(),
+                    index,
+                ),
+                proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey()),
+            ] {
+                send(svm, &[&dao], instruction).expect("queue TWAP trade-fee policy");
+            }
+            (transaction, proposal)
+        };
+        let policy_message = |trade_fee_bps| {
+            build_set_market_fees_message(
+                &squads_vault,
+                &twap_cfg,
+                &twap_authority,
+                &market,
+                &perc_id(),
+                trade_fee_bps,
+                0,
+                0,
+                0,
+                0,
+            )
+        };
+        let (stale_transaction, stale_proposal) =
+            queue(&mut svm, 3, policy_message(STALE_FEE_BPS));
+        let (correction_transaction, correction_proposal) =
+            queue(&mut svm, 4, policy_message(CORRECTED_FEE_BPS));
+        let legacy_message = build_unsequenced_set_market_fees_message(
+            &squads_vault,
+            &twap_cfg,
+            &twap_authority,
+            &market,
+            &perc_id(),
+            STALE_FEE_BPS,
+        );
+        let (legacy_transaction, legacy_proposal) = queue(&mut svm, 5, legacy_message);
+        let mut clock = svm.get_sysvar::<Clock>();
+        clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+        svm.set_sysvar(&clock);
+        send(
+            &mut svm,
+            &[&dao],
+            vault_transaction_execute_ix(
+                &squads,
+                &multisig,
+                &correction_proposal,
+                &correction_transaction,
+                &dao.pubkey(),
+                &remaining,
+            ),
+        )
+        .expect("execute the corrected TWAP trade fee first");
+        let market_after_correction = svm.get_account(&market).unwrap();
+        let policy_nonce = twap_program::policy_nonce_address(&twap_cfg, 18).0;
+        let nonce_after_correction = svm.get_account(&policy_nonce);
+        let stale_replay = send(
+            &mut svm,
+            &[&dao],
+            vault_transaction_execute_ix(
+                &squads,
+                &multisig,
+                &stale_proposal,
+                &stale_transaction,
+                &dao.pubkey(),
+                &remaining,
+            ),
+        );
+        if stale_replay.is_err() {
+            assert_eq!(
+                svm.get_account(&market).unwrap(),
+                market_after_correction,
+                "a rejected stale TWAP fee policy leaves the market byte-identical",
+            );
+            assert_eq!(
+                svm.get_account(&policy_nonce),
+                nonce_after_correction,
+                "a rejected stale TWAP fee policy cannot consume the nonce",
+            );
+            let legacy_remaining = vec![
+                AccountMeta::new_readonly(squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(twap_cfg, false),
+                AccountMeta::new_readonly(twap_authority, false),
+                AccountMeta::new_readonly(perc_id(), false),
+                AccountMeta::new_readonly(twap_id(), false),
+            ];
+            assert!(
+                send(
+                    &mut svm,
+                    &[&dao],
+                    vault_transaction_execute_ix(
+                        &squads,
+                        &multisig,
+                        &legacy_proposal,
+                        &legacy_transaction,
+                        &dao.pubkey(),
+                        &legacy_remaining,
+                    ),
+                )
+                .is_err(),
+                "legacy unsequenced TWAP fee messages cannot bypass the watermark",
+            );
+            assert_eq!(
+                svm.get_account(&market).unwrap(),
+                market_after_correction,
+                "a rejected legacy TWAP fee policy leaves the market byte-identical",
+            );
+            assert_eq!(
+                svm.get_account(&policy_nonce),
+                nonce_after_correction,
+                "a rejected legacy TWAP fee policy cannot consume the nonce",
+            );
+        }
+        let charged_bps = percolator_accounting::read_trade_fee_base_bps(
+            &svm.get_account(&market).unwrap().data,
+        )
+        .unwrap();
+        assert_eq!(
+            charged_bps,
+            if stale_replay.is_ok() {
+                STALE_FEE_BPS
+            } else {
+                CORRECTED_FEE_BPS
+            },
+        );
+
+        let long = Keypair::new();
+        let short = Keypair::new();
+        let long_portfolio = Keypair::new();
+        let short_portfolio = Keypair::new();
+        let portfolio_len =
+            percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+        let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+        for (owner, portfolio) in [(&long, &long_portfolio), (&short, &short_portfolio)] {
+            svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+            send(
+                &mut svm,
+                &[&payer, portfolio],
+                solana_sdk::system_instruction::create_account(
+                    &payer.pubkey(),
+                    &portfolio.pubkey(),
+                    portfolio_rent,
+                    portfolio_len as u64,
+                    &perc_id(),
+                ),
+            )
+            .expect("public trader allocates a portfolio");
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("public trader initializes a portfolio");
+            let source = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &source,
+                &collateral,
+                &owner.pubkey(),
+                DEPOSIT,
+            );
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit {
+                        amount: u128::from(DEPOSIT),
+                    },
+                ),
+            )
+            .expect("public trader deposits collateral");
+        }
+
+        let capital = |svm: &LiteSVM, portfolio: &Pubkey| {
+            percolator_prog::state::read_portfolio(
+                &svm.get_account(portfolio).unwrap().data,
+            )
+            .unwrap()
+            .capital
+            .get()
+        };
+        let long_before = capital(&svm, &long_portfolio.pubkey());
+        let short_before = capital(&svm, &short_portfolio.pubkey());
+        let insurance_before = percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        send(
+            &mut svm,
+            &[&payer, &long, &short],
+            pix(
+                vec![
+                    AccountMeta::new(long.pubkey(), true),
+                    AccountMeta::new(short.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(long_portfolio.pubkey(), false),
+                    AccountMeta::new(short_portfolio.pubkey(), false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: (percolator::POS_SCALE / 10) as i128,
+                    exec_price: initial_price,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("public traders execute after the relayer orders TWAP policies");
+        let expected_fee_per_user =
+            (TRADE_NOTIONAL * u128::from(charged_bps) + 9_999) / 10_000;
+        assert_eq!(
+            long_before - capital(&svm, &long_portfolio.pubkey()),
+            expected_fee_per_user,
+        );
+        assert_eq!(
+            short_before - capital(&svm, &short_portfolio.pubkey()),
+            expected_fee_per_user,
+        );
+        let insurance_after = percolator_accounting::read_asset_insurance_remaining(
+            &svm.get_account(&market).unwrap().data,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            insurance_after - insurance_before,
+            expected_fee_per_user * 2,
+            "canonical insurance receives exactly the two charged fees",
+        );
+        if stale_replay.is_ok() {
+            let corrected_fee =
+                (TRADE_NOTIONAL * u128::from(CORRECTED_FEE_BPS) + 9_999) / 10_000;
+            assert_eq!(
+                corrected_fee * 2 - (insurance_after - insurance_before),
+                600,
+                "the stale TWAP policy deterministically undercharges canonical insurance",
+            );
+            panic!(
+                "a public relayer replayed stale TWAP policy and undercharged canonical insurance",
+            );
+        }
+        return;
+    }
 
     if stale_reserve_order {
         let surplus = 500_000u64;
@@ -22413,21 +22716,53 @@ fn build_set_market_fees_message(
     backing_short_bps: u16,
     backing_short_insurance_bps: u16,
 ) -> Vec<u8> {
+    build_set_market_fees_message_with_expected(
+        squads_vault,
+        config,
+        twap_authority,
+        market,
+        percolator_program,
+        trade_fee_bps,
+        backing_long_bps,
+        backing_long_insurance_bps,
+        backing_short_bps,
+        backing_short_insurance_bps,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_set_market_fees_message_with_expected(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    trade_fee_bps: u64,
+    backing_long_bps: u16,
+    backing_long_insurance_bps: u16,
+    backing_short_bps: u16,
+    backing_short_insurance_bps: u16,
+    expected_policy_nonce: u64,
+) -> Vec<u8> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 18).0;
     let mut m = Vec::new();
     m.push(1);
-    m.push(0);
-    m.push(1); // market writable
-    m.push(6);
-    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
+    m.push(1); // Squads vault pays the policy nonce rent.
+    m.push(2); // market and policy nonce writable
+    m.push(8);
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer, writable
     m.extend_from_slice(market.as_ref()); // 1 writable
-    m.extend_from_slice(config.as_ref()); // 2
-    m.extend_from_slice(twap_authority.as_ref()); // 3
-    m.extend_from_slice(percolator_program.as_ref()); // 4
-    m.extend_from_slice(twap_id().as_ref()); // 5 program
+    m.extend_from_slice(policy_nonce.as_ref()); // 2 writable
+    m.extend_from_slice(config.as_ref()); // 3
+    m.extend_from_slice(twap_authority.as_ref()); // 4
+    m.extend_from_slice(percolator_program.as_ref()); // 5
+    m.extend_from_slice(system_program::ID.as_ref()); // 6
+    m.extend_from_slice(twap_id().as_ref()); // 7 program
     m.push(1);
-    m.push(5);
-    m.push(5);
-    for index in [0u8, 2, 3, 1, 4] {
+    m.push(7);
+    m.push(7);
+    for index in [0u8, 3, 4, 1, 5, 2, 6] {
         m.push(index);
     }
     let mut data = vec![18u8];
@@ -22436,10 +22771,65 @@ fn build_set_market_fees_message(
     data.extend_from_slice(&backing_long_insurance_bps.to_le_bytes());
     data.extend_from_slice(&backing_short_bps.to_le_bytes());
     data.extend_from_slice(&backing_short_insurance_bps.to_le_bytes());
+    data.extend_from_slice(&expected_policy_nonce.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
     m.push(0);
     m
+}
+
+fn set_market_fees_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<AccountMeta> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 18).0;
+    vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(*market, false),
+        AccountMeta::new(policy_nonce, false),
+        AccountMeta::new_readonly(*config, false),
+        AccountMeta::new_readonly(*twap_authority, false),
+        AccountMeta::new_readonly(*percolator_program, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
+}
+
+fn build_unsequenced_set_market_fees_message(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    twap_authority: &Pubkey,
+    market: &Pubkey,
+    percolator_program: &Pubkey,
+    trade_fee_bps: u64,
+) -> Vec<u8> {
+    let mut message = Vec::new();
+    message.push(1);
+    message.push(0);
+    message.push(1);
+    message.push(6);
+    message.extend_from_slice(squads_vault.as_ref());
+    message.extend_from_slice(market.as_ref());
+    message.extend_from_slice(config.as_ref());
+    message.extend_from_slice(twap_authority.as_ref());
+    message.extend_from_slice(percolator_program.as_ref());
+    message.extend_from_slice(twap_id().as_ref());
+    message.push(1);
+    message.push(5);
+    message.push(5);
+    for index in [0u8, 2, 3, 1, 4] {
+        message.push(index);
+    }
+    let mut data = vec![18u8];
+    data.extend_from_slice(&trade_fee_bps.to_le_bytes());
+    data.extend_from_slice(&[0u8; 8]);
+    message.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    message.extend_from_slice(&data);
+    message.push(0);
+    message
 }
 
 fn build_twap_restart_asset0_message(
@@ -25329,14 +25719,13 @@ fn e2e_post_genesis_futarchy_clears_batch_gating_backing_fees_through_twap() {
     svm.airdrop(&payer.pubkey(), 100_000_000_000_000).unwrap();
     let env = setup_handoff(&mut svm, &payer);
     let insurance_before = token_amount(&svm, &env.perc_vault);
-    let remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(env.twap_cfg, false),
-        AccountMeta::new_readonly(env.twap_authority, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let remaining = set_market_fees_remaining_accounts(
+        &env.squads_vault,
+        &env.twap_cfg,
+        &env.twap_authority,
+        &env.slab,
+        &perc_id(),
+    );
 
     let market_before_fee_increase = svm.get_account(&env.slab).unwrap();
     let rejected_fee_increase = build_set_market_fees_message(
@@ -69041,14 +69430,13 @@ fn e2e_organic_cross_backing_surplus_cannot_block_final_genesis_exit() {
         0,
         0,
     );
-    let clear_fees_remaining = vec![
-        AccountMeta::new_readonly(env.squads_vault, false),
-        AccountMeta::new(env.slab, false),
-        AccountMeta::new_readonly(twap_cfg, false),
-        AccountMeta::new_readonly(twap_authority, false),
-        AccountMeta::new_readonly(perc_id(), false),
-        AccountMeta::new_readonly(twap_id(), false),
-    ];
+    let clear_fees_remaining = set_market_fees_remaining_accounts(
+        &env.squads_vault,
+        &twap_cfg,
+        &twap_authority,
+        &env.slab,
+        &perc_id(),
+    );
     squads_execute(
         &mut svm,
         &env.squads,
