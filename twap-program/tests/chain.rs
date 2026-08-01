@@ -34547,6 +34547,511 @@ fn send(
 // Simulate an in-place program upgrade by retaining one exact historical AuctionBook generation.
 // Every header field was appended and every slot field was appended, so each old account is the
 // corresponding prefix plus the same 32 tightly-packed slot prefixes.
+// A recovery timeout must remain a bounded cleanup path when one account's exposure is split
+// across smaller counterparties. Otherwise a maintenance-healthy account can cross below initial
+// margin without being liquidatable, then permanently occupy a non-base slot after shutdown.
+#[test]
+fn probe_fragmented_recovery_asset_remains_permissionlessly_force_closable() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    let mut svm =
+        LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
+            compute_unit_limit: 1_400_000,
+            heap_size: 256 * 1024,
+            ..solana_program_runtime::compute_budget::ComputeBudget::default()
+        });
+    svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let oracle = Keypair::new();
+    let cranker = Keypair::new();
+    for signer in [&payer, &admin, &oracle, &cranker] {
+        svm.airdrop(&signer.pubkey(), 100_000_000_000)
+            .unwrap();
+    }
+    warp_to(&mut svm, 100);
+
+    let mint_authority = Keypair::new();
+    let collateral = create_real_mint(&mut svm, &payer, &mint_authority.pubkey());
+    let market = Keypair::new();
+    let market_len = percolator_prog::state::market_account_len_for_capacity(2).unwrap();
+    let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+    send(
+        &mut svm,
+        &[&payer, &market],
+        solana_sdk::system_instruction::create_account(
+            &payer.pubkey(),
+            &market.pubkey(),
+            market_rent,
+            market_len as u64,
+            &perc_id(),
+        ),
+    )
+    .expect("allocate the public two-asset market");
+    let market = market.pubkey();
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(collateral, false),
+            ],
+            PIx::InitMarket {
+                max_portfolio_assets: 2,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 1_000_000,
+                min_nonzero_mm_req: 599,
+                min_nonzero_im_req: 600,
+                maintenance_margin_bps: 1_000,
+                initial_margin_bps: 5_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 900,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 1,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+        ),
+    )
+    .expect("initialize the public two-asset market");
+    send(
+        &mut svm,
+        &[&payer, &admin, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetAuthority {
+                asset_index: 1,
+                kind: 4,
+                new_pubkey: oracle.pubkey().to_bytes(),
+            },
+        ),
+    )
+    .expect("assign asset 1 an independent oracle");
+    send(
+        &mut svm,
+        &[&payer, &oracle],
+        pix(
+            vec![
+                AccountMeta::new_readonly(oracle.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 1,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+            },
+        ),
+    )
+    .expect("configure asset 1's authenticated mark");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigureAuthMark {
+                asset_index: 0,
+                now_slot: 100,
+                initial_mark_e6: 1_000_000,
+            },
+        ),
+    )
+    .expect("configure the independently live base oracle");
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::ConfigurePermissionlessResolve {
+                stale_slots: 1_000,
+                force_close_delay_slots: 1,
+            },
+        ),
+    )
+    .expect("configure bounded public cleanup");
+
+    let vault_authority = perc_vault_authority(&market, &perc_id());
+    let vault = canonical_insurance_vault(&vault_authority, &collateral);
+    set_token(&mut svm, &vault, &collateral, &vault_authority, 0);
+
+    let owners = [
+        Keypair::new(),
+        Keypair::new(),
+        Keypair::new(),
+        Keypair::new(),
+    ];
+    let portfolios = [
+        Keypair::new(),
+        Keypair::new(),
+        Keypair::new(),
+        Keypair::new(),
+    ];
+    let portfolio_len =
+        percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+    let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+    for (owner, portfolio) in owners.iter().zip(portfolios.iter()) {
+        svm.airdrop(&owner.pubkey(), 100_000_000_000).unwrap();
+        send(
+            &mut svm,
+            &[&payer, portfolio],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &portfolio.pubkey(),
+                portfolio_rent,
+                portfolio_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("allocate a public portfolio");
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                ],
+                PIx::InitPortfolio,
+            ),
+        )
+        .expect("initialize a public portfolio");
+        let source = Pubkey::new_unique();
+        set_token(&mut svm, &source, &collateral, &owner.pubkey(), 0);
+        mint_coin(
+            &mut svm,
+            &payer,
+            &collateral,
+            &mint_authority,
+            &source,
+            2_000_000,
+        );
+        send(
+            &mut svm,
+            &[&payer, owner],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owner.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolio.pubkey(), false),
+                    AccountMeta::new(source, false),
+                    AccountMeta::new(vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::Deposit { amount: 2_000_000 },
+            ),
+        )
+        .expect("deposit independent collateral");
+    }
+
+    let position_q = percolator::POS_SCALE;
+    for long_index in 0..3 {
+        send(
+            &mut svm,
+            &[&payer, &owners[long_index], &owners[3]],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(owners[long_index].pubkey(), true),
+                    AccountMeta::new_readonly(owners[3].pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolios[long_index].pubkey(), false),
+                    AccountMeta::new(portfolios[3].pubkey(), false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 1,
+                    size_q: position_q as i128,
+                    exec_price: 1_000_000,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .expect("open one public fragment against the shared short");
+    }
+
+    let push_and_crank_short = |svm: &mut LiteSVM, slot: u64, mark_e6: u64| {
+        warp_to(svm, slot);
+        send(
+            svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 1,
+                    now_slot: slot,
+                    mark_e6,
+                },
+            ),
+        )
+        .expect("push a bounded authenticated mark");
+        send(
+            svm,
+            &[&cranker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(cranker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolios[3].pubkey(), false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: vec![percolator_prog::ix::CrankObservationHint {
+                        asset_index: 1,
+                        oracle_accounts: 0,
+                    }],
+                },
+            ),
+        )
+        .expect("refresh the maintenance-healthy short at the bounded mark");
+    };
+    push_and_crank_short(&mut svm, 101, 1_090_000);
+    push_and_crank_short(&mut svm, 102, 1_188_100);
+    push_and_crank_short(&mut svm, 103, 1_290_000);
+
+    let (_, live) =
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
+    assert_eq!(live.assets[1].oi_eff_long_q, 3 * position_q);
+    assert_eq!(live.assets[1].oi_eff_short_q, 3 * position_q);
+    let short_state = percolator_prog::state::read_portfolio(
+        &svm.get_account(&portfolios[3].pubkey()).unwrap().data,
+    )
+    .unwrap();
+    let short_health = short_state.health_cert.try_to_runtime().unwrap();
+    assert!(
+        short_health.certified_equity >= 0,
+        "the live short must retain positive equity before shutdown"
+    );
+    assert!(
+        short_health.certified_equity as u128 >= short_health.certified_maintenance_req,
+        "the live short must not be publicly liquidatable before shutdown"
+    );
+    assert!(
+        (short_health.certified_equity as u128) < short_health.certified_initial_req,
+        "the fragmented short must exercise the post-close initial-margin gate"
+    );
+
+    warp_to(&mut svm, 104);
+    send(
+        &mut svm,
+        &[&payer, &admin],
+        pix(
+            vec![
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            PIx::UpdateAssetLifecycle {
+                action: 3,
+                asset_index: 1,
+                now_slot: 104,
+                initial_price: 0,
+                insurance_authority: [0u8; 32],
+                insurance_operator: [0u8; 32],
+                backing_bucket_authority: [0u8; 32],
+                oracle_authority: [0u8; 32],
+            },
+        ),
+    )
+    .expect("governance starts asset 1's bounded shutdown");
+    warp_to(&mut svm, 106);
+
+    let mut first_force_close_error = None;
+    for long_index in 0..3 {
+        let market_before = svm.get_account(&market).unwrap();
+        let long_before = svm.get_account(&portfolios[long_index].pubkey()).unwrap();
+        let short_before = svm.get_account(&portfolios[3].pubkey()).unwrap();
+        let force_close = send(
+            &mut svm,
+            &[&cranker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(cranker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolios[long_index].pubkey(), false),
+                    AccountMeta::new(portfolios[3].pubkey(), false),
+                ],
+                PIx::ForceCloseAbandonedAsset {
+                    asset_index: 1,
+                    now_slot: 106,
+                    close_q: position_q,
+                },
+            ),
+        );
+        if let Err(error) = force_close {
+            assert_eq!(
+                svm.get_account(&market).unwrap(),
+                market_before,
+                "rejected force-close must roll the shared waterfall back"
+            );
+            assert_eq!(
+                svm.get_account(&portfolios[long_index].pubkey()).unwrap(),
+                long_before,
+                "rejected force-close must roll the selected long back"
+            );
+            assert_eq!(
+                svm.get_account(&portfolios[3].pubkey()).unwrap(),
+                short_before,
+                "rejected force-close must roll the fragmented short back"
+            );
+            first_force_close_error.get_or_insert(error);
+        }
+    }
+
+    if let Some(force_close_error) = first_force_close_error {
+        let market_before = svm.get_account(&market).unwrap();
+        let short_before = svm.get_account(&portfolios[3].pubkey()).unwrap();
+        let _keeper_crank = send(
+            &mut svm,
+            &[&cranker],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(cranker.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(portfolios[3].pubkey(), false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: 106,
+                    observations: vec![],
+                },
+            ),
+        );
+        assert_eq!(
+            svm.get_account(&market).unwrap(),
+            market_before,
+            "a recovery-mode keeper attempt must not advance the shared waterfall"
+        );
+        assert_eq!(
+            svm.get_account(&portfolios[3].pubkey()).unwrap(),
+            short_before,
+            "a recovery-mode keeper attempt must not mutate the fragmented short"
+        );
+
+        for long_index in 0..3 {
+            let market_before = svm.get_account(&market).unwrap();
+            let long_before = svm.get_account(&portfolios[long_index].pubkey()).unwrap();
+            let short_before = svm.get_account(&portfolios[3].pubkey()).unwrap();
+            assert!(
+                send(
+                    &mut svm,
+                    &[&payer, &owners[long_index], &owners[3]],
+                    pix(
+                        vec![
+                            AccountMeta::new_readonly(owners[long_index].pubkey(), true),
+                            AccountMeta::new_readonly(owners[3].pubkey(), true),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(portfolios[long_index].pubkey(), false),
+                            AccountMeta::new(portfolios[3].pubkey(), false),
+                        ],
+                        PIx::TradeNoCpi {
+                            asset_index: 1,
+                            size_q: -(position_q as i128),
+                            exec_price: 1_290_000,
+                            fee_bps: 0,
+                        },
+                    ),
+                )
+                .is_err(),
+                "even cooperating owners must not hide a working recovery route"
+            );
+            assert_eq!(svm.get_account(&market).unwrap(), market_before);
+            assert_eq!(
+                svm.get_account(&portfolios[long_index].pubkey()).unwrap(),
+                long_before
+            );
+            assert_eq!(
+                svm.get_account(&portfolios[3].pubkey()).unwrap(),
+                short_before
+            );
+        }
+
+        let far_slot = 10_000;
+        warp_to(&mut svm, far_slot);
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: far_slot,
+                    mark_e6: 1_000_000,
+                },
+            ),
+        )
+        .expect("keep the base oracle honestly fresh");
+        assert!(
+            send(
+                &mut svm,
+                &[&payer],
+                pix(
+                    vec![AccountMeta::new(market, false)],
+                    PIx::ResolveStalePermissionless { now_slot: far_slot },
+                ),
+            )
+            .is_err(),
+            "fresh asset 0 must keep whole-market stale resolution unavailable"
+        );
+        assert!(
+            send(
+                &mut svm,
+                &[&payer, &admin],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(admin.pubkey(), true),
+                        AccountMeta::new(market, false),
+                    ],
+                    PIx::RestartAssetOracle {
+                        asset_index: 1,
+                        now_slot: far_slot,
+                        initial_price: 1_000_000,
+                    },
+                ),
+            )
+            .is_err(),
+            "the occupied recovery slot must not be restartable"
+        );
+        let (_, stuck) =
+            percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
+        assert_eq!(stuck.assets[1].oi_eff_long_q, 3 * position_q);
+        assert_eq!(stuck.assets[1].oi_eff_short_q, 3 * position_q);
+        panic!(
+            "maintenance-healthy asset 1 stayed occupied after every fragmented force-close, \
+             owner reduction, keeper liquidation, fresh-base stale resolution, and restart \
+             failed: {force_close_error}"
+        );
+    }
+
+    let (_, closed) =
+        percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data).unwrap();
+    assert_eq!(closed.assets[1].oi_eff_long_q, 0);
+    assert_eq!(closed.assets[1].oi_eff_short_q, 0);
+}
+
 fn rewrite_book_layout(svm: &mut LiteSVM, book: &Pubkey, header: usize, slot_size: usize) {
     const CURRENT_HEADER: usize = 300;
     const CURRENT_SLOT_SIZE: usize = 178;
