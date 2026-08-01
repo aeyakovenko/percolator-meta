@@ -3162,10 +3162,13 @@ fn process_grant_genesis_pool<'a>(
 // market-authority update also rotates asset-0 roles that equal the outgoing key, but
 // it does not migrate secondary asset_admin roles. Accept only an asset-0-only market
 // or one whose secondary slots are all fully retired, with direct permissionless asset
-// append disabled; controller-governed secondary assets can then be activated after
-// the handoff. Funded asset-0 insurance owned by the outgoing raw key must exit before
-// donation; otherwise that key could withdraw its principal after handoff yet retain a
-// perpetual claim on later trade fees. Preserve only the recorded backing provider.
+// append disabled. The optional secondary base-unit mint must also be absent: deposits
+// enter only the primary vault, while resolved payouts may use either configured mint,
+// and this controller intentionally exposes no privileged par-swap operation.
+// Controller-governed secondary assets can then be activated after the handoff. Funded
+// asset-0 insurance owned by the outgoing raw key must exit before donation; otherwise
+// that key could withdraw its principal after handoff yet retain a perpetual claim on
+// later trade fees. Preserve only the recorded backing provider.
 // The market must still be live and have no materialized portfolio or user capital;
 // otherwise a withheld signature from a directly closed slab generation could capture
 // a funded replacement initialized at the same public key.
@@ -3213,6 +3216,9 @@ fn process_accept_market_authority<'a>(
         let market_data = market.try_borrow_data()?;
         if !percolator_accounting::all_secondary_assets_retired(&market_data)
             .map_err(|_| ProgramError::InvalidAccountData)?
+            || percolator_accounting::read_secondary_collateral_mint(&market_data)
+                .map_err(|_| ProgramError::InvalidAccountData)?
+                != [0u8; 32]
             || !percolator_accounting::market_is_live_before_portfolio_admission(&market_data)
                 .map_err(|_| ProgramError::InvalidAccountData)?
             || percolator_accounting::read_permissionless_market_init_fee(&market_data)
