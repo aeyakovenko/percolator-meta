@@ -585,13 +585,21 @@ cargo build-sbf --tools-version v1.52 --manifest-path distribution/Cargo.toml
 cargo build-sbf --tools-version v1.52 --manifest-path genesis-vote/Cargo.toml
 cargo build-sbf --tools-version v1.52 --manifest-path residual-distributor/Cargo.toml
 cargo build-sbf --tools-version v1.52 --manifest-path twap-program/Cargo.toml
+CARGO_TARGET_DIR="$PWD/target/auth-matcher-fixture" cargo build-sbf \
+  --tools-version v1.52 \
+  --manifest-path twap-program/tests/fixtures/auth-matcher/Cargo.toml \
+  --sbf-out-dir "$PWD/target/deploy"
 
-# Green Meta smoke suite. The separately named expected-red probe below exercises
-# a pinned Percolator liveness bug tracked by percolator-prog PR #270.
-cargo test --workspace -- --skip e2e_source_capacity_is_reserved_before_new_exposure
+# Green Meta smoke suite. The separately named expected-red probes below exercise
+# pinned Percolator bugs tracked by percolator-prog PRs #270 and #393.
+cargo test --workspace -- \
+  --skip e2e_source_capacity_is_reserved_before_new_exposure \
+  --skip e2e_revoked_matcher_retry_cannot_restore_lp_risk
 
 cargo test -p twap-program --test chain \
   e2e_source_capacity_is_reserved_before_new_exposure -- --exact
+cargo test -p twap-program --test chain \
+  e2e_revoked_matcher_retry_cannot_restore_lp_risk -- --exact
 
 # Full real-binary genesis, long/short funding, handoff, three TWAP rounds,
 # 50/50 buyback burn/reward routing, and cumulative 10/10/80 claims.
