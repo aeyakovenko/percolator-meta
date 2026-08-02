@@ -59541,8 +59541,7 @@ fn create_system_allocated_public_portfolio(
 // must absorb later spending before that independent owner's 50/50 principal is
 // impaired. Every Percolator market and portfolio below uses system allocation
 // followed by the pinned program's public initialization instructions.
-#[test]
-fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
+fn run_predeposit_protocol_insurance_cross_backing_loss(handoff_before_loss: bool) {
     use percolator_prog::ix::Instruction as PIx;
 
     const INITIAL_PRICE: u64 = 100;
@@ -59557,12 +59556,45 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
         .unwrap();
+    if handoff_before_loss {
+        svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+            .unwrap();
+    }
     let payer = Keypair::new();
     let admin = Keypair::new();
     let oracle = Keypair::new();
     for signer in [&payer, &admin, &oracle] {
         svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
     }
+    let governance = if handoff_before_loss {
+        let squads = squads_id();
+        let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+        let create_key = Keypair::new();
+        let multisig = multisig_pda(&squads, &create_key.pubkey());
+        let create_ix = multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&admin.pubkey()),
+            1,
+            &[(admin.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        );
+        let blockhash = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[create_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &create_key],
+            blockhash,
+        ))
+        .expect("initialize constrained Squads governance");
+        let squads_vault = vault_pda(&squads, &multisig, 0);
+        Some((squads, multisig, squads_vault))
+    } else {
+        None
+    };
     svm.set_sysvar(&Clock {
         slot: 100,
         unix_timestamp: 100,
@@ -59838,6 +59870,104 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
     .expect("independent owner deposits after the protocol buffer exists");
     assert_eq!(token_amount(&svm, &owner_destination), 0);
 
+    let twap_custody = if let Some((squads, multisig, squads_vault)) = governance.as_ref() {
+        let mut rotate_market_authority = Vec::new();
+        rotate_market_authority.push(2); // current admin + incoming Squads vault
+        rotate_market_authority.push(0); // both signers are read-only
+        rotate_market_authority.push(1); // market is writable
+        rotate_market_authority.push(4);
+        for key in [admin.pubkey(), *squads_vault, market, perc_id()] {
+            rotate_market_authority.extend_from_slice(key.as_ref());
+        }
+        rotate_market_authority.push(1);
+        rotate_market_authority.push(3); // Percolator program
+        rotate_market_authority.push(3);
+        rotate_market_authority.extend_from_slice(&[0, 1, 2]);
+        let rotate_data = PIx::UpdateAuthority {
+            new_pubkey: squads_vault.to_bytes(),
+        }
+        .encode();
+        rotate_market_authority.extend_from_slice(&(rotate_data.len() as u16).to_le_bytes());
+        rotate_market_authority.extend_from_slice(&rotate_data);
+        rotate_market_authority.push(0);
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            1,
+            &rotate_market_authority,
+            &[
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(*squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+        )
+        .expect("the current admin and Squads vault jointly rotate market governance");
+        send(
+            &mut svm,
+            &[&payer],
+            init_config_ix(
+                &payer.pubkey(),
+                &coin_mint,
+                &market,
+                multisig,
+                &admin.pubkey(),
+                &perc_id(),
+            ),
+        )
+        .expect("initialize the market-bound TWAP config");
+        let twap_config =
+            twap_config_pda(&market, multisig, &coin_mint, &perc_id());
+        let twap_authority =
+            Pubkey::find_program_address(&[b"market-0-twap", twap_config.as_ref()], &twap_id()).0;
+        let handoff = build_cross_backing_subledger_handoff_to_twap_message(
+            squads_vault,
+            &pool,
+            &market,
+            &twap_config,
+            &twap_authority,
+            &perc_id(),
+            &long_backing_ledger,
+            &short_backing_ledger,
+        );
+        let remaining = vec![
+            AccountMeta::new_readonly(*squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(twap_config, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(long_backing_ledger, false),
+            AccountMeta::new_readonly(short_backing_ledger, false),
+        ];
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            2,
+            &handoff,
+            &remaining,
+        )
+        .expect("governance hands the funded cross-backed pool to constrained TWAP custody");
+        let [nominal_owner_insurance, _] =
+            percolator_accounting::balanced_insurance_domains(u128::from(OWNER_PRINCIPAL));
+        assert_eq!(
+            read_reserved_floor(&svm, &twap_config),
+            nominal_owner_insurance,
+            "pre-deposit protocol insurance is not part of the owner-protected TWAP floor",
+        );
+        Some((twap_config, twap_authority, *squads_vault))
+    } else {
+        None
+    };
+
     let winner = Keypair::new();
     let loser = Keypair::new();
     let winner_portfolio = create_system_allocated_public_portfolio(
@@ -60030,18 +60160,37 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         !percolator_accounting::asset_has_position_or_loss_state(&market_data, 0).unwrap(),
         "bounded public cranks clear every exposure before owner withdrawal",
     );
-    send(
-        &mut svm,
-        &[&payer, &admin],
-        pix(
-            vec![
-                AccountMeta::new_readonly(admin.pubkey(), true),
+    if let Some((squads, multisig, squads_vault)) = governance.as_ref() {
+        let resolve = build_direct_resolve_message(squads_vault, &market, &perc_id());
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            3,
+            &resolve,
+            &[
+                AccountMeta::new_readonly(*squads_vault, false),
                 AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
             ],
-            PIx::ResolveMarket,
-        ),
-    )
-    .expect("the established lifecycle authority resolves the cleared market");
+        )
+        .expect("Squads resolves the cleared market through its constrained vault");
+    } else {
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ResolveMarket,
+            ),
+        )
+        .expect("the established lifecycle authority resolves the cleared market");
+    }
 
     let trader_destinations = [
         Pubkey::new_unique(),
@@ -60145,6 +60294,24 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         "the independent winner extracts a positive payout from the loss",
     );
 
+    if let Some((twap_config, twap_authority, squads_vault)) = twap_custody {
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_cross_backing_to_subledger_ix(
+                &squads_vault,
+                &pool,
+                &market,
+                &twap_config,
+                &twap_authority,
+                &perc_id(),
+                &long_backing_ledger,
+                &short_backing_ledger,
+            ),
+        )
+        .expect("any cranker returns resolved TWAP custody to the owner-bound pool");
+    }
+
     let owner_withdraw_data = subledger_insurance_withdraw_data(
         &svm,
         &owner_position,
@@ -60183,6 +60350,16 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         expected_payout,
         "pre-deposit protocol insurance must absorb insurance spending before owner principal",
     );
+}
+
+#[test]
+fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
+    run_predeposit_protocol_insurance_cross_backing_loss(false);
+}
+
+#[test]
+fn e2e_twap_recovery_preserves_cross_backing_predeposit_protocol_buffer() {
+    run_predeposit_protocol_insurance_cross_backing_loss(true);
 }
 
 // EXTERNAL-BACKING CAPTURE: a cross-backed genesis pool needs the backing role,
