@@ -374,11 +374,11 @@ makes this refresh monotonic, so post-epoch flow cannot mint points or dilute th
 At the inclusive end slot, funding-payer crystallization also supplies the allow-listed Percolator
 market read-only and succeeds only after every active portfolio leg is settled against a market asset
 advanced through that slot. Advancing the shared market through another portfolio cannot finalize a
-stale leg or shift the fixed reward between depositors. LP residual crystallization remains
-permissionless before the end slot, but the linked portfolio owner must sign its inclusive-end
-snapshot: an ordinary matched recovery can still increase the monotonic LP counter later in that
-same slot. The owner can atomically order its final recovery before crystallization; no cranker can
-lock an independent LP's denominator early.
+stale leg or shift the fixed reward between depositors. LP and trader residual crystallization
+remain permissionless before the end slot, but the linked portfolio owner must sign the
+inclusive-end snapshot: an ordinary matched recovery or realized loss can still increase a
+monotonic portfolio counter later in that same slot. The owner can atomically order final portfolio
+activity before crystallization; no cranker can lock an independent LP or trader denominator early.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads
