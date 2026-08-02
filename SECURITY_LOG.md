@@ -14727,3 +14727,35 @@ applied before the single final rounding. Fixed wrapper commit
 and 568 real-SBF LiteSVM tests pass, including hybrid, inversion, secondary-profile, liquidation-fee,
 and SPL-withdrawal paths. No instruction, account layout, signer, authority, amount, destination,
 custody route, or administrator surface was added.
+
+## Tick - predeposit protocol insurance was charged again to a later owner (surface B, REAL LOF)
+
+Cross-backed loss indexing treated every increase in Percolator's cumulative insurance-spent counter
+as owner loss. It did not distinguish protocol insurance already present before the owner deposited.
+An independent trader could therefore win against a live initialized market after unrelated public
+trades had funded enough protocol insurance to cover the complete insurance spend. The winner
+received a positive payout, but a later cross-backing owner recovered 27 of 29 atoms instead of the
+loss-adjusted 28: one backing atom was legitimately consumed and the same episode incorrectly
+charged another atom against owner insurance.
+
+The retained exact-parent LiteSVM regression system-allocates and publicly initializes the pinned
+Percolator market and every portfolio, produces protocol insurance through an unrelated 100%-fee
+round trip before the owner deposit, deposits 29 atoms with the canonical 50/50 split, moves the
+independent oracle from 100 to 301, and completes every recovery, resolution, settlement, and owner
+exit through public instructions. It proves the protocol buffer exceeds all insurance spending and
+the owner's nominal insurance remains physically present. Removing only the protocol-buffer
+subtraction reproduces the exact 27-versus-28 failure.
+
+FIX: current cross-backed pools reuse their existing serialized protected checkpoint as the physical
+insurance balance at owner actions and recovery/restart boundaries. A later spent-counter delta first
+consumes protocol insurance that was already present at that checkpoint; only the excess reduces the
+indexed owner claim. A protocol donation first observed with an existing loss remains surplus and
+cannot heal the realized owner haircut. Historical pools with no physical checkpoint retain the
+conservative prior treatment until a healthy synchronization establishes one.
+
+All 41 Subledger unit tests pass, including spent-counter generations, zero-payout share retirement,
+late donation, and historical/current layout coverage. The fresh public-chain regression and the
+existing re-handoff donation regression pass against Subledger SBF checksum
+`eea9d4e4e1ade9a8eb4dc22246b7c7655f475eea7e09b88b2db5f2fbc46e4d68`; pinned Percolator remains
+`74ce6b85576fcbcb7596fdc7a774ff92661853d50ca9eb9475fcba7b1b7f40a4`. No account growth,
+instruction, signer, authority, recipient, CPI, custody route, or administrator surface was added.
