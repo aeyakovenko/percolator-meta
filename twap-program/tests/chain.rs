@@ -43,6 +43,7 @@ enum PoolRestartScenario {
     StaleTwapTradeFeePolicyOrder,
     PredepositProtocolInsurance,
     PredepositProtocolInsurancePulledBeforeLoss,
+    PredecessorPredepositProtocolInsurancePulledBeforeLoss,
 }
 
 #[test]
@@ -138,6 +139,13 @@ fn e2e_twap_pull_cannot_make_late_fees_restore_lost_ordinary_principal() {
     );
 }
 
+#[test]
+fn probe_predecessor_ordinary_twap_pull_cannot_turn_late_fee_into_owner_recovery() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -161,8 +169,13 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleTwapTradeFeePolicyOrder;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
-    let twap_pulls_predeposit_before_loss =
-        scenario == PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss;
+    let predecessor_pool_layout =
+        scenario == PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss;
+    let twap_pulls_predeposit_before_loss = matches!(
+        scenario,
+        PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss
+            | PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss
+    );
     let predeposit_protocol_insurance = scenario == PoolRestartScenario::PredepositProtocolInsurance
         || twap_pulls_predeposit_before_loss;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -680,6 +693,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             owner_principal as u128
         },
     );
+    if predecessor_pool_layout {
+        // Model the deployed 329-byte custody layout across a program upgrade.
+        // It stores the one-shot grant slot at bytes 321..329 and has no
+        // appended loss checkpoints.
+        let mut predecessor = svm.get_account(&pool).unwrap();
+        assert_eq!(predecessor.data.len(), 361);
+        let grant_slot = predecessor.data[353..361].to_vec();
+        predecessor.data[321..329].copy_from_slice(&grant_slot);
+        predecessor.data.truncate(329);
+        svm.set_account(pool, predecessor).unwrap();
+    }
 
     if stale_twap_trade_fee_order {
         const STALE_FEE_BPS: u64 = 50;
