@@ -556,11 +556,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         let stale_floor = percolator::MAX_VAULT_TVL
             .checked_add(1)
             .expect("unreachable floor");
-        let remaining = vec![
-            AccountMeta::new_readonly(squads_vault, false),
-            AccountMeta::new(twap_cfg, false),
-            AccountMeta::new_readonly(twap_id(), false),
-        ];
+        let remaining = set_reserved_floor_remaining_accounts(&squads_vault, &twap_cfg);
         let queue = |svm: &mut LiteSVM, index: u64, message: Vec<u8>| {
             let transaction = transaction_pda(&squads, &multisig, index);
             let proposal = proposal_pda(&squads, &multisig, index);
@@ -585,16 +581,16 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             }
             (transaction, proposal)
         };
-        let (stale_transaction, stale_proposal) = queue(
-            &mut svm,
-            3,
-            build_set_reserved_floor_message(&squads_vault, &twap_cfg, stale_floor),
-        );
-        let (correction_transaction, correction_proposal) = queue(
-            &mut svm,
-            4,
-            build_set_reserved_floor_message(&squads_vault, &twap_cfg, corrected_floor),
-        );
+        let stale_message =
+            build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, stale_floor);
+        let correction_message =
+            build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, corrected_floor);
+        let legacy_message =
+            build_unsequenced_set_reserved_floor_message(&squads_vault, &twap_cfg, stale_floor);
+        let (stale_transaction, stale_proposal) = queue(&mut svm, 3, stale_message);
+        let (correction_transaction, correction_proposal) =
+            queue(&mut svm, 4, correction_message);
+        let (legacy_transaction, legacy_proposal) = queue(&mut svm, 5, legacy_message);
         let mut clock = svm.get_sysvar::<Clock>();
         clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
         svm.set_sysvar(&clock);
@@ -626,6 +622,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         );
         if stale_replay.is_ok() {
             let repair = build_set_reserved_floor_message(
+                &svm,
                 &squads_vault,
                 &twap_cfg,
                 corrected_floor,
@@ -637,7 +634,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                     &multisig,
                     &dao,
                     &payer,
-                    5,
+                    6,
                     &repair,
                     &remaining,
                 )
@@ -653,6 +650,32 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             svm.get_account(&twap_cfg).unwrap(),
             config_after_correction,
             "a rejected stale floor policy leaves the config byte-identical",
+        );
+        let legacy_remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        assert!(
+            send(
+                &mut svm,
+                &[&dao],
+                vault_transaction_execute_ix(
+                    &squads,
+                    &multisig,
+                    &legacy_proposal,
+                    &legacy_transaction,
+                    &dao.pubkey(),
+                    &legacy_remaining,
+                ),
+            )
+            .is_err(),
+            "legacy unsequenced floor policies cannot bypass the watermark",
+        );
+        assert_eq!(
+            svm.get_account(&twap_cfg).unwrap(),
+            config_after_correction,
+            "a rejected legacy floor policy leaves the config byte-identical",
         );
         return;
     }
@@ -2950,7 +2973,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         if absent_owner_buyback {
             let protected_floor = u128::from(owner_principal) + 1;
             let protect_retained_buffer =
-                build_set_reserved_floor_message(&squads_vault, &twap_cfg, protected_floor);
+                build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, protected_floor);
             let protect_remaining = vec![
                 AccountMeta::new_readonly(squads_vault, false),
                 AccountMeta::new(twap_cfg, false),
@@ -12643,6 +12666,21 @@ fn legacy_transaction_wire_size(transaction: &Transaction) -> usize {
     short_vec_len + signature_count * 64 + transaction.message.serialize().len()
 }
 
+fn set_reserved_floor_message_config(message: &[u8]) -> Option<Pubkey> {
+    if message.len() != 199
+        || message[..4] != [1, 1, 2, 5]
+        || message[164..171] != [1, 4, 4, 0, 1, 2, 3]
+        || u16::from_le_bytes(message[171..173].try_into().ok()?) != 25
+        || message[173] != 4
+        || message[198] != 0
+    {
+        return None;
+    }
+    Some(Pubkey::new_from_array(
+        message[36..68].try_into().ok()?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn squads_execute(
     svm: &mut LiteSVM,
@@ -12670,6 +12708,9 @@ fn squads_execute(
         )
         .map_err(|error| format!("{error:?}"))?;
     }
+    let floor_remaining = set_reserved_floor_message_config(message)
+        .map(|config| set_reserved_floor_remaining_accounts(&vault, &config));
+    let remaining = floor_remaining.as_deref().unwrap_or(remaining);
     let transaction = transaction_pda(squads, multisig, idx);
     let proposal = proposal_pda(squads, multisig, idx);
     let mut send = |svm: &mut LiteSVM, ix: Instruction| -> Result<(), String> {
@@ -22789,27 +22830,83 @@ fn build_configure_ewma_mark_message(
     m
 }
 
+fn policy_nonce_value(svm: &LiteSVM, config: &Pubkey, policy_tag: u8) -> u64 {
+    let nonce = twap_program::policy_nonce_address(config, policy_tag).0;
+    svm.get_account(&nonce).map_or(0, |account| {
+        u64::from_le_bytes(account.data[48..56].try_into().unwrap())
+    })
+}
+
+fn set_reserved_floor_remaining_accounts(
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+) -> Vec<AccountMeta> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 4).0;
+    vec![
+        AccountMeta::new(*squads_vault, false),
+        AccountMeta::new(*config, false),
+        AccountMeta::new(policy_nonce, false),
+        AccountMeta::new_readonly(system_program::ID, false),
+        AccountMeta::new_readonly(twap_id(), false),
+    ]
+}
+
 // Squads message wrapping twap.set_reserved_floor (tag 4) — the DAO sets the surplus floor
-// (reserved depositor principal) via the timelock. Accounts: [squads_vault(signer), config(w)].
+// (reserved depositor principal) via the timelock. The policy nonce makes independently approved
+// floor actions consume one total order, including no-op corrections.
 fn build_set_reserved_floor_message(
+    svm: &LiteSVM,
+    squads_vault: &Pubkey,
+    config: &Pubkey,
+    floor: u128,
+) -> Vec<u8> {
+    let policy_nonce = twap_program::policy_nonce_address(config, 4).0;
+    let expected_policy_nonce = policy_nonce_value(svm, config, 4);
+    let mut m = Vec::new();
+    m.push(1); // num_signers
+    m.push(1); // num_writable_signers (squads_vault pays nonce rent)
+    m.push(2); // num_writable_non_signers (config, policy_nonce)
+    m.push(5); // account_keys
+    m.extend_from_slice(squads_vault.as_ref()); // 0 signer, writable
+    m.extend_from_slice(config.as_ref()); // 1 w
+    m.extend_from_slice(policy_nonce.as_ref()); // 2 w
+    m.extend_from_slice(system_program::ID.as_ref()); // 3
+    m.extend_from_slice(twap_id().as_ref()); // 4 program
+    m.push(1); // instructions
+    m.push(4); // program_id_index -> twap
+    m.push(4); // account_indexes: squads_vault, config, policy_nonce, system
+    m.push(0);
+    m.push(1);
+    m.push(2);
+    m.push(3);
+    let mut data = vec![4u8]; // IX_SET_RESERVED_FLOOR
+    data.extend_from_slice(&floor.to_le_bytes());
+    data.extend_from_slice(&expected_policy_nonce.to_le_bytes());
+    m.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    m.extend_from_slice(&data);
+    m.push(0);
+    m
+}
+
+fn build_unsequenced_set_reserved_floor_message(
     squads_vault: &Pubkey,
     config: &Pubkey,
     floor: u128,
 ) -> Vec<u8> {
     let mut m = Vec::new();
-    m.push(1); // num_signers
-    m.push(0); // num_writable_signers
-    m.push(1); // num_writable_non_signers (config)
-    m.push(3); // account_keys
-    m.extend_from_slice(squads_vault.as_ref()); // 0 signer
-    m.extend_from_slice(config.as_ref()); // 1 w
-    m.extend_from_slice(twap_id().as_ref()); // 2 program
-    m.push(1); // instructions
-    m.push(2); // program_id_index -> twap
-    m.push(2); // account_indexes: squads_vault, config
+    m.push(1);
     m.push(0);
     m.push(1);
-    let mut data = vec![4u8]; // IX_SET_RESERVED_FLOOR
+    m.push(3);
+    m.extend_from_slice(squads_vault.as_ref());
+    m.extend_from_slice(config.as_ref());
+    m.extend_from_slice(twap_id().as_ref());
+    m.push(1);
+    m.push(2);
+    m.push(2);
+    m.push(0);
+    m.push(1);
+    let mut data = vec![4u8];
     data.extend_from_slice(&floor.to_le_bytes());
     m.extend_from_slice(&(data.len() as u16).to_le_bytes());
     m.extend_from_slice(&data);
@@ -23812,7 +23909,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     // ATTACK: governance pre-arms the one-time floor setter with zero. The
     // custody transition must derive its floor from the owner-bound pool rather
     // than trusting this first-write value.
-    let zero_floor = build_set_reserved_floor_message(&squads_vault, &twap_cfg, 0);
+    let zero_floor = build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, 0);
     let zero_floor_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -23913,7 +24010,8 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
     .expect("permissionless fee-surplus donation");
 
     let buffered_floor = (amount - 1) as u128 + protected_buffer;
-    let buffer_msg = build_set_reserved_floor_message(&squads_vault, &twap_cfg, buffered_floor);
+    let buffer_msg =
+        build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, buffered_floor);
     let buffer_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -24473,7 +24571,8 @@ fn e2e_post_handoff_deposit_blocked_by_authority_revoke() {
     ];
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 3, &op, &or)
         .expect("operator -> twap");
-    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fm =
+        build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, principal as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -25013,10 +25112,10 @@ fn setup_handoff_with_mint_mode(
 
     let principal = 1_000_000u64;
     let surplus = 500_000u64;
-    // Preserve historical Squads transaction indexes without advancing a live policy sequence.
-    // Reaffirming the pre-handoff MAX floor is harmless because no insurance is funded yet.
+    // Preserve historical Squads transaction indexes. Reaffirming the pre-handoff MAX floor is
+    // harmless because no insurance is funded yet, but still consumes the common floor order.
     let preliminary_policy =
-        build_set_reserved_floor_message(&squads_vault, &twap_cfg, u128::MAX);
+        build_set_reserved_floor_message(svm, &squads_vault, &twap_cfg, u128::MAX);
     let preliminary_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -25035,7 +25134,7 @@ fn setup_handoff_with_mint_mode(
     .expect("empty-market policy setup");
     // Index 2 was the retired Percolator insurance-policy call. Keep the slot with the same
     // pre-handoff floor reaffirmation so downstream fixtures retain their transaction indexes.
-    let pol = build_set_reserved_floor_message(&squads_vault, &twap_cfg, u128::MAX);
+    let pol = build_set_reserved_floor_message(svm, &squads_vault, &twap_cfg, u128::MAX);
     let pr = preliminary_remaining.clone();
     squads_execute(svm, &squads, &multisig, &dao, payer, 2, &pol, &pr)
         .expect("dao reconfigure (obsolete policy step)");
@@ -25096,7 +25195,8 @@ fn setup_handoff_with_mint_mode(
         ),
     )
     .expect("fund constrained TWAP insurance through inbound donation");
-    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fm =
+        build_set_reserved_floor_message(svm, &squads_vault, &twap_cfg, principal as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -26277,7 +26377,8 @@ fn execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator() {
     squads_execute(&mut svm, &squads, &multisig, &dao, &payer, 1, &topup, &tr)
         .expect("fund insurance");
     // Set a LOW floor (= principal) so surplus = 500_000 > 0 — but DELIBERATELY skip accept_operator.
-    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, principal as u128);
+    let fm =
+        build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, principal as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -35459,7 +35560,7 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
     ];
     for transaction_index in 3..=4 {
         let message =
-            build_set_reserved_floor_message(&squads_vault, &twap_cfg, u128::MAX);
+            build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, u128::MAX);
         squads_execute(
             svm,
             &squads,
@@ -39103,7 +39204,12 @@ fn e2e_full_genesis_to_buy_burn() {
     // insurance floor therefore protects the complementary half, not the full bond.
     let insurance_floor = principal / 2;
     let floor_msg =
-        build_set_reserved_floor_message(&squads_vault, &twap_cfg, insurance_floor as u128);
+        build_set_reserved_floor_message(
+            &svm,
+            &squads_vault,
+            &twap_cfg,
+            insurance_floor as u128,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -43019,7 +43125,12 @@ fn e2e_uniform_repricing_reconsiders_a_bid_excluded_at_a_provisional_marginal() 
     // is exercised without fabricating Percolator accounting.
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -43193,7 +43304,12 @@ fn e2e_uniform_repricing_maximizes_an_allocated_bid_at_equal_usd() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -43366,7 +43482,12 @@ fn e2e_uniform_repricing_reallocates_budget_to_a_skipped_priority_bid() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -43540,7 +43661,12 @@ fn e2e_uniform_repricing_maximizes_coin_at_equal_usd() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -43717,7 +43843,12 @@ fn e2e_uniform_repricing_uses_a_safe_exact_marginal_lot() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -43938,7 +44069,12 @@ fn e2e_uniform_repricing_uses_a_safe_interior_price_lot() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -44161,7 +44297,12 @@ fn e2e_uniform_repricing_finds_a_safe_off_ray_interior_lot() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -44674,6 +44815,7 @@ fn e2e_uniform_repricing_cascade_is_compute_bounded_and_conserves_escrow() {
     // exact seven-unit auction budget without fabricating Percolator accounting.
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message = build_set_reserved_floor_message(
+        &svm,
         &env.squads_vault,
         &env.twap_cfg,
         live_insurance,
@@ -46725,7 +46867,12 @@ fn e2e_full_book_of_max_scale_interior_rates_cannot_dos_execute() {
 
     let live_insurance = read_asset0_insurance(&svm, &env.slab);
     let floor_message =
-        build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, live_insurance);
+        build_set_reserved_floor_message(
+            &svm,
+            &env.squads_vault,
+            &env.twap_cfg,
+            live_insurance,
+        );
     let floor_remaining = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -47206,6 +47353,7 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
 
     let one_atom_surplus_floor = env.principal + env.surplus - 1;
     let floor = build_set_reserved_floor_message(
+        &svm,
         &env.squads_vault,
         &env.twap_cfg,
         one_atom_surplus_floor as u128,
@@ -47262,6 +47410,7 @@ fn e2e_permissionless_rounds_preserve_cumulative_surplus_split() {
     // entitlement without pulling from either principal domain.
     let impaired_floor = (one_atom_surplus_floor + 2) as u128;
     let impair = build_set_reserved_floor_message(
+        &svm,
         &env.squads_vault,
         &env.twap_cfg,
         impaired_floor,
@@ -49997,7 +50146,7 @@ fn e2e_parasite_config_on_same_market_cannot_drain_insurance() {
     .expect("config-A inits its book");
 
     // config-A sets its OWN reserved_floor to 0 (bypassing config-B's 1M principal floor).
-    let fm = build_set_reserved_floor_message(&vault_a, &config_a, 0);
+    let fm = build_set_reserved_floor_message(&svm, &vault_a, &config_a, 0);
     let fr = vec![
         AccountMeta::new_readonly(vault_a, false),
         AccountMeta::new(config_a, false),
@@ -53732,7 +53881,8 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         token_amount(&svm, &perc_vault),
         vault_before_surplus + surplus,
     );
-    let fm = build_set_reserved_floor_message(&squads_vault, &twap_cfg, amount as u128);
+    let fm =
+        build_set_reserved_floor_message(&svm, &squads_vault, &twap_cfg, amount as u128);
     let fr = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(twap_cfg, false),
@@ -56727,7 +56877,8 @@ fn dao_cannot_lower_the_surplus_floor_to_drain_principal() {
 
     // The DAO, via a timelock'd Squads execute, tries to LOWER the floor to 1 (re-opening the drain of
     // the now-locked depositor principal). Must be rejected -> floor unchanged.
-    let fm = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 1u128);
+    let fm =
+        build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, 1u128);
     let fr = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -56751,7 +56902,12 @@ fn dao_cannot_lower_the_surplus_floor_to_drain_principal() {
     );
 
     // Non-tautology: the DAO CAN still RAISE the floor (more protection) — the guard is monotonic-up, not frozen.
-    let fm2 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, floor0 + 500_000);
+    let fm2 = build_set_reserved_floor_message(
+        &svm,
+        &env.squads_vault,
+        &env.twap_cfg,
+        floor0 + 500_000,
+    );
     let fr2 = vec![
         AccountMeta::new_readonly(env.squads_vault, false),
         AccountMeta::new(env.twap_cfg, false),
@@ -56812,7 +56968,8 @@ fn dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity() {
 
     // ATTACK step 1: raise the REAL floor back to the u128::MAX unset sentinel. Must be REJECTED — re-arming the
     // sentinel is what re-enables the unbounded lower below.
-    let m1 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, u128::MAX);
+    let m1 =
+        build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, u128::MAX);
     assert!(squads_execute(&mut svm, &env.squads, &env.multisig, &env.dao, &payer, 5, &m1, &fr()).is_err(),
         "raising a real floor back to the u128::MAX sentinel must be rejected (no re-arm of the monotonicity bypass)");
     assert_eq!(
@@ -56822,7 +56979,12 @@ fn dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity() {
     );
 
     // CONTROL: the DAO CAN still raise to a high REAL value (pause pulls: surplus saturates to 0) — just not MAX.
-    let m2 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, u128::MAX - 1);
+    let m2 = build_set_reserved_floor_message(
+        &svm,
+        &env.squads_vault,
+        &env.twap_cfg,
+        u128::MAX - 1,
+    );
     squads_execute(
         &mut svm,
         &env.squads,
@@ -56841,7 +57003,8 @@ fn dao_cannot_re_arm_the_max_sentinel_to_bypass_the_floor_monotonicity() {
     );
 
     // ATTACK step 2: now try to LOWER from that high real value to 1 (the drain). Monotonic holds -> rejected.
-    let m3 = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 1u128);
+    let m3 =
+        build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, 1u128);
     assert!(
         squads_execute(
             &mut svm,
@@ -67616,7 +67779,7 @@ fn run_stale_coin_sink_after_correction(correction_burns: bool) {
     .expect("independent donor funds canonical protocol insurance");
     assert_eq!(read_asset0_insurance(&svm, &env.slab), u128::from(donated));
 
-    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    let floor = build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, 0);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -67936,7 +68099,7 @@ fn e2e_stale_shutdown_cannot_sweep_collateral_refilled_after_a_correction() {
     )
     .expect("the first independent donor funds canonical insurance");
 
-    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    let floor = build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, 0);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -68285,7 +68448,7 @@ fn run_stale_buyback_economics_after_correction(correction_buyback_bps: u16) {
         ),
     )
     .expect("an independent donor funds canonical protocol insurance");
-    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    let floor = build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, 0);
     squads_execute(
         &mut svm,
         &env.squads,
@@ -68613,7 +68776,7 @@ fn run_stale_auction_share_after_correction(
         ),
     )
     .expect("an independent donor funds canonical protocol insurance");
-    let floor = build_set_reserved_floor_message(&env.squads_vault, &env.twap_cfg, 0);
+    let floor = build_set_reserved_floor_message(&svm, &env.squads_vault, &env.twap_cfg, 0);
     squads_execute(
         &mut svm,
         &env.squads,
