@@ -57254,6 +57254,7 @@ enum OrganicRewardCleanup {
     OwnerReinitializeBeforeCrystallize,
     OwnerCloseAfterRecovery,
     OwnerCloseDilutesHonestTrader,
+    OwnerReplacementDilutesHonestTrader,
     OwnerReinitializeAfterRecovery,
     PublicRematerializeLpAfterClose,
 }
@@ -57265,10 +57266,17 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         cleanup,
         OrganicRewardCleanup::OwnerCloseAfterRecovery
             | OrganicRewardCleanup::OwnerCloseDilutesHonestTrader
+            | OrganicRewardCleanup::OwnerReplacementDilutesHonestTrader
             | OrganicRewardCleanup::OwnerReinitializeAfterRecovery
             | OrganicRewardCleanup::PublicRematerializeLpAfterClose
     );
-    let honest_cotrader = cleanup == OrganicRewardCleanup::OwnerCloseDilutesHonestTrader;
+    let honest_cotrader = matches!(
+        cleanup,
+        OrganicRewardCleanup::OwnerCloseDilutesHonestTrader
+            | OrganicRewardCleanup::OwnerReplacementDilutesHonestTrader
+    );
+    let owner_reinitialize_before_finalize =
+        cleanup == OrganicRewardCleanup::OwnerReplacementDilutesHonestTrader;
     let public_rematerialize_lp =
         cleanup == OrganicRewardCleanup::PublicRematerializeLpAfterClose;
     let owner_reinitialize_after_recovery =
@@ -58444,7 +58452,10 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             ],
             PIx::ClosePortfolio,
         );
-        if owner_reinitialize_after_recovery || public_rematerialize_lp {
+        if owner_reinitialize_after_recovery
+            || owner_reinitialize_before_finalize
+            || public_rematerialize_lp
+        {
             svm.expire_blockhash();
             let bh = svm.latest_blockhash();
             svm.send_transaction(Transaction::new_signed_with_payer(
@@ -58474,6 +58485,34 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             svm.get_account(&reward_archive).is_none(),
             "a direct Percolator owner close cannot create the controller archive"
         );
+        if owner_reinitialize_before_finalize {
+            send(
+                &mut svm,
+                &[&loser],
+                pix(
+                    vec![
+                        AccountMeta::new(loser.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(loser_pf, false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("the owner replaces the closed witness before finalization");
+            assert!(
+                percolator_prog::state::read_portfolio_id(
+                    &svm.get_account(&loser_pf).unwrap().data,
+                )
+                .unwrap()
+                    > registered_loser_portfolio_id,
+                "the replacement has a distinct market-owned incarnation ID"
+            );
+            assert_eq!(
+                read_portfolio_crystallized(&svm, &loser_pf),
+                0,
+                "the replacement carries no authenticated old reward counters"
+            );
+        }
         if honest_cotrader {
             svm.set_sysvar(&Clock {
                 slot: 550,
@@ -59185,6 +59224,13 @@ fn e2e_owner_close_cannot_bypass_trader_live_cap_after_organic_recovery() {
 fn e2e_owner_close_finalization_preserves_honest_trader_reward_after_organic_recovery() {
     run_organic_pnl_loss_real_trade_feeds_reward_cohort(
         OrganicRewardCleanup::OwnerCloseDilutesHonestTrader,
+    );
+}
+
+#[test]
+fn e2e_owner_replacement_finalization_preserves_honest_trader_reward() {
+    run_organic_pnl_loss_real_trade_feeds_reward_cohort(
+        OrganicRewardCleanup::OwnerReplacementDilutesHonestTrader,
     );
 }
 
