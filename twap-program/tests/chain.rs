@@ -53215,6 +53215,670 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_lp_recovery() {
     );
 }
 
+// PUBLIC REWARD LOF PROBE: trader crystallization is permissionless, but a
+// portfolio's monotonic crystallized-loss counter can still advance in the
+// inclusive reward end slot. A co-staker must not be able to snapshot a victim
+// before two equal final-slot losses, snapshot itself afterward, and transfer
+// fixed reward COIN while every Percolator collateral outcome remains unchanged.
+#[test]
+fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_trader_loss() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const OPEN_SLOT: u64 = 1;
+    const EMISSION_END: u64 = 5;
+    const FINALIZE_WINDOW: u64 = 3;
+    const DEPOSIT: u64 = 1_000_000;
+    const REWARD_SUPPLY: u64 = 1_000_000;
+
+    #[derive(Debug)]
+    struct Outcome {
+        early_snapshot_landed: bool,
+        post_window_refresh_landed: bool,
+        victim_points: u128,
+        beneficiary_points: u128,
+        victim_points_after_refresh: u128,
+        victim_loss: u128,
+        beneficiary_loss: u128,
+        victim_reward: u64,
+        beneficiary_reward: u64,
+        reward_vault: u64,
+        capitals: [u128; 4],
+        pnls: [i128; 4],
+        backing: [u128; 3],
+        collateral_vault: u64,
+    }
+
+    fn stake_points(svm: &LiteSVM, stake: &Pubkey) -> u128 {
+        let account = svm.get_account(stake).expect("trader stake");
+        u128::from_le_bytes(account.data[176..192].try_into().unwrap())
+    }
+
+    fn portfolio_financials(svm: &LiteSVM, portfolio: &Pubkey) -> (u128, i128) {
+        let account = svm.get_account(portfolio).expect("live portfolio");
+        let state = percolator_prog::state::read_portfolio(&account.data).unwrap();
+        (state.capital.get(), state.pnl.get())
+    }
+
+    fn run(crystallize_victim_before_loss: bool) -> Outcome {
+        let mut svm = LiteSVM::new().with_compute_budget(
+            solana_program_runtime::compute_budget::ComputeBudget {
+                compute_unit_limit: 1_400_000,
+                heap_size: 256 * 1024,
+                ..solana_program_runtime::compute_budget::ComputeBudget::default()
+            },
+        );
+        svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+        svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+
+        let payer = Keypair::new();
+        let creator = Keypair::new();
+        let oracle = Keypair::new();
+        let victim_winner = Keypair::new();
+        let beneficiary_winner = Keypair::new();
+        let victim = Keypair::new();
+        let beneficiary = Keypair::new();
+        for signer in [
+            &payer,
+            &creator,
+            &oracle,
+            &victim_winner,
+            &beneficiary_winner,
+            &victim,
+            &beneficiary,
+        ] {
+            svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+        }
+        warp_to(&mut svm, OPEN_SLOT);
+
+        let collateral_authority = Keypair::new();
+        let collateral_mint =
+            create_real_mint(&mut svm, &payer, &collateral_authority.pubkey());
+        let market_signer = Keypair::new();
+        let market = market_signer.pubkey();
+        let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+        let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+        send(
+            &mut svm,
+            &[&payer, &market_signer],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &market,
+                market_rent,
+                market_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("publicly allocate the loss market");
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(collateral_mint, false),
+                ],
+                PIx::InitMarket {
+                    max_portfolio_assets: 1,
+                    h_min: 0,
+                    h_max: 10,
+                    initial_price: 1_000,
+                    min_nonzero_mm_req: 1,
+                    min_nonzero_im_req: 2,
+                    maintenance_margin_bps: 10_000,
+                    initial_margin_bps: 10_000,
+                    max_trading_fee_bps: 10_000,
+                    trade_fee_base_bps: 0,
+                    liquidation_fee_bps: 0,
+                    liquidation_fee_cap: 0,
+                    min_liquidation_abs: 0,
+                    max_price_move_bps_per_slot: 10_000,
+                    max_accrual_dt_slots: 1,
+                    max_abs_funding_e9_per_slot: 0,
+                    min_funding_lifetime_slots: 1,
+                    max_account_b_settlement_chunks: 1,
+                    max_bankrupt_close_chunks: 1,
+                    max_bankrupt_close_lifetime_slots: 100,
+                    public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                    maintenance_fee_per_slot: 0,
+                },
+            ),
+        )
+        .expect("publicly initialize the loss market");
+        send(
+            &mut svm,
+            &[&payer, &creator, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind: 4,
+                    new_pubkey: oracle.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("separate the market oracle authority");
+        send(
+            &mut svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: OPEN_SLOT,
+                    initial_mark_e6: 1_000,
+                },
+            ),
+        )
+        .expect("configure the authenticated loss mark");
+        warp_to(&mut svm, OPEN_SLOT + 1);
+
+        let vault_authority = perc_vault_authority(&market, &perc_id());
+        let collateral_vault =
+            canonical_insurance_vault(&vault_authority, &collateral_mint);
+        set_token(
+            &mut svm,
+            &collateral_vault,
+            &collateral_mint,
+            &vault_authority,
+            0,
+        );
+        let provider_source = canonical_insurance_vault(&creator.pubkey(), &collateral_mint);
+        set_token(
+            &mut svm,
+            &provider_source,
+            &collateral_mint,
+            &creator.pubkey(),
+            1,
+        );
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(provider_source, false),
+                    AccountMeta::new(collateral_vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+                PIx::TopUpBackingBucket {
+                    domain: 0,
+                    amount: 1,
+                    expiry_slot: 100,
+                },
+            ),
+        )
+        .expect("external provider deposits one backing atom");
+
+        let reward_authority = Keypair::new();
+        let reward_mint =
+            create_real_mint(&mut svm, &payer, &reward_authority.pubkey());
+        let reward_config = rd_epoch_config_pda(&payer.pubkey(), &reward_mint, 1);
+        let reward_vault = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &reward_vault,
+            &reward_mint,
+            &reward_config,
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &reward_authority],
+            spl_token::instruction::mint_to(
+                &spl_token::ID,
+                &reward_mint,
+                &reward_vault,
+                &reward_authority.pubkey(),
+                &[],
+                REWARD_SUPPLY,
+            )
+            .unwrap(),
+        )
+        .expect("fund the fixed reward vault");
+        send(
+            &mut svm,
+            &[&payer],
+            rd_epoch_init_ix(
+                &payer.pubkey(),
+                &payer.pubkey(),
+                &reward_mint,
+                &perc_id(),
+                &sub_id(),
+                &reward_config,
+                &reward_vault,
+                1,
+                OPEN_SLOT + 1,
+                EMISSION_END,
+                REWARD_SUPPLY,
+                0,
+                0,
+                0,
+                0,
+                FINALIZE_WINDOW,
+                0,
+                &[(market, Pubkey::default(), Pubkey::default())],
+            ),
+        )
+        .expect("initialize the trader-only reward epoch");
+        send(
+            &mut svm,
+            &[&payer, &reward_authority],
+            spl_token::instruction::set_authority(
+                &spl_token::ID,
+                &reward_mint,
+                None,
+                spl_token::instruction::AuthorityType::MintTokens,
+                &reward_authority.pubkey(),
+                &[],
+            )
+            .unwrap(),
+        )
+        .expect("fix the reward supply");
+
+        let victim_winner_portfolio = Keypair::new();
+        let beneficiary_winner_portfolio = Keypair::new();
+        let victim_portfolio = Keypair::new();
+        let beneficiary_portfolio = Keypair::new();
+        let portfolio_len =
+            percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
+        let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+        for (owner, portfolio) in [
+            (&victim_winner, &victim_winner_portfolio),
+            (&beneficiary_winner, &beneficiary_winner_portfolio),
+            (&victim, &victim_portfolio),
+            (&beneficiary, &beneficiary_portfolio),
+        ] {
+            send(
+                &mut svm,
+                &[&payer, portfolio],
+                solana_sdk::system_instruction::create_account(
+                    &payer.pubkey(),
+                    &portfolio.pubkey(),
+                    portfolio_rent,
+                    portfolio_len as u64,
+                    &perc_id(),
+                ),
+            )
+            .expect("publicly allocate a portfolio");
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("publicly initialize a portfolio");
+            let source = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &source,
+                &collateral_mint,
+                &owner.pubkey(),
+                DEPOSIT,
+            );
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(collateral_vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit {
+                        amount: u128::from(DEPOSIT),
+                    },
+                ),
+            )
+            .expect("deposit collateral into the public portfolio");
+        }
+
+        for (owner, portfolio) in [
+            (&victim, &victim_portfolio),
+            (&beneficiary, &beneficiary_portfolio),
+        ] {
+            send(
+                &mut svm,
+                &[&payer, owner],
+                rd_register_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &owner.pubkey(),
+                    &owner.pubkey(),
+                    &market,
+                    &portfolio.pubkey(),
+                    3,
+                ),
+            )
+            .expect("register an independent trader beneficiary");
+        }
+
+        let position_size = -((percolator::POS_SCALE / 2) as i128);
+        for (winner, winner_portfolio, loser, loser_portfolio) in [
+            (
+                &victim_winner,
+                &victim_winner_portfolio,
+                &victim,
+                &victim_portfolio,
+            ),
+            (
+                &beneficiary_winner,
+                &beneficiary_winner_portfolio,
+                &beneficiary,
+                &beneficiary_portfolio,
+            ),
+        ] {
+            send(
+                &mut svm,
+                &[&payer, winner, loser],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(winner.pubkey(), true),
+                        AccountMeta::new_readonly(loser.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(winner_portfolio.pubkey(), false),
+                        AccountMeta::new(loser_portfolio.pubkey(), false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index: 0,
+                        size_q: position_size,
+                        exec_price: 1_000,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+            .expect("open one independent loss pair");
+        }
+
+        warp_to(&mut svm, EMISSION_END);
+        let early_snapshot_landed = if crystallize_victim_before_loss {
+            send(
+                &mut svm,
+                &[&beneficiary],
+                rd_crystallize_ix(
+                    &beneficiary.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    3,
+                ),
+            )
+            .is_ok()
+        } else {
+            false
+        };
+
+        send(
+            &mut svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: EMISSION_END,
+                    mark_e6: 500,
+                },
+            ),
+        )
+        .expect("move the authenticated mark against both losing longs");
+        let crank = |svm: &mut LiteSVM, portfolio: Pubkey| {
+            send(
+                svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: EMISSION_END,
+                        observations: vec![percolator_prog::ix::CrankObservationHint {
+                            asset_index: 0,
+                            oracle_accounts: 0,
+                        }],
+                    },
+                ),
+            )
+        };
+        for portfolio in [
+            victim_winner_portfolio.pubkey(),
+            beneficiary_winner_portfolio.pubkey(),
+            victim_portfolio.pubkey(),
+            beneficiary_portfolio.pubkey(),
+        ] {
+            crank(&mut svm, portfolio).expect("settle the marked loss");
+            crank(&mut svm, portfolio).expect("refresh after loss settlement");
+        }
+        let victim_loss = read_portfolio_crystallized(&svm, &victim_portfolio.pubkey());
+        let beneficiary_loss =
+            read_portfolio_crystallized(&svm, &beneficiary_portfolio.pubkey());
+        assert!(victim_loss > 0);
+        assert_eq!(victim_loss, beneficiary_loss);
+
+        if !crystallize_victim_before_loss || !early_snapshot_landed {
+            send(
+                &mut svm,
+                &[&victim],
+                rd_crystallize_ix(
+                    &victim.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    3,
+                ),
+            )
+            .expect("victim snapshots after its eligible loss");
+        }
+        send(
+            &mut svm,
+            &[&beneficiary],
+            rd_crystallize_ix(
+                &beneficiary.pubkey(),
+                &reward_config,
+                &beneficiary.pubkey(),
+                &market,
+                &beneficiary_portfolio.pubkey(),
+                3,
+            ),
+        )
+        .expect("beneficiary snapshots after its eligible loss");
+
+        let victim_stake = rd_stake_pda(
+            &reward_config,
+            &victim.pubkey(),
+            &victim_portfolio.pubkey(),
+            3,
+        );
+        let beneficiary_stake = rd_stake_pda(
+            &reward_config,
+            &beneficiary.pubkey(),
+            &beneficiary_portfolio.pubkey(),
+            3,
+        );
+        let victim_points = stake_points(&svm, &victim_stake);
+        let beneficiary_points = stake_points(&svm, &beneficiary_stake);
+
+        warp_to(&mut svm, EMISSION_END + 1);
+        let post_window_refresh_landed = send(
+            &mut svm,
+            &[&payer],
+            rd_crystallize_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &victim.pubkey(),
+                &market,
+                &victim_portfolio.pubkey(),
+                3,
+            ),
+        )
+        .is_ok();
+        let victim_points_after_refresh = stake_points(&svm, &victim_stake);
+
+        let mut capitals = [0u128; 4];
+        let mut pnls = [0i128; 4];
+        for (index, portfolio) in [
+            victim_winner_portfolio.pubkey(),
+            beneficiary_winner_portfolio.pubkey(),
+            victim_portfolio.pubkey(),
+            beneficiary_portfolio.pubkey(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            (capitals[index], pnls[index]) = portfolio_financials(&svm, portfolio);
+        }
+        let (_, group) =
+            percolator_prog::state::read_market(&svm.get_account(&market).unwrap().data)
+                .unwrap();
+        let backing = [
+            group.source_backing_buckets[0].fresh_unliened_backing_num,
+            group.source_backing_buckets[0].consumed_liened_backing_num,
+            group.source_credit[0].provider_receivable_num,
+        ];
+        let collateral_vault_amount = token_amount(&svm, &collateral_vault);
+
+        warp_to(&mut svm, EMISSION_END + FINALIZE_WINDOW);
+        send(
+            &mut svm,
+            &[&payer],
+            rd_freeze_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &reward_mint,
+                &reward_vault,
+            ),
+        )
+        .expect("freeze the trader denominator");
+        let victim_reward_destination = Pubkey::new_unique();
+        let beneficiary_reward_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &victim_reward_destination,
+            &reward_mint,
+            &victim.pubkey(),
+            0,
+        );
+        set_token(
+            &mut svm,
+            &beneficiary_reward_destination,
+            &reward_mint,
+            &beneficiary.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer],
+            rd_claim_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &victim.pubkey(),
+                &market,
+                &victim_portfolio.pubkey(),
+                3,
+                &reward_vault,
+                &victim_reward_destination,
+            ),
+        )
+        .expect("victim claims its frozen trader points");
+        send(
+            &mut svm,
+            &[&payer],
+            rd_claim_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &beneficiary.pubkey(),
+                &market,
+                &beneficiary_portfolio.pubkey(),
+                3,
+                &reward_vault,
+                &beneficiary_reward_destination,
+            ),
+        )
+        .expect("beneficiary claims its frozen trader points");
+
+        Outcome {
+            early_snapshot_landed,
+            post_window_refresh_landed,
+            victim_points,
+            beneficiary_points,
+            victim_points_after_refresh,
+            victim_loss,
+            beneficiary_loss,
+            victim_reward: token_amount(&svm, &victim_reward_destination),
+            beneficiary_reward: token_amount(&svm, &beneficiary_reward_destination),
+            reward_vault: token_amount(&svm, &reward_vault),
+            capitals,
+            pnls,
+            backing,
+            collateral_vault: collateral_vault_amount,
+        }
+    }
+
+    let control = run(false);
+    let attacked = run(true);
+    assert_eq!(control.victim_loss, control.beneficiary_loss);
+    assert_eq!(attacked.victim_loss, attacked.beneficiary_loss);
+    assert_eq!(attacked.victim_loss, control.victim_loss);
+    assert_eq!(attacked.capitals, control.capitals);
+    assert_eq!(attacked.pnls, control.pnls);
+    assert_eq!(attacked.backing, control.backing);
+    assert_eq!(attacked.collateral_vault, control.collateral_vault);
+    assert_eq!(
+        control.victim_reward + control.beneficiary_reward + control.reward_vault,
+        REWARD_SUPPLY,
+    );
+    assert_eq!(
+        attacked.victim_reward + attacked.beneficiary_reward + attacked.reward_vault,
+        REWARD_SUPPLY,
+    );
+    assert!(control.post_window_refresh_landed);
+    assert!(attacked.post_window_refresh_landed);
+    assert_eq!(control.victim_points, control.beneficiary_points);
+    assert_eq!(
+        attacked.beneficiary_points, control.beneficiary_points,
+    );
+    assert!(
+        !attacked.early_snapshot_landed,
+        "an unrelated co-staker locked the victim before its final-slot loss: control={control:?}, attacked={attacked:?}",
+    );
+    assert_eq!(
+        attacked.victim_points_after_refresh, control.victim_points,
+        "the reduce-only post-window refresh could not restore the omitted loss: control={control:?}, attacked={attacked:?}",
+    );
+    assert_eq!(attacked.victim_points, control.victim_points);
+    assert_eq!(
+        attacked.beneficiary_reward, control.beneficiary_reward,
+        "same-slot transaction order transferred fixed trader reward COIN: control={control:?}, attacked={attacked:?}",
+    );
+    assert_eq!(
+        attacked.victim_reward, control.victim_reward,
+        "a public cranker cannot omit an independent trader's eligible loss",
+    );
+}
+
 #[test]
 fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
     use percolator_prog::ix::Instruction as PIx;
