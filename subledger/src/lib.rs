@@ -406,9 +406,10 @@ struct Pool {
     /// Monotonic Percolator insurance consumption already applied to the
     /// indexed owner claim.
     insurance_spent_checkpoint: u128,
-    /// Canonical owner backing observed when the indexed claim was last priced.
-    /// This excludes trader source backing, utilization earnings, and backing
-    /// above the pool's nominal 50/50 tranche.
+    /// Cross-backed pools store canonical owner backing here. Current ordinary
+    /// principal pools use the otherwise-unused field as the physical-insurance
+    /// checkpoint paired with `insurance_spent_checkpoint`, so protocol insurance
+    /// already present at a user-action boundary absorbs later spending first.
     backing_protected_checkpoint: u64,
     /// Ordinary principal-only insurance protected by the depositor subledger.
     /// Deposits raise this value and realized payouts lower it; fees and donations
@@ -1590,9 +1591,14 @@ fn principal_protected_after_external_loss(
     physical_insurance: u64,
     observed_insurance_spent: u128,
 ) -> Result<u64, ProgramError> {
-    let new_loss = observed_insurance_spent
+    let spent_delta = observed_insurance_spent
         .checked_sub(pool.insurance_spent_checkpoint)
         .ok_or(ProgramError::InvalidAccountData)?;
+    let protocol_insurance_at_checkpoint = pool
+        .backing_protected_checkpoint
+        .saturating_sub(pool.principal_protected_checkpoint);
+    let new_loss =
+        spent_delta.saturating_sub(u128::from(protocol_insurance_at_checkpoint));
     let protected = u128::from(pool.principal_protected_checkpoint)
         .saturating_sub(new_loss)
         .min(u128::from(physical_insurance));
@@ -1610,6 +1616,7 @@ fn sync_principal_protected_checkpoint(
         observed_insurance_spent,
     )?;
     pool.insurance_spent_checkpoint = observed_insurance_spent;
+    pool.backing_protected_checkpoint = physical_insurance;
     Ok(())
 }
 
@@ -3468,6 +3475,9 @@ fn process_insurance_deposit(
             .principal_protected_checkpoint
             .checked_add(amount)
             .ok_or(ProgramError::ArithmeticOverflow)?;
+        pool.backing_protected_checkpoint = insurance_before
+            .checked_add(amount)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
     }
     if pool.cross_backing && uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
         let backing_after = backing_before
@@ -4393,6 +4403,7 @@ fn process_insurance_withdraw_impl(
     pool.outstanding_principal = outstanding_after;
     if principal_loss_checkpoint {
         pool.principal_protected_checkpoint = principal_protected_after;
+        pool.backing_protected_checkpoint = insurance_after;
     }
     if pool.cross_backing && uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
         let observed_after = owner_backing_protection(&pool, backing_after)?;
@@ -6648,6 +6659,44 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_loss_spends_checkpointed_protocol_insurance_first() {
+        let make_pool = || {
+            let mut pool = historical_pool_fixture();
+            pool.policy = POLICY_PRINCIPAL;
+            pool.domain = DOMAIN_INSURANCE;
+            pool.outstanding_principal = 10;
+            pool.principal_protected_checkpoint = 10;
+            pool.insurance_spent_checkpoint = 5;
+            pool
+        };
+
+        let mut checkpointed = make_pool();
+        checkpointed.backing_protected_checkpoint = 110;
+        sync_principal_protected_checkpoint(&mut checkpointed, 108, 7).unwrap();
+        assert_eq!(
+            checkpointed.principal_protected_checkpoint, 10,
+            "checkpointed protocol insurance absorbs the complete spent delta",
+        );
+        assert_eq!(
+            checkpointed.backing_protected_checkpoint, 108,
+            "synchronization records the new physical-insurance boundary",
+        );
+
+        let mut late_donation = make_pool();
+        late_donation.backing_protected_checkpoint = 10;
+        sync_principal_protected_checkpoint(&mut late_donation, 108, 7).unwrap();
+        assert_eq!(
+            late_donation.principal_protected_checkpoint, 8,
+            "insurance first observed with a loss cannot restore the owner",
+        );
+        sync_principal_protected_checkpoint(&mut late_donation, 107, 8).unwrap();
+        assert_eq!(
+            late_donation.principal_protected_checkpoint, 8,
+            "once checkpointed, the protocol surplus absorbs only future spending",
+        );
+    }
+
+    #[test]
     fn backing_checkpoint_tracks_only_owner_capital_flows() {
         assert_eq!(backing_checkpoint_after_deposit(13, 2, 16), Ok(15));
         assert_eq!(
@@ -7012,6 +7061,7 @@ mod tests {
         pool.policy = POLICY_PRINCIPAL;
         pool.domain = DOMAIN_INSURANCE;
         pool.insurance_spent_checkpoint = 19;
+        pool.backing_protected_checkpoint = 37;
         pool.principal_protected_checkpoint = 31;
         pool.custody_granted = true;
         pool.custody_grant_slot_plus_one = 101;
@@ -7021,6 +7071,7 @@ mod tests {
         let decoded = Pool::deserialize(&current).unwrap();
         assert!(!decoded.cross_backing);
         assert_eq!(decoded.insurance_spent_checkpoint, 19);
+        assert_eq!(decoded.backing_protected_checkpoint, 37);
         assert_eq!(decoded.principal_protected_checkpoint, 31);
         assert!(decoded.custody_granted);
         assert_eq!(decoded.custody_grant_slot_plus_one, 101);
@@ -7032,6 +7083,7 @@ mod tests {
         pool.serialize(&mut loss_checkpoint_predecessor).unwrap();
         let decoded_predecessor = Pool::deserialize(&loss_checkpoint_predecessor).unwrap();
         assert_eq!(decoded_predecessor.insurance_spent_checkpoint, 19);
+        assert_eq!(decoded_predecessor.backing_protected_checkpoint, 37);
         assert_eq!(decoded_predecessor.principal_protected_checkpoint, 31);
         assert!(!decoded_predecessor.custody_granted);
 
@@ -7044,6 +7096,12 @@ mod tests {
                 .unwrap()
                 .principal_protected_checkpoint,
             0,
+        );
+        assert_eq!(
+            Pool::deserialize(&predecessor)
+                .unwrap()
+                .backing_protected_checkpoint,
+            37,
         );
     }
 

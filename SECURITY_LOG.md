@@ -14727,3 +14727,38 @@ applied before the single final rounding. Fixed wrapper commit
 and 568 real-SBF LiteSVM tests pass, including hybrid, inversion, secondary-profile, liquidation-fee,
 and SPL-withdrawal paths. No instruction, account layout, signer, authority, amount, destination,
 custody route, or administrator surface was added.
+
+## Tick - predeposit protocol insurance was charged to an ordinary pool owner (surface B, REAL LOF)
+
+An ordinary principal-only pool stored the owner's protected balance and Percolator's cumulative
+insurance-spent counter, but not the physical insurance paired with that counter. Once the empty
+pool held custody, unrelated public users could fund protocol insurance through a round-trip trade
+before an owner deposited. A later one-atom insurance spend then reduced the owner's durable claim
+even though that earlier protocol buffer covered the complete spend.
+
+The retained exact-parent LiteSVM regression publicly initializes the pinned Percolator market,
+controller, Squads governance, ordinary Subledger pool, TWAP config, and every portfolio. Two
+unrelated users produce protocol insurance through a 100%-fee round trip before the one-atom owner
+deposit. Independent users then create the public liquidation, bounded cranks clear the episode,
+governance resolves through its existing controller lifecycle, all five portfolios settle, and the
+winner withdraws more than its deposit. Permissionless resolved-empty custody recovery returns only
+the bound pool roles. At RED commit `d55a058`, the unrelated owner then recovered zero instead of one.
+
+FIX: current ordinary principal pools reuse their otherwise-unused serialized backing checkpoint as
+the physical-insurance snapshot paired with the existing spent counter. A later spent delta consumes
+protocol insurance already present at that snapshot before reducing the separately stored owner
+claim. Deposits and exits update both values atomically; restart and recovery reuse the existing
+healthy synchronization. Value first observed with an existing loss remains protocol surplus and
+cannot heal a charged owner claim. Historical pools with no physical snapshot keep the conservative
+prior treatment until a healthy synchronization establishes one.
+
+All 41 Subledger unit tests pass, including predeposit protocol insurance, late donation,
+counter-generation restart, and historical/current layout coverage. The fresh full-chain regression,
+ordinary late-fee regression, full and partial loss restarts, buyback continuation, and healthy
+restart pass. Removing only the protocol-buffer subtraction reproduces the exact zero-versus-one
+failure after the winner withdraws. Fixed Subledger SBF checksum is
+`df4653595bf79568863cd6fc1d27592fcfa46d2a0d24f0392b6b79433843c446`; exact-base TWAP is
+`e63f03b7dab35869c6b7d49e9f74cfa94580086620bfd23f34ff16d618a83f35`, and pinned Percolator remains
+`74ce6b85576fcbcb7596fdc7a774ff92661853d50ca9eb9475fcba7b1b7f40a4`. No account growth,
+instruction, signer, authority, recipient, CPI, custody route, caller-selected amount, or
+administrator surface was added.
