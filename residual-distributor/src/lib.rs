@@ -1190,6 +1190,29 @@ fn market_is_retired(
     Ok(true)
 }
 
+fn portfolio_has_exact_live_identity(
+    config: &Config,
+    owner: &Pubkey,
+    portfolio_id: u64,
+    market: &Pubkey,
+    portfolio: &AccountInfo,
+) -> Result<bool, ProgramError> {
+    if portfolio.data_len() == 0 || *portfolio.owner != config.percolator_program {
+        return Ok(false);
+    }
+    let data = portfolio.try_borrow_data()?;
+    let live = match percolator_accounting::read_portfolio_reward_snapshot(
+        &data,
+        &portfolio.key.to_bytes(),
+    ) {
+        Ok(live) => live,
+        Err(_) => return Ok(false),
+    };
+    Ok(live.owner == owner.to_bytes()
+        && live.market_group == market.to_bytes()
+        && live.portfolio_id == portfolio_id)
+}
+
 fn portfolio_totals(
     program_id: &Pubkey,
     config: &Config,
@@ -2356,39 +2379,70 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 retired_market,
             )?;
             let retired = market_is_retired(&config, &portfolio_market, retired_market)?;
-            let totals = portfolio_totals(
-                program_id,
-                &config,
-                &stake.owner,
-                Some(stake.portfolio_id),
-                backing_ledger,
-                portfolio_archive,
-                Some(&portfolio_market),
-                retired,
-            )?;
-            let spent = totals.residual_spent_principal;
-            let counter = residual_counter(
-                stake.cohort,
-                totals.residual_received,
-                totals.residual_crystallized_loss,
-                spent,
-            );
-            let net_delta = counter.saturating_sub(stake.residual_snap);
-            let (new_pts, new_net) = if post_emission_finalize {
-                let cap_net =
-                    trader_live_cap(stake.earnings_snap, stake.eligible_accum, net_delta, spent);
-                (
-                    cap_residual_points(stake.points, stake.earnings_snap, cap_net)?,
-                    cap_net,
-                )
+            // A direct Percolator close forfeits a trader claim because no authenticated terminal
+            // counters remain. During the reduce-only window, retire that already-unclaimable
+            // stake from the shared denominator as well. This also covers a replacement portfolio
+            // incarnation at the same key; neither case can increase points or move collateral.
+            let terminal_forfeit = if now > config.emission_end_slot
+                && stake.cohort == COHORT_TRADER
+            {
+                let (_, _, archive_exists) = archive_for_identity(
+                    program_id,
+                    portfolio_archive,
+                    &config.percolator_program,
+                    &portfolio_market,
+                    &stake.owner,
+                    backing_ledger.key,
+                )?;
+                !archive_exists
+                    && !portfolio_has_exact_live_identity(
+                        &config,
+                        &stake.owner,
+                        stake.portfolio_id,
+                        &portfolio_market,
+                        backing_ledger,
+                    )?
             } else {
-                let tenure = now.saturating_sub(stake.start_slot);
-                (
-                    floor_log2(tenure)
-                        .checked_mul(net_delta)
-                        .ok_or(ProgramError::ArithmeticOverflow)?,
-                    net_delta,
-                )
+                false
+            };
+            let (new_pts, new_net, spent) = if terminal_forfeit {
+                (0, 0, 0)
+            } else {
+                let totals = portfolio_totals(
+                    program_id,
+                    &config,
+                    &stake.owner,
+                    Some(stake.portfolio_id),
+                    backing_ledger,
+                    portfolio_archive,
+                    Some(&portfolio_market),
+                    retired,
+                )?;
+                let spent = totals.residual_spent_principal;
+                let counter = residual_counter(
+                    stake.cohort,
+                    totals.residual_received,
+                    totals.residual_crystallized_loss,
+                    spent,
+                );
+                let net_delta = counter.saturating_sub(stake.residual_snap);
+                let (new_pts, new_net) = if post_emission_finalize {
+                    let cap_net =
+                        trader_live_cap(stake.earnings_snap, stake.eligible_accum, net_delta, spent);
+                    (
+                        cap_residual_points(stake.points, stake.earnings_snap, cap_net)?,
+                        cap_net,
+                    )
+                } else {
+                    let tenure = now.saturating_sub(stake.start_slot);
+                    (
+                        floor_log2(tenure)
+                            .checked_mul(net_delta)
+                            .ok_or(ProgramError::ArithmeticOverflow)?,
+                        net_delta,
+                    )
+                };
+                (new_pts, new_net, spent)
             };
             replace_cohort_points(
                 config.cohort_points_mut(stake.cohort),

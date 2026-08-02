@@ -58514,6 +58514,14 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             );
         }
         if honest_cotrader {
+            let config_before = svm.get_account(&rd_config).unwrap();
+            let stake_before = svm.get_account(&t_stake).unwrap();
+            assert!(
+                send(&mut svm, &[&payer], crystallize_ix()).is_err(),
+                "a missing or replaced witness cannot erase points before emission ends"
+            );
+            assert_eq!(svm.get_account(&rd_config).unwrap(), config_before);
+            assert_eq!(svm.get_account(&t_stake).unwrap(), stake_before);
             svm.set_sysvar(&Clock {
                 slot: 550,
                 unix_timestamp: 550,
