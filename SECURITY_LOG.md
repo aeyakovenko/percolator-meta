@@ -14782,3 +14782,30 @@ built local program binaries. The Residual SBF checksum is
 `030ab49001c4e1632daa58929e16b996431f1c196c1038b86c0ad2e7c3d84e94`. No account layout, new
 authority, recipient, destination, token CPI, custody route, withdrawal path, or administrator
 surface was added.
+
+## Tick - final-slot trader order shifted an independent depositor's fixed reward (surface D, REAL LOF)
+
+Trader points derive from a portfolio's monotonic
+`residual_crystallized_loss_atoms_total - residual_spent_principal_atoms_total`, and crystallization
+was permissionless through the inclusive reward end slot. A co-staker could crystallize an
+independent trader before its marked loss was realized later in that slot, realize two equal losses,
+and crystallize itself afterward. The next-slot trader refresh succeeded but was reduce-only, so it
+could not add the victim's omitted counter delta to the frozen denominator.
+
+The retained clean-room LiteSVM regression allocates and initializes one real pinned Percolator
+market and four portfolios through public instructions. Two independent losing longs each
+crystallize 250 collateral atoms at the inclusive end slot. At RED commit
+`467f5c7ca9a55322922bb5360cc39539f9c4d06c`, the control paid 500,000 COIN to each trader, while
+the public ordering paid 0 to the victim and 1,000,000 to the beneficiary. Both runs retained
+capitals `[1,000,000, 1,000,000, 999,750, 999,750]`, PnL `[250, 250, 0, 0]`, backing state
+`[501000000000000, 0, 0]`, and 4,000,001 collateral atoms in the canonical vault. The reachable
+loss was fixed reward COIN only, never portfolio collateral or external backing.
+
+FIX: ordinary trader crystallization remains permissionless, but the linked portfolio owner must
+sign at the exact inclusive end slot. A monotonic total cannot prove that no later transaction will
+update it in the same slot; the owner can instead atomically order its final loss realization before
+its terminal snapshot. The finalize-window refresh remains permissionless and reduce-only. No
+account layout, new authority, recipient, destination, token CPI, custody route, withdrawal path,
+or administrator surface was added. All 96 Residual LiteSVM compatibility tests and all 286
+full-chain LiteSVM tests pass; the fixed Residual SBF checksum is
+`ba18cc0d805f852ad837aa6a8332e23cd42e52964fdf052530b7beaaccbbd3d8`.

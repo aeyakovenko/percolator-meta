@@ -2353,10 +2353,11 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             stake.eligible_accum = crystallized_slot as u128;
         }
         COHORT_LP | COHORT_TRADER => {
-            // A monotonic LP counter cannot prove that no later recovery will land
-            // in this inclusive slot. Keep ordinary LP cranks permissionless, but
-            // require the owner to choose its terminal snapshot ordering.
-            if stake.cohort == COHORT_LP
+            // Monotonic portfolio counters cannot prove that no later recovery
+            // or realized loss will land in this inclusive slot. Keep ordinary
+            // cranks permissionless, but require the owner to choose its
+            // terminal snapshot ordering.
+            if matches!(stake.cohort, COHORT_LP | COHORT_TRADER)
                 && config.config_kind == CONFIG_KIND_REWARD_EPOCH
                 && now == config.emission_end_slot
                 && cranker.key != &stake.owner

@@ -30,10 +30,11 @@ The regular `register -> crystallize -> freeze -> claim` instructions are shared
   spent; it uses the same monotonic live cap as claim and cannot admit counter growth created after the
   reward period. At exactly `end`, funding-payer crystallization includes the allow-listed Percolator
   market as a read-only witness and requires every active portfolio leg's funding snapshot to match
-  its side's accumulator after the asset advanced through `end`. LP crystallization is permissionless
-  before `end`; at exactly `end`, the linked portfolio owner signs so an unrelated cranker cannot
-  snapshot its monotonic `residual_received` counter before a later same-slot recovery. The owner may
-  atomically order its final recovery and snapshot. Permissionless freeze opens only after that window.
+  its side's accumulator after the asset advanced through `end`. LP/trader crystallization is
+  permissionless before `end`; at exactly `end`, the linked portfolio owner signs so an unrelated
+  cranker cannot snapshot its monotonic `residual_received` or `crystallized_loss` counter before a
+  later same-slot recovery or realized loss. The owner may atomically order its final portfolio
+  activity and snapshot. Permissionless freeze opens only after that window.
 - A scope may omit insurance/backing pools and contribute only portfolio-flow points. This lets a
   handed-off genesis market provide capital cohorts while other DAO-vetted live markets provide OI.
 
