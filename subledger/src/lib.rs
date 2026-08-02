@@ -242,6 +242,9 @@ const IX_ROUTE_CROSS_BACKING_EARNINGS: u8 = 15;
 // subledger must first realize that generation's loss into its durable claim
 // accumulator. Only the exact config-derived TWAP PDA can invoke this path.
 const IX_PREPARE_ASSET0_RESTART: u8 = 16;
+// Value-neutral checkpoint after a pool-bound TWAP execute. This keeps an
+// ordinary pool's physical-insurance snapshot aligned with TWAP withdrawals.
+const IX_CHECKPOINT_TWAP_INSURANCE: u8 = 17;
 
 // Percolator CPI tags (verified against pinned percolator-prog 867ca977).
 const PERC_IX_TOP_UP_INSURANCE_DOMAIN: u8 = 56;
@@ -1972,6 +1975,9 @@ pub fn process_instruction(
         }
         IX_PREPARE_ASSET0_RESTART => {
             process_prepare_asset0_restart(program_id, accounts, &mut data)
+        }
+        IX_CHECKPOINT_TWAP_INSURANCE => {
+            process_checkpoint_twap_insurance(program_id, accounts, &mut data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }
@@ -4588,6 +4594,88 @@ fn validate_twap_recovery_grant(
     }
 }
 
+// checkpoint_twap_insurance accounts:
+// [twap_authority(signer), twap_config, pool(w), market_slab, percolator_program]
+//
+// TWAP invokes this after its only live insurance-withdrawal path. Updating the
+// ordinary pool's physical checkpoint in the same transaction prevents a
+// withdrawn protocol buffer from masking a later owner loss. This instruction
+// cannot move value and accepts only the config-bound active TWAP authority.
+fn process_checkpoint_twap_insurance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &mut &[u8],
+) -> ProgramResult {
+    if !data.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let iter = &mut accounts.iter();
+    let twap_authority = next_account_info(iter)?;
+    let twap_config = next_account_info(iter)?;
+    let pool_account = next_account_info(iter)?;
+    let market_slab = next_account_info(iter)?;
+    let percolator_program = next_account_info(iter)?;
+    if iter.next().is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !twap_authority.is_signer || !pool_account.is_writable {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if pool_account.owner != program_id
+        || market_slab.owner != percolator_program.key
+        || !percolator_program.executable
+    {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    if !pool.is_insurance()
+        || !pool.custody_granted
+        || *market_slab.key != pool.market_slab
+        || *percolator_program.key != pool.percolator_program
+    {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    validate_pool_pda(program_id, pool_account, &pool)?;
+    validate_twap_recovery_grant(
+        twap_authority,
+        twap_config,
+        pool_account,
+        market_slab,
+        percolator_program,
+        false,
+    )?;
+
+    let market_data = market_slab.try_borrow_data()?;
+    for authority in [
+        percolator_accounting::read_asset_admin(&market_data, 0),
+        percolator_accounting::read_asset_insurance_authority(&market_data, 0),
+        percolator_accounting::read_asset_insurance_operator(&market_data, 0),
+    ] {
+        if authority.map_err(|_| ProgramError::InvalidAccountData)?
+            != twap_authority.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+    }
+    if pool.cross_backing || !uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+        return Ok(());
+    }
+    let physical_insurance =
+        percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)
+            .and_then(|value| {
+                u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+            })?;
+    let insurance_spent =
+        percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)
+            .and_then(aggregate_insurance_spent)?;
+    drop(market_data);
+    sync_principal_protected_checkpoint(&mut pool, physical_insurance, insurance_spent)?;
+    pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stage_cross_backing_for_restart<'a>(
     program_id: &Pubkey,
@@ -6693,6 +6781,17 @@ mod tests {
         assert_eq!(
             late_donation.principal_protected_checkpoint, 8,
             "once checkpointed, the protocol surplus absorbs only future spending",
+        );
+
+        let mut twap_pull = make_pool();
+        twap_pull.backing_protected_checkpoint = 110;
+        sync_principal_protected_checkpoint(&mut twap_pull, 10, 5).unwrap();
+        assert_eq!(twap_pull.principal_protected_checkpoint, 10);
+        assert_eq!(twap_pull.backing_protected_checkpoint, 10);
+        sync_principal_protected_checkpoint(&mut twap_pull, 10, 6).unwrap();
+        assert_eq!(
+            twap_pull.principal_protected_checkpoint, 9,
+            "a post-pull fee cannot replace principal consumed before that fee",
         );
     }
 

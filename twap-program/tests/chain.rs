@@ -1023,6 +1023,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             twap_authority,
             perc_vault: vault,
             vault_authority,
+            custody_pool: Some(pool),
             principal: owner_principal,
             surplus,
         };
@@ -2470,6 +2471,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         twap_authority,
         perc_vault: vault,
         vault_authority,
+        custody_pool: Some(pool),
         principal: owner_principal,
         surplus: 0,
     };
@@ -2500,19 +2502,43 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             u64::from_le_bytes(book_data.data[240..248].try_into().unwrap())
         };
         warp_to(&mut svm, round_end);
+        let execute = execute_ix(
+            &payer.pubkey(),
+            &handoff_env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            None,
+        );
+        let mut bypass_checkpoint = execute.clone();
+        bypass_checkpoint.accounts.truncate(
+            bypass_checkpoint
+                .accounts
+                .len()
+                .checked_sub(2)
+                .unwrap(),
+        );
+        let market_before_bypass = svm.get_account(&market).unwrap();
+        let pool_before_bypass = svm.get_account(&pool).unwrap();
+        let config_before_bypass = svm.get_account(&twap_cfg).unwrap();
+        let holding_before_bypass = svm.get_account(&book.holding).unwrap();
+        assert!(
+            send(&mut svm, &[&payer], bypass_checkpoint).is_err(),
+            "a public execute cannot omit the bound-pool checkpoint",
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before_bypass);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before_bypass);
+        assert_eq!(svm.get_account(&twap_cfg).unwrap(), config_before_bypass);
+        assert_eq!(
+            svm.get_account(&book.holding).unwrap(),
+            holding_before_bypass,
+        );
         send(
             &mut svm,
             &[&payer],
-            execute_ix(
-                &payer.pubkey(),
-                &handoff_env,
-                &book.book,
-                &book.holding,
-                &book.settlement_usd,
-                &book.book_escrow,
-                &book.coin_escrow,
-                None,
-            ),
+            execute,
         )
         .expect("permissionless TWAP execution pulls the predeposit protocol buffer");
         assert_eq!(
@@ -24542,6 +24568,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
         twap_authority,
         perc_vault,
         vault_authority,
+        custody_pool: Some(pool),
         principal: 0,
         surplus: fee_surplus,
     };
@@ -25282,6 +25309,7 @@ struct HandoffEnv {
     twap_authority: Pubkey,
     perc_vault: Pubkey,
     vault_authority: Pubkey,
+    custody_pool: Option<Pubkey>,
     principal: u64,
     surplus: u64,
 }
@@ -25475,6 +25503,7 @@ fn setup_handoff_with_mint_mode(
         twap_authority,
         perc_vault,
         vault_authority,
+        custody_pool: None,
         principal,
         surplus,
     }
@@ -26709,6 +26738,7 @@ fn execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator() {
         twap_authority,
         perc_vault,
         vault_authority,
+        custody_pool: None,
         principal,
         surplus,
     };
@@ -34595,6 +34625,10 @@ fn execute_ix_full(
     if let Some(s) = coin_sink {
         accounts.push(AccountMeta::new(s, false));
     }
+    if let Some(pool) = env.custody_pool {
+        accounts.push(AccountMeta::new(pool, false));
+        accounts.push(AccountMeta::new_readonly(sub_id(), false));
+    }
     Instruction {
         program_id: twap_id(),
         accounts,
@@ -35845,6 +35879,7 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
         twap_authority,
         perc_vault: canonical_insurance_vault(&vault_authority, &collateral_mint),
         vault_authority,
+        custody_pool: None,
         principal: 0,
         surplus: 0,
     }
@@ -39936,6 +39971,8 @@ fn e2e_full_genesis_to_buy_burn() {
                 AccountMeta::new(coin_mint, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new(reward_vault, false),
+                AccountMeta::new(pool, false),
+                AccountMeta::new_readonly(sub_id(), false),
             ],
             data: vec![8u8],
         };
@@ -54271,6 +54308,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         twap_authority,
         perc_vault,
         vault_authority,
+        custody_pool: Some(pool),
         principal: amount,
         surplus,
     };
@@ -63178,6 +63216,8 @@ fn e2e_resolved_users_recover_without_dao_and_protocol_insurance_stays_isolated(
                 AccountMeta::new(coin_escrow, false),
                 AccountMeta::new(env.coin_mint, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(env.pool, false),
+                AccountMeta::new_readonly(sub_id(), false),
             ],
             data: vec![8u8], // IX_EXECUTE
         },
