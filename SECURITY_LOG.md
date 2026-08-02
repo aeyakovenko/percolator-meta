@@ -14753,3 +14753,32 @@ equality check makes the real-binary regression fail with the 400,000/600,000 tr
 rejects both orderings and preserves 500,000/500,000. All 96 Residual LiteSVM compatibility tests
 pass. No account layout, signer, authority, recipient, destination, token CPI, custody route, or
 administrator surface was added.
+
+## Tick - final-slot LP order shifted an independent depositor's fixed reward (surface D, REAL LOF)
+
+LP points derive from a portfolio's monotonic `residual_received_atoms_total`, and crystallization
+was permissionless through the inclusive reward end slot. A co-staker could crystallize an
+independent LP before an ordinary matched recovery later in that slot, execute its own equal recovery,
+and crystallize itself afterward. The next slot closed LP crystallization, so the victim's omitted
+counter delta could never enter the frozen denominator.
+
+The retained clean-room LiteSVM regression allocates and initializes one real pinned Percolator
+market and four portfolios through public instructions. Two independent losing longs each
+crystallize 250 collateral atoms; two equal end-slot recovery fills then credit 250 monotonic LP
+atoms to the victim and beneficiary. At RED commit
+`9da4250ed0677dc0203f8d17288b3014b34402bd`, the control paid 500,000 COIN to each LP, while the
+public ordering paid 0 to the victim and 1,000,000 to the beneficiary. Both runs retained capitals
+`[1,000,000, 1,000,000, 999,750, 999,750]`, PnL `[250, 250, 0, 0]`, backing state
+`[501000000000000, 0, 0]`, and 4,000,001 collateral atoms in the canonical vault. The reachable loss
+was fixed reward COIN only, never portfolio collateral or external backing.
+
+FIX: ordinary LP crystallization remains permissionless, but the linked portfolio owner must sign at
+the exact inclusive end slot. A monotonic total cannot prove that no later transaction will update it
+in the same slot; the owner can instead atomically order its final recovery before its terminal
+snapshot. The fixed real-binary regression rejects the unrelated early snapshot and preserves the
+500,000/500,000 split. All 96 Residual LiteSVM compatibility tests pass, including permissionless
+pre-end portfolio-flow crystallization, and all 285 full-chain LiteSVM tests pass against freshly
+built local program binaries. The Residual SBF checksum is
+`030ab49001c4e1632daa58929e16b996431f1c196c1038b86c0ad2e7c3d84e94`. No account layout, new
+authority, recipient, destination, token CPI, custody route, withdrawal path, or administrator
+surface was added.

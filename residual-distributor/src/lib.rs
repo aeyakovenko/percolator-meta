@@ -2353,6 +2353,16 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             stake.eligible_accum = crystallized_slot as u128;
         }
         COHORT_LP | COHORT_TRADER => {
+            // A monotonic LP counter cannot prove that no later recovery will land
+            // in this inclusive slot. Keep ordinary LP cranks permissionless, but
+            // require the owner to choose its terminal snapshot ordering.
+            if stake.cohort == COHORT_LP
+                && config.config_kind == CONFIG_KIND_REWARD_EPOCH
+                && now == config.emission_end_slot
+                && cranker.key != &stake.owner
+            {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
             // crystallized_loss - spent since register.
             let (portfolio_archive, retired_market, _) =
