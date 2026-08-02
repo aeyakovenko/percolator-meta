@@ -57253,6 +57253,7 @@ enum OrganicRewardCleanup {
     LegacyPreIdPortfolioCleanup,
     OwnerReinitializeBeforeCrystallize,
     OwnerCloseAfterRecovery,
+    OwnerCloseDilutesHonestTrader,
     OwnerReinitializeAfterRecovery,
     PublicRematerializeLpAfterClose,
 }
@@ -57263,9 +57264,11 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     let owner_close_after_recovery = matches!(
         cleanup,
         OrganicRewardCleanup::OwnerCloseAfterRecovery
+            | OrganicRewardCleanup::OwnerCloseDilutesHonestTrader
             | OrganicRewardCleanup::OwnerReinitializeAfterRecovery
             | OrganicRewardCleanup::PublicRematerializeLpAfterClose
     );
+    let honest_cotrader = cleanup == OrganicRewardCleanup::OwnerCloseDilutesHonestTrader;
     let public_rematerialize_lp =
         cleanup == OrganicRewardCleanup::PublicRematerializeLpAfterClose;
     let owner_reinitialize_after_recovery =
@@ -57540,11 +57543,23 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     svm.airdrop(&loser.pubkey(), 1_000_000_000).unwrap();
     let winner = Keypair::new();
     svm.airdrop(&winner.pubkey(), 1_000_000_000).unwrap();
+    let honest = Keypair::new();
+    let honest_counterparty = Keypair::new();
     let loser_pf = Pubkey::new_unique();
     let winner_pf = Pubkey::new_unique();
-    for (owner, pf) in [(&loser, &loser_pf), (&winner, &winner_pf)] {
+    let honest_pf = Pubkey::new_unique();
+    let honest_counterparty_pf = Pubkey::new_unique();
+    let mut traders = vec![(&loser, loser_pf), (&winner, winner_pf)];
+    if honest_cotrader {
+        svm.airdrop(&honest.pubkey(), 1_000_000_000).unwrap();
+        svm.airdrop(&honest_counterparty.pubkey(), 1_000_000_000)
+            .unwrap();
+        traders.push((&honest, honest_pf));
+        traders.push((&honest_counterparty, honest_counterparty_pf));
+    }
+    for (owner, pf) in traders {
         svm.set_account(
-            *pf,
+            pf,
             Account {
                 lamports: 1_000_000_000,
                 data: vec![0u8; plen],
@@ -57561,7 +57576,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
                 vec![
                     AccountMeta::new(owner.pubkey(), true),
                     AccountMeta::new(market, false),
-                    AccountMeta::new(*pf, false),
+                    AccountMeta::new(pf, false),
                 ],
                 PIx::InitPortfolio,
             )],
@@ -57579,7 +57594,7 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
                 vec![
                     AccountMeta::new(owner.pubkey(), true),
                     AccountMeta::new(market, false),
-                    AccountMeta::new(*pf, false),
+                    AccountMeta::new(pf, false),
                     AccountMeta::new(src, false),
                     AccountMeta::new(perc_vault, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
@@ -57704,6 +57719,8 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     let loser_archive = rd_portfolio_archive_pda(&market, &loser.pubkey(), &loser_pf);
     let reward_archive =
         rd_portfolio_archive_pda(&market, &reward_owner.pubkey(), &reward_pf);
+    let honest_stake = rd_stake_pda(&rd_config, &honest.pubkey(), &honest_pf, 3);
+    let honest_archive = rd_portfolio_archive_pda(&market, &honest.pubkey(), &honest_pf);
     let zero_fee_decoy = if cleanup == OrganicRewardCleanup::BeforeCrystallize {
         let decoy = Pubkey::new_unique();
         svm.set_account(
@@ -57819,6 +57836,35 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         return;
     }
     registration.expect("register reward portfolio");
+    if honest_cotrader {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[Instruction {
+                program_id: rd_id(),
+                accounts: vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new_readonly(rd_config, false),
+                    AccountMeta::new_readonly(honest.pubkey(), true),
+                    AccountMeta::new_readonly(honest.pubkey(), false),
+                    AccountMeta::new_readonly(honest_pf, false),
+                    AccountMeta::new(honest_stake, false),
+                    AccountMeta::new_readonly(system_program::ID, false),
+                    AccountMeta::new_readonly(honest_archive, false),
+                    AccountMeta::new_readonly(market, false),
+                    AccountMeta::new_readonly(
+                        retired_market_pda(&market, &perc_id()),
+                        false,
+                    ),
+                ],
+                data: vec![1u8, 3u8],
+            }],
+            Some(&payer.pubkey()),
+            &[&payer, &honest],
+            bh,
+        ))
+        .expect("register the independent honest trader");
+    }
     let reward_stake = svm.get_account(&t_stake).unwrap();
     assert_eq!(reward_stake.data.len(), 220);
     assert_eq!(
@@ -57945,6 +57991,31 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     //      permissionless crank settles the long's now-negative PnL out of its principal. size_q is owner_a's
     //      signed size: negative => owner_a short, owner_b long. The maker/counterparty (owner_b) is the side
     //      whose marked loss flows through the backing b-settlement, so the registered trader is owner_b. ----
+    let crank = |svm: &mut LiteSVM, pf: &Pubkey, slot: u64| {
+        svm.expire_blockhash();
+        let bh = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[pix(
+                vec![
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(*pf, false),
+                ],
+                PIx::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: (0..market_slots)
+                        .map(|asset_index| percolator_prog::ix::CrankObservationHint {
+                            asset_index: asset_index as u16,
+                            oracle_accounts: 0,
+                        })
+                        .collect(),
+                },
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            bh,
+        ))
+    };
     let pos = -((percolator::POS_SCALE / 2) as i128); // notional 500; the long loses when the mark halves
     svm.expire_blockhash();
     let bh = svm.latest_blockhash();
@@ -57969,6 +58040,41 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
         bh,
     ))
     .expect("loser (owner_b) opens long vs winner short");
+    if honest_cotrader {
+        svm.set_sysvar(&Clock {
+            slot: 101,
+            unix_timestamp: 101,
+            ..Clock::default()
+        });
+        for pf in [&winner_pf, &loser_pf, &honest_counterparty_pf, &honest_pf] {
+            crank(&mut svm, pf, 101).expect("refresh every portfolio before the second open");
+        }
+        let oi_before_second = read_asset0_oi(&svm, &market);
+        send(
+            &mut svm,
+            &[&honest_counterparty, &honest],
+            pix(
+                vec![
+                    AccountMeta::new(honest_counterparty.pubkey(), true),
+                    AccountMeta::new(honest.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new(honest_counterparty_pf, false),
+                    AccountMeta::new(honest_pf, false),
+                ],
+                PIx::TradeNoCpi {
+                    asset_index: 0,
+                    size_q: pos,
+                    exec_price: initial_price,
+                    fee_bps: 0,
+                },
+            ),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "independent honest trader opens the same long against the counterparty; OI before second trade {oi_before_second:?}: {error}"
+            )
+        });
+    }
     svm.set_sysvar(&Clock {
         slot: 110,
         unix_timestamp: 110,
@@ -57997,41 +58103,31 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
     .expect("oracle drops against the long");
     // Successive auto-cranks realize the marked loss and then settle the now-negative pnl out of
     // principal, which bumps residual_crystallized_loss.
-    let crank = |svm: &mut LiteSVM, pf: &Pubkey, slot: u64| {
-        svm.expire_blockhash();
-        let bh = svm.latest_blockhash();
-        svm.send_transaction(Transaction::new_signed_with_payer(
-            &[pix(
-                vec![
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new(market, false),
-                    AccountMeta::new(*pf, false),
-                ],
-                PIx::PermissionlessCrank {
-                    now_slot: slot,
-                    observations: (0..market_slots)
-                        .map(|asset_index| percolator_prog::ix::CrankObservationHint {
-                            asset_index: asset_index as u16,
-                            oracle_accounts: 0,
-                        })
-                        .collect(),
-                },
-            )],
-            Some(&payer.pubkey()),
-            &[&payer],
-            bh,
-        ))
-    };
     // Crank the counterparty first (updates the asset's shared b-accumulator), then the loser.
     crank(&mut svm, &winner_pf, 110).expect("auto-crank winner settlement");
     crank(&mut svm, &winner_pf, 110).expect("auto-crank winner refresh after settlement");
     crank(&mut svm, &loser_pf, 110).expect("auto-crank loser settlement");
     crank(&mut svm, &loser_pf, 110).expect("auto-crank loser refresh after settlement");
+    if honest_cotrader {
+        crank(&mut svm, &honest_counterparty_pf, 110)
+            .expect("auto-crank honest counterparty settlement");
+        crank(&mut svm, &honest_counterparty_pf, 110)
+            .expect("auto-crank honest counterparty refresh");
+        crank(&mut svm, &honest_pf, 110).expect("auto-crank honest trader settlement");
+        crank(&mut svm, &honest_pf, 110).expect("auto-crank honest trader refresh");
+    }
     let crystallized = read_portfolio_crystallized(&svm, &loser_pf);
     assert!(
         crystallized > 0,
         "the settled loss organically bumped crystallized_loss (got {crystallized})"
     );
+    if honest_cotrader {
+        assert_eq!(
+            read_portfolio_crystallized(&svm, &honest_pf),
+            crystallized,
+            "the attacker and honest trader take equal organic losses"
+        );
+    }
     if !maintenance_fee_cleanup && !owner_close_after_recovery {
         send(
             &mut svm,
@@ -58117,6 +58213,45 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             bh,
         ))
         .expect("crystallize");
+        if honest_cotrader {
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                &[Instruction {
+                    program_id: rd_id(),
+                    accounts: vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new(rd_config, false),
+                        AccountMeta::new(honest_stake, false),
+                        AccountMeta::new_readonly(honest_pf, false),
+                        AccountMeta::new_readonly(honest_archive, false),
+                        AccountMeta::new_readonly(
+                            retired_market_pda(&market, &perc_id()),
+                            false,
+                        ),
+                    ],
+                    data: vec![2u8],
+                }],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .expect("crystallize the independent honest loss");
+            let attacker_points = u128::from_le_bytes(
+                svm.get_account(&t_stake).unwrap().data[176..192]
+                    .try_into()
+                    .unwrap(),
+            );
+            let honest_points = u128::from_le_bytes(
+                svm.get_account(&honest_stake).unwrap().data[176..192]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(
+                honest_points, attacker_points,
+                "equal organic losses at equal tenure contribute equal trader points"
+            );
+        }
     }
 
     if owner_close_after_recovery {
@@ -58296,6 +58431,11 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             bh,
         ))
         .expect("withdraw all collateral before the public owner close");
+        assert_eq!(
+            token_amount(&svm, &closed_collateral),
+            u64::try_from(closed_capital).unwrap(),
+            "direct close returns the owner's remaining collateral before touching reward state"
+        );
         let close_portfolio = pix(
             vec![
                 AccountMeta::new_readonly(closed_owner.pubkey(), true),
@@ -58334,6 +58474,33 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             svm.get_account(&reward_archive).is_none(),
             "a direct Percolator owner close cannot create the controller archive"
         );
+        if honest_cotrader {
+            svm.set_sysvar(&Clock {
+                slot: 550,
+                unix_timestamp: 550,
+                ..Clock::default()
+            });
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            let finalize_result = svm.send_transaction(Transaction::new_signed_with_payer(
+                &[crystallize_ix()],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ));
+            finalize_result.expect(
+                "an honest finalize-window cranker retires the absent trader's forfeited points",
+            );
+            assert_eq!(
+                u128::from_le_bytes(
+                    svm.get_account(&t_stake).unwrap().data[176..192]
+                        .try_into()
+                        .unwrap(),
+                ),
+                0,
+                "the absent trader can no longer dilute the frozen denominator"
+            );
+        }
     }
 
     if maintenance_fee_cleanup {
@@ -58685,6 +58852,76 @@ fn run_organic_pnl_loss_real_trade_feeds_reward_cohort(cleanup: OrganicRewardCle
             assert_eq!(token_amount(&svm, &rd_vault), 0);
             return;
         }
+        if honest_cotrader {
+            assert!(
+                claim_result.is_err(),
+                "the closed attacker cannot claim its now-consumed trader points"
+            );
+            let honest_coin = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &honest_coin,
+                &coin_mint,
+                &honest.pubkey(),
+                0,
+            );
+            svm.expire_blockhash();
+            let bh = svm.latest_blockhash();
+            svm.send_transaction(Transaction::new_signed_with_payer(
+                &[Instruction {
+                    program_id: rd_id(),
+                    accounts: vec![
+                        AccountMeta::new(payer.pubkey(), true),
+                        AccountMeta::new_readonly(rd_config, false),
+                        AccountMeta::new(honest_stake, false),
+                        AccountMeta::new(rd_vault, false),
+                        AccountMeta::new(honest_coin, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(honest_pf, false),
+                        AccountMeta::new_readonly(honest_archive, false),
+                        AccountMeta::new_readonly(
+                            retired_market_pda(&market, &perc_id()),
+                            false,
+                        ),
+                    ],
+                    data: vec![5u8],
+                }],
+                Some(&payer.pubkey()),
+                &[&payer],
+                bh,
+            ))
+            .expect("the independent honest trader can claim its frozen fraction");
+            assert_eq!(
+                token_amount(&svm, &honest_coin),
+                supply,
+                "the honest trader receives the full cohort after stale points are retired"
+            );
+            assert_eq!(
+                token_amount(&svm, &rd_vault),
+                0,
+                "direct owner close cannot strand fixed reward supply"
+            );
+            assert_eq!(
+                token_amount(&svm, &reward_coin),
+                0,
+                "the attack cannot steal COIN; it can only deny the honest allocation"
+            );
+            assert!(
+                send(
+                    &mut svm,
+                    &[&payer],
+                    crystallize_ix(),
+                )
+                .is_err(),
+                "freeze permanently closes the only denominator-reduction instruction"
+            );
+            assert_eq!(
+                token_amount(&svm, &rd_vault),
+                0,
+                "the completed honest payout remains final"
+            );
+            return;
+        }
         assert!(
             claim_result.is_err(),
             "closing or recreating a trader without an archive must not bypass its zero live cap"
@@ -58941,6 +59178,13 @@ fn e2e_pre_id_reward_portfolio_cannot_block_backing_return_and_market_close() {
 fn e2e_owner_close_cannot_bypass_trader_live_cap_after_organic_recovery() {
     run_organic_pnl_loss_real_trade_feeds_reward_cohort(
         OrganicRewardCleanup::OwnerCloseAfterRecovery,
+    );
+}
+
+#[test]
+fn e2e_owner_close_finalization_preserves_honest_trader_reward_after_organic_recovery() {
+    run_organic_pnl_loss_real_trade_feeds_reward_cohort(
+        OrganicRewardCleanup::OwnerCloseDilutesHonestTrader,
     );
 }
 
