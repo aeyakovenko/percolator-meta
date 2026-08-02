@@ -28,7 +28,10 @@ The regular `register -> crystallize -> freeze -> claim` instructions are shared
   Subledger resets the position clock on every top-up, so post-epoch capital earns zero tenure. A
   permissionless reduce-only trader refresh may remove points whose crystallized loss was subsequently
   spent; it uses the same monotonic live cap as claim and cannot admit counter growth created after the
-  reward period. Permissionless freeze opens only after that window.
+  reward period. At exactly `end`, funding-payer crystallization includes the allow-listed Percolator
+  market as a read-only witness and requires every active portfolio leg's funding snapshot to match
+  its side's accumulator after the asset advanced through `end`. Permissionless freeze opens only
+  after that window.
 - A scope may omit insurance/backing pools and contribute only portfolio-flow points. This lets a
   handed-off genesis market provide capital cohorts while other DAO-vetted live markets provide OI.
 

@@ -51753,6 +51753,9 @@ impl TestInstruction for RdCrystallizeRequest {
                 retired_market_pda(&self.market, &perc_id()),
                 false,
             ));
+            if self.cohort == 4 {
+                accounts.push(AccountMeta::new_readonly(self.market, false));
+            }
         }
         Instruction {
             program_id: rd_id(),
@@ -51855,6 +51858,8 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
 
     #[derive(Debug)]
     struct Outcome {
+        early_snapshot_landed: bool,
+        stale_leg_snapshot_landed: bool,
         victim_points: u128,
         beneficiary_points: u128,
         victim_paid: u128,
@@ -52251,7 +52256,7 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
         assert_eq!(victim_before, beneficiary_before);
 
         warp_to(&mut svm, EMISSION_END);
-        if crystallize_victim_before_final_crank {
+        let early_snapshot_landed = if crystallize_victim_before_final_crank {
             send(
                 &mut svm,
                 &[&payer],
@@ -52264,10 +52269,34 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
                     4,
                 ),
             )
-            .expect("attacker snapshots the victim before the final public crank");
-        }
-        for portfolio in [
+            .is_ok()
+        } else {
+            false
+        };
+        crank(
+            &mut svm,
             counterparty_portfolio.pubkey(),
+            EMISSION_END,
+        )
+        .expect("public final-slot crank advances the shared market");
+        let stale_leg_snapshot_landed = if crystallize_victim_before_final_crank {
+            send(
+                &mut svm,
+                &[&payer],
+                rd_crystallize_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    4,
+                ),
+            )
+            .is_ok()
+        } else {
+            false
+        };
+        for portfolio in [
             victim_portfolio.pubkey(),
             beneficiary_portfolio.pubkey(),
         ] {
@@ -52281,7 +52310,9 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
         assert!(victim_paid > victim_before);
         assert_eq!(victim_paid, beneficiary_paid);
 
-        if !crystallize_victim_before_final_crank {
+        if !crystallize_victim_before_final_crank
+            || (!early_snapshot_landed && !stale_leg_snapshot_landed)
+        {
             send(
                 &mut svm,
                 &[&payer],
@@ -52417,6 +52448,8 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
         .expect("co-staker claims its frozen funding points");
 
         Outcome {
+            early_snapshot_landed,
+            stale_leg_snapshot_landed,
             victim_points,
             beneficiary_points,
             victim_paid,
@@ -52449,9 +52482,14 @@ fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
     assert_eq!(control.victim_points, control.beneficiary_points);
     assert_eq!(attacked.beneficiary_points, control.beneficiary_points);
     assert!(
-        attacked.victim_points < control.victim_points,
-        "the attack must exercise a stale final-slot victim snapshot: control={control:?}, attacked={attacked:?}",
+        !attacked.early_snapshot_landed,
+        "a final-slot funding snapshot landed before the linked portfolio was current: control={control:?}, attacked={attacked:?}",
     );
+    assert!(
+        !attacked.stale_leg_snapshot_landed,
+        "advancing the shared market let a stale victim leg crystallize: control={control:?}, attacked={attacked:?}",
+    );
+    assert_eq!(attacked.victim_points, control.victim_points);
     assert_eq!(
         attacked.beneficiary_reward, control.beneficiary_reward,
         "same-slot transaction order transferred fixed reward COIN: control={control:?}, attacked={attacked:?}",
