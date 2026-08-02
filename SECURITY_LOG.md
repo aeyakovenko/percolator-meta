@@ -14727,3 +14727,24 @@ applied before the single final rounding. Fixed wrapper commit
 and 568 real-SBF LiteSVM tests pass, including hybrid, inversion, secondary-profile, liquidation-fee,
 and SPL-withdrawal paths. No instruction, account layout, signer, authority, amount, destination,
 custody route, or administrator surface was added.
+
+## Tick - stale protected-floor pause permanently disabled buybacks (surface C, REAL DOS)
+
+The protected insurance floor was monotonic but its timelocked setter carried no ordering witness.
+An unprivileged Squads executor could execute a later no-op correction first, then execute an older
+approved raise to `MAX_VAULT_TVL + 1`. No realizable market balance could exceed that floor, and the
+same monotonicity that protects depositor principal rejected every later repair. The live market and
+owner exits remained safe, but every subsequent permissionless surplus buyback was permanently
+disabled.
+
+The exact-parent LiteSVM RED at `ba83cfb` publicly initializes the real pinned Percolator market,
+grants owner-bound pool custody, hands it to TWAP through real Squads, queues both approved policies,
+executes the correction first, and proves both the stale pause and the failed repair. The fix makes
+every floor action, including a no-op correction, consume an exact config-bound policy nonce.
+Pre-upgrade unsequenced floor messages fail closed. The nonce account cannot sign, hold tokens, name
+a recipient, grant authority, or move value.
+
+The fixed TWAP SBF checksum is
+`ec6473134e83176da09c6a6c6f898bfd04e82d1f68638c1844ac784421299fbf`.
+All 284 full-chain LiteSVM tests and all 11 TWAP unit tests pass, including Genesis-to-buy/burn,
+principal-floor monotonicity, sentinel-bypass rejection, custody recovery, and terminal cleanup.

@@ -1179,8 +1179,9 @@ fn process_set_economics(
     Ok(())
 }
 
-// set_reserved_floor accounts: [squads_vault(signer), config(w)]
-// data: new_reserved_floor (u128)
+// set_reserved_floor accounts: [squads_vault(signer,payer), config(w), policy_nonce(w),
+//   system_program]
+// data: new_reserved_floor (u128) || expected_policy_nonce (u64)
 //
 // Squads -> TWAP control: set or raise the surplus floor. Canonical funded custody
 // initializes the floor from subledger accounting during handoff. This setter remains
@@ -1193,11 +1194,14 @@ fn process_set_reserved_floor(
     let iter = &mut accounts.iter();
     let squads_vault = next_account_info(iter)?;
     let config_account = next_account_info(iter)?;
+    let policy_nonce = next_account_info(iter)?;
+    let system_program = next_account_info(iter)?;
 
-    if data.len() != 16 {
+    if data.len() != 24 || iter.next().is_some() {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let new_floor = u128::from_le_bytes(data.try_into().unwrap());
+    let new_floor = u128::from_le_bytes(data[..16].try_into().unwrap());
+    let expected_policy_nonce = u64::from_le_bytes(data[16..24].try_into().unwrap());
     if config_account.owner != program_id {
         return Err(ProgramError::IllegalOwner);
     }
@@ -1226,6 +1230,15 @@ fn process_set_reserved_floor(
     {
         return Err(ProgramError::InvalidArgument);
     }
+    consume_policy_nonce(
+        program_id,
+        squads_vault,
+        config_account,
+        policy_nonce,
+        system_program,
+        IX_SET_RESERVED_FLOOR,
+        expected_policy_nonce,
+    )?;
     config.reserved_floor = new_floor;
     config.serialize(&mut config_account.try_borrow_mut_data()?)?;
     Ok(())
