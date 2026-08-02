@@ -45,6 +45,7 @@ enum PoolRestartScenario {
     PredepositProtocolInsurancePulledBeforeLoss,
     PredecessorPredepositProtocolInsurancePulledBeforeLoss,
     PredecessorPredepositProtocolInsuranceBeforeHandoff,
+    PredecessorUpgradeAfterProtocolInsurancePull,
 }
 
 #[test]
@@ -154,6 +155,13 @@ fn e2e_predecessor_ordinary_pool_initializes_checkpoint_during_twap_handoff() {
     );
 }
 
+#[test]
+fn probe_predecessor_ordinary_loss_before_first_upgraded_checkpoint() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::PredecessorUpgradeAfterProtocolInsurancePull,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -181,11 +189,14 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss;
     let predecessor_before_handoff =
         scenario == PoolRestartScenario::PredecessorPredepositProtocolInsuranceBeforeHandoff;
+    let predecessor_after_protocol_pull =
+        scenario == PoolRestartScenario::PredecessorUpgradeAfterProtocolInsurancePull;
     let twap_pulls_predeposit_before_loss = matches!(
         scenario,
         PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss
             | PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss
             | PoolRestartScenario::PredecessorPredepositProtocolInsuranceBeforeHandoff
+            | PoolRestartScenario::PredecessorUpgradeAfterProtocolInsurancePull
     );
     let predeposit_protocol_insurance = scenario == PoolRestartScenario::PredepositProtocolInsurance
         || twap_pulls_predeposit_before_loss;
@@ -2609,6 +2620,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             u128::from(owner_principal),
             "the old protocol buffer leaves Percolator before the owner loss",
         );
+        if predecessor_after_protocol_pull {
+            // Model the deployed 329-byte pool at the upgrade boundary after
+            // predecessor TWAP code already pulled the protocol buffer. The old
+            // layout had no persistent loss checkpoint for that pull.
+            let mut predecessor = svm.get_account(&pool).unwrap();
+            assert_eq!(predecessor.data.len(), 361);
+            let grant_slot = predecessor.data[353..361].to_vec();
+            predecessor.data[321..329].copy_from_slice(&grant_slot);
+            predecessor.data.truncate(329);
+            svm.set_account(pool, predecessor).unwrap();
+        }
         round_end + 1
     } else {
         101
