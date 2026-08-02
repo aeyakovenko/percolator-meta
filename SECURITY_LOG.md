@@ -2,6 +2,37 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - deployed ordinary custody pool could capture a late protocol fee (surface B/C, REAL LOF)
+
+A publicly initialized 329-byte ordinary principal-insurance pool could enter authenticated TWAP
+custody without a cumulative-loss checkpoint. TWAP first pulled a preexisting protocol-insurance
+buffer, a later public trade consumed the owner's remaining principal, and an unrelated trade then
+added one protocol-fee atom. The predecessor recovery and signed owner exit treated that late fee as
+restored owner principal. At exact-parent RED commit `b8d9e82`, the independent winner received the
+crystallized loss payout while the zero-value owner claim still withdrew one protocol atom.
+
+FIX: deployed 329-byte ordinary pools now persist the loss-only tuple in bytes that were unused for
+non-cross-backed pools. A fixed marker distinguishes the tuple from a cross-backed pool's existing
+rate fields. The first post-upgrade accounting observation establishes a conservative live boundary;
+authenticated handoff, permissionless TWAP execute, and authenticated recovery persist every later
+checkpoint before roles move. Restart remains fail-closed when an uninitialized predecessor has live
+claims and the slab already proves loss, so restart cannot erase historical spending.
+
+The retained real-SBF LiteSVM regressions system-allocate and publicly initialize the pinned
+Percolator market and portfolios, create the protocol fee through public trades, execute the Squads
+handoff and permissionless TWAP pull, crystallize the public loss, add the unrelated late fee,
+resolve and settle the market, return custody permissionlessly, and exercise the signed owner exit.
+One path upgrades a pool already in custody; another upgrades before its first current-code handoff.
+Both pay the owner zero. The complete Subledger package passes 44 unit, 113 Percolator-integration,
+and 23 Subledger-integration tests. All 290 TWAP chain tests pass cumulatively with branch-matching
+artifacts. Final SBF checksums are Subledger
+`ef110c264dc723324b38cb7b37cb4fe9653a32445e2378bb14985d677b88320d`, TWAP
+`09e01fe5fd69e778f63195a38164fac6ce88c782ec0d28c443ea7c5b34f04218`, Residual
+`5fd1e717262da87142fd4d05246586967a22a0f6bdaf8e2a1e0e92d1b0188b44`, and pinned Percolator
+`74ce6b85576fcbcb7596fdc7a774ff92661853d50ca9eb9475fcba7b1b7f40a4`. No signer, authority,
+recipient, transfer route, caller-selected amount, administrator surface, or account growth was
+added.
+
 ## Tick - TWAP recovery double-charged cross-backed protocol insurance (surface B/C, REAL LOF)
 
 Unrelated public traders could create protocol insurance before a cross-backed owner deposited.
