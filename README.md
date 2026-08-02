@@ -144,10 +144,12 @@ principal from both protection classes, subject to losses incurred during their 
   atomically. Owners can recover the staged portion through the existing signed exit while any
   cranker restores the same TWAP custody between exits. For provenance-aware TWAP configs, its
   fixed return also replaces only the recorded pool component of the reserved floor with the
-  loss-adjusted claim; retained protocol and DAO-raised buffer is unchanged. Historical custody
-  layouts without a cumulative-loss checkpoint may cross restart with live claims only when
-  cumulative insurance spend is zero; an ordinary historical pool must also retain its full
-  outstanding principal.
+  loss-adjusted claim; retained protocol and DAO-raised buffer is unchanged. Deployed 329-byte
+  ordinary pools persist the same loss-only tuple in bytes unused by non-cross-backed pools; their
+  first post-upgrade value observation establishes the boundary without moving tokens or adding an
+  authority. Other historical custody layouts without a cumulative-loss checkpoint may cross
+  restart with live claims only when cumulative insurance spend is zero; an ordinary historical
+  pool must also retain its full outstanding principal.
   Otherwise restart fails closed while the existing owner-signed return-and-exit remains live.
   After the bound Percolator market is resolved and empty, anyone can crank the
   same fixed return while the pool attests that owner principal remains. Once the bootstrap deadline

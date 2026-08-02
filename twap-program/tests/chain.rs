@@ -43,6 +43,8 @@ enum PoolRestartScenario {
     StaleTwapTradeFeePolicyOrder,
     PredepositProtocolInsurance,
     PredepositProtocolInsurancePulledBeforeLoss,
+    PredecessorPredepositProtocolInsurancePulledBeforeLoss,
+    PredecessorPredepositProtocolInsuranceBeforeHandoff,
 }
 
 #[test]
@@ -138,6 +140,20 @@ fn e2e_twap_pull_cannot_make_late_fees_restore_lost_ordinary_principal() {
     );
 }
 
+#[test]
+fn e2e_predecessor_ordinary_twap_pull_cannot_turn_late_fee_into_owner_recovery() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss,
+    );
+}
+
+#[test]
+fn e2e_predecessor_ordinary_pool_initializes_checkpoint_during_twap_handoff() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::PredecessorPredepositProtocolInsuranceBeforeHandoff,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -161,8 +177,16 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleTwapTradeFeePolicyOrder;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
-    let twap_pulls_predeposit_before_loss =
-        scenario == PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss;
+    let predecessor_pool_layout =
+        scenario == PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss;
+    let predecessor_before_handoff =
+        scenario == PoolRestartScenario::PredecessorPredepositProtocolInsuranceBeforeHandoff;
+    let twap_pulls_predeposit_before_loss = matches!(
+        scenario,
+        PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss
+            | PoolRestartScenario::PredecessorPredepositProtocolInsurancePulledBeforeLoss
+            | PoolRestartScenario::PredecessorPredepositProtocolInsuranceBeforeHandoff
+    );
     let predeposit_protocol_insurance = scenario == PoolRestartScenario::PredepositProtocolInsurance
         || twap_pulls_predeposit_before_loss;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -627,6 +651,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         assert_eq!(read_asset_insurance_remaining(&svm, &market, 0), 0);
     }
 
+    if predecessor_before_handoff {
+        // Model a deployed custody pool whose first post-upgrade accounting
+        // boundary is the authenticated TWAP handoff itself.
+        let mut predecessor = svm.get_account(&pool).unwrap();
+        assert_eq!(predecessor.data.len(), 361);
+        let grant_slot = predecessor.data[353..361].to_vec();
+        predecessor.data[321..329].copy_from_slice(&grant_slot);
+        predecessor.data.truncate(329);
+        svm.set_account(pool, predecessor).unwrap();
+    }
+
     send(
         &mut svm,
         &[&payer],
@@ -643,19 +678,34 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     let twap_cfg = twap_config_pda(&market, &multisig, &coin_mint, &perc_id());
     let twap_authority =
         Pubkey::find_program_address(&[b"market-0-twap", twap_cfg.as_ref()], &twap_id()).0;
-    let handoff = build_subledger_handoff_to_twap_message(
-        &squads_vault,
-        &pool,
-        &market,
-        &twap_cfg,
-        &twap_authority,
-        &perc_id(),
-    );
+    let handoff = if predecessor_before_handoff {
+        build_subledger_handoff_to_twap_message_with_pool_write(
+            &squads_vault,
+            &pool,
+            &market,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        )
+    } else {
+        build_subledger_handoff_to_twap_message(
+            &squads_vault,
+            &pool,
+            &market,
+            &twap_cfg,
+            &twap_authority,
+            &perc_id(),
+        )
+    };
     let handoff_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
         AccountMeta::new(twap_cfg, false),
-        AccountMeta::new_readonly(pool, false),
+        if predecessor_before_handoff {
+            AccountMeta::new(pool, false)
+        } else {
+            AccountMeta::new_readonly(pool, false)
+        },
         AccountMeta::new_readonly(twap_authority, false),
         AccountMeta::new_readonly(perc_id(), false),
         AccountMeta::new_readonly(twap_id(), false),
@@ -680,6 +730,17 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             owner_principal as u128
         },
     );
+    if predecessor_pool_layout {
+        // Model the deployed 329-byte custody layout across a program upgrade.
+        // It stores the one-shot grant slot at bytes 321..329 and has no
+        // appended loss checkpoints.
+        let mut predecessor = svm.get_account(&pool).unwrap();
+        assert_eq!(predecessor.data.len(), 361);
+        let grant_slot = predecessor.data[353..361].to_vec();
+        predecessor.data[321..329].copy_from_slice(&grant_slot);
+        predecessor.data.truncate(329);
+        svm.set_account(pool, predecessor).unwrap();
+    }
 
     if stale_twap_trade_fee_order {
         const STALE_FEE_BPS: u64 = 50;
@@ -12785,10 +12846,49 @@ fn build_subledger_handoff_to_twap_message(
     twap_authority: &Pubkey,
     percolator_program: &Pubkey,
 ) -> Vec<u8> {
+    build_subledger_handoff_to_twap_message_inner(
+        squads_vault,
+        pool,
+        market_slab,
+        twap_config,
+        twap_authority,
+        percolator_program,
+        false,
+    )
+}
+
+fn build_subledger_handoff_to_twap_message_with_pool_write(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+) -> Vec<u8> {
+    build_subledger_handoff_to_twap_message_inner(
+        squads_vault,
+        pool,
+        market_slab,
+        twap_config,
+        twap_authority,
+        percolator_program,
+        true,
+    )
+}
+
+fn build_subledger_handoff_to_twap_message_inner(
+    squads_vault: &Pubkey,
+    pool: &Pubkey,
+    market_slab: &Pubkey,
+    twap_config: &Pubkey,
+    twap_authority: &Pubkey,
+    percolator_program: &Pubkey,
+    pool_writable: bool,
+) -> Vec<u8> {
     let mut m = Vec::new();
     m.push(1); // num_signers
     m.push(0); // num_writable_signers
-    m.push(2); // market_slab + twap_config
+    m.push(if pool_writable { 3 } else { 2 }); // market_slab + twap_config [+ pool]
     m.push(8); // account_keys count
     m.extend_from_slice(squads_vault.as_ref()); // 0 signer
     m.extend_from_slice(market_slab.as_ref()); // 1 writable
