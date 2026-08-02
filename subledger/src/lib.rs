@@ -4627,12 +4627,15 @@ fn validate_twap_recovery_grant(
 }
 
 // checkpoint_twap_insurance accounts:
-// [twap_authority(signer), twap_config, pool(w), market_slab, percolator_program]
+// [twap_authority(signer), twap_config, pool(w), market_slab, percolator_program,
+//  cross_backing_long_ledger?, cross_backing_short_ledger?]
 //
 // TWAP invokes this after its only live insurance-withdrawal path. Updating the
-// ordinary pool's physical checkpoint in the same transaction prevents a
-// withdrawn protocol buffer from masking a later owner loss. This instruction
-// cannot move value and accepts only the config-bound active TWAP authority.
+// pool's physical checkpoints in the same transaction prevents a withdrawn
+// protocol buffer from masking a later owner loss. Cross-backed pools also
+// checkpoint both canonical backing domains so insurance and backing losses are
+// applied atomically. This instruction cannot move value and accepts only the
+// config-bound active TWAP authority.
 fn process_checkpoint_twap_insurance(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -4647,9 +4650,6 @@ fn process_checkpoint_twap_insurance(
     let pool_account = next_account_info(iter)?;
     let market_slab = next_account_info(iter)?;
     let percolator_program = next_account_info(iter)?;
-    if iter.next().is_some() {
-        return Err(ProgramError::InvalidInstructionData);
-    }
     if !twap_authority.is_signer || !pool_account.is_writable {
         return Err(ProgramError::MissingRequiredSignature);
     }
@@ -4660,6 +4660,11 @@ fn process_checkpoint_twap_insurance(
         return Err(ProgramError::IllegalOwner);
     }
     let mut pool = Pool::deserialize(&pool_account.try_borrow_data()?)?;
+    let backing_ledgers = match iter.as_slice() {
+        [] => None,
+        [long, short] => Some([long, short]),
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
     if !pool.is_insurance()
         || !pool.custody_granted
         || *market_slab.key != pool.market_slab
@@ -4689,7 +4694,81 @@ fn process_checkpoint_twap_insurance(
             return Err(ProgramError::InvalidAccountData);
         }
     }
-    if pool.cross_backing || !uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
+    if pool.cross_backing {
+        if !uses_external_loss_checkpoints(&pool, pool_account.data_len()) {
+            return Ok(());
+        }
+        let mut provider_principals = [0u128; 2];
+        for (domain, ledger) in backing_ledgers
+            .ok_or(ProgramError::NotEnoughAccountKeys)?
+            .into_iter()
+            .enumerate()
+        {
+            provider_principals[domain] = validate_backing_ledger(
+                program_id,
+                pool_account.key,
+                market_slab.key,
+                percolator_program.key,
+                ledger,
+                domain as u16,
+            )?;
+        }
+        if percolator_accounting::read_asset_backing_authority(&market_data, 0)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+            != pool_account.key.to_bytes()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let backing_balances =
+            percolator_accounting::read_asset_backing_balances(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let backing_sources =
+            percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+        let mut owner_backing = u128::from(pool.pending_backing_total()?);
+        for domain in 0..2 {
+            owner_backing = owner_backing
+                .checked_add(
+                    backing_balances[domain]
+                        .provider_protected_principal_atoms(
+                            provider_principals[domain],
+                            backing_sources[domain],
+                        )
+                        .map_err(|_| ProgramError::InvalidAccountData)?,
+                )
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+        }
+        let owner_backing = owner_backing_protection(&pool, owner_backing)?;
+        let physical_insurance =
+            percolator_accounting::read_asset_insurance_remaining(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)
+                .and_then(|value| {
+                    u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
+                })?;
+        let insurance_spent =
+            percolator_accounting::read_asset_insurance_spent(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)
+                .and_then(aggregate_insurance_spent)?;
+        let protected = u128::from(physical_insurance)
+            .checked_add(u128::from(owner_backing))
+            .map(|value| value.min(u128::from(pool.outstanding_principal)))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        drop(market_data);
+        sync_indexed_cross_backing_external_loss(
+            &mut pool,
+            protected,
+            physical_insurance,
+            insurance_spent,
+            owner_backing,
+        )?;
+        pool.serialize(&mut pool_account.try_borrow_mut_data()?)?;
+        return Ok(());
+    }
+    if backing_ledgers.is_some() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !uses_principal_loss_checkpoint(&pool, pool_account.data_len()) {
         return Ok(());
     }
     let physical_insurance =
@@ -5247,7 +5326,14 @@ fn process_accept_operator(
                 .ok_or(ProgramError::ArithmeticOverflow)?;
         }
         let owner_backing = owner_backing_protection(&pool, owner_backing)?;
-        let owner_insurance = if let Some(checkpoint) = insurance_spent_checkpoint {
+        let owner_insurance = if uses_external_loss_checkpoints(&pool, pool_account.data_len())
+            && custody_principal.is_some()
+        {
+            core::cmp::min(
+                live_insurance,
+                u128::from(custody_principal.ok_or(ProgramError::InvalidAccountData)?),
+            )
+        } else if let Some(checkpoint) = insurance_spent_checkpoint {
             let insurance_loss = insurance_spent
                 .checked_sub(checkpoint)
                 .ok_or(ProgramError::InvalidAccountData)?;
@@ -6801,6 +6887,72 @@ mod tests {
             .unwrap(),
             26,
             "once checkpointed, protocol insurance absorbs only future spending",
+        );
+    }
+
+    #[test]
+    fn cross_twap_pull_checkpoint_preserves_loss_and_fee_ordering() {
+        let make_pool = || {
+            let mut pool = historical_pool_fixture();
+            pool.cross_backing = true;
+            pool.policy = POLICY_PRINCIPAL;
+            pool.domain = DOMAIN_INSURANCE;
+            pool.outstanding_principal = 29;
+            pool.total_shares = 29 * VIRTUAL_SHARES;
+            pool.share_rate_numerator = 1;
+            pool.share_rate_denominator = VIRTUAL_SHARES;
+            pool.insurance_spent_checkpoint = 10;
+            pool.backing_protected_checkpoint = 15;
+            pool.principal_protected_checkpoint = 16;
+            pool
+        };
+
+        let mut buffer_remains = make_pool();
+        sync_indexed_cross_backing_external_loss(
+            &mut buffer_remains,
+            28,
+            15,
+            11,
+            14,
+        )
+        .unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                buffer_remains.total_shares,
+                buffer_remains.share_rate_numerator,
+                buffer_remains.share_rate_denominator,
+            )
+            .unwrap(),
+            28,
+            "an unwithdrawn protocol buffer absorbs insurance spending before owners",
+        );
+
+        let mut buffer_pulled = make_pool();
+        sync_indexed_cross_backing_external_loss(
+            &mut buffer_pulled,
+            29,
+            14,
+            10,
+            15,
+        )
+        .unwrap();
+        sync_indexed_cross_backing_external_loss(
+            &mut buffer_pulled,
+            28,
+            14,
+            11,
+            14,
+        )
+        .unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                buffer_pulled.total_shares,
+                buffer_pulled.share_rate_numerator,
+                buffer_pulled.share_rate_denominator,
+            )
+            .unwrap(),
+            27,
+            "a post-loss fee cannot replace a protocol buffer withdrawn before the loss",
         );
     }
 

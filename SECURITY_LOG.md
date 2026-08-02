@@ -2,6 +2,37 @@
 
 Running note so the 5-min loop doesn't repeat vectors. Format: vector → verdict.
 
+## Tick - TWAP recovery double-charged cross-backed protocol insurance (surface B/C, REAL LOF)
+
+Unrelated public traders could create protocol insurance before a cross-backed owner deposited.
+After the owner handed custody to TWAP, a later public loss consumed one insurance atom and one
+canonical backing atom. The protocol buffer fully covered the insurance spend, but TWAP recovery
+pre-subtracted the cumulative spend from its owner-insurance cap before Subledger applied the same
+loss against its physical checkpoint. At exact-parent RED commit `1b5f637`, the independent winner
+withdrew a positive loss payout and the 29-atom owner recovered 27 instead of the correct 28.
+
+FIX: current-layout recovery caps owner insurance by the recorded handoff principal and delegates
+loss ordering to Subledger's monotonic spent and physical-balance checkpoints. Every pool-bound
+TWAP execute already performs a value-neutral checkpoint after its only insurance pull; the
+cross-backed shape now supplies both canonical backing ledgers and atomically advances insurance,
+backing, and loss-only share-rate checkpoints. Omitting or swapping those ledgers rejects and rolls
+back the complete execute. Historical 264-byte and 272-byte TWAP configs retain their predecessor
+recovery semantics.
+
+The retained public-init LiteSVM regression system-allocates and initializes the pinned Percolator
+market and all portfolios, produces predeposit insurance through a 100%-fee round trip, performs
+the Squads handoff, realizes and settles the public loss, returns custody permissionlessly, and
+proves the owner receives 28. A second full path pulls the buffer before the loss, generates a
+later public fee, and proves the owner receives 27 while the complete fee remains protocol
+insurance. Making the execute checkpoint a no-op changes that result to 28; restoring it returns
+the test to green. All 43 Subledger unit tests, 11 TWAP unit tests, and 288 chain tests pass.
+Final Subledger SBF checksum is
+`7696062a919bbf1dea19887cecb5b47b5a5122d2c5ded8c0ff9be9e1d0f6d08f`; TWAP is
+`09e01fe5fd69e778f63195a38164fac6ce88c782ec0d28c443ea7c5b34f04218`; pinned Percolator remains
+`74ce6b85576fcbcb7596fdc7a774ff92661853d50ca9eb9475fcba7b1b7f40a4`. No account layout,
+signer, authority, recipient, transfer route, caller-selected amount, or administrator surface was
+added.
+
 ## Tick - later protocol insurance could erase an unsynchronized cross-backing loss (surface B/C)
 
 A cross-backed genesis pool prices owner claims lazily. While TWAP held the asset-0 roles, a public
