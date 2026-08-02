@@ -371,6 +371,9 @@ capital owners may crystallize live or terminal insurance/backing at that fixed 
 resets the Subledger position clock, so post-epoch capital earns zero tenure. Any cranker may only
 reduce a trader stake whose previously crystallized loss has since been spent; the shared claim cap
 makes this refresh monotonic, so post-epoch flow cannot mint points or dilute the frozen denominator.
+If the owner directly closes or replaces that exact portfolio incarnation without a controller
+archive, its trader claim is already forfeited; after emission, any cranker may remove only those
+stale points before freeze. This terminal cleanup cannot move Percolator/Subledger collateral or COIN.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads
