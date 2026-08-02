@@ -4193,7 +4193,8 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
 // execute accounts: [cranker(signer), config(w), book(w), twap_authority(pda), market_slab(w),
 //   percolator_vault(w), vault_authority, percolator_program, holding(w), settlement_usd(w),
 //   book_escrow(pda), coin_escrow(w), coin_mint(w), token_program, savings_dest(w)?,
-//   coin_sink(w)?, custody_pool(w)?, subledger_program?]
+//   coin_sink(w)?, custody_pool(w)?, cross_backing_long_ledger(w)?,
+//   cross_backing_short_ledger(w)?, subledger_program?]
 //
 // PERMISSIONLESS, allowed once the round's slots have expired. The SOLE path that moves insurance:
 //  1) surplus = live asset-0 insurance - reserved_floor (the principal counter);
@@ -4253,20 +4254,37 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
         return Err(ProgramError::InvalidSeeds);
     }
     let pool_checkpoint = if config.custody_pool != Pubkey::default() {
-        let checkpoint_accounts = accounts
-            .get(accounts.len().saturating_sub(2)..)
-            .ok_or(ProgramError::NotEnoughAccountKeys)?;
-        let [custody_pool, subledger_program] = checkpoint_accounts else {
-            return Err(ProgramError::NotEnoughAccountKeys);
-        };
+        let (custody_pool, backing_ledgers, subledger_program) =
+            if accounts.len() >= 4
+                && accounts[accounts.len() - 4].key == &config.custody_pool
+            {
+                (
+                    &accounts[accounts.len() - 4],
+                    Some([
+                        &accounts[accounts.len() - 3],
+                        &accounts[accounts.len() - 2],
+                    ]),
+                    &accounts[accounts.len() - 1],
+                )
+            } else {
+                let checkpoint_accounts = accounts
+                    .get(accounts.len().saturating_sub(2)..)
+                    .ok_or(ProgramError::NotEnoughAccountKeys)?;
+                let [custody_pool, subledger_program] = checkpoint_accounts else {
+                    return Err(ProgramError::NotEnoughAccountKeys);
+                };
+                (custody_pool, None, subledger_program)
+            };
         if *custody_pool.key != config.custody_pool
             || !custody_pool.is_writable
+            || backing_ledgers
+                .is_some_and(|ledgers| ledgers.iter().any(|ledger| !ledger.is_writable))
             || *subledger_program.key != SUBLEDGER_PROGRAM_ID
             || !subledger_program.executable
         {
             return Err(ProgramError::InvalidAccountData);
         }
-        Some((custody_pool, subledger_program))
+        Some((custody_pool, backing_ledgers, subledger_program))
     } else {
         None
     };
@@ -4508,27 +4526,35 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
             &[&auth_seeds],
         )?;
     }
-    if let Some((custody_pool, subledger_program)) = pool_checkpoint {
+    if let Some((custody_pool, backing_ledgers, subledger_program)) = pool_checkpoint {
+        let mut checkpoint_accounts = vec![
+            AccountMeta::new_readonly(*twap_authority.key, true),
+            AccountMeta::new_readonly(*config_account.key, false),
+            AccountMeta::new(*custody_pool.key, false),
+            AccountMeta::new_readonly(*market_slab.key, false),
+            AccountMeta::new_readonly(*percolator_program.key, false),
+        ];
+        let mut checkpoint_account_infos = vec![
+            twap_authority.clone(),
+            config_account.clone(),
+            custody_pool.clone(),
+            market_slab.clone(),
+            percolator_program.clone(),
+        ];
+        if let Some(backing_ledgers) = backing_ledgers {
+            for ledger in backing_ledgers {
+                checkpoint_accounts.push(AccountMeta::new(*ledger.key, false));
+                checkpoint_account_infos.push(ledger.clone());
+            }
+        }
+        checkpoint_account_infos.push(subledger_program.clone());
         invoke_signed(
             &Instruction {
                 program_id: *subledger_program.key,
-                accounts: vec![
-                    AccountMeta::new_readonly(*twap_authority.key, true),
-                    AccountMeta::new_readonly(*config_account.key, false),
-                    AccountMeta::new(*custody_pool.key, false),
-                    AccountMeta::new_readonly(*market_slab.key, false),
-                    AccountMeta::new_readonly(*percolator_program.key, false),
-                ],
+                accounts: checkpoint_accounts,
                 data: vec![SUBLEDGER_IX_CHECKPOINT_TWAP_INSURANCE],
             },
-            &[
-                twap_authority.clone(),
-                config_account.clone(),
-                custody_pool.clone(),
-                market_slab.clone(),
-                percolator_program.clone(),
-                subledger_program.clone(),
-            ],
+            &checkpoint_account_infos,
             &[&auth_seeds],
         )?;
     }

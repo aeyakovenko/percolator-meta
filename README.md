@@ -22,6 +22,8 @@ principal from both protection classes, subject to losses incurred during their 
   a withdrawal. A current TWAP handoff checkpoints asset-0's cumulative insurance consumption;
   recovery applies only the loss-adjusted owner insurance plus canonical provider backing before
   rotating custody, so later fees or donations cannot restore an already-incurred owner loss.
+  Every pool-bound TWAP insurance pull atomically advances that checkpoint; cross-backed pools
+  supply both canonical ledgers, so a removed protocol buffer cannot mask a later owner loss.
   Genesis cross backing uses two canonical Percolator-owned ledgers while the
   owner-bound pool remains its backing authority through the TWAP handoff. Neither the DAO nor a
   cranker can select a principal amount or recipient. Backing utilization earnings are excluded
@@ -309,7 +311,8 @@ slot-only wire remains valid only for predecessor books that are exit-only under
    insurance complement in the TWAP floor, capped by live insurance, and checkpoints the selected
    asset's monotonic insurance-consumption counters while the pool keeps backing authority. On
    return, Subledger combines the post-checkpoint insurance loss with canonical long/short backing
-   ledgers before updating its loss-only share rate. An atomic live
+   ledgers before updating its loss-only share rate. Each intervening TWAP pull performs the same
+   value-neutral checkpoint with those fixed ledgers. An atomic live
    owner exit creates a one-use permit for any cranker to re-handoff that same pool to that same
    config; the crank replaces only the exited principal component. Retained insurance stays protected
    and exited principal no longer strands fee surplus.

@@ -1024,6 +1024,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             perc_vault: vault,
             vault_authority,
             custody_pool: Some(pool),
+            custody_backing_ledgers: None,
             principal: owner_principal,
             surplus,
         };
@@ -2472,6 +2473,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         perc_vault: vault,
         vault_authority,
         custody_pool: Some(pool),
+        custody_backing_ledgers: None,
         principal: owner_principal,
         surplus: 0,
     };
@@ -24569,6 +24571,7 @@ fn e2e_subledger_recovery_rehandoff_tracks_live_principal() {
         perc_vault,
         vault_authority,
         custody_pool: Some(pool),
+        custody_backing_ledgers: None,
         principal: 0,
         surplus: fee_surplus,
     };
@@ -25310,6 +25313,7 @@ struct HandoffEnv {
     perc_vault: Pubkey,
     vault_authority: Pubkey,
     custody_pool: Option<Pubkey>,
+    custody_backing_ledgers: Option<[Pubkey; 2]>,
     principal: u64,
     surplus: u64,
 }
@@ -25504,6 +25508,7 @@ fn setup_handoff_with_mint_mode(
         perc_vault,
         vault_authority,
         custody_pool: None,
+        custody_backing_ledgers: None,
         principal,
         surplus,
     }
@@ -26739,6 +26744,7 @@ fn execute_pull_is_rejected_when_the_config_is_not_the_insurance_operator() {
         perc_vault,
         vault_authority,
         custody_pool: None,
+        custody_backing_ledgers: None,
         principal,
         surplus,
     };
@@ -34627,6 +34633,11 @@ fn execute_ix_full(
     }
     if let Some(pool) = env.custody_pool {
         accounts.push(AccountMeta::new(pool, false));
+        if let Some(backing_ledgers) = env.custody_backing_ledgers {
+            for ledger in backing_ledgers {
+                accounts.push(AccountMeta::new(ledger, false));
+            }
+        }
         accounts.push(AccountMeta::new_readonly(sub_id(), false));
     }
     Instruction {
@@ -35880,6 +35891,7 @@ fn setup_public_empty_market_handoff(svm: &mut LiteSVM, payer: &Keypair) -> Hand
         perc_vault: canonical_insurance_vault(&vault_authority, &collateral_mint),
         vault_authority,
         custody_pool: None,
+        custody_backing_ledgers: None,
         principal: 0,
         surplus: 0,
     }
@@ -39972,6 +39984,8 @@ fn e2e_full_genesis_to_buy_burn() {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new(reward_vault, false),
                 AccountMeta::new(pool, false),
+                AccountMeta::new(long_genesis_backing_ledger, false),
+                AccountMeta::new(short_genesis_backing_ledger, false),
                 AccountMeta::new_readonly(sub_id(), false),
             ],
             data: vec![8u8],
@@ -54309,6 +54323,7 @@ fn e2e_market_genesis_traders_residual_decider_then_handoff_twap() {
         perc_vault,
         vault_authority,
         custody_pool: Some(pool),
+        custody_backing_ledgers: None,
         principal: amount,
         surplus,
     };
@@ -59541,12 +59556,15 @@ fn create_system_allocated_public_portfolio(
 // must absorb later spending before that independent owner's 50/50 principal is
 // impaired. Every Percolator market and portfolio below uses system allocation
 // followed by the pinned program's public initialization instructions.
-#[test]
-fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
+fn run_predeposit_protocol_insurance_cross_backing_loss(
+    handoff_before_loss: bool,
+    twap_pulls_before_loss: bool,
+) {
     use percolator_prog::ix::Instruction as PIx;
 
     const INITIAL_PRICE: u64 = 100;
     const OWNER_PRINCIPAL: u64 = 29;
+    assert!(!twap_pulls_before_loss || handoff_before_loss);
 
     let mut svm =
         LiteSVM::new().with_compute_budget(solana_program_runtime::compute_budget::ComputeBudget {
@@ -59557,12 +59575,45 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
     svm.add_program_from_file(perc_id(), perc_so()).unwrap();
     svm.add_program_from_file(sub_id(), so_deploy("subledger_program"))
         .unwrap();
+    if handoff_before_loss {
+        svm.add_program_from_file(twap_id(), so_deploy("twap_program"))
+            .unwrap();
+    }
     let payer = Keypair::new();
     let admin = Keypair::new();
     let oracle = Keypair::new();
     for signer in [&payer, &admin, &oracle] {
         svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
     }
+    let governance = if handoff_before_loss {
+        let squads = squads_id();
+        let treasury = install_squads(&mut svm, &squads, &payer.pubkey());
+        let create_key = Keypair::new();
+        let multisig = multisig_pda(&squads, &create_key.pubkey());
+        let create_ix = multisig_create_v2_ix(
+            &squads,
+            &treasury,
+            &multisig,
+            &create_key.pubkey(),
+            &payer.pubkey(),
+            Some(&admin.pubkey()),
+            1,
+            &[(admin.pubkey(), PERM_ALL)],
+            TIMELOCK_1_WEEK_SECS,
+        );
+        let blockhash = svm.latest_blockhash();
+        svm.send_transaction(Transaction::new_signed_with_payer(
+            &[create_ix],
+            Some(&payer.pubkey()),
+            &[&payer, &create_key],
+            blockhash,
+        ))
+        .expect("initialize constrained Squads governance");
+        let squads_vault = vault_pda(&squads, &multisig, 0);
+        Some((squads, multisig, squads_vault))
+    } else {
+        None
+    };
     svm.set_sysvar(&Clock {
         slot: 100,
         unix_timestamp: 100,
@@ -59838,6 +59889,195 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
     .expect("independent owner deposits after the protocol buffer exists");
     assert_eq!(token_amount(&svm, &owner_destination), 0);
 
+    let twap_custody = if let Some((squads, multisig, squads_vault)) = governance.as_ref() {
+        let mut rotate_market_authority = Vec::new();
+        rotate_market_authority.push(2); // current admin + incoming Squads vault
+        rotate_market_authority.push(0); // both signers are read-only
+        rotate_market_authority.push(1); // market is writable
+        rotate_market_authority.push(4);
+        for key in [admin.pubkey(), *squads_vault, market, perc_id()] {
+            rotate_market_authority.extend_from_slice(key.as_ref());
+        }
+        rotate_market_authority.push(1);
+        rotate_market_authority.push(3); // Percolator program
+        rotate_market_authority.push(3);
+        rotate_market_authority.extend_from_slice(&[0, 1, 2]);
+        let rotate_data = PIx::UpdateAuthority {
+            new_pubkey: squads_vault.to_bytes(),
+        }
+        .encode();
+        rotate_market_authority.extend_from_slice(&(rotate_data.len() as u16).to_le_bytes());
+        rotate_market_authority.extend_from_slice(&rotate_data);
+        rotate_market_authority.push(0);
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            1,
+            &rotate_market_authority,
+            &[
+                AccountMeta::new_readonly(admin.pubkey(), true),
+                AccountMeta::new_readonly(*squads_vault, false),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
+            ],
+        )
+        .expect("the current admin and Squads vault jointly rotate market governance");
+        send(
+            &mut svm,
+            &[&payer],
+            init_config_ix(
+                &payer.pubkey(),
+                &coin_mint,
+                &market,
+                multisig,
+                &admin.pubkey(),
+                &perc_id(),
+            ),
+        )
+        .expect("initialize the market-bound TWAP config");
+        let twap_config =
+            twap_config_pda(&market, multisig, &coin_mint, &perc_id());
+        let twap_authority =
+            Pubkey::find_program_address(&[b"market-0-twap", twap_config.as_ref()], &twap_id()).0;
+        let handoff = build_cross_backing_subledger_handoff_to_twap_message(
+            squads_vault,
+            &pool,
+            &market,
+            &twap_config,
+            &twap_authority,
+            &perc_id(),
+            &long_backing_ledger,
+            &short_backing_ledger,
+        );
+        let remaining = vec![
+            AccountMeta::new_readonly(*squads_vault, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(twap_config, false),
+            AccountMeta::new_readonly(pool, false),
+            AccountMeta::new_readonly(twap_authority, false),
+            AccountMeta::new_readonly(perc_id(), false),
+            AccountMeta::new_readonly(twap_id(), false),
+            AccountMeta::new_readonly(sub_id(), false),
+            AccountMeta::new_readonly(long_backing_ledger, false),
+            AccountMeta::new_readonly(short_backing_ledger, false),
+        ];
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            2,
+            &handoff,
+            &remaining,
+        )
+        .expect("governance hands the funded cross-backed pool to constrained TWAP custody");
+        let [nominal_owner_insurance, _] =
+            percolator_accounting::balanced_insurance_domains(u128::from(OWNER_PRINCIPAL));
+        assert_eq!(
+            read_reserved_floor(&svm, &twap_config),
+            nominal_owner_insurance,
+            "pre-deposit protocol insurance is not part of the owner-protected TWAP floor",
+        );
+        Some((twap_config, twap_authority, *squads_vault))
+    } else {
+        None
+    };
+    if twap_pulls_before_loss {
+        let (squads, multisig, squads_vault) = governance.as_ref().unwrap();
+        let (twap_config, twap_authority, _) = twap_custody.unwrap();
+        let policy = build_twap_reconfigure_message(
+            squads_vault,
+            &twap_config,
+            &twap_id(),
+            10_000,
+        );
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            3,
+            &policy,
+            &reconfigure_remaining_accounts(squads_vault, &twap_config),
+        )
+        .expect("governance configures a full-surplus auction");
+        let auction_env = HandoffEnv {
+            squads: *squads,
+            multisig: *multisig,
+            dao: Keypair::from_bytes(&admin.to_bytes()).unwrap(),
+            squads_vault: *squads_vault,
+            slab: market,
+            collateral_mint,
+            coin_mint,
+            coin_mint_authority: Keypair::from_bytes(&mint_authority.to_bytes()).unwrap(),
+            twap_cfg: twap_config,
+            twap_authority,
+            perc_vault: percolator_vault,
+            vault_authority,
+            custody_pool: Some(pool),
+            custody_backing_ledgers: Some([long_backing_ledger, short_backing_ledger]),
+            principal: OWNER_PRINCIPAL,
+            surplus: u64::try_from(predeposit_protocol_insurance).unwrap(),
+        };
+        let book = setup_auction_at_index(
+            &mut svm,
+            &payer,
+            &auction_env,
+            4,
+            1,
+            0,
+            None,
+            0,
+        );
+        let round_end = u64::from_le_bytes(
+            svm.get_account(&book.book).unwrap().data[240..248]
+                .try_into()
+                .unwrap(),
+        );
+        warp_to(&mut svm, round_end);
+        let execute = execute_ix(
+            &payer.pubkey(),
+            &auction_env,
+            &book.book,
+            &book.holding,
+            &book.settlement_usd,
+            &book.book_escrow,
+            &book.coin_escrow,
+            None,
+        );
+        let mut missing_ledgers = execute.clone();
+        let subledger_program = missing_ledgers.accounts.pop().unwrap();
+        missing_ledgers.accounts.pop();
+        missing_ledgers.accounts.pop();
+        missing_ledgers.accounts.push(subledger_program);
+        let market_before = svm.get_account(&market).unwrap();
+        let pool_before = svm.get_account(&pool).unwrap();
+        let config_before = svm.get_account(&twap_config).unwrap();
+        let holding_before = svm.get_account(&book.holding).unwrap();
+        assert!(
+            send(&mut svm, &[&payer], missing_ledgers).is_err(),
+            "a cross-backed TWAP execute cannot omit either canonical backing ledger",
+        );
+        assert_eq!(svm.get_account(&market).unwrap(), market_before);
+        assert_eq!(svm.get_account(&pool).unwrap(), pool_before);
+        assert_eq!(svm.get_account(&twap_config).unwrap(), config_before);
+        assert_eq!(svm.get_account(&book.holding).unwrap(), holding_before);
+        send(&mut svm, &[&payer], execute)
+            .expect("permissionless TWAP execution pulls the predeposit protocol buffer");
+        let [nominal_owner_insurance, _] =
+            percolator_accounting::balanced_insurance_domains(u128::from(OWNER_PRINCIPAL));
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            nominal_owner_insurance,
+            "the public auction removes only protocol insurance before the loss",
+        );
+    }
+
     let winner = Keypair::new();
     let loser = Keypair::new();
     let winner_portfolio = create_system_allocated_public_portfolio(
@@ -60022,26 +60262,85 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         owner_backing_loss > 0,
         "the control loss consumes canonical owner backing",
     );
+    let expected_live_owner_insurance = if twap_pulls_before_loss {
+        nominal_owner_insurance
+            .checked_sub(insurance_spent)
+            .unwrap()
+    } else {
+        nominal_owner_insurance
+    };
     assert!(
-        read_asset_insurance_remaining(&svm, &market, 0) >= nominal_owner_insurance,
-        "the owner's nominal insurance tranche remains physically present",
+        read_asset_insurance_remaining(&svm, &market, 0) >= expected_live_owner_insurance,
+        "live insurance reflects whether protocol value was present for the loss",
     );
     assert!(
         !percolator_accounting::asset_has_position_or_loss_state(&market_data, 0).unwrap(),
         "bounded public cranks clear every exposure before owner withdrawal",
     );
-    send(
-        &mut svm,
-        &[&payer, &admin],
-        pix(
-            vec![
-                AccountMeta::new_readonly(admin.pubkey(), true),
+    let late_protocol_fee = if twap_pulls_before_loss {
+        let insurance_before_fee =
+            read_asset_insurance_remaining(&svm, &market, 0);
+        let fee_size_q = (percolator::POS_SCALE / 100) as i128;
+        for size_q in [fee_size_q, -fee_size_q] {
+            send(
+                &mut svm,
+                &[&payer, &fee_long, &fee_short],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(fee_long.pubkey(), true),
+                        AccountMeta::new_readonly(fee_short.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(fee_long_portfolio, false),
+                        AccountMeta::new(fee_short_portfolio, false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index: 0,
+                        size_q,
+                        exec_price: target_mark,
+                        fee_bps: 10_000,
+                    },
+                ),
+            )
+            .expect("unrelated users generate protocol insurance after the owner loss");
+        }
+        let late_fee =
+            read_asset_insurance_remaining(&svm, &market, 0) - insurance_before_fee;
+        assert!(late_fee > 0, "the public round trip creates a late fee");
+        late_fee
+    } else {
+        0
+    };
+    if let Some((squads, multisig, squads_vault)) = governance.as_ref() {
+        let resolve = build_direct_resolve_message(squads_vault, &market, &perc_id());
+        squads_execute(
+            &mut svm,
+            squads,
+            multisig,
+            &admin,
+            &payer,
+            if twap_pulls_before_loss { 5 } else { 3 },
+            &resolve,
+            &[
+                AccountMeta::new_readonly(*squads_vault, false),
                 AccountMeta::new(market, false),
+                AccountMeta::new_readonly(perc_id(), false),
             ],
-            PIx::ResolveMarket,
-        ),
-    )
-    .expect("the established lifecycle authority resolves the cleared market");
+        )
+        .expect("Squads resolves the cleared market through its constrained vault");
+    } else {
+        send(
+            &mut svm,
+            &[&payer, &admin],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(admin.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ResolveMarket,
+            ),
+        )
+        .expect("the established lifecycle authority resolves the cleared market");
+    }
 
     let trader_destinations = [
         Pubkey::new_unique(),
@@ -60145,6 +60444,24 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         "the independent winner extracts a positive payout from the loss",
     );
 
+    if let Some((twap_config, twap_authority, squads_vault)) = twap_custody {
+        send(
+            &mut svm,
+            &[&payer],
+            twap_return_cross_backing_to_subledger_ix(
+                &squads_vault,
+                &pool,
+                &market,
+                &twap_config,
+                &twap_authority,
+                &perc_id(),
+                &long_backing_ledger,
+                &short_backing_ledger,
+            ),
+        )
+        .expect("any cranker returns resolved TWAP custody to the owner-bound pool");
+    }
+
     let owner_withdraw_data = subledger_insurance_withdraw_data(
         &svm,
         &owner_position,
@@ -60174,8 +60491,14 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         },
     )
     .expect("owner exits after all market exposure is cleared");
+    let owner_insurance_loss = if twap_pulls_before_loss {
+        insurance_spent
+    } else {
+        0
+    };
     let expected_payout = u128::from(OWNER_PRINCIPAL)
         .checked_sub(owner_backing_loss)
+        .and_then(|value| value.checked_sub(owner_insurance_loss))
         .and_then(|value| u64::try_from(value).ok())
         .unwrap();
     assert_eq!(
@@ -60183,6 +60506,28 @@ fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
         expected_payout,
         "pre-deposit protocol insurance must absorb insurance spending before owner principal",
     );
+    if twap_pulls_before_loss {
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            late_protocol_fee,
+            "a fee first observed after the loss remains protocol insurance",
+        );
+    }
+}
+
+#[test]
+fn e2e_predeposit_protocol_insurance_absorbs_cross_backing_loss_first() {
+    run_predeposit_protocol_insurance_cross_backing_loss(false, false);
+}
+
+#[test]
+fn e2e_twap_recovery_preserves_cross_backing_predeposit_protocol_buffer() {
+    run_predeposit_protocol_insurance_cross_backing_loss(true, false);
+}
+
+#[test]
+fn e2e_cross_twap_pull_cannot_turn_late_fee_into_owner_recovery() {
+    run_predeposit_protocol_insurance_cross_backing_loss(true, true);
 }
 
 // EXTERNAL-BACKING CAPTURE: a cross-backed genesis pool needs the backing role,
