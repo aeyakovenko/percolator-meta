@@ -51753,6 +51753,9 @@ impl TestInstruction for RdCrystallizeRequest {
                 retired_market_pda(&self.market, &perc_id()),
                 false,
             ));
+            if self.cohort == 4 {
+                accounts.push(AccountMeta::new_readonly(self.market, false));
+            }
         }
         Instruction {
             program_id: rd_id(),
@@ -51837,6 +51840,664 @@ fn rd_claim_ix(
         accounts,
         data: vec![5],
     }
+}
+
+// PUBLIC REWARD LOF PROBE: funding crystallization is permissionless and the reward end slot is
+// inclusive. A co-staker must not be able to crystallize the victim before the final public funding
+// crank in that slot, crystallize itself afterward, and transfer fixed reward COIN while leaving all
+// Percolator collateral outcomes unchanged.
+#[test]
+fn e2e_final_slot_crystallize_cannot_omit_later_same_slot_funding() {
+    use percolator_prog::ix::Instruction as PIx;
+
+    const OPEN_SLOT: u64 = 1;
+    const EMISSION_END: u64 = 5;
+    const FINALIZE_WINDOW: u64 = 3;
+    const DEPOSIT: u64 = 100_000_000;
+    const REWARD_SUPPLY: u64 = 1_000_000;
+
+    #[derive(Debug)]
+    struct Outcome {
+        early_snapshot_landed: bool,
+        stale_leg_snapshot_landed: bool,
+        victim_points: u128,
+        beneficiary_points: u128,
+        victim_paid: u128,
+        beneficiary_paid: u128,
+        victim_reward: u64,
+        beneficiary_reward: u64,
+        reward_vault: u64,
+        capitals: [u128; 3],
+        pnls: [i128; 3],
+        collateral_vault: u64,
+    }
+
+    fn stake_points(svm: &LiteSVM, stake: &Pubkey) -> u128 {
+        let account = svm.get_account(stake).expect("funding stake");
+        u128::from_le_bytes(account.data[176..192].try_into().unwrap())
+    }
+
+    fn portfolio_financials(svm: &LiteSVM, portfolio: &Pubkey) -> (u128, i128) {
+        let account = svm.get_account(portfolio).expect("live portfolio");
+        let state = percolator_prog::state::read_portfolio(&account.data).unwrap();
+        (state.capital.get(), state.pnl.get())
+    }
+
+    fn run(crystallize_victim_before_final_crank: bool) -> Outcome {
+        let mut svm = LiteSVM::new().with_compute_budget(
+            solana_program_runtime::compute_budget::ComputeBudget {
+                compute_unit_limit: 1_400_000,
+                heap_size: 256 * 1024,
+                ..solana_program_runtime::compute_budget::ComputeBudget::default()
+            },
+        );
+        svm.add_program_from_file(perc_id(), perc_so()).unwrap();
+        svm.add_program_from_file(rd_id(), rd_so()).unwrap();
+
+        let payer = Keypair::new();
+        let creator = Keypair::new();
+        let oracle = Keypair::new();
+        let victim = Keypair::new();
+        let beneficiary = Keypair::new();
+        let counterparty = Keypair::new();
+        for signer in [
+            &payer,
+            &creator,
+            &oracle,
+            &victim,
+            &beneficiary,
+            &counterparty,
+        ] {
+            svm.airdrop(&signer.pubkey(), 100_000_000_000).unwrap();
+        }
+        svm.set_sysvar(&Clock {
+            slot: OPEN_SLOT,
+            unix_timestamp: OPEN_SLOT as i64,
+            ..Clock::default()
+        });
+
+        let collateral_authority = Keypair::new();
+        let collateral_mint =
+            create_real_mint(&mut svm, &payer, &collateral_authority.pubkey());
+        let market_signer = Keypair::new();
+        let market = market_signer.pubkey();
+        let market_len = percolator_prog::state::market_account_len_for_capacity(1).unwrap();
+        let market_rent = svm.minimum_balance_for_rent_exemption(market_len);
+        send(
+            &mut svm,
+            &[&payer, &market_signer],
+            solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &market,
+                market_rent,
+                market_len as u64,
+                &perc_id(),
+            ),
+        )
+        .expect("publicly allocate the funding market");
+        send(
+            &mut svm,
+            &[&payer, &creator],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new(market, false),
+                    AccountMeta::new_readonly(collateral_mint, false),
+                ],
+                PIx::InitMarket {
+                    max_portfolio_assets: 1,
+                    h_min: 0,
+                    h_max: 10,
+                    initial_price: 100,
+                    min_nonzero_mm_req: 1,
+                    min_nonzero_im_req: 2,
+                    maintenance_margin_bps: 10_000,
+                    initial_margin_bps: 10_000,
+                    max_trading_fee_bps: 10_000,
+                    trade_fee_base_bps: 0,
+                    liquidation_fee_bps: 0,
+                    liquidation_fee_cap: 0,
+                    min_liquidation_abs: 0,
+                    max_price_move_bps_per_slot: 100,
+                    max_accrual_dt_slots: 1,
+                    max_abs_funding_e9_per_slot: 10_000,
+                    min_funding_lifetime_slots: 1,
+                    max_account_b_settlement_chunks: 1,
+                    max_bankrupt_close_chunks: 1,
+                    max_bankrupt_close_lifetime_slots: 1,
+                    public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                    maintenance_fee_per_slot: 0,
+                },
+            ),
+        )
+        .expect("publicly initialize the funding market");
+        send(
+            &mut svm,
+            &[&payer, &creator, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(creator.pubkey(), true),
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::UpdateAssetAuthority {
+                    asset_index: 0,
+                    kind: 4,
+                    new_pubkey: oracle.pubkey().to_bytes(),
+                },
+            ),
+        )
+        .expect("separate the funding oracle authority");
+        send(
+            &mut svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::ConfigureAuthMark {
+                    asset_index: 0,
+                    now_slot: OPEN_SLOT,
+                    initial_mark_e6: 100,
+                },
+            ),
+        )
+        .expect("configure the authenticated funding mark");
+
+        let vault_authority = perc_vault_authority(&market, &perc_id());
+        let collateral_vault =
+            canonical_insurance_vault(&vault_authority, &collateral_mint);
+        set_token(
+            &mut svm,
+            &collateral_vault,
+            &collateral_mint,
+            &vault_authority,
+            0,
+        );
+
+        let reward_authority = Keypair::new();
+        let reward_mint =
+            create_real_mint(&mut svm, &payer, &reward_authority.pubkey());
+        let reward_config = rd_epoch_config_pda(&payer.pubkey(), &reward_mint, 1);
+        let reward_vault = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &reward_vault,
+            &reward_mint,
+            &reward_config,
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer, &reward_authority],
+            spl_token::instruction::mint_to(
+                &spl_token::ID,
+                &reward_mint,
+                &reward_vault,
+                &reward_authority.pubkey(),
+                &[],
+                REWARD_SUPPLY,
+            )
+            .unwrap(),
+        )
+        .expect("fund the fixed reward vault");
+        send(
+            &mut svm,
+            &[&payer],
+            rd_epoch_init_ix(
+                &payer.pubkey(),
+                &payer.pubkey(),
+                &reward_mint,
+                &perc_id(),
+                &sub_id(),
+                &reward_config,
+                &reward_vault,
+                1,
+                OPEN_SLOT,
+                EMISSION_END,
+                REWARD_SUPPLY,
+                0,
+                0,
+                0,
+                10_000,
+                FINALIZE_WINDOW,
+                0,
+                &[(market, Pubkey::default(), Pubkey::default())],
+            ),
+        )
+        .expect("initialize the funding-only reward epoch");
+        send(
+            &mut svm,
+            &[&payer, &reward_authority],
+            spl_token::instruction::set_authority(
+                &spl_token::ID,
+                &reward_mint,
+                None,
+                spl_token::instruction::AuthorityType::MintTokens,
+                &reward_authority.pubkey(),
+                &[],
+            )
+            .unwrap(),
+        )
+        .expect("fix the reward supply");
+
+        let victim_portfolio = Keypair::new();
+        let beneficiary_portfolio = Keypair::new();
+        let counterparty_portfolio = Keypair::new();
+        let portfolio_len =
+            percolator_prog::state::portfolio_account_len_for_market_slots(2).unwrap();
+        let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
+        for (owner, portfolio) in [
+            (&victim, &victim_portfolio),
+            (&beneficiary, &beneficiary_portfolio),
+            (&counterparty, &counterparty_portfolio),
+        ] {
+            send(
+                &mut svm,
+                &[&payer, portfolio],
+                solana_sdk::system_instruction::create_account(
+                    &payer.pubkey(),
+                    &portfolio.pubkey(),
+                    portfolio_rent,
+                    portfolio_len as u64,
+                    &perc_id(),
+                ),
+            )
+            .expect("publicly allocate a portfolio");
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                    ],
+                    PIx::InitPortfolio,
+                ),
+            )
+            .expect("publicly initialize a portfolio");
+            let source = Pubkey::new_unique();
+            set_token(
+                &mut svm,
+                &source,
+                &collateral_mint,
+                &owner.pubkey(),
+                DEPOSIT,
+            );
+            send(
+                &mut svm,
+                &[&payer, owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio.pubkey(), false),
+                        AccountMeta::new(source, false),
+                        AccountMeta::new(collateral_vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                    ],
+                    PIx::Deposit {
+                        amount: u128::from(DEPOSIT),
+                    },
+                ),
+            )
+            .expect("deposit collateral into the public portfolio");
+        }
+
+        for (owner, portfolio) in [
+            (&victim, &victim_portfolio),
+            (&beneficiary, &beneficiary_portfolio),
+        ] {
+            send(
+                &mut svm,
+                &[&payer, owner],
+                rd_register_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &owner.pubkey(),
+                    &owner.pubkey(),
+                    &market,
+                    &portfolio.pubkey(),
+                    4,
+                ),
+            )
+            .expect("register a live funding payer");
+        }
+
+        let position_size = 100_000 * percolator::POS_SCALE as i128;
+        for (short_owner, short_portfolio) in [
+            (&victim, &victim_portfolio),
+            (&beneficiary, &beneficiary_portfolio),
+        ] {
+            send(
+                &mut svm,
+                &[&payer, &counterparty, short_owner],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(counterparty.pubkey(), true),
+                        AccountMeta::new_readonly(short_owner.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(counterparty_portfolio.pubkey(), false),
+                        AccountMeta::new(short_portfolio.pubkey(), false),
+                    ],
+                    PIx::TradeNoCpi {
+                        asset_index: 0,
+                        size_q: position_size,
+                        exec_price: 100,
+                        fee_bps: 0,
+                    },
+                ),
+            )
+            .expect("open one equal short against the common long");
+        }
+
+        let crank = |svm: &mut LiteSVM, portfolio: Pubkey, slot: u64| {
+            send(
+                svm,
+                &[&payer],
+                pix(
+                    vec![
+                        AccountMeta::new_readonly(payer.pubkey(), true),
+                        AccountMeta::new(market, false),
+                        AccountMeta::new(portfolio, false),
+                    ],
+                    PIx::PermissionlessCrank {
+                        now_slot: slot,
+                        observations: vec![percolator_prog::ix::CrankObservationHint {
+                            asset_index: 0,
+                            oracle_accounts: 0,
+                        }],
+                    },
+                ),
+            )
+        };
+
+        warp_to(&mut svm, 2);
+        send(
+            &mut svm,
+            &[&payer, &oracle],
+            pix(
+                vec![
+                    AccountMeta::new_readonly(oracle.pubkey(), true),
+                    AccountMeta::new(market, false),
+                ],
+                PIx::PushAuthMark {
+                    asset_index: 0,
+                    now_slot: 2,
+                    mark_e6: 50,
+                },
+            ),
+        )
+        .expect("publish the short-pays-long discount");
+        for slot in 2..EMISSION_END {
+            warp_to(&mut svm, slot);
+            for (index, portfolio) in [
+                counterparty_portfolio.pubkey(),
+                victim_portfolio.pubkey(),
+                beneficiary_portfolio.pubkey(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                crank(&mut svm, portfolio, slot).unwrap_or_else(|error| {
+                    panic!(
+                        "record ordinary paid funding at slot {slot}, portfolio {index}: {error}"
+                    )
+                });
+            }
+        }
+        let victim_before =
+            read_portfolio_funding_short_paid(&svm, &victim_portfolio.pubkey());
+        let beneficiary_before =
+            read_portfolio_funding_short_paid(&svm, &beneficiary_portfolio.pubkey());
+        assert!(victim_before > 0);
+        assert_eq!(victim_before, beneficiary_before);
+
+        warp_to(&mut svm, EMISSION_END);
+        let early_snapshot_landed = if crystallize_victim_before_final_crank {
+            send(
+                &mut svm,
+                &[&payer],
+                rd_crystallize_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    4,
+                ),
+            )
+            .is_ok()
+        } else {
+            false
+        };
+        crank(
+            &mut svm,
+            counterparty_portfolio.pubkey(),
+            EMISSION_END,
+        )
+        .expect("public final-slot crank advances the shared market");
+        let stale_leg_snapshot_landed = if crystallize_victim_before_final_crank {
+            send(
+                &mut svm,
+                &[&payer],
+                rd_crystallize_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    4,
+                ),
+            )
+            .is_ok()
+        } else {
+            false
+        };
+        for portfolio in [
+            victim_portfolio.pubkey(),
+            beneficiary_portfolio.pubkey(),
+        ] {
+            crank(&mut svm, portfolio, EMISSION_END)
+                .expect("public final-slot crank records eligible funding");
+        }
+        let victim_paid =
+            read_portfolio_funding_short_paid(&svm, &victim_portfolio.pubkey());
+        let beneficiary_paid =
+            read_portfolio_funding_short_paid(&svm, &beneficiary_portfolio.pubkey());
+        assert!(victim_paid > victim_before);
+        assert_eq!(victim_paid, beneficiary_paid);
+
+        if !crystallize_victim_before_final_crank
+            || (!early_snapshot_landed && !stale_leg_snapshot_landed)
+        {
+            send(
+                &mut svm,
+                &[&payer],
+                rd_crystallize_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    4,
+                ),
+            )
+            .expect("control snapshots the victim after the final public crank");
+        }
+        send(
+            &mut svm,
+            &[&payer],
+            rd_crystallize_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &beneficiary.pubkey(),
+                &market,
+                &beneficiary_portfolio.pubkey(),
+                4,
+            ),
+        )
+        .expect("co-staker snapshots after the final public crank");
+
+        let victim_stake = rd_stake_pda(
+            &reward_config,
+            &victim.pubkey(),
+            &victim_portfolio.pubkey(),
+            4,
+        );
+        let beneficiary_stake = rd_stake_pda(
+            &reward_config,
+            &beneficiary.pubkey(),
+            &beneficiary_portfolio.pubkey(),
+            4,
+        );
+        let victim_points = stake_points(&svm, &victim_stake);
+        let beneficiary_points = stake_points(&svm, &beneficiary_stake);
+
+        warp_to(&mut svm, EMISSION_END + 1);
+        assert!(
+            send(
+                &mut svm,
+                &[&payer],
+                rd_crystallize_ix(
+                    &payer.pubkey(),
+                    &reward_config,
+                    &victim.pubkey(),
+                    &market,
+                    &victim_portfolio.pubkey(),
+                    4,
+                ),
+            )
+            .is_err(),
+            "the next slot cannot repair a stale funding snapshot"
+        );
+
+        let mut capitals = [0u128; 3];
+        let mut pnls = [0i128; 3];
+        for (index, portfolio) in [
+            counterparty_portfolio.pubkey(),
+            victim_portfolio.pubkey(),
+            beneficiary_portfolio.pubkey(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            (capitals[index], pnls[index]) = portfolio_financials(&svm, portfolio);
+        }
+        let collateral_vault_amount = token_amount(&svm, &collateral_vault);
+
+        warp_to(&mut svm, EMISSION_END + FINALIZE_WINDOW);
+        send(
+            &mut svm,
+            &[&payer],
+            rd_freeze_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &reward_mint,
+                &reward_vault,
+            ),
+        )
+        .expect("freeze the funding denominator");
+        let victim_reward_destination = Pubkey::new_unique();
+        let beneficiary_reward_destination = Pubkey::new_unique();
+        set_token(
+            &mut svm,
+            &victim_reward_destination,
+            &reward_mint,
+            &victim.pubkey(),
+            0,
+        );
+        set_token(
+            &mut svm,
+            &beneficiary_reward_destination,
+            &reward_mint,
+            &beneficiary.pubkey(),
+            0,
+        );
+        send(
+            &mut svm,
+            &[&payer],
+            rd_claim_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &victim.pubkey(),
+                &market,
+                &victim_portfolio.pubkey(),
+                4,
+                &reward_vault,
+                &victim_reward_destination,
+            ),
+        )
+        .expect("victim claims its frozen funding points");
+        send(
+            &mut svm,
+            &[&payer],
+            rd_claim_ix(
+                &payer.pubkey(),
+                &reward_config,
+                &beneficiary.pubkey(),
+                &market,
+                &beneficiary_portfolio.pubkey(),
+                4,
+                &reward_vault,
+                &beneficiary_reward_destination,
+            ),
+        )
+        .expect("co-staker claims its frozen funding points");
+
+        Outcome {
+            early_snapshot_landed,
+            stale_leg_snapshot_landed,
+            victim_points,
+            beneficiary_points,
+            victim_paid,
+            beneficiary_paid,
+            victim_reward: token_amount(&svm, &victim_reward_destination),
+            beneficiary_reward: token_amount(&svm, &beneficiary_reward_destination),
+            reward_vault: token_amount(&svm, &reward_vault),
+            capitals,
+            pnls,
+            collateral_vault: collateral_vault_amount,
+        }
+    }
+
+    let control = run(false);
+    let attacked = run(true);
+    assert_eq!(control.victim_paid, control.beneficiary_paid);
+    assert_eq!(attacked.victim_paid, attacked.beneficiary_paid);
+    assert_eq!(attacked.victim_paid, control.victim_paid);
+    assert_eq!(attacked.capitals, control.capitals);
+    assert_eq!(attacked.pnls, control.pnls);
+    assert_eq!(attacked.collateral_vault, control.collateral_vault);
+    assert_eq!(
+        control.victim_reward + control.beneficiary_reward + control.reward_vault,
+        REWARD_SUPPLY,
+    );
+    assert_eq!(
+        attacked.victim_reward + attacked.beneficiary_reward + attacked.reward_vault,
+        REWARD_SUPPLY,
+    );
+    assert_eq!(control.victim_points, control.beneficiary_points);
+    assert_eq!(attacked.beneficiary_points, control.beneficiary_points);
+    assert!(
+        !attacked.early_snapshot_landed,
+        "a final-slot funding snapshot landed before the linked portfolio was current: control={control:?}, attacked={attacked:?}",
+    );
+    assert!(
+        !attacked.stale_leg_snapshot_landed,
+        "advancing the shared market let a stale victim leg crystallize: control={control:?}, attacked={attacked:?}",
+    );
+    assert_eq!(attacked.victim_points, control.victim_points);
+    assert_eq!(
+        attacked.beneficiary_reward, control.beneficiary_reward,
+        "same-slot transaction order transferred fixed reward COIN: control={control:?}, attacked={attacked:?}",
+    );
+    assert_eq!(
+        attacked.victim_reward, control.victim_reward,
+        "a public cranker cannot omit an independent payer's eligible funding",
+    );
 }
 
 #[test]

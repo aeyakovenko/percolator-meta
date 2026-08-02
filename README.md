@@ -371,6 +371,10 @@ capital owners may crystallize live or terminal insurance/backing at that fixed 
 resets the Subledger position clock, so post-epoch capital earns zero tenure. Any cranker may only
 reduce a trader stake whose previously crystallized loss has since been spent; the shared claim cap
 makes this refresh monotonic, so post-epoch flow cannot mint points or dilute the frozen denominator.
+At the inclusive end slot, funding-payer crystallization also supplies the allow-listed Percolator
+market read-only and succeeds only after every active portfolio leg is settled against a market asset
+advanced through that slot. Advancing the shared market through another portfolio cannot finalize a
+stale leg or shift the fixed reward between depositors.
 
 Each reward epoch binds its authority, COIN mint, schedule, percentages, canonical vault, and up to
 six selected market/pool scopes. A maximal six-scope initialization fits a one-member-signed Squads

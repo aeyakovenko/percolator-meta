@@ -1992,6 +1992,16 @@ fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
         3,
         100,
     );
+    set_slot(&mut svm, emission_end - 1);
+    for env in &envs {
+        crystallize(&mut svm, &payer, env, &insurance_owner, &insurance_position)
+            .expect("insurance crystallizes");
+        crystallize(&mut svm, &payer, env, &backing_owner, &backing_position)
+            .expect("backing crystallizes");
+        crystallize(&mut svm, &payer, env, &funding_owner, &funding_portfolio)
+            .expect("funding payer crystallizes");
+    }
+
     set_slot(&mut svm, emission_end);
     let late_owner = Keypair::new();
     let late_position = Pubkey::new_unique();
@@ -2017,14 +2027,6 @@ fn one_coin_mint_can_run_two_independent_dao_reward_epochs() {
         .is_err(),
         "registration closes exactly at emission_end; late capital cannot dilute the epoch"
     );
-    for env in &envs {
-        crystallize(&mut svm, &payer, env, &insurance_owner, &insurance_position)
-            .expect("insurance crystallizes");
-        crystallize(&mut svm, &payer, env, &backing_owner, &backing_position)
-            .expect("backing crystallizes");
-        crystallize(&mut svm, &payer, env, &funding_owner, &funding_portfolio)
-            .expect("funding payer crystallizes");
-    }
 
     set_slot(&mut svm, emission_end + finalize_window);
     assert!(
@@ -4291,6 +4293,9 @@ fn crystallize_as(
             retired_market_pda(&env.stub_perc, &market),
             false,
         ));
+        if cohort == COHORT_FUNDING_PAYER {
+            accounts.push(AccountMeta::new_readonly(market, false));
+        }
     }
     let mut data = vec![2u8];
     if matches!(cohort, COHORT_INSURANCE | COHORT_BACKING) {
@@ -4346,6 +4351,9 @@ fn crystallize_cohort(
             retired_market_pda(&env.stub_perc, &market),
             false,
         ));
+        if cohort == COHORT_FUNDING_PAYER {
+            accounts.push(AccountMeta::new_readonly(market, false));
+        }
     }
     let mut data = vec![2u8];
     if matches!(cohort, COHORT_INSURANCE | COHORT_BACKING) {

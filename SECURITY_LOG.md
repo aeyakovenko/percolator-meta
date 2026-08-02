@@ -14727,3 +14727,29 @@ applied before the single final rounding. Fixed wrapper commit
 and 568 real-SBF LiteSVM tests pass, including hybrid, inversion, secondary-profile, liquidation-fee,
 and SPL-withdrawal paths. No instruction, account layout, signer, authority, amount, destination,
 custody route, or administrator surface was added.
+
+## Tick - final-slot funding order shifted a depositor's fixed reward (surface D, REAL LOF)
+
+Current reward epochs include `emission_end_slot`, but cumulative funding is settled by a separate
+permissionless Percolator crank. At that slot, an attacker could crystallize an independent victim,
+advance funding, then crystallize itself. The next slot closed funding crystallization, permanently
+leaving the victim's denominator stale. A second ordering advanced the shared market through another
+portfolio before crystallizing the still-stale victim leg. Checking only the market slot did not stop
+that variant.
+
+The retained clean-room LiteSVM regression allocates and initializes the real pinned Percolator
+accounts through public instructions, opens balanced positions, activates the EWMA funding path, and
+settles exactly 300,000 funding atoms for each depositor. At RED commit
+`fd62794a47c8fee3a491de49dc8d9457719fddad`, the control paid 500,000 COIN to each depositor;
+either public ordering changed the split to 400,000/600,000. All three principals remained
+99,800,000, the collateral vault remained 300,000,000, and portfolio PnL remained
+`[600,000, 0, 0]`: the reachable loss was fixed reward COIN only, never collateral or backing.
+
+FIX: exact-end funding crystallization now appends the allow-listed Percolator market as a read-only
+witness. Every active portfolio leg must match its side's live funding accumulator after the
+corresponding asset advanced through the inclusive cutoff. Archive, retired-market, LP, trader, and
+predecessor-config paths retain their prior account and lifecycle behavior. Removing only the per-leg
+equality check makes the real-binary regression fail with the 400,000/600,000 transfer; restoring it
+rejects both orderings and preserves 500,000/500,000. All 96 Residual LiteSVM compatibility tests
+pass. No account layout, signer, authority, recipient, destination, token CPI, custody route, or
+administrator surface was added.

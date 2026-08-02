@@ -4,8 +4,8 @@ use core::mem::{offset_of, size_of};
 use percolator::{
     AssetStateV16Account, BackingBucketV16Account, EngineAssetSlotV16Account,
     InsuranceCreditReservationV16Account, Market, MarketGroupV16HeaderAccount,
-    PortfolioAccountV16Account, ProvenanceHeaderV16Account, SourceCreditStateV16Account,
-    V16ConfigAccount, BOUND_SCALE,
+    PortfolioAccountV16Account, PortfolioLegV16Account, ProvenanceHeaderV16Account,
+    SourceCreditStateV16Account, V16ConfigAccount, BOUND_SCALE,
 };
 
 pub const HEADER_LEN: usize = 16;
@@ -390,6 +390,10 @@ fn read_u128(data: &[u8], offset: usize) -> Result<u128, ReadError> {
     Ok(u128::from_le_bytes(bytes(data, offset)?))
 }
 
+fn read_i128(data: &[u8], offset: usize) -> Result<i128, ReadError> {
+    Ok(i128::from_le_bytes(bytes(data, offset)?))
+}
+
 fn validate_header(data: &[u8], kind: u8) -> Result<(), ReadError> {
     if read_u64(data, 0)? != MAGIC
         || read_u16(data, 8)? != VERSION
@@ -499,6 +503,85 @@ fn read_portfolio_reward_snapshot_inner(
             funding_short_received_atoms_total
         ))?,
     })
+}
+
+/// Returns true when every active portfolio leg has settled the market's cumulative
+/// funding value after that asset advanced through `cutoff_slot`.
+///
+/// This is a read-only cutoff witness for reward snapshots. A different portfolio
+/// may advance the shared market first, so checking the market slot alone is not
+/// sufficient; each linked leg's `f_snap` must also equal its side's live `f` value.
+pub fn portfolio_funding_is_current_at_slot(
+    portfolio_data: &[u8],
+    portfolio: &[u8; 32],
+    market_data: &[u8],
+    market: &[u8; 32],
+    cutoff_slot: u64,
+) -> Result<bool, ReadError> {
+    let snapshot = read_portfolio_reward_snapshot(portfolio_data, portfolio)?;
+    validate_market(market_data)?;
+    if snapshot.market_group != *market {
+        return Err(ReadError::InvalidAccounting);
+    }
+    let (configured, _) = market_slot_counts(market_data)?;
+    let legs_base = HEADER_LEN + offset_of!(PortfolioAccountV16Account, legs);
+    for leg_index in 0..percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+        let leg = legs_base
+            .checked_add(
+                leg_index
+                    .checked_mul(size_of::<PortfolioLegV16Account>())
+                    .ok_or(ReadError::Truncated)?,
+            )
+            .ok_or(ReadError::Truncated)?;
+        match portfolio_data.get(leg).copied() {
+            Some(0) => continue,
+            Some(1) => {}
+            _ => return Err(ReadError::InvalidAccounting),
+        }
+        let asset_index = read_u32(
+            portfolio_data,
+            leg + offset_of!(PortfolioLegV16Account, asset_index),
+        )? as usize;
+        if asset_index >= configured {
+            return Err(ReadError::InvalidAsset);
+        }
+        let asset = asset_engine_offset(asset_index)?
+            .checked_add(offset_of!(EngineAssetSlotV16Account, asset))
+            .ok_or(ReadError::Truncated)?;
+        let leg_market_id = read_u64(
+            portfolio_data,
+            leg + offset_of!(PortfolioLegV16Account, market_id),
+        )?;
+        let asset_market_id = read_u64(
+            market_data,
+            asset + offset_of!(AssetStateV16Account, market_id),
+        )?;
+        if leg_market_id == 0 || leg_market_id != asset_market_id {
+            return Err(ReadError::InvalidAccounting);
+        }
+        let side = portfolio_data
+            .get(leg + offset_of!(PortfolioLegV16Account, side))
+            .copied()
+            .ok_or(ReadError::Truncated)?;
+        let funding_offset = match side {
+            0 => offset_of!(AssetStateV16Account, f_long_num),
+            1 => offset_of!(AssetStateV16Account, f_short_num),
+            _ => return Err(ReadError::InvalidAccounting),
+        };
+        let leg_funding = read_i128(
+            portfolio_data,
+            leg + offset_of!(PortfolioLegV16Account, f_snap),
+        )?;
+        let market_funding = read_i128(market_data, asset + funding_offset)?;
+        let asset_slot = read_u64(
+            market_data,
+            asset + offset_of!(AssetStateV16Account, slot_last),
+        )?;
+        if asset_slot < cutoff_slot || leg_funding != market_funding {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_asset(data: &[u8], asset_index: usize) -> Result<(), ReadError> {
@@ -2094,5 +2177,76 @@ mod tests {
             read_portfolio_reward_snapshot(&split_owner, &portfolio),
             Err(ReadError::InvalidAccounting)
         );
+    }
+
+    #[test]
+    fn funding_cutoff_witness_requires_asset_slot_and_portfolio_leg_snapshot() {
+        let market_key = [1u8; 32];
+        let portfolio_key = [2u8; 32];
+        let owner = [3u8; 32];
+        let mut portfolio = portfolio_with_reward_snapshot(market_key, portfolio_key, owner);
+        let leg = HEADER_LEN + offset_of!(PortfolioAccountV16Account, legs);
+        portfolio[leg] = 1;
+        portfolio[leg + offset_of!(PortfolioLegV16Account, asset_index)
+            ..leg + offset_of!(PortfolioLegV16Account, asset_index) + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+        portfolio[leg + offset_of!(PortfolioLegV16Account, market_id)
+            ..leg + offset_of!(PortfolioLegV16Account, market_id) + 8]
+            .copy_from_slice(&7u64.to_le_bytes());
+        portfolio[leg + offset_of!(PortfolioLegV16Account, side)] = 1;
+        portfolio[leg + offset_of!(PortfolioLegV16Account, f_snap)
+            ..leg + offset_of!(PortfolioLegV16Account, f_snap) + 16]
+            .copy_from_slice(&(-55i128).to_le_bytes());
+
+        let mut market = market_with_insurance_capacity();
+        let asset =
+            asset_engine_offset(0).unwrap() + offset_of!(EngineAssetSlotV16Account, asset);
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, market_id),
+            7,
+        );
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, slot_last),
+            19,
+        );
+        market[asset + offset_of!(AssetStateV16Account, f_short_num)
+            ..asset + offset_of!(AssetStateV16Account, f_short_num) + 16]
+            .copy_from_slice(&(-55i128).to_le_bytes());
+
+        assert!(portfolio_funding_is_current_at_slot(
+            &portfolio,
+            &portfolio_key,
+            &market,
+            &market_key,
+            19,
+        )
+        .unwrap());
+        assert!(!portfolio_funding_is_current_at_slot(
+            &portfolio,
+            &portfolio_key,
+            &market,
+            &market_key,
+            20,
+        )
+        .unwrap());
+
+        write_u64_at(
+            &mut market,
+            asset + offset_of!(AssetStateV16Account, slot_last),
+            20,
+        );
+        market[asset + offset_of!(AssetStateV16Account, f_short_num)
+            ..asset + offset_of!(AssetStateV16Account, f_short_num) + 16]
+            .copy_from_slice(&(-56i128).to_le_bytes());
+        assert!(!portfolio_funding_is_current_at_slot(
+            &portfolio,
+            &portfolio_key,
+            &market,
+            &market_key,
+            20,
+        )
+        .unwrap());
     }
 }

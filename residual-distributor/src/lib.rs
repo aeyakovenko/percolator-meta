@@ -2180,7 +2180,8 @@ fn register_start(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) ->
 }
 
 // crystallize accounts: [cranker(s), config(w), stake(w), backing_ledger,
-//   portfolio_archive, retired_market_marker (portfolio cohorts only)]
+//   portfolio_archive, retired_market_marker (portfolio cohorts only),
+//   portfolio_market? (funding-payer only)]
 // capital data: expected_principal(u64) | expected_start_slot(u64) |
 //   expected_position_action_nonce(u64); portfolio-flow data: none
 fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
@@ -2231,7 +2232,17 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         stake.cohort,
         COHORT_LP | COHORT_TRADER | COHORT_FUNDING_PAYER
     ) {
-        Some((next_account_info(iter)?, next_account_info(iter)?))
+        let portfolio_archive = next_account_info(iter)?;
+        let retired_market = next_account_info(iter)?;
+        Some((
+            portfolio_archive,
+            retired_market,
+            if stake.cohort == COHORT_FUNDING_PAYER {
+                iter.next()
+            } else {
+                None
+            },
+        ))
     } else {
         None
     };
@@ -2344,7 +2355,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         COHORT_LP | COHORT_TRADER => {
             // Residual cohorts: points = TIME-WEIGHTED delta of LP residual_received or trader
             // crystallized_loss - spent since register.
-            let (portfolio_archive, retired_market) =
+            let (portfolio_archive, retired_market, _) =
                 portfolio_context.ok_or(ProgramError::NotEnoughAccountKeys)?;
             let portfolio_market = portfolio_market_for_stake(
                 program_id,
@@ -2407,7 +2418,7 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             // Funding-payer cohort: points = raw delta of paid funding since register. No age multiplier:
             // funding accumulators already represent settled payment volume, and late payments should not
             // inherit early registration tenure.
-            let (portfolio_archive, retired_market) =
+            let (portfolio_archive, retired_market, portfolio_market_account) =
                 portfolio_context.ok_or(ProgramError::NotEnoughAccountKeys)?;
             let portfolio_market = portfolio_market_for_stake(
                 program_id,
@@ -2431,6 +2442,42 @@ fn crystallize(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             )?;
             let counter =
                 funding_payer_counter(totals.funding_long_paid, totals.funding_short_paid);
+            if config.config_kind == CONFIG_KIND_REWARD_EPOCH
+                && now == config.emission_end_slot
+                && !retired
+                && backing_ledger.data_len() != 0
+                && *backing_ledger.owner == config.percolator_program
+            {
+                let live = percolator_accounting::read_portfolio_reward_snapshot(
+                    &backing_ledger.try_borrow_data()?,
+                    &backing_ledger.key.to_bytes(),
+                )
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+                if live.portfolio_id == stake.portfolio_id
+                    && live.owner == stake.owner.to_bytes()
+                    && live.market_group == portfolio_market.to_bytes()
+                {
+                    // The end slot is inclusive. Require both the market asset and every linked
+                    // portfolio leg to be current through it; checking only the shared market lets
+                    // an attacker advance it with another portfolio while leaving the victim stale.
+                    let market_account =
+                        portfolio_market_account.ok_or(ProgramError::NotEnoughAccountKeys)?;
+                    if *market_account.key != portfolio_market
+                        || *market_account.owner != config.percolator_program
+                        || market_account.executable
+                        || !percolator_accounting::portfolio_funding_is_current_at_slot(
+                            &backing_ledger.try_borrow_data()?,
+                            &backing_ledger.key.to_bytes(),
+                            &market_account.try_borrow_data()?,
+                            &market_account.key.to_bytes(),
+                            config.emission_end_slot,
+                        )
+                        .map_err(|_| ProgramError::InvalidAccountData)?
+                    {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+                }
+            }
             let net_delta = counter.saturating_sub(stake.residual_snap);
             let new_pts = net_delta;
             replace_cohort_points(
