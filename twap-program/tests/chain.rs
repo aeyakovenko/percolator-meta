@@ -42,6 +42,7 @@ enum PoolRestartScenario {
     NoopReservePolicyOrder,
     StaleTwapTradeFeePolicyOrder,
     PredepositProtocolInsurance,
+    PredepositProtocolInsurancePulledBeforeLoss,
 }
 
 #[test]
@@ -130,6 +131,13 @@ fn e2e_predeposit_protocol_insurance_absorbs_ordinary_pool_loss_first() {
     run_pool_restart_claim_scenario(PoolRestartScenario::PredepositProtocolInsurance);
 }
 
+#[test]
+fn e2e_twap_pull_cannot_make_late_fees_restore_lost_ordinary_principal() {
+    run_pool_restart_claim_scenario(
+        PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss,
+    );
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -153,11 +161,15 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleTwapTradeFeePolicyOrder;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
-    let predeposit_protocol_insurance =
-        scenario == PoolRestartScenario::PredepositProtocolInsurance;
+    let twap_pulls_predeposit_before_loss =
+        scenario == PoolRestartScenario::PredepositProtocolInsurancePulledBeforeLoss;
+    let predeposit_protocol_insurance = scenario == PoolRestartScenario::PredepositProtocolInsurance
+        || twap_pulls_predeposit_before_loss;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
     let surviving_owner_claim =
-        if partial_owner_buyback || predeposit_protocol_insurance {
+        if partial_owner_buyback
+            || (predeposit_protocol_insurance && !twap_pulls_predeposit_before_loss)
+        {
             1u64
         } else {
             0
@@ -2482,6 +2494,37 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         ),
     )
     .expect("public bidder escrows one COIN for the next buyback round");
+    let loss_start_slot = if twap_pulls_predeposit_before_loss {
+        let round_end = {
+            let book_data = svm.get_account(&book.book).unwrap();
+            u64::from_le_bytes(book_data.data[240..248].try_into().unwrap())
+        };
+        warp_to(&mut svm, round_end);
+        send(
+            &mut svm,
+            &[&payer],
+            execute_ix(
+                &payer.pubkey(),
+                &handoff_env,
+                &book.book,
+                &book.holding,
+                &book.settlement_usd,
+                &book.book_escrow,
+                &book.coin_escrow,
+                None,
+            ),
+        )
+        .expect("permissionless TWAP execution pulls the predeposit protocol buffer");
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            u128::from(owner_principal),
+            "the old protocol buffer leaves Percolator before the owner loss",
+        );
+        round_end + 1
+    } else {
+        101
+    };
+    let loss_final_slot = loss_start_slot + 1;
 
     let portfolio_len = percolator_prog::state::portfolio_account_len_for_market_slots(1).unwrap();
     let portfolio_rent = svm.minimum_balance_for_rent_exemption(portfolio_len);
@@ -2572,8 +2615,14 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         percolator_prog::constants::ORACLE_MODE_AUTH_MARK,
         "custody handoffs must preserve the authenticated-mark profile"
     );
-    warp_to(&mut svm, 101);
-    let mark_message = build_push_auth_mark_message(&squads_vault, &market, &perc_id(), 101, 399);
+    warp_to(&mut svm, loss_start_slot);
+    let mark_message = build_push_auth_mark_message(
+        &squads_vault,
+        &market,
+        &perc_id(),
+        loss_start_slot,
+        399,
+    );
     let mark_remaining = vec![
         AccountMeta::new_readonly(squads_vault, false),
         AccountMeta::new(market, false),
@@ -2590,7 +2639,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         &mark_remaining,
     )
     .expect("governance publishes the authenticated mark through the timelock");
-    for slot in [101u64, 102] {
+    for slot in [loss_start_slot, loss_final_slot] {
         warp_to(&mut svm, slot);
         send(
             &mut svm,
@@ -2647,7 +2696,12 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     );
     assert_eq!(
         read_asset_insurance_remaining(&svm, &market, 0),
-        u128::from(owner_principal) + predeposit_buffer,
+        u128::from(owner_principal)
+            + if twap_pulls_predeposit_before_loss {
+                0
+            } else {
+                predeposit_buffer
+            },
     );
 
     for _ in 0..5 {
@@ -2661,7 +2715,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                     AccountMeta::new(traders[0].1.pubkey(), false),
                 ],
                 PIx::PermissionlessCrank {
-                    now_slot: 102,
+                    now_slot: loss_final_slot,
                     observations: vec![],
                 },
             ),
@@ -2670,7 +2724,9 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     }
     assert_eq!(
         read_asset_insurance_remaining(&svm, &market, 0),
-        if predeposit_protocol_insurance {
+        if twap_pulls_predeposit_before_loss {
+            0
+        } else if predeposit_protocol_insurance {
             predeposit_buffer
         } else {
             u128::from(surviving_owner_claim)
@@ -2681,6 +2737,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     )
     .unwrap();
     assert_eq!(protected_loser.close_progress.insurance_spent.get(), 1);
+    let mut late_protocol_fee = 0;
     if predeposit_protocol_insurance {
         send(
             &mut svm,
@@ -2692,7 +2749,7 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
                     AccountMeta::new(traders[1].1.pubkey(), false),
                 ],
                 PIx::PermissionlessCrank {
-                    now_slot: 102,
+                    now_slot: loss_final_slot,
                     observations: vec![],
                 },
             ),
@@ -2750,6 +2807,54 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             .unwrap(),
             "bounded public cranks clear the complete loss episode",
         );
+        late_protocol_fee = if twap_pulls_predeposit_before_loss {
+            let insurance_before_fee = read_asset_insurance_remaining(&svm, &market, 0);
+            let fee_size_q = (percolator::POS_SCALE / 100) as i128;
+            for size_q in [fee_size_q, -fee_size_q] {
+                send(
+                    &mut svm,
+                    &[
+                        &payer,
+                        &predeposit_fee_traders[0].0,
+                        &predeposit_fee_traders[1].0,
+                    ],
+                    pix(
+                        vec![
+                            AccountMeta::new_readonly(
+                                predeposit_fee_traders[0].0.pubkey(),
+                                true,
+                            ),
+                            AccountMeta::new_readonly(
+                                predeposit_fee_traders[1].0.pubkey(),
+                                true,
+                            ),
+                            AccountMeta::new(market, false),
+                            AccountMeta::new(
+                                predeposit_fee_traders[0].1.pubkey(),
+                                false,
+                            ),
+                            AccountMeta::new(
+                                predeposit_fee_traders[1].1.pubkey(),
+                                false,
+                            ),
+                        ],
+                        PIx::TradeNoCpi {
+                            asset_index: 0,
+                            size_q,
+                            exec_price: 399,
+                            fee_bps: 10_000,
+                        },
+                    ),
+                )
+                .expect("unrelated users generate protocol fees after the owner loss");
+            }
+            let late_fee =
+                read_asset_insurance_remaining(&svm, &market, 0) - insurance_before_fee;
+            assert!(late_fee > 0, "the public round trip creates a late fee");
+            late_fee
+        } else {
+            0
+        };
         let resolve_witness = controller_market_generation_witness(&svm, &market);
         let resolve = build_controller_generation_proxy_message(
             &squads_vault,
@@ -2905,6 +3010,21 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         ],
         data: subledger_insurance_withdraw_data(&svm, &position, 1, 0),
     };
+    if twap_pulls_predeposit_before_loss {
+        send(&mut svm, &[&payer, &depositor], direct_exit)
+            .expect("the impaired owner retires after permissionless custody recovery");
+        assert_eq!(
+            token_amount(&svm, &depositor_token),
+            0,
+            "a fee first observed after the loss cannot restore lost owner principal",
+        );
+        assert_eq!(
+            read_asset_insurance_remaining(&svm, &market, 0),
+            late_protocol_fee,
+            "the complete late fee remains protocol insurance after the impaired owner exits",
+        );
+        return;
+    }
     if predeposit_protocol_insurance {
         send(&mut svm, &[&payer, &depositor], direct_exit)
             .expect("the owner exits after permissionless custody recovery");
