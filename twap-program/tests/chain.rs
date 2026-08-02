@@ -41,6 +41,7 @@ enum PoolRestartScenario {
     StaleReservePolicyOrder,
     NoopReservePolicyOrder,
     StaleTwapTradeFeePolicyOrder,
+    StaleReservedFloorPolicyOrder,
 }
 
 #[test]
@@ -124,6 +125,11 @@ fn e2e_stale_twap_trade_fee_policy_cannot_overwrite_a_later_correction() {
     run_pool_restart_claim_scenario(PoolRestartScenario::StaleTwapTradeFeePolicyOrder);
 }
 
+#[test]
+fn e2e_stale_reserved_floor_pause_cannot_overwrite_a_later_correction() {
+    run_pool_restart_claim_scenario(PoolRestartScenario::StaleReservedFloorPolicyOrder);
+}
+
 fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -145,6 +151,8 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
         scenario == PoolRestartScenario::StaleReservePolicyOrder || noop_reserve_order;
     let stale_twap_trade_fee_order =
         scenario == PoolRestartScenario::StaleTwapTradeFeePolicyOrder;
+    let stale_reserved_floor_order =
+        scenario == PoolRestartScenario::StaleReservedFloorPolicyOrder;
     let partial_owner_buyback =
         scenario == PoolRestartScenario::RestartAfterPartialLossAbsentOwnerBuyback;
     let owner_principal = if partial_owner_buyback { 2u64 } else { 1 };
@@ -542,6 +550,112 @@ fn run_pool_restart_claim_scenario(scenario: PoolRestartScenario) {
             owner_principal as u128
         },
     );
+
+    if stale_reserved_floor_order {
+        let corrected_floor = read_reserved_floor(&svm, &twap_cfg);
+        let stale_floor = percolator::MAX_VAULT_TVL
+            .checked_add(1)
+            .expect("unreachable floor");
+        let remaining = vec![
+            AccountMeta::new_readonly(squads_vault, false),
+            AccountMeta::new(twap_cfg, false),
+            AccountMeta::new_readonly(twap_id(), false),
+        ];
+        let queue = |svm: &mut LiteSVM, index: u64, message: Vec<u8>| {
+            let transaction = transaction_pda(&squads, &multisig, index);
+            let proposal = proposal_pda(&squads, &multisig, index);
+            for instruction in [
+                vault_transaction_create_ix(
+                    &squads,
+                    &multisig,
+                    &transaction,
+                    &dao.pubkey(),
+                    &message,
+                ),
+                proposal_create_ix(
+                    &squads,
+                    &multisig,
+                    &proposal,
+                    &dao.pubkey(),
+                    index,
+                ),
+                proposal_approve_ix(&squads, &multisig, &proposal, &dao.pubkey()),
+            ] {
+                send(svm, &[&dao], instruction).expect("queue TWAP floor policy");
+            }
+            (transaction, proposal)
+        };
+        let (stale_transaction, stale_proposal) = queue(
+            &mut svm,
+            3,
+            build_set_reserved_floor_message(&squads_vault, &twap_cfg, stale_floor),
+        );
+        let (correction_transaction, correction_proposal) = queue(
+            &mut svm,
+            4,
+            build_set_reserved_floor_message(&squads_vault, &twap_cfg, corrected_floor),
+        );
+        let mut clock = svm.get_sysvar::<Clock>();
+        clock.unix_timestamp += i64::from(TIMELOCK_1_WEEK_SECS) + 1;
+        svm.set_sysvar(&clock);
+        send(
+            &mut svm,
+            &[&dao],
+            vault_transaction_execute_ix(
+                &squads,
+                &multisig,
+                &correction_proposal,
+                &correction_transaction,
+                &dao.pubkey(),
+                &remaining,
+            ),
+        )
+        .expect("execute the corrected TWAP floor first");
+        let config_after_correction = svm.get_account(&twap_cfg).unwrap();
+        let stale_replay = send(
+            &mut svm,
+            &[&dao],
+            vault_transaction_execute_ix(
+                &squads,
+                &multisig,
+                &stale_proposal,
+                &stale_transaction,
+                &dao.pubkey(),
+                &remaining,
+            ),
+        );
+        if stale_replay.is_ok() {
+            let repair = build_set_reserved_floor_message(
+                &squads_vault,
+                &twap_cfg,
+                corrected_floor,
+            );
+            assert!(
+                squads_execute(
+                    &mut svm,
+                    &squads,
+                    &multisig,
+                    &dao,
+                    &payer,
+                    5,
+                    &repair,
+                    &remaining,
+                )
+                .is_err(),
+                "the monotonic floor must make a stale unreachable pause irreversible",
+            );
+        }
+        assert!(
+            stale_replay.is_err(),
+            "an older approved floor pause must not overwrite a later correction",
+        );
+        assert_eq!(
+            svm.get_account(&twap_cfg).unwrap(),
+            config_after_correction,
+            "a rejected stale floor policy leaves the config byte-identical",
+        );
+        return;
+    }
 
     if stale_twap_trade_fee_order {
         const STALE_FEE_BPS: u64 = 50;
