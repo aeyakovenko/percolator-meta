@@ -414,9 +414,10 @@ struct Pool {
     /// checkpoint paired with `insurance_spent_checkpoint`, so protocol insurance
     /// already present at a user-action boundary absorbs later spending first.
     backing_protected_checkpoint: u64,
-    /// Ordinary principal-only insurance protected by the depositor subledger.
-    /// Deposits raise this value and realized payouts lower it; fees and donations
-    /// cannot raise it, while cumulative insurance consumption can lower it.
+    /// Ordinary pools store their protected principal here. Current cross-backed
+    /// pools use the same appended wire field as the physical-insurance checkpoint
+    /// paired with `insurance_spent_checkpoint`; this lets insurance that was
+    /// already protocol surplus at a user-action boundary absorb later spending.
     principal_protected_checkpoint: u64,
 }
 
@@ -1515,29 +1516,55 @@ fn sync_indexed_share_rate(pool: &mut Pool, protected_balance: u64) -> ProgramRe
     Ok(())
 }
 
-fn indexed_protected_balance_after_external_loss(
+fn indexed_cross_backing_claim_and_new_loss(
     pool: &Pool,
-    protected_balance: u64,
     observed_insurance_spent: u128,
     observed_backing_protected: u64,
-) -> Result<u64, ProgramError> {
-    let new_insurance_loss = observed_insurance_spent
+) -> Result<(u64, u128), ProgramError> {
+    let spent_delta = observed_insurance_spent
         .checked_sub(pool.insurance_spent_checkpoint)
         .ok_or(ProgramError::InvalidAccountData)?;
+    let indexed_claim = if pool.total_shares == 0 {
+        0
+    } else {
+        redeem_indexed_shares(
+            pool.total_shares,
+            pool.share_rate_numerator,
+            pool.share_rate_denominator,
+        )?
+    };
+    let owner_backing_at_checkpoint =
+        core::cmp::min(pool.backing_protected_checkpoint, indexed_claim);
+    let owner_insurance_at_checkpoint =
+        indexed_claim.saturating_sub(owner_backing_at_checkpoint);
+    let protocol_insurance_at_checkpoint = pool
+        .principal_protected_checkpoint
+        .saturating_sub(owner_insurance_at_checkpoint);
+    let new_insurance_loss =
+        spent_delta.saturating_sub(u128::from(protocol_insurance_at_checkpoint));
     let new_backing_loss = pool
         .backing_protected_checkpoint
         .saturating_sub(observed_backing_protected);
     let new_loss = new_insurance_loss
         .checked_add(u128::from(new_backing_loss))
         .ok_or(ProgramError::ArithmeticOverflow)?;
-    if pool.total_shares == 0 {
+    Ok((indexed_claim, new_loss))
+}
+
+fn indexed_protected_balance_after_external_loss(
+    pool: &Pool,
+    protected_balance: u64,
+    observed_insurance_spent: u128,
+    observed_backing_protected: u64,
+) -> Result<u64, ProgramError> {
+    let (indexed_claim, new_loss) = indexed_cross_backing_claim_and_new_loss(
+        pool,
+        observed_insurance_spent,
+        observed_backing_protected,
+    )?;
+    if indexed_claim == 0 {
         return Ok(0);
     }
-    let indexed_claim = redeem_indexed_shares(
-        pool.total_shares,
-        pool.share_rate_numerator,
-        pool.share_rate_denominator,
-    )?;
     let loss_cap = u128::from(indexed_claim)
         .saturating_sub(new_loss)
         .min(u128::from(pool.outstanding_principal));
@@ -1551,18 +1578,15 @@ fn indexed_protected_balance_after_external_loss(
 fn sync_indexed_cross_backing_external_loss(
     pool: &mut Pool,
     protected_balance: u64,
+    observed_insurance_balance: u64,
     observed_insurance_spent: u128,
     observed_backing_protected: u64,
 ) -> ProgramResult {
-    let new_insurance_loss = observed_insurance_spent
-        .checked_sub(pool.insurance_spent_checkpoint)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    let new_backing_loss = pool
-        .backing_protected_checkpoint
-        .saturating_sub(observed_backing_protected);
-    let new_loss = new_insurance_loss
-        .checked_add(u128::from(new_backing_loss))
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let (_, new_loss) = indexed_cross_backing_claim_and_new_loss(
+        pool,
+        observed_insurance_spent,
+        observed_backing_protected,
+    )?;
     let protected = if new_loss == 0 {
         // Deposits and exact share exits can leave the aggregate real-share
         // redemption one floor atom below the stored rational rate. Feeding that
@@ -1579,6 +1603,7 @@ fn sync_indexed_cross_backing_external_loss(
     };
     sync_indexed_share_rate(pool, protected)?;
     pool.insurance_spent_checkpoint = observed_insurance_spent;
+    pool.principal_protected_checkpoint = observed_insurance_balance;
     // A recovery is protocol surplus under the loss-only policy. Only an owner
     // backing deposit may raise this checkpoint; otherwise the same recovered
     // atom could be charged again after a later public loss.
@@ -3239,6 +3264,7 @@ fn process_insurance_deposit(
         sync_indexed_cross_backing_external_loss(
             &mut pool,
             protected_before,
+            insurance_before,
             insurance_spent_before.ok_or(ProgramError::InvalidAccountData)?,
             owner_backing_before,
         )?;
@@ -3495,6 +3521,10 @@ fn process_insurance_deposit(
             protection_deposit[1],
             observed_after,
         )?;
+        pool.principal_protected_checkpoint = u128::from(insurance_before)
+            .checked_add(protection_deposit[0])
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(ProgramError::ArithmeticOverflow)?;
     }
     position.principal = position
         .principal
@@ -3950,6 +3980,7 @@ fn process_insurance_withdraw_impl(
         sync_indexed_cross_backing_external_loss(
             &mut pool,
             protected_balance,
+            insurance,
             insurance_spent,
             owner_backing,
         )?;
@@ -4418,6 +4449,7 @@ fn process_insurance_withdraw_impl(
             backing_owed,
             observed_after,
         );
+        pool.principal_protected_checkpoint = insurance_after;
     }
     position.principal -= amount;
     // The position retires its nominal shares. Historical pools burn only the
@@ -4991,6 +5023,7 @@ fn process_prepare_asset0_restart(
             sync_indexed_cross_backing_external_loss(
                 &mut pool,
                 protected,
+                insurance,
                 insurance_spent,
                 observed_owner_backing,
             )?;
@@ -5247,6 +5280,8 @@ fn process_accept_operator(
             sync_indexed_cross_backing_external_loss(
                 &mut pool,
                 protected,
+                u64::try_from(live_insurance)
+                    .map_err(|_| ProgramError::ArithmeticOverflow)?,
                 insurance_spent,
                 owner_backing,
             )?;
@@ -6626,10 +6661,12 @@ mod tests {
         pool.share_rate_denominator = VIRTUAL_SHARES;
         pool.insurance_spent_checkpoint = 10;
         pool.backing_protected_checkpoint = 15;
+        pool.principal_protected_checkpoint = 14;
 
-        sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 14).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 12, 14).unwrap();
         assert_eq!(pool.insurance_spent_checkpoint, 12);
         assert_eq!(pool.backing_protected_checkpoint, 14);
+        assert_eq!(pool.principal_protected_checkpoint, 12);
         assert_eq!(
             redeem_indexed_shares(
                 pool.total_shares,
@@ -6644,27 +6681,40 @@ mod tests {
 
         pool.total_shares -= VIRTUAL_SHARES;
         pool.outstanding_principal -= 1;
-        sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 14).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 12, 14).unwrap();
         assert_eq!(
             (pool.share_rate_numerator, pool.share_rate_denominator),
             impaired_rate,
             "a zero-value share exit cannot feed an aggregate floor back into the rate",
         );
 
-        sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 15).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 12, 15).unwrap();
         assert_eq!(
             (pool.share_rate_numerator, pool.share_rate_denominator),
             impaired_rate,
             "a fee buffer or backing recovery cannot raise the indexed owner loss",
         );
-        assert!(sync_indexed_cross_backing_external_loss(&mut pool, 40, 11, 15).is_err());
+        assert!(
+            sync_indexed_cross_backing_external_loss(&mut pool, 40, 12, 11, 15).is_err()
+        );
         assert_eq!(pool.insurance_spent_checkpoint, 12);
         assert_eq!(
             pool.backing_protected_checkpoint, 14,
             "protocol recovery cannot re-arm an already charged backing loss",
         );
 
-        sync_indexed_cross_backing_external_loss(&mut pool, 40, 13, 14).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 11, 13, 14).unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                pool.total_shares,
+                pool.share_rate_numerator,
+                pool.share_rate_denominator,
+            )
+            .unwrap(),
+            25,
+            "the unowned atom left by a zero-payout exit absorbs the next spend",
+        );
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 10, 14, 14).unwrap();
         assert_eq!(
             redeem_indexed_shares(
                 pool.total_shares,
@@ -6673,7 +6723,84 @@ mod tests {
             )
             .unwrap(),
             24,
-            "only newly observed owner loss lowers the surviving claim",
+            "only spending beyond checkpointed protocol insurance lowers owners",
+        );
+    }
+
+    #[test]
+    fn indexed_external_loss_spends_checkpointed_protocol_insurance_first() {
+        let make_pool = || {
+            let mut pool = historical_pool_fixture();
+            pool.cross_backing = true;
+            pool.policy = POLICY_PRINCIPAL;
+            pool.domain = DOMAIN_INSURANCE;
+            pool.outstanding_principal = 29;
+            pool.total_shares = 29 * VIRTUAL_SHARES;
+            pool.share_rate_numerator = 1;
+            pool.share_rate_denominator = VIRTUAL_SHARES;
+            pool.insurance_spent_checkpoint = 10;
+            pool.backing_protected_checkpoint = 15;
+            pool
+        };
+
+        let mut checkpointed = make_pool();
+        checkpointed.principal_protected_checkpoint = 114;
+        sync_indexed_cross_backing_external_loss(
+            &mut checkpointed,
+            29,
+            112,
+            12,
+            14,
+        )
+        .unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                checkpointed.total_shares,
+                checkpointed.share_rate_numerator,
+                checkpointed.share_rate_denominator,
+            )
+            .unwrap(),
+            28,
+            "only the physically consumed owner backing atom lowers the claim",
+        );
+
+        let mut late_donation = make_pool();
+        late_donation.principal_protected_checkpoint = 14;
+        sync_indexed_cross_backing_external_loss(
+            &mut late_donation,
+            29,
+            112,
+            12,
+            14,
+        )
+        .unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                late_donation.total_shares,
+                late_donation.share_rate_numerator,
+                late_donation.share_rate_denominator,
+            )
+            .unwrap(),
+            26,
+            "insurance arriving after an unsynchronized loss cannot restore owners",
+        );
+        sync_indexed_cross_backing_external_loss(
+            &mut late_donation,
+            29,
+            111,
+            13,
+            14,
+        )
+        .unwrap();
+        assert_eq!(
+            redeem_indexed_shares(
+                late_donation.total_shares,
+                late_donation.share_rate_numerator,
+                late_donation.share_rate_denominator,
+            )
+            .unwrap(),
+            26,
+            "once checkpointed, protocol insurance absorbs only future spending",
         );
     }
 
@@ -6710,8 +6837,9 @@ mod tests {
         cross_backing.share_rate_denominator = VIRTUAL_SHARES;
         cross_backing.insurance_spent_checkpoint = 5;
         cross_backing.backing_protected_checkpoint = 5;
+        cross_backing.principal_protected_checkpoint = 5;
 
-        sync_indexed_cross_backing_external_loss(&mut cross_backing, 7, 7, 4).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut cross_backing, 7, 3, 7, 4).unwrap();
         assert_eq!(
             redeem_indexed_shares(
                 cross_backing.total_shares,
@@ -6722,7 +6850,7 @@ mod tests {
             7,
         );
         cross_backing.insurance_spent_checkpoint = 0;
-        sync_indexed_cross_backing_external_loss(&mut cross_backing, 7, 0, 4).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut cross_backing, 7, 3, 0, 4).unwrap();
         assert_eq!(
             redeem_indexed_shares(
                 cross_backing.total_shares,
@@ -6733,7 +6861,7 @@ mod tests {
             7,
             "staged backing survives a healthy replacement generation",
         );
-        sync_indexed_cross_backing_external_loss(&mut cross_backing, 6, 1, 4).unwrap();
+        sync_indexed_cross_backing_external_loss(&mut cross_backing, 6, 2, 1, 4).unwrap();
         assert_eq!(
             redeem_indexed_shares(
                 cross_backing.total_shares,
@@ -7061,6 +7189,7 @@ mod tests {
         pool.custody_grant_slot_plus_one = 101;
         pool.insurance_spent_checkpoint = 19;
         pool.backing_protected_checkpoint = 7;
+        pool.principal_protected_checkpoint = 23;
 
         let mut current = [0u8; POOL_SIZE_CUSTODY_GRANT];
         pool.serialize(&mut current).unwrap();
@@ -7082,9 +7211,14 @@ mod tests {
         assert_eq!(decoded.share_rate_denominator, VIRTUAL_SHARES);
         assert_eq!(decoded.insurance_spent_checkpoint, 19);
         assert_eq!(decoded.backing_protected_checkpoint, 7);
+        assert_eq!(
+            decoded.principal_protected_checkpoint, 23,
+            "current cross-backed pools persist their physical-insurance checkpoint",
+        );
 
         pool.insurance_spent_checkpoint = 0;
         pool.backing_protected_checkpoint = 0;
+        pool.principal_protected_checkpoint = 0;
         let mut custody_predecessor = [0u8; POOL_SIZE_CUSTODY_GRANT_LEGACY];
         pool.serialize(&mut custody_predecessor).unwrap();
         let decoded_custody_predecessor = Pool::deserialize(&custody_predecessor).unwrap();
