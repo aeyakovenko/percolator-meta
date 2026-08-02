@@ -123,6 +123,7 @@ const SUBLEDGER_IX_ASSERT_NO_PRINCIPAL: u8 = 10;
 const SUBLEDGER_IX_ASSERT_PRINCIPAL: u8 = 11;
 const SUBLEDGER_IX_INSURANCE_WITHDRAW_FULL: u8 = 13;
 const SUBLEDGER_IX_PREPARE_ASSET0_RESTART: u8 = 16;
+const SUBLEDGER_IX_CHECKPOINT_TWAP_INSURANCE: u8 = 17;
 const RESTART_CHECKPOINT_RETURN_DISC: [u8; 8] = *b"RSTFLR01";
 const MARKET_CONTROLLER_PROGRAM_ID: Pubkey =
     solana_program::pubkey!("3ueoyr1JepT2DvPxh8LrhdJZ6YsL2sT9Sm7y3TfNyfi9");
@@ -4191,7 +4192,8 @@ fn process_place_bid(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8])
 
 // execute accounts: [cranker(signer), config(w), book(w), twap_authority(pda), market_slab(w),
 //   percolator_vault(w), vault_authority, percolator_program, holding(w), settlement_usd(w),
-//   book_escrow(pda), coin_escrow(w), coin_mint(w), token_program, coin_sink(w)?]
+//   book_escrow(pda), coin_escrow(w), coin_mint(w), token_program, savings_dest(w)?,
+//   coin_sink(w)?, custody_pool(w)?, subledger_program?]
 //
 // PERMISSIONLESS, allowed once the round's slots have expired. The SOLE path that moves insurance:
 //  1) surplus = live asset-0 insurance - reserved_floor (the principal counter);
@@ -4250,6 +4252,24 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
     if *twap_authority.key != expected_auth {
         return Err(ProgramError::InvalidSeeds);
     }
+    let pool_checkpoint = if config.custody_pool != Pubkey::default() {
+        let checkpoint_accounts = accounts
+            .get(accounts.len().saturating_sub(2)..)
+            .ok_or(ProgramError::NotEnoughAccountKeys)?;
+        let [custody_pool, subledger_program] = checkpoint_accounts else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+        if *custody_pool.key != config.custody_pool
+            || !custody_pool.is_writable
+            || *subledger_program.key != SUBLEDGER_PROGRAM_ID
+            || !subledger_program.executable
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Some((custody_pool, subledger_program))
+    } else {
+        None
+    };
     if *vault_authority.key != perc_vault_authority(market_slab.key, percolator_program.key) {
         return Err(ProgramError::InvalidSeeds);
     }
@@ -4484,6 +4504,30 @@ fn process_execute(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -
                 savings_dest.clone(),
                 twap_authority.clone(),
                 token_program.clone(),
+            ],
+            &[&auth_seeds],
+        )?;
+    }
+    if let Some((custody_pool, subledger_program)) = pool_checkpoint {
+        invoke_signed(
+            &Instruction {
+                program_id: *subledger_program.key,
+                accounts: vec![
+                    AccountMeta::new_readonly(*twap_authority.key, true),
+                    AccountMeta::new_readonly(*config_account.key, false),
+                    AccountMeta::new(*custody_pool.key, false),
+                    AccountMeta::new_readonly(*market_slab.key, false),
+                    AccountMeta::new_readonly(*percolator_program.key, false),
+                ],
+                data: vec![SUBLEDGER_IX_CHECKPOINT_TWAP_INSURANCE],
+            },
+            &[
+                twap_authority.clone(),
+                config_account.clone(),
+                custody_pool.clone(),
+                market_slab.clone(),
+                percolator_program.clone(),
+                subledger_program.clone(),
             ],
             &[&auth_seeds],
         )?;
