@@ -501,6 +501,32 @@ fn read_portfolio_reward_snapshot_inner(
     })
 }
 
+pub fn read_portfolio_matcher_sequence(data: &[u8]) -> Result<u64, ReadError> {
+    validate_header(data, KIND_PORTFOLIO)?;
+    if data.len() == percolator_prog::constants::PORTFOLIO_LEGACY_ACCOUNT_LEN {
+        return Ok(0);
+    }
+    percolator_prog::state::read_portfolio_matcher_sequence(data)
+        .map_err(|_| ReadError::InvalidAccounting)
+}
+
+pub fn read_portfolio_position_epoch(data: &[u8]) -> Result<u64, ReadError> {
+    validate_header(data, KIND_PORTFOLIO)?;
+    if data.len() == percolator_prog::constants::PORTFOLIO_LEGACY_ACCOUNT_LEN {
+        return Ok(0);
+    }
+    percolator_prog::state::read_portfolio_position_epoch(data)
+        .map_err(|_| ReadError::InvalidAccounting)
+}
+
+pub fn read_portfolio_close_witness(data: &[u8]) -> Result<(u64, u64, u64), ReadError> {
+    validate_header(data, KIND_PORTFOLIO)?;
+    let portfolio_id = read_u64(data, percolator_prog::constants::PORTFOLIO_ID_OFF)?;
+    let sequence = read_portfolio_matcher_sequence(data)?;
+    let position_epoch = read_portfolio_position_epoch(data)?;
+    Ok((portfolio_id, sequence, position_epoch))
+}
+
 fn validate_asset(data: &[u8], asset_index: usize) -> Result<(), ReadError> {
     let (configured, capacity) = market_slot_counts(data)?;
     if asset_index >= configured || asset_index >= capacity {
@@ -2094,5 +2120,30 @@ mod tests {
             read_portfolio_reward_snapshot(&split_owner, &portfolio),
             Err(ReadError::InvalidAccounting)
         );
+    }
+
+    #[test]
+    fn portfolio_close_witness_extracts_id_sequence_and_epoch() {
+        let market = [1u8; 32];
+        let portfolio = [2u8; 32];
+        let owner = [3u8; 32];
+        let mut data = portfolio_with_reward_snapshot(market, portfolio, owner);
+        data[percolator_prog::constants::PORTFOLIO_MATCHER_SEQUENCE_OFF
+            ..percolator_prog::constants::PORTFOLIO_MATCHER_SEQUENCE_OFF + 8]
+            .copy_from_slice(&15u64.to_le_bytes());
+
+        let (id, seq, epoch) = read_portfolio_close_witness(&data).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(seq, 15);
+        assert_eq!(epoch, 0);
+
+        let mut legacy_data = vec![0u8; percolator_prog::constants::PORTFOLIO_LEGACY_ACCOUNT_LEN];
+        legacy_data.copy_from_slice(&data[0..percolator_prog::constants::PORTFOLIO_LEGACY_ACCOUNT_LEN]);
+        assert_eq!(read_portfolio_matcher_sequence(&legacy_data).unwrap(), 0);
+        assert_eq!(read_portfolio_position_epoch(&legacy_data).unwrap(), 0);
+        let (id, seq, epoch) = read_portfolio_close_witness(&legacy_data).unwrap();
+        assert_eq!(id, 7);
+        assert_eq!(seq, 0);
+        assert_eq!(epoch, 0);
     }
 }

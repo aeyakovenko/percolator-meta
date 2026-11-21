@@ -19,6 +19,7 @@ extern crate alloc;
 #[allow(unused_imports)]
 use alloc::format;
 use alloc::vec;
+use alloc::vec::Vec;
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     clock::Clock,
@@ -2725,6 +2726,16 @@ fn process_close_resolved_portfolio<'a>(
             )?;
         }
     }
+    let (portfolio_id, sequence, position_epoch) = {
+        let portfolio_data = portfolio.try_borrow_data()?;
+        percolator_accounting::read_portfolio_close_witness(&portfolio_data)
+            .map_err(|_| ProgramError::InvalidAccountData)?
+    };
+    let mut close_data = Vec::with_capacity(25);
+    close_data.push(PERC_IX_CLOSE_PORTFOLIO);
+    close_data.extend_from_slice(&portfolio_id.to_le_bytes());
+    close_data.extend_from_slice(&sequence.to_le_bytes());
+    close_data.extend_from_slice(&position_epoch.to_le_bytes());
     invoke_signed(
         &Instruction {
             program_id: *percolator_program.key,
@@ -2733,7 +2744,7 @@ fn process_close_resolved_portfolio<'a>(
                 AccountMeta::new(*market.key, false),
                 AccountMeta::new(*portfolio.key, false),
             ],
-            data: vec![PERC_IX_CLOSE_PORTFOLIO],
+            data: close_data,
         },
         &[
             controller.clone(),
@@ -3847,5 +3858,23 @@ mod tests {
             decode_sequenced_admin_data(&[PERC_IX_RESOLVE_MARKET]),
             Ok((&[PERC_IX_RESOLVE_MARKET][..], None))
         );
+    }
+
+    #[test]
+    fn close_resolved_portfolio_payload_binds_close_witness() {
+        let portfolio_id = 42u64;
+        let sequence = 99u64;
+        let position_epoch = 12u64;
+        let mut close_data = Vec::with_capacity(25);
+        close_data.push(PERC_IX_CLOSE_PORTFOLIO);
+        close_data.extend_from_slice(&portfolio_id.to_le_bytes());
+        close_data.extend_from_slice(&sequence.to_le_bytes());
+        close_data.extend_from_slice(&position_epoch.to_le_bytes());
+
+        assert_eq!(close_data.len(), 25);
+        assert_eq!(close_data[0], 8);
+        assert_eq!(u64::from_le_bytes(close_data[1..9].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(close_data[9..17].try_into().unwrap()), 99);
+        assert_eq!(u64::from_le_bytes(close_data[17..25].try_into().unwrap()), 12);
     }
 }

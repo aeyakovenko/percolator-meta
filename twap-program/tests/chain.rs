@@ -52229,7 +52229,11 @@ fn presigned_portfolio_close_cannot_erase_later_funding_rewards() {
                 AccountMeta::new(market, false),
                 AccountMeta::new(victim_portfolio, false),
             ],
-            PIx::ClosePortfolio,
+            PIx::ClosePortfolio {
+                portfolio_id: victim_portfolio_id,
+                expected_sequence: 0,
+                position_epoch: 0,
+            },
         );
         let refill_portfolio = solana_sdk::system_instruction::transfer(
             &beneficiary.pubkey(),
