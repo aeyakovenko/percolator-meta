@@ -70091,6 +70091,8 @@ fn run_public_raw_liquidation_policy_replay_case(replay_retained: bool) -> (u64,
         ],
         PIx::UpdateLiquidationFeePolicy {
             cranker_share_bps: 10_000,
+            policy_sequence: 1,
+            authority_epoch: 0,
         },
     );
     svm.expire_blockhash();
@@ -70125,13 +70127,17 @@ fn run_public_raw_liquidation_policy_replay_case(replay_retained: bool) -> (u64,
             ],
             PIx::UpdateLiquidationFeePolicy {
                 cranker_share_bps: 1,
+                policy_sequence: 2,
+                authority_epoch: 0,
             },
         ),
     )
     .expect("governance corrects the liquidation cranker share to one basis point");
     if replay_retained {
-        svm.send_transaction(retained_high_policy)
-            .expect("the current pin accepts the stale high-share variant");
+        assert!(
+            svm.send_transaction(retained_high_policy).is_err(),
+            "the upstream fix rejects the stale high-share variant"
+        );
     }
 
     let vault_authority = perc_vault_authority(&market, &perc_id());
@@ -70332,13 +70338,12 @@ fn run_public_raw_liquidation_policy_replay_case(replay_retained: bool) -> (u64,
 }
 
 #[test]
-#[ignore = "RED: raw liquidation policies need a monotonic sequence"]
 fn probe_public_raw_liquidation_policy_replay_redirects_victim_penalty() {
     let control = run_public_raw_liquidation_policy_replay_case(false);
     let replay = run_public_raw_liquidation_policy_replay_case(true);
 
     assert_eq!(control, (1, 2));
-    assert_eq!(replay, (3, 0));
+    assert_eq!(replay, (1, 2));
     assert_eq!(
         replay, control,
         "a retained policy intent must not overwrite a later governance correction",
