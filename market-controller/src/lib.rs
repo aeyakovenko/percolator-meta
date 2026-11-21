@@ -1345,11 +1345,31 @@ fn process_proxy_admin<'a>(
         percolator_program.key,
         &bump_seed,
     );
+    let cpi_data = if perc_tag == PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY
+        || perc_tag == PERC_IX_UPDATE_MAINTENANCE_FEE_POLICY
+    {
+        if percolator_data.len() == 3 {
+            let market_data = market.try_borrow_data()?;
+            let authority_epoch = percolator_accounting::read_asset_authority_epoch(&market_data, 0)
+                .map_err(|_| ProgramError::InvalidAccountData)?;
+            let (_, expected_sequence) =
+                policy_sequence_update.ok_or(ProgramError::InvalidInstructionData)?;
+            let mut data = alloc::vec::Vec::with_capacity(19);
+            data.extend_from_slice(percolator_data);
+            data.extend_from_slice(&expected_sequence.to_le_bytes());
+            data.extend_from_slice(&authority_epoch.to_le_bytes());
+            data
+        } else {
+            percolator_data.to_vec()
+        }
+    } else {
+        percolator_data.to_vec()
+    };
     invoke_signed(
         &Instruction {
             program_id: *percolator_program.key,
             accounts: metas,
-            data: percolator_data.to_vec(),
+            data: cpi_data,
         },
         &cpi_accounts,
         &[&seeds],
@@ -3847,5 +3867,27 @@ mod tests {
             decode_sequenced_admin_data(&[PERC_IX_RESOLVE_MARKET]),
             Ok((&[PERC_IX_RESOLVE_MARKET][..], None))
         );
+    }
+
+    #[test]
+    fn policy_sequence_payload_binds_sequence_and_epoch_for_cpi() {
+        let tag = PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY;
+        let cranker_share_bps = 100u16;
+        let mut raw = vec![tag];
+        raw.extend_from_slice(&cranker_share_bps.to_le_bytes());
+        assert_eq!(raw.len(), 3);
+
+        let sequence = 42u64;
+        let epoch = 3u64;
+        let mut cpi_data = alloc::vec::Vec::with_capacity(19);
+        cpi_data.extend_from_slice(&raw);
+        cpi_data.extend_from_slice(&sequence.to_le_bytes());
+        cpi_data.extend_from_slice(&epoch.to_le_bytes());
+
+        assert_eq!(cpi_data.len(), 19);
+        assert_eq!(cpi_data[0], PERC_IX_UPDATE_LIQUIDATION_FEE_POLICY);
+        assert_eq!(u16::from_le_bytes(cpi_data[1..3].try_into().unwrap()), 100);
+        assert_eq!(u64::from_le_bytes(cpi_data[3..11].try_into().unwrap()), 42);
+        assert_eq!(u64::from_le_bytes(cpi_data[11..19].try_into().unwrap()), 3);
     }
 }
