@@ -3149,6 +3149,7 @@ fn process_insurance_deposit(
         insurance_spent_before,
         backing_balance_before,
         backing_sources_before,
+        backing_floors_before,
     ) = {
         let market_data = market_slab.try_borrow_data()?;
         let insurance = percolator_accounting::read_asset_insurance_balance(&market_data, 0)
@@ -3162,7 +3163,7 @@ fn process_insurance_deposit(
         } else {
             None
         };
-        let (backing, sources) = if pool.cross_backing {
+        let (backing, sources, floors) = if pool.cross_backing {
             (
                 Some(
                     percolator_accounting::read_asset_backing_balances(&market_data, 0)
@@ -3172,26 +3173,34 @@ fn process_insurance_deposit(
                     percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
                         .map_err(|_| ProgramError::InvalidAccountData)?,
                 ),
+                Some(
+                    percolator_accounting::read_asset_backing_provider_protection_floors(
+                        &market_data,
+                        0,
+                    )
+                    .map_err(|_| ProgramError::InvalidAccountData)?,
+                ),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
-        (insurance, spent, backing, sources)
+        (insurance, spent, backing, sources, floors)
     };
     let backing_protected_domains = match (
         backing_balance_before,
         backing_sources_before,
         backing_ledger_principals,
+        backing_floors_before,
     ) {
-        (Some(balances), Some(sources), Some(principals)) => [
+        (Some(balances), Some(sources), Some(principals), Some(floors)) => [
             balances[0]
-                .provider_protected_principal_atoms(principals[0], sources[0])
+                .provider_protected_principal_atoms_with_floor(principals[0], sources[0], floors[0])
                 .map_err(|_| ProgramError::InvalidAccountData)?,
             balances[1]
-                .provider_protected_principal_atoms(principals[1], sources[1])
+                .provider_protected_principal_atoms_with_floor(principals[1], sources[1], floors[1])
                 .map_err(|_| ProgramError::InvalidAccountData)?,
         ],
-        (None, None, None) => [0, 0],
+        (None, None, None, None) => [0, 0],
         _ => return Err(ProgramError::InvalidAccountData),
     };
     let backing_effective_domains = [
@@ -3851,6 +3860,7 @@ fn process_insurance_withdraw_impl(
         live_insurance_balance,
         backing_balances,
         backing_sources,
+        backing_floors,
         live_asset_exposed,
     ) = {
         let market_data = market_slab.try_borrow_data()?;
@@ -3875,17 +3885,23 @@ fn process_insurance_withdraw_impl(
         let exposed = live
             && percolator_accounting::asset_has_position_or_loss_state(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
-        let (backing, sources) = if pool.cross_backing {
+        let (backing, sources, floors) = if pool.cross_backing {
             (
                 percolator_accounting::read_asset_backing_balances(&market_data, 0)
                     .map_err(|_| ProgramError::InvalidAccountData)?,
                 percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
                     .map_err(|_| ProgramError::InvalidAccountData)?,
+                percolator_accounting::read_asset_backing_provider_protection_floors(
+                    &market_data,
+                    0,
+                )
+                .map_err(|_| ProgramError::InvalidAccountData)?,
             )
         } else {
             (
                 [percolator_accounting::BackingDomainBalance::default(); 2],
                 [percolator_accounting::BackingSourceCredit::default(); 2],
+                [0u128; 2],
             )
         };
         (
@@ -3894,16 +3910,25 @@ fn process_insurance_withdraw_impl(
             live_balance,
             backing,
             sources,
+            floors,
             exposed,
         )
     };
     let backing_protected_domains = if let Some(principals) = backing_ledger_principals {
         [
             backing_balances[0]
-                .provider_protected_principal_atoms(principals[0], backing_sources[0])
+                .provider_protected_principal_atoms_with_floor(
+                    principals[0],
+                    backing_sources[0],
+                    backing_floors[0],
+                )
                 .map_err(|_| ProgramError::InvalidAccountData)?,
             backing_balances[1]
-                .provider_protected_principal_atoms(principals[1], backing_sources[1])
+                .provider_protected_principal_atoms_with_floor(
+                    principals[1],
+                    backing_sources[1],
+                    backing_floors[1],
+                )
                 .map_err(|_| ProgramError::InvalidAccountData)?,
         ]
     } else {
@@ -4641,10 +4666,19 @@ fn stage_cross_backing_for_restart<'a>(
         }
         let sources = percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
             .map_err(|_| ProgramError::InvalidAccountData)?;
+        let floors = percolator_accounting::read_asset_backing_provider_protection_floors(
+            &market_data,
+            0,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
         let mut owner_backing = [0u64; 2];
         for domain in 0..2 {
             owner_backing[domain] = balances[domain]
-                .provider_protected_principal_atoms(provider_principal[domain], sources[domain])
+                .provider_protected_principal_atoms_with_floor(
+                    provider_principal[domain],
+                    sources[domain],
+                    floors[domain],
+                )
                 .map_err(|_| ProgramError::InvalidAccountData)
                 .and_then(|value| {
                     u64::try_from(value).map_err(|_| ProgramError::ArithmeticOverflow)
@@ -5101,14 +5135,20 @@ fn process_accept_operator(
         let backing_sources =
             percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
+        let floors = percolator_accounting::read_asset_backing_provider_protection_floors(
+            &market_data,
+            0,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
         let mut owner_backing = u128::from(pool.pending_backing_total()?);
         for domain in 0..2 {
             owner_backing = owner_backing
                 .checked_add(
                     backing_balances[domain]
-                        .provider_protected_principal_atoms(
+                        .provider_protected_principal_atoms_with_floor(
                             provider_principals[domain],
                             backing_sources[domain],
+                            floors[domain],
                         )
                         .map_err(|_| ProgramError::InvalidAccountData)?,
                 )
@@ -5586,14 +5626,20 @@ fn process_handoff_to_twap(
         let backing_sources =
             percolator_accounting::read_asset_backing_source_credits(&market_data, 0)
                 .map_err(|_| ProgramError::InvalidAccountData)?;
+        let floors = percolator_accounting::read_asset_backing_provider_protection_floors(
+            &market_data,
+            0,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
         let mut backing = 0u128;
         for domain in 0..2 {
             backing = backing
                 .checked_add(
                     backing_balances[domain]
-                        .provider_protected_principal_atoms(
+                        .provider_protected_principal_atoms_with_floor(
                             provider_principals[domain],
                             backing_sources[domain],
+                            floors[domain],
                         )
                         .map_err(|_| ProgramError::InvalidAccountData)?,
                 )
@@ -6575,6 +6621,47 @@ mod tests {
             .unwrap(),
             24,
             "only newly observed owner loss lowers the surviving claim",
+        );
+    }
+
+    #[test]
+    fn delayed_backing_recovery_observation_ratchets_share_rate_using_provider_protection_floor() {
+        let mut pool = historical_pool_fixture();
+        pool.cross_backing = true;
+        pool.policy = POLICY_PRINCIPAL;
+        pool.domain = DOMAIN_INSURANCE;
+        pool.outstanding_principal = 33;
+        pool.total_shares = 33 * VIRTUAL_SHARES;
+        pool.share_rate_numerator = 1;
+        pool.share_rate_denominator = VIRTUAL_SHARES;
+        pool.insurance_spent_checkpoint = 0;
+        pool.backing_protected_checkpoint = 15;
+
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 0, 14).unwrap();
+        assert_eq!(pool.backing_protected_checkpoint, 14);
+        assert_eq!(
+            redeem_indexed_shares(
+                pool.total_shares,
+                pool.share_rate_numerator,
+                pool.share_rate_denominator,
+            )
+            .unwrap(),
+            32,
+        );
+        let ratcheted_rate = (pool.share_rate_numerator, pool.share_rate_denominator);
+
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 0, 15).unwrap();
+        assert_eq!(pool.backing_protected_checkpoint, 14);
+        assert_eq!(
+            (pool.share_rate_numerator, pool.share_rate_denominator),
+            ratcheted_rate,
+        );
+
+        sync_indexed_cross_backing_external_loss(&mut pool, 40, 0, 14).unwrap();
+        assert_eq!(pool.backing_protected_checkpoint, 14);
+        assert_eq!(
+            (pool.share_rate_numerator, pool.share_rate_denominator),
+            ratcheted_rate,
         );
     }
 

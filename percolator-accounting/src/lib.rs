@@ -161,6 +161,16 @@ impl BackingDomainBalance {
             provider_principal_atoms,
         ))
     }
+
+    pub fn provider_protected_principal_atoms_with_floor(
+        self,
+        provider_principal_atoms: u128,
+        source: BackingSourceCredit,
+        floor_atoms: u128,
+    ) -> Result<u128, ReadError> {
+        let live = self.provider_protected_principal_atoms(provider_principal_atoms, source)?;
+        Ok(core::cmp::min(live, floor_atoms))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1036,6 +1046,28 @@ pub fn read_asset_backing_authority(
         data,
         asset_wrapper_offset(asset_index)? + BACKING_AUTHORITY_PROFILE_OFFSET,
     )
+}
+
+/// Returns the monotonic provider-protection floors for both backing domains of an asset,
+/// in whole atoms.
+pub fn read_asset_backing_provider_protection_floors(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<[u128; 2], ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    let base_domain = asset_index
+        .checked_mul(2)
+        .ok_or(ReadError::InvalidAccounting)?;
+    let read_floor = |domain: usize| -> Result<u128, ReadError> {
+        let protection = percolator_prog::state::read_provider_protection(data, domain)
+            .map_err(|_| ReadError::InvalidAccounting)?;
+        if protection.floor_num % BOUND_SCALE != 0 {
+            return Err(ReadError::InvalidAccounting);
+        }
+        Ok(protection.floor_num / BOUND_SCALE)
+    };
+    Ok([read_floor(base_domain)?, read_floor(base_domain + 1)?])
 }
 
 /// Returns the engine-assigned generation identifier for one configured asset slot.
@@ -2000,6 +2032,30 @@ mod tests {
         assert_eq!(
             recovered.provider_protected_principal_atoms(1, mismatched),
             Err(ReadError::InvalidAccounting),
+        );
+        assert_eq!(
+            recovered.provider_protected_principal_atoms_with_floor(
+                1,
+                source_for(recovered, 0),
+                0,
+            ),
+            Ok(0),
+        );
+        assert_eq!(
+            recovered.provider_protected_principal_atoms_with_floor(
+                1,
+                source_for(recovered, 0),
+                1,
+            ),
+            Ok(1),
+        );
+        assert_eq!(
+            recovered.provider_protected_principal_atoms_with_floor(
+                1,
+                source_for(recovered, 0),
+                2,
+            ),
+            Ok(1),
         );
     }
 
