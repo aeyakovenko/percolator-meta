@@ -70115,6 +70115,8 @@ fn run_public_raw_maintenance_policy_replay_case(replay_retained: bool) -> (u64,
         ],
         PIx::UpdateMaintenanceFeePolicy {
             cranker_share_bps: 10_000,
+            policy_sequence: 1,
+            authority_epoch: 0,
         },
     );
     svm.expire_blockhash();
@@ -70149,13 +70151,17 @@ fn run_public_raw_maintenance_policy_replay_case(replay_retained: bool) -> (u64,
             ],
             PIx::UpdateMaintenanceFeePolicy {
                 cranker_share_bps: 0,
+                policy_sequence: 2,
+                authority_epoch: 0,
             },
         ),
     )
     .expect("governance corrects the maintenance cranker share to zero");
     if replay_retained {
-        svm.send_transaction(retained_high_policy)
-            .expect("the current pin accepts the stale high-share variant");
+        assert!(
+            svm.send_transaction(retained_high_policy).is_err(),
+            "the sequence-bound pin must reject the stale high-share variant"
+        );
     }
 
     let mut clock = svm.get_sysvar::<Clock>();
@@ -70230,13 +70236,12 @@ fn run_public_raw_maintenance_policy_replay_case(replay_retained: bool) -> (u64,
 }
 
 #[test]
-#[ignore = "RED: raw maintenance policies need a monotonic sequence"]
 fn probe_public_raw_maintenance_policy_replay_redirects_victim_fee() {
     let control = run_public_raw_maintenance_policy_replay_case(false);
     let replay = run_public_raw_maintenance_policy_replay_case(true);
 
     assert_eq!(control, (9, 1, 1));
-    assert_eq!(replay, (9, 2, 0));
+    assert_eq!(replay, (9, 1, 1));
     assert_eq!(
         replay, control,
         "a retained policy intent must not overwrite a later governance correction",
