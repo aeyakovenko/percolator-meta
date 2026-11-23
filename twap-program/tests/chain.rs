@@ -28,7 +28,6 @@ fn twap_id() -> Pubkey {
 // carries no provider mutation sequence. Two fee variants signed for one intended
 // top-up must not both expose the provider's wallet to counterparty PnL.
 #[test]
-#[ignore = "expected RED until the pinned Percolator insurance top-up wire is sequenced"]
 fn e2e_presigned_insurance_topup_retry_cannot_fund_counterparty_profit_twice() {
     use percolator_prog::ix::Instruction as PIx;
 
@@ -284,6 +283,9 @@ fn e2e_presigned_insurance_topup_retry_cannot_fund_counterparty_profit_twice() {
             AccountMeta::new_readonly(spl_token::ID, false),
         ],
         PIx::TopUpInsurance {
+            market_id: 0,
+            intent_id: 1,
+            authority_epoch: 0,
             amount: INSURANCE_TOP_UP as u128,
         },
     );
