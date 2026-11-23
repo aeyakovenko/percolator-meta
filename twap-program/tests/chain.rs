@@ -69103,6 +69103,11 @@ fn run_public_backing_topup_retry_case(submit_retry: bool) -> PublicBackingRetry
         ],
         PIx::TopUpBackingBucket {
             domain: 1,
+            market_id: 0,
+            intent_id: 1,
+            authority_epoch: 0,
+            backing_fee_bps: 0,
+            insurance_share_bps: 0,
             amount: u128::from(BACKING),
             expiry_slot: EXPIRY_SLOT,
         },
@@ -69263,7 +69268,6 @@ fn run_public_backing_topup_retry_case(submit_retry: bool) -> PublicBackingRetry
 // carrying the provider's same backing authorization. Every Percolator state
 // account is system-allocated and initialized through the public API.
 #[test]
-#[ignore = "RED: presigned backing top-up variants are both accepted"]
 fn probe_public_backing_topup_retry_cannot_transfer_provider_funds() {
     let control = run_public_backing_topup_retry_case(false);
     let retry = run_public_backing_topup_retry_case(true);
@@ -69280,20 +69284,6 @@ fn probe_public_backing_topup_retry_cannot_transfer_provider_funds() {
             winner_terminal: true,
             loser_terminal: true,
         },
-    );
-    assert_eq!(
-        retry,
-        PublicBackingRetryOutcome {
-            retry_accepted: true,
-            provider_source: 0,
-            provider_recovery: 0,
-            provider_withdraw_succeeded: false,
-            winner_payout: 3_000,
-            loser_payout: 0,
-            winner_terminal: true,
-            loser_terminal: true,
-        },
-        "the current pin accepts both presigned backing top-up variants",
     );
     assert_eq!(
         retry, control,

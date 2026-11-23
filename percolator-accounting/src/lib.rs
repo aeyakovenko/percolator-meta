@@ -1093,6 +1093,49 @@ pub fn read_asset_admin(data: &[u8], asset_index: usize) -> Result<[u8; 32], Rea
     )
 }
 
+/// Returns the control sequences for one asset slot from the pinned wrapper.
+pub fn read_asset_control_sequences(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<percolator_prog::state::AssetControlSequencesV16, ReadError> {
+    validate_market(data)?;
+    validate_asset(data, asset_index)?;
+    percolator_prog::state::read_asset_control_sequences(data, asset_index)
+        .map_err(|_| ReadError::InvalidAccounting)
+}
+
+/// Returns the monotonic liquidation fee policy sequence for one asset slot.
+pub fn read_asset_liquidation_policy_sequence(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<u64, ReadError> {
+    read_asset_control_sequences(data, asset_index).map(|s| s.liquidation_fee)
+}
+
+/// Returns the monotonic maintenance fee policy sequence for one asset slot.
+pub fn read_asset_maintenance_policy_sequence(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<u64, ReadError> {
+    read_asset_control_sequences(data, asset_index).map(|s| s.maintenance_fee)
+}
+
+/// Returns the monotonic backing top-up policy sequence for one asset slot.
+pub fn read_asset_backing_topup_sequence(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<u64, ReadError> {
+    read_asset_control_sequences(data, asset_index).map(|s| s.backing_top_up)
+}
+
+/// Returns the authority epoch recorded for one asset slot.
+pub fn read_asset_authority_epoch(
+    data: &[u8],
+    asset_index: usize,
+) -> Result<u64, ReadError> {
+    read_asset_control_sequences(data, asset_index).map(|s| s.authority_epoch)
+}
+
 /// Returns the insurance attributed to one asset's long and short domains, including
 /// the amount Percolator currently permits an asset-wide withdrawal to consume.
 ///
@@ -2094,5 +2137,34 @@ mod tests {
             read_portfolio_reward_snapshot(&split_owner, &portfolio),
             Err(ReadError::InvalidAccounting)
         );
+    }
+
+    #[test]
+    fn read_asset_control_sequences_extracts_policy_sequences_and_epoch() {
+        let mut data = market_with_insurance_capacity();
+        let sequences = percolator_prog::state::AssetControlSequencesV16 {
+            oracle_observation: 0,
+            backing_fee: 0,
+            authority_epoch: 5,
+            trade_fee: 0,
+            liquidation_fee: 42,
+            maintenance_fee: 17,
+            fee_redirect: 0,
+            market_init_fee: 0,
+            permissionless_resolve: 0,
+            insurance_top_up: 0,
+            backing_top_up: 99,
+        };
+        percolator_prog::state::write_asset_control_sequences(&mut data, 0, &sequences).unwrap();
+
+        let read = read_asset_control_sequences(&data, 0).unwrap();
+        assert_eq!(read.liquidation_fee, 42);
+        assert_eq!(read.maintenance_fee, 17);
+        assert_eq!(read.backing_top_up, 99);
+        assert_eq!(read.authority_epoch, 5);
+        assert_eq!(read_asset_liquidation_policy_sequence(&data, 0).unwrap(), 42);
+        assert_eq!(read_asset_maintenance_policy_sequence(&data, 0).unwrap(), 17);
+        assert_eq!(read_asset_backing_topup_sequence(&data, 0).unwrap(), 99);
+        assert_eq!(read_asset_authority_epoch(&data, 0).unwrap(), 5);
     }
 }
